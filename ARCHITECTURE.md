@@ -1,0 +1,175 @@
+# Arquitectura técnica — L1 con agilidad cuántica
+
+Documento de diseño. Las decisiones marcadas como ya tomadas en el prompt maestro no se reabren aquí salvo un caso (ver §1/§2, agregación de firmas), señalado explícitamente por ser una consecuencia técnica real de combinar dos decisiones ya fijadas, no una preferencia alternativa.
+
+Referencias cruzadas: cada sección se apoya en una o más skills creadas en `/mnt/skills/user/` (`pqc-cryptography`, `stark-proofs-and-hash-commitments`, `dag-consensus-design`, `blockchain-core-rust`, `wasm-vm-integration`, `blockchain-security-audit`). Ese es el lugar para el detalle de referencia; este documento es el lugar para la decisión y su razonamiento.
+
+---
+
+## 1. Capa de consenso
+
+**Decisión.** Narwhal-Bullshark: capa de disponibilidad de datos (Narwhal, DAG de lotes certificados propuestos en paralelo por cada validador) separada de la capa de ordenamiento (Bullshark, BFT determinista sobre esa DAG). Tolerancia a fallas bizantinas: **f < n/3** (33%), bajo sincronía parcial — el límite estándar y probado de esta familia de protocolos (HotStuff, Bullshark, Tusk), no negociado a la baja. Selección de validadores: proof-of-stake ponderado por stake, con rotación por épocas (conjunto de validadores fijo durante la época, re-evaluado en el corte según ranking de stake y eventos de slashing). Finalidad objetivo: del orden de 2-3 round-trips de red, sub-2 segundos bajo buenas condiciones de WAN según benchmarks publicados de Bullshark a ~50-100 validadores geodistribuidos — **objetivo a validar empíricamente en testnet propio, no un número prometido**.
+
+**Justificación.** Frente a Avalanche snowman, Narwhal-Bullshark da finalidad determinista (no probabilística), que importa para una L1 orientada a pagos/DeFi donde "probablemente final" no es una garantía equivalente a "final". La separación mempool/ordenamiento es lo que realmente entrega paralelismo — cada validador dissemina sus propios lotes de forma concurrente e independiente, en vez de que un solo líder secuencial (incluso uno rápido) serialice todas las decisiones de inclusión. Es, además, un diseño publicado con pruebas de seguridad/vivacidad bajo sincronía parcial, con dos linajes de producción independientes (Sui, Aptos) de los que aprender lecciones de despliegue sin adoptar su capa criptográfica (basada en curvas elípticas).
+
+**Riesgos y mitigación.**
+- *Bandwidth de certificados más grande de lo habitual en esta familia de protocolos*: la mayoría de las implementaciones reales de Narwhal-Bullshark (Sui, Aptos) usan agregación BLS para comprimir los 2f+1 firmas individuales de un certificado de quórum en una sola firma agregada corta. Esa opción está explícitamente descartada aquí (BLS es pairing-based, roto por Shor igual que Verkle/KZG). Consecuencia real, no hipotética: en fase 1-2, los certificados de quórum de este proyecto llevarán 2f+1 firmas individuales (o un esquema de agregación hash/lattice, todavía inmaduro/no estandarizado) en vez de una firma agregada compacta — certificados más pesados que en un DAG-BFT equivalente basado en BLS. Mitigado en fase 1-2 porque el conjunto de validadores es pequeño (~10-20), así que 2f+1 firmas individuales es manejable; **revisar agregación lattice-based como investigación activa para fase 2+, sin comprometerse a una fecha.**
+- *Censura de validador dentro de su propio lote*: no completamente resuelta por ningún DAG-BFT actual (ver §7). Mitigado parcialmente por la propiedad "cualquier worker puede llevar cualquier transacción" + rotación de líder con fallback por timeout en Bullshark.
+- *Partición de red*: seguridad se preserva, vivacidad se pausa y retoma al sanar la partición — propiedad estructural del modelo de sincronía parcial, no un mecanismo ad hoc separado.
+
+**Fuera de alcance en fase 1.** Conjunto de validadores grande (cientos+) — el perfil de bandwidth de Narwhal-Bullshark no se ha validado a esa escala en este proyecto todavía. Agregación de firmas para certificados. Testing de simulación determinista tipo FoundationDB/TigerBeetle para la capa DAG (se documenta como inversión deliberada de fase 2, no ausencia por descuido).
+
+---
+
+## 2. Capa criptográfica
+
+**Decisión — formato de transacción.** Direcciones son un hash de 32 bytes (`sha3(pubkey_clásica || pubkey_pqc || scheme_ids)`), no la clave pública cruda — así el tamaño de dirección es constante sin importar qué esquema use la cuenta, el mismo patrón "revela la clave completa solo al gastar" ya usado y probado en un prototipo previo de esta cuenta. El *bundle* de claves públicas completo solo viaja en la primera transacción de una cuenta (o en la creación de cuenta); transacciones posteriores solo cargan la firma, no las claves, porque los validadores ya cachean el bundle asociado a esa dirección.
+
+```
+Transaction {
+  version: u8,
+  payer: Address,                    // 32 bytes, hash-derivada
+  nonce: u64,
+  recent_cert_ref: Hash,             // ancla de recencia / anti-replay
+  fee_limit: u64,
+  instructions: [Instruction],
+  signatures: [SignatureEnvelope],   // uno por firmante
+}
+
+SignatureEnvelope {
+  classical_scheme_id: u16,
+  pqc_scheme_id: u16,
+  classical_sig: bytes,              // largo fijo según classical_scheme_id
+  pqc_sig: bytes,                    // largo variable, prefijado por longitud
+  pubkey_bundle: Option<Bundle>,     // solo presente la primera vez que se ve esta dirección
+}
+```
+
+Separar metadatos (versión, nonce, instrucciones) de la carga pesada (firmas) en el formato serializado permite a la capa de red validar estructura y fee *antes* de deserializar/verificar los bytes de firma, que son los caros.
+
+**Decisión — registro on-chain de algoritmos.** Cada esquema es una entrada `{AlgorithmId, Name, PubkeyLen, SigLen, VerifyGasCost, Status, ActivationEpoch}`. Alta de un esquema nuevo requiere supermayoría de gobernanza + ventana de revisión pública con time-lock antes de quedar `Active` para cuentas nuevas. Baja (deprecación) es igualmente time-locked con período de gracia de migración — nunca invalidación instantánea que deje fondos varados detrás de un esquema que ya no se acepta.
+
+**Decisión — política de firma híbrida.** Durante la fase híbrida, **ambos** componentes (clásico Ed25519 + PQC ML-DSA, o el que el registro indique) son obligatorios y se verifican independientemente. Ninguno es opcional ni "informativo". Una transacción con solo un componente válido es inválida — la única postura que entrega seguridad cuántica real desde el día uno en vez de "cuando alguien se acuerde de activarla". Ver `blockchain-security-audit` para el ataque de downgrade que esto previene explícitamente.
+
+**Análisis de impacto en tamaño de bloque y ancho de banda (números concretos).** Ed25519 puro: 32B clave + 64B firma = 96B de overhead criptográfico por firma. Híbrido Ed25519+ML-DSA-65 (nuestro esquema por defecto): bundle de claves 1,984B (solo en primer uso) + firma combinada 3,373B — overhead marginal por transacción, una vez cacheado el bundle, de **~3.4KB**, ~35x el de Ed25519 solo. A un objetivo de throughput de 10,000 TPS con firma híbrida, eso son **~34 MB/s** solo de bytes de firma que deben propagarse por la capa de mempool DAG — una cifra real que hay que asumir explícitamente, no esconder. Justifica directamente: (a) que el fee escale con tamaño en bytes, no sea plano (§5); (b) por qué el paralelismo de workers de Narwhal existe específicamente para repartir esta carga entre rutas de red y núcleos distintos; (c) por qué SLH-DSA (clave diminuta, firma de hasta 50KB) es *peor* para este problema de ancho de banda que ML-DSA-65, y por tanto no es el esquema por defecto pese a su conservadurismo criptográfico superior.
+
+**Riesgos y mitigación.** Ataque de downgrade (interceptar/despojar el componente PQC) — mitigado por el rechazo obligatorio de payloads incompletos en la capa de admisión del mempool, antes de llegar a consenso. Bug de implementación PQC (timing side-channel en muestreo por rechazo de Dilithium) — mitigado usando exclusivamente liboqs/PQClean, nunca matemática propia (ver `pqc-cryptography`).
+
+**Fuera de alcance en fase 1.** Agregación de firmas lattice/hash-based para certificados de consenso (inmadura, ver §1). SLH-DSA como opción activa en el registro (documentado, no habilitado hasta fase 3). Migración completa a solo-PQC (mecanismo de gobernanza existe desde fase 1, activación es decisión de fase 3+).
+
+---
+
+## 3. Capa de estado y almacenamiento
+
+**Decisión.** Árbol de estado Merkle basado en hash (SHA3-256/BLAKE3), indexado por dirección de cuenta, explícitamente **no** un árbol Verkle con KZG. Cada hoja: `{balance, nonce, algorithm_id, code_hash, storage_root}`. Backend de almacenamiento: RocksDB (vía el crate `rocksdb`) — el estándar de facto para KV embebido en clientes blockchain (Ethereum, Solana lo usan), con cacheo en memoria de subárboles calientes; evaluar `redb` (Rust puro) como alternativa si en algún momento se prioriza eliminar la dependencia C++ de RocksDB sobre su madurez comprobada.
+
+**Justificación.** Con millones de cuentas, un árbol Merkle estándar tiene ~21-24 niveles de profundidad y pruebas de inclusión de unos cientos de bytes a ~1KB — perfectamente tratable; el costo real no está en el tamaño de la prueba sino en la escritura del árbol por bloque, de ahí RocksDB + cacheo en vez de recalcular la raíz completa cada vez. Un Verkle tree daría pruebas multi-punto más compactas, pero su instanciación práctica desplegada (KZG) es pairing-based — reintroduciría exactamente la fragilidad cuántica que todo el diseño busca evitar, aunque sea el patrón "de moda". No hay reemplazo maduro de compromiso vectorial PQC-seguro para Verkle hoy; no se reconsidera sin uno.
+
+**Riesgos y mitigación.** *State bloat por claves/firmas PQC pesadas* (ver `blockchain-security-audit` #1): no retener firmas históricas completas más allá de la ventana activa de prueba para light clients; precio de storage (no solo cómputo) en el modelo de gas, proporcional a bytes persistidos.
+
+**Fuera de alcance en fase 1.** Compresión STARK de transiciones de estado para light clients (fase 2, ver §siguiente). Pruebas de ejecución WASM completa vía zkWASM (fase 3+, área de investigación, sin fecha comprometida).
+
+### Compresión de estado vía STARK (fase 2)
+
+Winterfell (librería Rust embebible) sobre el stack de StarkWare, específicamente porque no obliga a adoptar Cairo como segunda VM junto a WASM. Hash de compromiso: SHA3/BLAKE3 para el árbol de estado externo (conservador); un hash "algebraico" (Poseidon2/Rescue-Prime) opcional solo dentro de los árboles Merkle internos del probador STARK, como optimización de rendimiento aislada con su propio presupuesto de riesgo — su historial de criptoanálisis es más delgado que SHA3, así que no es el default del proyecto. Un STARK de fase 2 prueba "la raíz de estado S_n sigue válidamente de S_0 dada la secuencia de bloques finalizados por la DAG" — transición de estado agregada, no prueba de ejecución WASM instrucción por instrucción (eso es zkWASM, fase 3+, no comprometido).
+
+---
+
+## 4. Capa de ejecución
+
+**Decisión.** Runtime WASM: **Wasmtime**, no construido desde cero. Razón concreta: medición de combustible (fuel) determinista integrada de fábrica, que mapea directo al modelo de gas sin instrumentación adicional, y un historial de diseño centrado en seguridad/sandboxing (Bytecode Alliance, usado en producción por Fastly/Fermyon) — relevante porque, a diferencia de un prototipo previo de esta cuenta que solo ejecutaba código Rust nativo de confianza, este proyecto necesita correr contratos de terceros *no confiables* de forma segura desde el diseño.
+
+**Modelo de ejecución sobre la DAG.** Bullshark produce un orden total sobre lotes certificados; la ejecución recorre ese orden. Dentro de una "ola" del orden, transacciones cuyos *working sets* de cuentas son disjuntos (mismo patrón de acceso-por-cuenta ya usado en un prototipo previo, ver `blockchain-core-rust`) se despachan en paralelo a un pool de hilos; solo las que realmente compiten por la misma cuenta se serializan. Esta es la razón concreta por la que el modelo de cuentas estilo Solana (no UTXO, no cuenta-global-EVM) se adopta conceptualmente: es lo que hace el paralelismo detectable de antemano.
+
+**Modelo de gas.** Dos componentes con precio independiente porque representan recursos escasos distintos: (a) cómputo, vía fuel de Wasmtime calibrado por clase de instrucción; (b) syscalls, con precio propio no derivado del conteo de instrucciones — I/O de storage (escritura más cara que lectura, reflejando que el crecimiento de estado es el recurso realmente escaso a largo plazo) y verificación criptográfica (cada esquema del registro cobra según su costo nativo *medido*, no una tarifa plana — un verify de ML-DSA-65 cuesta órdenes de magnitud más CPU que uno de Ed25519 y el gas debe reflejarlo).
+
+**Determinismo (no negociable).** Versión de Wasmtime fijada por versión de protocolo — un cambio de codegen es un cambio relevante a consenso, se revisa con el mismo rigor que un upgrade de protocolo. Punto flotante restringido a aritmética entera/fija en contratos por defecto en fase 1 (evita el problema de patrones de bits NaN implementation-defined entre compiladores) en vez de depender de canonicalización de NaN sin verificación independiente.
+
+**Syscalls de agilidad criptográfica.** `host_verify_signature(scheme_id, pubkey, msg, sig) -> bool`, `host_get_account_scheme(address) -> scheme_id`, `host_get_registry_entry(scheme_id) -> RegistryEntry` — llaman directo a la capa nativa de criptografía, nunca a una reimplementación en WASM (más lenta y un segundo camino de código sin auditar en paralelo al primero).
+
+**Riesgos y mitigación.** Ver `wasm-vm-integration` y `blockchain-security-audit` #1/#8.
+
+**Fuera de alcance en fase 1.** Backend LLVM/Wasmer como alternativa (Wasmtime cubre las necesidades). Punto flotante en contratos. Programación completamente automática de paralelismo especulativo (se empieza con detección de conflictos declarada explícitamente vía las cuentas listadas, no inferencia dinámica).
+
+---
+
+## 5. Modelo económico (tokenomics)
+
+**Decisión — mecanismo de fee.** Tres componentes: `fee = base_fee_per_byte × tamaño_tx_bytes + priority_fee (tip del usuario) + gas × gas_price`. El `base_fee_per_byte` se ajusta algorítmicamente por ronda/época al estilo EIP-1559 (objetivo de utilización de la DAG, ej. 50%; sube si se supera, baja si no se alcanza) — esto precia directamente el tamaño real de las firmas PQC pesadas, no solo el cómputo, atacando de raíz el vector de bandwidth-DoS de `blockchain-security-audit` #2. Distribución: `priority_fee` va íntegro al validador cuyo worker incluyó la transacción (incentivo real de inclusión); `base_fee` se divide — recomendado 50% quemado / 50% a un pool de recompensas de validadores, ajustable por gobernanza.
+
+**Por qué no "casi gratis" ni excesivo.** Fees casi cero invitan spam de bandwidth precisamente porque las firmas PQC son ~35x más pesadas que las clásicas (§2) — sin un piso de fee proporcional al tamaño, un atacante satura el mempool DAG a costo trivial. Fees excesivos matan adopción y no tienen justificación técnica una vez que el fee ya escala con el costo real de bytes/cómputo que el atacante o el usuario legítimo le imponen a la red. El rango objetivo: piso comparable en orden de magnitud al de Solana (fracciones de centavo) para el componente base de una transacción simple con firma clásica-equivalente, pero el componente proporcional a bytes hace que una transacción con firma híbrida PQC cueste sensiblemente más que el piso de Solana — proporcional al ~35x de payload criptográfico real, no una cifra arbitraria. Esto es lo que "ni muy barato ni muy caro" significa concretamente en este proyecto: el precio refleja el costo real, no un número copiado de otra cadena con un perfil criptográfico distinto.
+
+**Decisión — staking.** Validadores bondean stake para participar; el stake determina peso de voto en el quórum 2f+1 de Narwhal-Bullshark y elegibilidad de recompensa. Slashing por equivocation (evidencia criptográfica auto-contenida, ver §1/§7) y por indisponibilidad severa. **Delegated staking desde fase 1** (no solo validadores): cualquier holder puede delegar a un validador y compartir recompensas menos una comisión — patrón estándar (Cosmos/Solana-style), elegido desde el inicio porque la distribución amplia de stake importa para la historia de descentralización real del proyecto, no es algo para posponer.
+
+**Riesgos y mitigación.** Ver `blockchain-security-audit` #2, #5.
+
+**Fuera de alcance en fase 1.** Calibración fina de la tasa de emisión/staking con modelado económico real (se lanza con parámetros de partida razonables, explícitamente documentados como ajustables — el mismo patrón usado ya en un proyecto previo de esta cuenta para su reserva de staking). Mercados de fee por prioridad más sofisticados que un tip simple (ej. subastas de lote).
+
+---
+
+## 6. Gobernanza y mecanismo de actualización
+
+**Decisión.** Votación on-chain ponderada por stake, con umbrales escalonados por nivel de riesgo:
+- Parámetros de bajo riesgo (constantes de la curva de fee, tabla de precios de gas): mayoría simple del stake participante.
+- Cambios al registro de algoritmos (alta/baja de esquemas de firma): supermayoría (2/3) + ventana de revisión con time-lock obligatorio (ver §2).
+- **Migración completa a solo-PQC**: umbral más alto (2/3 a 3/4 de supermayoría) + time-lock largo + período de señalización on-chain (validadores/nodos señalan disposición antes de la activación, al estilo BIP9/enmienda on-chain de Tezos).
+
+**Por qué esto logra "migración trivial, no hard fork".** El registro de algoritmos y la lógica de verificación híbrida ya son parte del protocolo base desde el día uno (§2) — "migrar por completo" significa activar una política ya soportada por el software de todos los validadores ("ya no se aceptan cuentas nuevas con firma solo-clásica" / "PQC sola es suficiente, híbrido deja de ser obligatorio"), no distribuir cliente nuevo con criptografía nueva. Es literalmente un voto de gobernanza que cambia un flag de política que el protocolo ya sabe interpretar, exactamente el objetivo no negociable #2.
+
+**Riesgos y mitigación.** Ataque de gobernanza al registro — ver `blockchain-security-audit` #7. Captura de gobernanza por concentración de stake — mitigado parcialmente por delegated staking (§5) ampliando la base de votantes reales, aunque esto no es una solución completa y merece revisión de diseño de gobernanza dedicada antes de mainnet (no resuelto aquí en detalle).
+
+**Fuera de alcance en fase 1.** Gobernanza automatizada de ejecución de propuestas (fase 1 puede requerir un paso de ejecución manual/multisig del resultado de una votación, con la votación en sí ya siendo on-chain y vinculante en intención).
+
+---
+
+## 7. Seguridad y superficie de ataque
+
+Lista completa con mitigación específica en `blockchain-security-audit`; resumen de los diez vectores identificados:
+
+1. **State bloat por firmas/claves PQC pesadas** — precio de storage proporcional a bytes, no retención indefinida de firmas históricas crudas.
+2. **Bandwidth-DoS vía spam de firmas de tamaño máximo** — fee escalado por bytes + rate-limiting en la capa de admisión del worker, independiente del mercado de fees.
+3. **Equivocation en la DAG** — resuelto estructuralmente por el quórum 2f+1 de Narwhal-Bullshark; evidencia criptográfica auto-contenida y slasheable.
+4. **Censura de validador** — parcialmente mitigado estructuralmente (inclusión no depende del líder de orden); **no resuelto del todo** contra un líder que despriorice cuentas específicas dentro de sus propios lotes — inclusion lists (investigación de Ethereum) como candidato de fase 2+, señalado honestamente como abierto.
+5. **Spam por fee demasiado bajo** — por qué el objetivo #4 rechaza explícitamente "casi gratis" (§5).
+6. **Ataque de downgrade criptográfico** — rechazo obligatorio de payloads híbridos incompletos en admisión de mempool (§2).
+7. **Ataque de gobernanza al registro** — supermayoría + time-lock + período de gracia en deprecación (§2/§6).
+8. **Side-channel en implementaciones PQC** — solo liboqs/PQClean, nunca matemática propia (`pqc-cryptography`).
+9. **Reorganización de largo alcance** — **prevenida estructuralmente** por la finalidad determinista de Bullshark; propiedad del diseño, no solo un riesgo mitigado.
+10. **"Harvest now, decrypt/forge later"** — aplicar PQC híbrido también al transporte P2P de validadores (ML-KEM + X25519), en el mismo cronograma que las firmas de usuario, no como idea tardía.
+
+**Plan de auditoría externa.** Tres alcances separados antes de mainnet: (a) revisión de seguridad/vivacidad del consenso DAG, idealmente con métodos formales, no solo revisión de código; (b) revisión de la capa criptográfica — específicamente el código de integración con liboqs y la lógica de verificación híbrida, no solo "liboqs está auditado por tanto es seguro"; (c) revisión del sandboxing del runtime WASM. Firmas con experiencia combinada en consenso blockchain y PQC (lista corta hoy: Trail of Bits, NCC Group, Zellic, Kudelski — verificar capacidad vigente antes de contratar). Bug bounty público en testnet por un período de meses, no una formalidad de semanas.
+
+**Fuera de alcance en fase 1.** Auditoría externa formal (se planea para antes de mainnet, fase 3). Mitigación completa de censura de validador (abierta, ver arriba).
+
+---
+
+## 8. Interoperabilidad y developer experience
+
+**Decisión.** SDK nativo en Rust más SDK en TypeScript/JS para wallets y dApps web — ambos con el modelo de agilidad criptográfica (múltiples esquemas, firma híbrida) como ciudadano de primera clase desde el diseño de la API, no agregado después. Wallet de referencia debe manejar generación/almacenamiento/firma de *ambos* pares de claves (clásico + PQC) del modelo híbrido. Explorador de bloques con decodificación de firma extensible por esquema (un plugin por entrada del registro, no hardcodeado a un esquema).
+
+**Riesgo de adopción nombrado explícitamente.** El material PQC es mucho más grande, y el soporte de wallets de hardware para ML-DSA es todavía inmaduro en toda la industria — la mayoría de hardware wallets hoy solo soportan curvas clásicas. Mitigación: software-wallet-first en fases 1-2, sin prometer paridad de hardware wallet en fase 1; acercarse a fabricantes de hardware wallet una vez que su soporte PQC madure a nivel de industria, no antes.
+
+**Interoperabilidad EVM/Solana.** Explícitamente **no** prioridad de fase 1 dado el tamaño del equipo. Si se persigue, el camino realista es un puente lock-and-mint (no una capa de compatibilidad de VM nativa, que sería un proyecto en sí mismo) — y cualquier puente introduce sus propios supuestos de confianza (validadores/relayers del puente) que necesitan análisis de seguridad separado del resto de este documento. Contingente a señales reales de demanda, no diseñado especulativamente ahora.
+
+**Fuera de alcance en fase 1.** Puente EVM/Solana. Soporte de hardware wallet. SDKs en lenguajes adicionales más allá de Rust/TypeScript.
+
+---
+
+## Roadmap por fases
+
+**Fase 1 — Testnet.** Narwhal-Bullshark con conjunto de validadores pequeño (~10-20). Firmas híbridas Ed25519+ML-DSA-65 obligatorias, ambas verificadas siempre. Ejecución WASM vía Wasmtime con medición de gas básica. Árbol de estado Merkle plano (sin compresión STARK todavía). Fee de tres componentes (base por bytes + priority + gas) con ajuste algorítmico simple. Delegated staking activo. Gobernanza on-chain votante pero con ejecución de resultado manual/multisig. CLI wallet + RPC básico. Sin puente, sin hardware wallet, sin auditoría externa todavía.
+
+**Fase 2 — Compresión y gobernanza activa.** STARKs (Winterfell) para compresión de transición de estado y light clients. Registro de algoritmos con flujo real de alta/baja vía gobernanza. Ejecución de gobernanza automatizada on-chain. Testing de simulación determinista para el consenso. Expansión del conjunto de validadores, con revisión empírica del perfil de bandwidth de certificados (§1). Investigación activa de agregación de firmas lattice-based para certificados.
+
+**Fase 3 — Mainnet.** Auditorías externas (consenso, cripto, WASM) completadas. Bug bounty público de varios meses. Mecanismo de migración completa a solo-PQC probado y disponible (activación es decisión de gobernanza posterior, no bloqueante para el lanzamiento de mainnet). SLH-DSA disponible como opción opt-in en el registro. zkWASM evaluado como línea de investigación, sin compromiso de fecha. Puente EVM/Solana solo si hay señal de demanda real.
+
+---
+
+## Preguntas abiertas
+
+Solo las que genuinamente requieren una decisión del equipo, no una técnica:
+
+1. **Tamaño y geografía objetivo del conjunto de validadores de testnet** — afecta directamente la calibración real de finalidad y bandwidth (§1); es una decisión operativa/de producto, no algo que se pueda fijar solo con argumentos técnicos.
+2. **Split exacto de fee (% quemado vs. % a validadores) y utilización objetivo de la curva de ajuste tipo EIP-1559** — el mecanismo ya está especificado (§5); los números finales son una decisión de tokenomics/negocio dentro de ese mecanismo.
+3. **Si se persigue un puente EVM/Solana y en qué horizonte** — depende de estrategia de adopción, no de una restricción técnica (§8).
+4. **Estructura legal/jurisdicción y plan de distribución del token de gobernanza** — fuera del alcance de un arquitecto técnico, pero condiciona directamente el diseño de gobernanza de §6 (quién puede votar, cómo se distribuye el stake inicial) y debería resolverse antes de fijar los parámetros finales de esa sección.
