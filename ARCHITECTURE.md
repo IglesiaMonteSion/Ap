@@ -10,6 +10,8 @@ Referencias cruzadas: cada sección se apoya en una o más skills creadas en `/m
 
 **Decisión.** Narwhal-Bullshark: capa de disponibilidad de datos (Narwhal, DAG de lotes certificados propuestos en paralelo por cada validador) separada de la capa de ordenamiento (Bullshark, BFT determinista sobre esa DAG). Tolerancia a fallas bizantinas: **f < n/3** (33%), bajo sincronía parcial — el límite estándar y probado de esta familia de protocolos (HotStuff, Bullshark, Tusk), no negociado a la baja. Selección de validadores: proof-of-stake ponderado por stake, con rotación por épocas (conjunto de validadores fijo durante la época, re-evaluado en el corte según ranking de stake y eventos de slashing). Finalidad objetivo: del orden de 2-3 round-trips de red, sub-2 segundos bajo buenas condiciones de WAN según benchmarks publicados de Bullshark a ~50-100 validadores geodistribuidos — **objetivo a validar empíricamente en testnet propio, no un número prometido**.
 
+**Conjunto de validadores del testnet de fase 1 (confirmado con el equipo).** 10-20 validadores, geodistribuidos en 3+ regiones/continentes — deliberadamente no centralizado en una sola nube/región, precisamente para que la finalidad y el comportamiento de la DAG bajo latencia real se validen desde el primer testnet, no se asuman.
+
 **Justificación.** Frente a Avalanche snowman, Narwhal-Bullshark da finalidad determinista (no probabilística), que importa para una L1 orientada a pagos/DeFi donde "probablemente final" no es una garantía equivalente a "final". La separación mempool/ordenamiento es lo que realmente entrega paralelismo — cada validador dissemina sus propios lotes de forma concurrente e independiente, en vez de que un solo líder secuencial (incluso uno rápido) serialice todas las decisiones de inclusión. Es, además, un diseño publicado con pruebas de seguridad/vivacidad bajo sincronía parcial, con dos linajes de producción independientes (Sui, Aptos) de los que aprender lecciones de despliegue sin adoptar su capa criptográfica (basada en curvas elípticas).
 
 **Riesgos y mitigación.**
@@ -95,7 +97,11 @@ Winterfell (librería Rust embebible) sobre el stack de StarkWare, específicame
 
 ## 5. Modelo económico (tokenomics)
 
-**Decisión — mecanismo de fee.** Tres componentes: `fee = base_fee_per_byte × tamaño_tx_bytes + priority_fee (tip del usuario) + gas × gas_price`. El `base_fee_per_byte` se ajusta algorítmicamente por ronda/época al estilo EIP-1559 (objetivo de utilización de la DAG, ej. 50%; sube si se supera, baja si no se alcanza) — esto precia directamente el tamaño real de las firmas PQC pesadas, no solo el cómputo, atacando de raíz el vector de bandwidth-DoS de `blockchain-security-audit` #2. Distribución: `priority_fee` va íntegro al validador cuyo worker incluyó la transacción (incentivo real de inclusión); `base_fee` se divide — recomendado 50% quemado / 50% a un pool de recompensas de validadores, ajustable por gobernanza.
+**Decisión — mecanismo de fee (confirmado con el equipo).** Tres componentes: `fee = base_fee_per_byte × tamaño_tx_bytes + priority_fee (tip del usuario) + gas × gas_price`. El `base_fee_per_byte` se ajusta algorítmicamente por ronda/época al estilo EIP-1559 (objetivo de utilización de la DAG, 50% — punto de partida, ajustable por gobernanza; sube si se supera, baja si no se alcanza) — esto precia directamente el tamaño real de las firmas PQC pesadas, no solo el cómputo, atacando de raíz el vector de bandwidth-DoS de `blockchain-security-audit` #2. Distribución: `priority_fee` va íntegro al validador cuyo worker incluyó la transacción (incentivo real de inclusión); `base_fee` se divide **50% quemado / 50% a un pool de recompensas de validadores** — split confirmado como punto de partida, ajustable por gobernanza (§6) según lo que muestre la operación real.
+
+**Decisión — quema automática de residuos ("dust").** Además del `base_fee` quemado, cualquier cuenta que quede con un balance mayor a cero pero por debajo de un umbral mínimo (`DUST_THRESHOLD`) después de una transferencia se pone en cero automáticamente, y ese residuo se suma al total quemado — el mismo mecanismo, con la misma motivación, ya implementado y probado en un prototipo previo de esta cuenta. Ataca directamente el problema real que resuelve: en cadenas sin este mecanismo (ej. Solana, donde cada cuenta debe mantener un mínimo exento de renta), intentar enviar "todo" el balance de una cuenta deja un residuo de centavos varado — no se puede gastar, no desaparece, simplemente queda inmovilizado en millones de cuentas a escala de red. Aquí, en vez de quedar varado, se destruye, reforzando la presión deflacionaria del `base_fee` quemado en vez de dejar valor atrapado sin uso.
+
+Exclusiones explícitas: cuentas propias del protocolo (pool de recompensas de staking, cualquier cuenta de tesoro que exista) nunca se barren así, sin importar cuán bajo llegue su balance — barrerlas sería un bug, no limpieza de residuos (lección ya documentada en `project-lessons-learned` desde el prototipo anterior). `DUST_THRESHOLD` es un parámetro de partida razonable, no calibrado con modelado económico — igual que la tasa de emisión de staking, ajustable por gobernanza antes de mainnet.
 
 **Por qué no "casi gratis" ni excesivo.** Fees casi cero invitan spam de bandwidth precisamente porque las firmas PQC son ~35x más pesadas que las clásicas (§2) — sin un piso de fee proporcional al tamaño, un atacante satura el mempool DAG a costo trivial. Fees excesivos matan adopción y no tienen justificación técnica una vez que el fee ya escala con el costo real de bytes/cómputo que el atacante o el usuario legítimo le imponen a la red. El rango objetivo: piso comparable en orden de magnitud al de Solana (fracciones de centavo) para el componente base de una transacción simple con firma clásica-equivalente, pero el componente proporcional a bytes hace que una transacción con firma híbrida PQC cueste sensiblemente más que el piso de Solana — proporcional al ~35x de payload criptográfico real, no una cifra arbitraria. Esto es lo que "ni muy barato ni muy caro" significa concretamente en este proyecto: el precio refleja el costo real, no un número copiado de otra cadena con un perfil criptográfico distinto.
 
@@ -118,7 +124,9 @@ Winterfell (librería Rust embebible) sobre el stack de StarkWare, específicame
 
 **Riesgos y mitigación.** Ataque de gobernanza al registro — ver `blockchain-security-audit` #7. Captura de gobernanza por concentración de stake — mitigado parcialmente por delegated staking (§5) ampliando la base de votantes reales, aunque esto no es una solución completa y merece revisión de diseño de gobernanza dedicada antes de mainnet (no resuelto aquí en detalle).
 
-**Fuera de alcance en fase 1.** Gobernanza automatizada de ejecución de propuestas (fase 1 puede requerir un paso de ejecución manual/multisig del resultado de una votación, con la votación en sí ya siendo on-chain y vinculante en intención).
+**Estructura legal/jurisdicción y distribución del token de gobernanza (deliberadamente pendiente).** El equipo confirmó que esto todavía no está definido, y se deja explícitamente pendiente por ahora — no bloquea el diseño técnico de esta sección: los umbrales de votación y el mecanismo de time-lock funcionan igual sin importar la estructura legal final. Sí es un prerrequisito real antes de fijar los parámetros de **distribución inicial de stake/voto** (quién arranca con qué peso de voto) — ese detalle específico queda abierto hasta que exista una decisión legal/de negocio, y debe resolverse antes de mainnet, no antes de testnet.
+
+**Fuera de alcance en fase 1.** Gobernanza automatizada de ejecución de propuestas (fase 1 puede requerir un paso de ejecución manual/multisig del resultado de una votación, con la votación en sí ya siendo on-chain y vinculante en intención). Distribución final de stake/voto inicial (depende de la estructura legal, todavía no definida).
 
 ---
 
@@ -149,7 +157,7 @@ Lista completa con mitigación específica en `blockchain-security-audit`; resum
 
 **Riesgo de adopción nombrado explícitamente.** El material PQC es mucho más grande, y el soporte de wallets de hardware para ML-DSA es todavía inmaduro en toda la industria — la mayoría de hardware wallets hoy solo soportan curvas clásicas. Mitigación: software-wallet-first en fases 1-2, sin prometer paridad de hardware wallet en fase 1; acercarse a fabricantes de hardware wallet una vez que su soporte PQC madure a nivel de industria, no antes.
 
-**Interoperabilidad EVM/Solana.** Explícitamente **no** prioridad de fase 1 dado el tamaño del equipo. Si se persigue, el camino realista es un puente lock-and-mint (no una capa de compatibilidad de VM nativa, que sería un proyecto en sí mismo) — y cualquier puente introduce sus propios supuestos de confianza (validadores/relayers del puente) que necesitan análisis de seguridad separado del resto de este documento. Contingente a señales reales de demanda, no diseñado especulativamente ahora.
+**Interoperabilidad EVM/Solana (confirmado con el equipo).** **No** es prioridad de fase 1 — decisión cerrada, no solo recomendación. Se revisa únicamente si aparecen señales reales de demanda, no se diseña especulativamente ahora. Si en algún momento se persigue, el camino realista es un puente lock-and-mint (no una capa de compatibilidad de VM nativa, que sería un proyecto en sí mismo) — y cualquier puente introduce sus propios supuestos de confianza (validadores/relayers del puente) que necesitarían análisis de seguridad separado del resto de este documento.
 
 **Fuera de alcance en fase 1.** Puente EVM/Solana. Soporte de hardware wallet. SDKs en lenguajes adicionales más allá de Rust/TypeScript.
 
@@ -157,7 +165,7 @@ Lista completa con mitigación específica en `blockchain-security-audit`; resum
 
 ## Roadmap por fases
 
-**Fase 1 — Testnet.** Narwhal-Bullshark con conjunto de validadores pequeño (~10-20). Firmas híbridas Ed25519+ML-DSA-65 obligatorias, ambas verificadas siempre. Ejecución WASM vía Wasmtime con medición de gas básica. Árbol de estado Merkle plano (sin compresión STARK todavía). Fee de tres componentes (base por bytes + priority + gas) con ajuste algorítmico simple. Delegated staking activo. Gobernanza on-chain votante pero con ejecución de resultado manual/multisig. CLI wallet + RPC básico. Sin puente, sin hardware wallet, sin auditoría externa todavía.
+**Fase 1 — Testnet.** Narwhal-Bullshark con 10-20 validadores geodistribuidos en 3+ regiones. Firmas híbridas Ed25519+ML-DSA-65 obligatorias, ambas verificadas siempre. Ejecución WASM vía Wasmtime con medición de gas básica. Árbol de estado Merkle plano (sin compresión STARK todavía). Fee de tres componentes (base por bytes + priority + gas) con ajuste algorítmico simple, split 50/50 quema/validadores, más quema automática de residuos ("dust") en cada transferencia. Delegated staking activo. Gobernanza on-chain votante pero con ejecución de resultado manual/multisig; distribución inicial de stake/voto pendiente de la estructura legal, todavía no definida. CLI wallet + RPC básico. Sin puente, sin hardware wallet, sin auditoría externa todavía.
 
 **Fase 2 — Compresión y gobernanza activa.** STARKs (Winterfell) para compresión de transición de estado y light clients. Registro de algoritmos con flujo real de alta/baja vía gobernanza. Ejecución de gobernanza automatizada on-chain. Testing de simulación determinista para el consenso. Expansión del conjunto de validadores, con revisión empírica del perfil de bandwidth de certificados (§1). Investigación activa de agregación de firmas lattice-based para certificados.
 
@@ -165,11 +173,13 @@ Lista completa con mitigación específica en `blockchain-security-audit`; resum
 
 ---
 
-## Preguntas abiertas
+## Decisiones cerradas (ronda de cierre con el equipo)
 
-Solo las que genuinamente requieren una decisión del equipo, no una técnica:
+Las cuatro preguntas abiertas de la primera versión de este documento ya se resolvieron y quedaron incorporadas en sus secciones correspondientes:
 
-1. **Tamaño y geografía objetivo del conjunto de validadores de testnet** — afecta directamente la calibración real de finalidad y bandwidth (§1); es una decisión operativa/de producto, no algo que se pueda fijar solo con argumentos técnicos.
-2. **Split exacto de fee (% quemado vs. % a validadores) y utilización objetivo de la curva de ajuste tipo EIP-1559** — el mecanismo ya está especificado (§5); los números finales son una decisión de tokenomics/negocio dentro de ese mecanismo.
-3. **Si se persigue un puente EVM/Solana y en qué horizonte** — depende de estrategia de adopción, no de una restricción técnica (§8).
-4. **Estructura legal/jurisdicción y plan de distribución del token de gobernanza** — fuera del alcance de un arquitecto técnico, pero condiciona directamente el diseño de gobernanza de §6 (quién puede votar, cómo se distribuye el stake inicial) y debería resolverse antes de fijar los parámetros finales de esa sección.
+1. **Validadores de testnet** → 10-20, geodistribuidos en 3+ regiones (§1).
+2. **Split de fee y dust** → 50% quema / 50% validadores en el `base_fee` (punto de partida, ajustable por gobernanza), más quema automática de residuos por debajo de un umbral en cada transferencia, exenta explícitamente para cuentas propias del protocolo (§5).
+3. **Puente EVM/Solana** → no es prioridad de fase 1, decisión cerrada; se revisa solo si hay demanda real (§8).
+4. **Estructura legal/token de gobernanza** → deliberadamente pendiente, no bloquea el diseño técnico de gobernanza; sí es prerrequisito para fijar la distribución inicial de stake/voto antes de mainnet (§6).
+
+No quedan preguntas abiertas pendientes de este documento. Nuevas decisiones que surjan durante la implementación se registran en la skill `project-lessons-learned` (sección "Architecture decisions log"), no aquí — este documento es el diseño de referencia, no el changelog vivo del proyecto.
