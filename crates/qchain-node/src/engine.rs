@@ -11,6 +11,15 @@
 //! are simply skipped and logged), and no garbage collection of stale vote
 //! entries for vertices that never reach quorum. All are noted as phase-2
 //! hardening work in the `blockchain-core-rust` skill.
+//!
+//! **Known liveness gap (found via load testing, see
+//! `project-lessons-learned`):** a transaction whose nonce is ahead of its
+//! account's current nonce at commit time (e.g. several transactions from
+//! one account submitted concurrently, arriving at the mempool out of
+//! order) fails in `try_commit` below and is silently dropped forever -
+//! there is no per-account mempool ordering and no retry queue. Any client
+//! issuing more than one transaction per account without waiting for each
+//! to confirm first risks losing transactions, not just delaying them.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex};

@@ -254,6 +254,26 @@ enum Command {
         rpc: String,
         proposal: String,
     },
+    /// Real network throughput measurement: submits `count` signed
+    /// transfers to `rpc` as fast as this process can sign+POST them
+    /// (concurrently, across `threads` workers), then polls every node in
+    /// `monitor` until they've all executed - reporting submission rate
+    /// and true end-to-end (gossip+consensus+execution) throughput. Not a
+    /// literature estimate - see `project-lessons-learned`.
+    LoadTest {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long, default_value_t = 200)]
+        count: u64,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        /// RPC URLs to poll for completion (defaults to just `--rpc`).
+        /// Pass multiple times to confirm convergence across nodes.
+        #[arg(long = "monitor")]
+        monitor: Vec<String>,
+    },
 }
 
 fn fetch_account(rpc: &str, address: &Pubkey) -> anyhow::Result<Option<Account>> {
@@ -264,6 +284,16 @@ fn fetch_account(rpc: &str, address: &Pubkey) -> anyhow::Result<Option<Account>>
     }
     let account: Account = resp.error_for_status()?.json()?;
     Ok(Some(account))
+}
+
+#[derive(serde::Deserialize)]
+struct NodeStatus {
+    executed_transactions: u64,
+}
+
+fn fetch_executed_count(rpc: &str) -> anyhow::Result<u64> {
+    let status: NodeStatus = reqwest::blocking::get(format!("{rpc}/status"))?.error_for_status()?.json()?;
+    Ok(status.executed_transactions)
 }
 
 fn submit_instruction(
@@ -469,6 +499,132 @@ fn main() -> anyhow::Result<()> {
             let account = fetch_account(&rpc, &proposal_pk)?.ok_or_else(|| anyhow::anyhow!("proposal account not found"))?;
             let proposal: Proposal = borsh::from_slice(&account.data)?;
             println!("{proposal:#?}");
+        }
+        Command::LoadTest { rpc, keypair, count, threads, monitor } => {
+            let payer = qchain_crypto::read_keypair_file(&keypair)?;
+            let to = Keypair::generate()?.pubkey();
+
+            // One fresh, independently-funded account per transaction
+            // rather than N transactions from a single payer: this
+            // execution model enforces strict per-account nonce order
+            // (see `qchain-execution`'s `Ledger`), and concurrent
+            // multi-threaded submission from one payer races that order -
+            // a transaction that lands even one slot early is rejected
+            // and *permanently lost* (never retried), which understates
+            // real throughput by measuring a self-inflicted failure mode
+            // instead of the network's actual capacity. Funding is a
+            // separate, sequential, un-timed setup phase for exactly this
+            // reason.
+            println!("funding {count} fresh accounts (sequential setup, not timed)...");
+            let senders: Vec<Keypair> = (0..count).map(|_| Keypair::generate().unwrap()).collect();
+            let start_nonce = fetch_account(&rpc, &payer.pubkey())?.map(|a| a.nonce).unwrap_or(0);
+            let fund_amount = 1_000_000u64;
+            let client = reqwest::blocking::Client::new();
+            for (i, sender) in senders.iter().enumerate() {
+                let ix = Instruction {
+                    program_id: Pubkey::system_program_id(),
+                    accounts: vec![payer.pubkey(), sender.pubkey()],
+                    data: borsh::to_vec(&SystemInstruction::Transfer { amount: fund_amount })?,
+                };
+                let tx = Transaction::new_signed(&payer, start_nonce + i as u64, [0u8; 32], 10_000_000, vec![ix])?;
+                let resp = client.post(format!("{rpc}/tx")).json(&tx).send()?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("funding transaction rejected: {}", resp.text()?);
+                }
+            }
+            print!("  waiting for funding to land...");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let fund_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let last = senders.last().unwrap().pubkey();
+                if fetch_account(&rpc, &last)?.map(|a| a.balance).unwrap_or(0) > 0 {
+                    break;
+                }
+                if std::time::Instant::now() > fund_deadline {
+                    anyhow::bail!("timed out waiting for funding to land");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            println!(" done");
+
+            println!("signing {count} transactions (one per funded account)...");
+            let sign_start = std::time::Instant::now();
+            let txs: Vec<Transaction> = senders
+                .iter()
+                .map(|sender| {
+                    let ix = Instruction {
+                        program_id: Pubkey::system_program_id(),
+                        accounts: vec![sender.pubkey(), to],
+                        data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+                    };
+                    Transaction::new_signed(sender, 0, [0u8; 32], fund_amount, vec![ix]).unwrap()
+                })
+                .collect();
+            let sign_elapsed = sign_start.elapsed();
+            println!("  {:?} total, {:.0} tx/s", sign_elapsed, count as f64 / sign_elapsed.as_secs_f64());
+
+            let monitors = if monitor.is_empty() { vec![rpc.clone()] } else { monitor };
+            let baseline: Vec<u64> = monitors.iter().map(|m| fetch_executed_count(m).unwrap_or(0)).collect();
+
+            let worker_count = threads.max(1);
+            let chunk_size = (count as usize).div_ceil(worker_count).max(1);
+            println!("submitting {count} independent txs to {rpc} across {worker_count} worker threads...");
+            let submit_start = std::time::Instant::now();
+            let handles: Vec<_> = txs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let chunk = chunk.to_vec();
+                    let rpc = rpc.clone();
+                    std::thread::spawn(move || {
+                        let client = reqwest::blocking::Client::new();
+                        let mut failures = 0u64;
+                        for tx in &chunk {
+                            match client.post(format!("{rpc}/tx")).json(tx).send() {
+                                Ok(resp) if resp.status().is_success() => {}
+                                Ok(resp) => {
+                                    eprintln!("submit rejected: {:?}", resp.text());
+                                    failures += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("submit error: {e}");
+                                    failures += 1;
+                                }
+                            }
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            let failures: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            let submit_elapsed = submit_start.elapsed();
+            println!(
+                "  {:?} total, {:.0} tx/s submission rate ({failures} failed to submit)",
+                submit_elapsed,
+                count as f64 / submit_elapsed.as_secs_f64()
+            );
+
+            println!("waiting for execution to converge across {} monitored node(s)...", monitors.len());
+            let timeout = std::time::Duration::from_secs(120);
+            for (m, base) in monitors.iter().zip(baseline.iter()) {
+                let target = base + count - failures;
+                loop {
+                    let current = fetch_executed_count(m)?;
+                    if current >= target {
+                        break;
+                    }
+                    if submit_start.elapsed() > timeout {
+                        anyhow::bail!("timed out waiting for {m} to execute {count} transactions (at {current}/{target})");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                let total_elapsed = submit_start.elapsed();
+                println!(
+                    "  {m}: executed {count} txs end-to-end (submit -> gossip -> consensus -> executed) in {:?} ({:.0} tx/s)",
+                    total_elapsed,
+                    count as f64 / total_elapsed.as_secs_f64()
+                );
+            }
         }
     }
     Ok(())
