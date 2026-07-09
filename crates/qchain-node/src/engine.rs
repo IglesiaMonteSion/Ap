@@ -220,14 +220,33 @@ impl Engine {
 
     /// Proposes this validator's vertex for the next round, once the
     /// previous round has quorum certificates to reference as parents (or
-    /// immediately, for round 0). No-op if a proposal is already pending
-    /// certification.
+    /// immediately, for round 0). If a proposal is already pending
+    /// certification, re-broadcasts that same vertex instead of no-op -
+    /// see the retry note below.
     pub async fn propose_round(&self) {
+        // Retry path: a proposal is still waiting on quorum votes.
+        // Re-broadcasting it every tick until it certifies is what fixes
+        // a real liveness bug found via `qchain-simulation`'s
+        // healing-partition scenario (see project-lessons-learned):
+        // without this, a single dropped copy of a VertexProposal (e.g.
+        // during a transient network partition, or the ordinary
+        // connection-refused race at validator startup) stalls this
+        // validator - and every later round that depends on its
+        // certificate - permanently, since nothing else ever resends it.
+        // Idempotent for peers who already voted: the equivocation lock
+        // in `handle_message`'s `VertexProposal` arm treats a repeat of
+        // the exact same digest as a harmless no-op re-vote.
+        let retry_vertex = {
+            let state = self.state.lock().await;
+            state.own_pending_vertex.clone()
+        };
+        if let Some(vertex) = retry_vertex {
+            self.network.broadcast(&NetMessage::VertexProposal(vertex)).await;
+            return;
+        }
+
         let (vertex, batch) = {
             let mut state = self.state.lock().await;
-            if state.own_pending_vertex.is_some() {
-                return;
-            }
             let round = state.next_round;
             if round > 0 {
                 let prev_round = round - 1;

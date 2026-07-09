@@ -1859,6 +1859,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qchain-simulation"
+version = "0.1.0"
+dependencies = [
+ "qchain-consensus",
+ "qchain-core",
+ "qchain-crypto",
+ "rand",
+]
+
+[[package]]
 name = "qchain-storage"
 version = "0.1.0"
 dependencies = [

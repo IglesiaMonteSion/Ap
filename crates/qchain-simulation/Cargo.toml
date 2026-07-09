@@ -1,0 +1,10 @@
+[package]
+name = "qchain-simulation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-consensus = { path = "../qchain-consensus" }
+rand.workspace = true
