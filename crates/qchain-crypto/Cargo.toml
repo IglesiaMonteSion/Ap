@@ -1,0 +1,16 @@
+[package]
+name = "qchain-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+ed25519-dalek.workspace = true
+oqs.workspace = true
+rand.workspace = true
+bs58.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+sha3.workspace = true

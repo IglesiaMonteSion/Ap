@@ -1,0 +1,17 @@
+[package]
+name = "qchain-execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-core = { path = "../qchain-core" }
+qchain-storage = { path = "../qchain-storage" }
+serde.workspace = true
+borsh.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+wasmtime.workspace = true
+
+[dev-dependencies]
+wat.workspace = true

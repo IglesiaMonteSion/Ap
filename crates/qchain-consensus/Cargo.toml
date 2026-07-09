@@ -1,0 +1,9 @@
+[package]
+name = "qchain-consensus"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+sha3.workspace = true

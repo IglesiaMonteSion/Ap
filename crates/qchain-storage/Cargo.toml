@@ -1,0 +1,11 @@
+[package]
+name = "qchain-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-core = { path = "../qchain-core" }
+serde.workspace = true
+borsh.workspace = true
+sha3.workspace = true
