@@ -265,14 +265,9 @@ mod tests {
     }
 
     fn new_slh_dsa_entry() -> RegistryEntry {
-        RegistryEntry {
-            id: qchain_crypto::AlgorithmId(3),
-            name: "SLH-DSA".to_string(),
-            pubkey_len: 64,
-            max_sig_len: 49_856,
-            status: AlgorithmStatus::Active,
-            activation_epoch: 0,
-        }
+        // Real, measured sizes for SPHINCS+-SHA2-256s-simple (see
+        // `qchain_crypto::slh_dsa`'s own size test) - not a placeholder.
+        qchain_crypto::slh_dsa_registry_entry(0)
     }
 
     fn create_proposal(accounts: &mut HashMap<Pubkey, Account>, proposer: Pubkey, action: ProposalAction, round: Round) {
@@ -339,7 +334,7 @@ mod tests {
         execute(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds + rule.timelock_rounds).unwrap();
 
         let registry: Vec<RegistryEntry> = Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert!(registry.iter().any(|e| e.id == qchain_crypto::AlgorithmId(3) && e.status == AlgorithmStatus::Active));
+        assert!(registry.iter().any(|e| e.id == qchain_crypto::ALGORITHM_SLH_DSA && e.status == AlgorithmStatus::Active));
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Executed);
     }

@@ -1,0 +1,127 @@
+//! Real SLH-DSA (SPHINCS+) support via liboqs, added as an *opt-in*
+//! standalone scheme - registered as `ALGORITHM_SLH_DSA` in `registry.rs`,
+//! but (see that constant's doc comment) **not yet wired into**
+//! `Transaction`/`Certificate` signature verification, consensus vote
+//! verification, or the WASM `host_verify_signature` syscall. All three of
+//! those still hardcode exactly the Ed25519+ML-DSA-65 pair via
+//! `PublicKeyBundle`/`HybridSignature`, which are fixed two-field types, not
+//! a generic `{scheme_id, bytes}` shape - making SLH-DSA (or any third
+//! scheme) a real, accepted signature type for accounts/consensus is a
+//! separate, larger change (touches `qchain-core`, `qchain-consensus`,
+//! `qchain-network`, `qchain-execution`) deliberately deferred, not started
+//! here. What *is* real and tested here: genuine liboqs keygen/sign/verify
+//! for the chosen parameter set, ready to be plugged in once that wiring
+//! happens.
+//!
+//! Parameter set: `SPHINCS+-SHA2-256s-simple` - NIST security level 5 (the
+//! highest available), "s" (small-signature, slower-signing) variant. Per
+//! the `pqc-cryptography` skill, SLH-DSA's role in this project is the
+//! conservative opt-in fallback for high-value/long-lived accounts
+//! (treasury, validator root keys, cold storage) where a slower signing
+//! path is an acceptable trade for hash-based security's more conservative
+//! assumption and for keeping the (already large) signature as small as
+//! this scheme allows.
+
+use oqs::sig::{Algorithm as OqsAlgorithm, Sig};
+
+use crate::ensure_oqs_init;
+
+fn slh_dsa_sig() -> anyhow::Result<Sig> {
+    ensure_oqs_init();
+    Sig::new(OqsAlgorithm::SphincsSha2256sSimple).map_err(|e| anyhow::anyhow!("liboqs SLH-DSA (SHA2-256s-simple) unavailable: {e}"))
+}
+
+/// A standalone SLH-DSA keypair - deliberately not merged into the hybrid
+/// `Keypair` type, since this scheme is opt-in, not part of the mandatory
+/// pair every account must have.
+pub struct SlhDsaKeypair {
+    pk: Vec<u8>,
+    sk: Vec<u8>,
+}
+
+impl SlhDsaKeypair {
+    pub fn generate() -> anyhow::Result<Self> {
+        let sig_alg = slh_dsa_sig()?;
+        let (pk, sk) = sig_alg.keypair().map_err(|e| anyhow::anyhow!("SLH-DSA keygen failed: {e}"))?;
+        Ok(SlhDsaKeypair { pk: pk.into_vec(), sk: sk.into_vec() })
+    }
+
+    pub fn public_key_bytes(&self) -> &[u8] {
+        &self.pk
+    }
+
+    pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let sig_alg = slh_dsa_sig()?;
+        let sk_ref = sig_alg
+            .secret_key_from_bytes(&self.sk)
+            .ok_or_else(|| anyhow::anyhow!("corrupt SLH-DSA secret key"))?;
+        let sig = sig_alg.sign(msg, sk_ref).map_err(|e| anyhow::anyhow!("SLH-DSA signing failed: {e}"))?;
+        Ok(sig.into_vec())
+    }
+}
+
+/// Verify a standalone SLH-DSA signature. Mirrors
+/// `verify_ml_dsa_65_component`'s shape/failure-mode (returns `false` rather
+/// than erroring on any malformed input) for the same reason: this is meant
+/// to slot into the same kind of "check one registered scheme's signature"
+/// call site `host_verify_signature` already has for the two phase-1
+/// schemes, once SLH-DSA is actually wired in there.
+pub fn verify_slh_dsa_component(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let Ok(sig_alg) = slh_dsa_sig() else { return false };
+    let Some(pk_ref) = sig_alg.public_key_from_bytes(pubkey) else {
+        return false;
+    };
+    let Some(sig_ref) = sig_alg.signature_from_bytes(sig) else {
+        return false;
+    };
+    sig_alg.verify(msg, sig_ref, pk_ref).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_and_verify_roundtrip() {
+        let kp = SlhDsaKeypair::generate().unwrap();
+        let msg = b"hello qchain, slh-dsa opt-in";
+        let sig = kp.sign(msg).unwrap();
+        assert!(verify_slh_dsa_component(kp.public_key_bytes(), msg, &sig));
+    }
+
+    #[test]
+    fn tampered_message_fails_verification() {
+        let kp = SlhDsaKeypair::generate().unwrap();
+        let sig = kp.sign(b"hello qchain").unwrap();
+        assert!(!verify_slh_dsa_component(kp.public_key_bytes(), b"goodbye qchain", &sig));
+    }
+
+    #[test]
+    fn wrong_key_fails_verification() {
+        let kp = SlhDsaKeypair::generate().unwrap();
+        let other = SlhDsaKeypair::generate().unwrap();
+        let sig = kp.sign(b"hello qchain").unwrap();
+        assert!(!verify_slh_dsa_component(other.public_key_bytes(), b"hello qchain", &sig));
+    }
+
+    #[test]
+    fn tampered_signature_bytes_fail_verification() {
+        let kp = SlhDsaKeypair::generate().unwrap();
+        let msg = b"hello qchain";
+        let mut sig = kp.sign(msg).unwrap();
+        let last = sig.len() - 1;
+        sig[last] ^= 0xFF;
+        assert!(!verify_slh_dsa_component(kp.public_key_bytes(), msg, &sig));
+    }
+
+    #[test]
+    fn real_key_and_signature_sizes_match_the_sha2_256s_simple_parameter_set() {
+        // Measured via a real liboqs round-trip (`--nocapture` probe),
+        // not assumed from the FIPS 205 table - matches this project's
+        // "measure, don't estimate" rule (see project-lessons-learned).
+        let kp = SlhDsaKeypair::generate().unwrap();
+        let sig = kp.sign(b"size probe").unwrap();
+        assert_eq!(kp.public_key_bytes().len(), 64);
+        assert_eq!(sig.len(), 29_792);
+    }
+}

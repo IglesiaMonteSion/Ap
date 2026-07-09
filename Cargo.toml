@@ -25,7 +25,7 @@ borsh = { version = "1", features = ["derive"] }
 sha3 = "0.10"
 bs58 = "0.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-oqs = { version = "0.11", default-features = false, features = ["ml_dsa", "vendored", "std"] }
+oqs = { version = "0.11", default-features = false, features = ["ml_dsa", "sphincs", "vendored", "std"] }
 rand = "0.8"
 anyhow = "1"
 thiserror = "1"

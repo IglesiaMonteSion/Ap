@@ -17,9 +17,21 @@ pub struct AlgorithmId(pub u16);
 pub const ALGORITHM_ED25519: AlgorithmId = AlgorithmId(1);
 /// PQC half - NIST FIPS 204, security level 3. See `pqc-cryptography` skill.
 pub const ALGORITHM_ML_DSA_65: AlgorithmId = AlgorithmId(2);
-// Ids 3-999 are reserved for individual signature scheme components,
-// allocated by governance vote in later phases (SLH-DSA variants,
-// ML-DSA-87, ...) - never reused once assigned, even after retirement.
+/// SLH-DSA (SPHINCS+) - NIST FIPS 205, security level 5, the
+/// `sha2-256s-simple` parameter set (see `pqc-cryptography` skill for why
+/// hash-based/"s" was chosen: conservative opt-in fallback for
+/// high-value/long-lived accounts, where minimizing signature size matters
+/// more than signing speed). Real keygen/sign/verify functions live in
+/// `qchain_crypto::slh_dsa` - **not yet wired into `Transaction`, consensus
+/// vote signatures, or the WASM `host_verify_signature` syscall**, all of
+/// which still hardcode the Ed25519+ML-DSA-65 pair (see
+/// `project-lessons-learned` for why "activating" this id via governance
+/// today is bookkeeping only, not a change in what a validator accepts).
+pub const ALGORITHM_SLH_DSA: AlgorithmId = AlgorithmId(3);
+// Ids 4-999 are reserved for individual signature scheme components,
+// allocated by governance vote in later phases (other SLH-DSA parameter
+// sets, ML-DSA-87, ...) - never reused once assigned, even after
+// retirement.
 
 /// Ids >= 1000 identify a *combination policy* an account can be under, not
 /// a single scheme - what `Account.algorithm_id` actually stores. Phase 1
@@ -76,6 +88,23 @@ pub fn genesis_registry() -> Vec<RegistryEntry> {
     ]
 }
 
+/// A `RegistryEntry` for `ALGORITHM_SLH_DSA`, ready to use as the payload of
+/// a real `ActivateAlgorithm` governance proposal - deliberately not part of
+/// `genesis_registry()` (it's opt-in, not phase-1-active). `pubkey_len`/
+/// `max_sig_len` are the real, measured liboqs sizes for
+/// SPHINCS+-SHA2-256s-simple (see `qchain_crypto::slh_dsa`'s own size test),
+/// not estimated from a published table.
+pub fn slh_dsa_registry_entry(activation_epoch: u64) -> RegistryEntry {
+    RegistryEntry {
+        id: ALGORITHM_SLH_DSA,
+        name: "SLH-DSA-SHA2-256s-simple".to_string(),
+        pubkey_len: 64,
+        max_sig_len: 29_792,
+        status: AlgorithmStatus::Active,
+        activation_epoch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +116,23 @@ mod tests {
         assert!(reg.iter().all(|e| e.status == AlgorithmStatus::Active));
         assert!(reg.iter().any(|e| e.id == ALGORITHM_ED25519));
         assert!(reg.iter().any(|e| e.id == ALGORITHM_ML_DSA_65));
+    }
+
+    #[test]
+    fn slh_dsa_is_not_part_of_the_phase_1_genesis_registry() {
+        // It's opt-in (see ALGORITHM_SLH_DSA's doc comment) - genesis must
+        // not silently activate it.
+        let reg = genesis_registry();
+        assert!(!reg.iter().any(|e| e.id == ALGORITHM_SLH_DSA));
+    }
+
+    #[test]
+    fn slh_dsa_registry_entry_reports_the_real_measured_sizes() {
+        let entry = slh_dsa_registry_entry(42);
+        assert_eq!(entry.id, ALGORITHM_SLH_DSA);
+        assert_eq!(entry.pubkey_len, 64);
+        assert_eq!(entry.max_sig_len, 29_792);
+        assert_eq!(entry.activation_epoch, 42);
+        assert_eq!(entry.status, AlgorithmStatus::Active);
     }
 }

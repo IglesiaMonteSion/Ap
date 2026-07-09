@@ -15,6 +15,7 @@
 //! the same size no matter which registry entries it uses.
 
 pub mod registry;
+pub mod slh_dsa;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -27,8 +28,8 @@ use std::str::FromStr;
 use std::sync::Once;
 
 pub use registry::{
-    AlgorithmId, AlgorithmStatus, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65,
-    COMBO_HYBRID_ED25519_ML_DSA_65,
+    slh_dsa_registry_entry, AlgorithmId, AlgorithmStatus, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65,
+    ALGORITHM_SLH_DSA, COMBO_HYBRID_ED25519_ML_DSA_65,
 };
 
 static OQS_INIT: Once = Once::new();
