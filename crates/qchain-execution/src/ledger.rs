@@ -331,4 +331,61 @@ mod tests {
         assert_eq!(fee_after, new_params.base_fee_per_byte * expected_byte_size);
         assert!(fee_after > fee_before * 5, "the new on-chain rate must actually be what gets charged");
     }
+
+    /// Real, reproducible throughput measurement - not a literature
+    /// estimate (see `project-lessons-learned`'s "benchmark before making
+    /// a throughput claim" entry). Measures two things separately: hybrid
+    /// signing (client-side cost, not on the validator's critical path)
+    /// and `Ledger::apply_transaction` (signature *verification* + fee +
+    /// dust-sweep + System Program dispatch - what a validator actually
+    /// does per transaction). This is single-threaded sequential
+    /// execution on whatever machine runs it, with no network/consensus
+    /// overhead included - a floor on per-core execution throughput, not
+    /// a network TPS claim. Run with:
+    /// `cargo test --release -p qchain-execution -- --ignored --nocapture apply_transaction_throughput`
+    #[test]
+    #[ignore]
+    fn apply_transaction_throughput() {
+        const N: usize = 500;
+        let mut ledger = new_test_ledger();
+        let validator = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+
+        let sign_start = std::time::Instant::now();
+        let signed: Vec<Transaction> = (0..N)
+            .map(|_| {
+                let payer = Keypair::generate().unwrap();
+                ledger.credit(payer.pubkey(), 10_000_000);
+                let ix = Instruction {
+                    program_id: Pubkey::system_program_id(),
+                    accounts: vec![payer.pubkey(), bob],
+                    data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+                };
+                Transaction::new_signed(&payer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap()
+            })
+            .collect();
+        let sign_elapsed = sign_start.elapsed();
+
+        let fee = signed[0].byte_size() as u64 * BASE_FEE_PER_BYTE_UNITS;
+
+        let exec_start = std::time::Instant::now();
+        for tx in &signed {
+            ledger.apply_transaction(tx, &validator, 0).unwrap();
+        }
+        let exec_elapsed = exec_start.elapsed();
+
+        println!(
+            "sign+build {N} hybrid txs: {:?} total, {:?}/tx, {:.0} tx/s",
+            sign_elapsed,
+            sign_elapsed / N as u32,
+            N as f64 / sign_elapsed.as_secs_f64()
+        );
+        println!(
+            "apply_transaction (verify+fee+dust+dispatch) x{N}: {:?} total, {:?}/tx, {:.0} tx/s",
+            exec_elapsed,
+            exec_elapsed / N as u32,
+            N as f64 / exec_elapsed.as_secs_f64()
+        );
+        println!("byte_size per tx: {} bytes, fee at default rate ({BASE_FEE_PER_BYTE_UNITS}/byte): {fee} units", signed[0].byte_size());
+    }
 }
