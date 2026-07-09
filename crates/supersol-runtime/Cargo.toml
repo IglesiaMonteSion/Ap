@@ -1,9 +1,0 @@
-[package]
-name = "supersol-runtime"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-supersol-crypto = { path = "../supersol-crypto" }
-supersol-core = { path = "../supersol-core" }
-borsh.workspace = true
