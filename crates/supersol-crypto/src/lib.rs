@@ -83,6 +83,18 @@ impl Pubkey {
         ])
     }
 
+    /// The staking-rewards reserve: a fixed slice of the genesis supply set
+    /// aside to fund staking rewards without inflating past the 700M cap.
+    /// Like the treasury, this is a hardcoded sentinel with no corresponding
+    /// keypair - only the protocol's own reward-distribution logic
+    /// (`Ledger::distribute_staking_rewards`) can move funds out of it.
+    pub const fn staking_rewards_pool() -> Self {
+        Pubkey([
+            0x53, 0x54, 0x41, 0x4B, 0x45, 0x50, 0x4F, 0x4F, 0x4C, // "STAKEPOOL"
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+    }
+
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
@@ -363,5 +375,70 @@ mod tests {
         let mut bundle = kp.public_key_bundle();
         bundle.ed25519[0] ^= 0xFF;
         assert_ne!(bundle.to_address(), kp.pubkey());
+    }
+
+    /// Not a correctness test - a throughput measurement, run explicitly with
+    /// `cargo test --release -p supersol-crypto -- --ignored --nocapture`.
+    /// Grounds the README's TPS estimate in a real number instead of a
+    /// guess: this is the single-core cost of verifying one transaction's
+    /// signature, which is the dominant per-transaction cost in this engine.
+    #[test]
+    #[ignore]
+    fn bench_hybrid_verify_throughput() {
+        use std::time::Instant;
+
+        let kp = Keypair::generate();
+        let msg = b"benchmark message payload, roughly transaction-sized-ish";
+        let sig = kp.sign(msg);
+        let bundle = kp.public_key_bundle();
+        assert!(verify(&bundle, msg, &sig));
+
+        const ITERS: u32 = 2_000;
+
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(verify(&bundle, msg, &sig));
+        }
+        let hybrid_elapsed = start.elapsed();
+
+        let ed_vk = VerifyingKey::from_bytes(&bundle.ed25519).unwrap();
+        let ed_dsig = DalekSignature::from_bytes(&sig.ed25519.0);
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(ed_vk.verify(msg, &ed_dsig).is_ok());
+        }
+        let ed25519_elapsed = start.elapsed();
+
+        println!(
+            "hybrid verify:  {:>8.2} ops/sec ({:>6.2} us/op)",
+            ITERS as f64 / hybrid_elapsed.as_secs_f64(),
+            hybrid_elapsed.as_secs_f64() * 1_000_000.0 / ITERS as f64
+        );
+        println!(
+            "ed25519 verify: {:>8.2} ops/sec ({:>6.2} us/op) - included above, shown for comparison",
+            ITERS as f64 / ed25519_elapsed.as_secs_f64(),
+            ed25519_elapsed.as_secs_f64() * 1_000_000.0 / ITERS as f64
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_hybrid_sign_throughput() {
+        use std::time::Instant;
+
+        let kp = Keypair::generate();
+        let msg = b"benchmark message payload, roughly transaction-sized-ish";
+
+        const ITERS: u32 = 2_000;
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(kp.sign(msg));
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "hybrid sign:    {:>8.2} ops/sec ({:>6.2} us/op)",
+            ITERS as f64 / elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() * 1_000_000.0 / ITERS as f64
+        );
     }
 }

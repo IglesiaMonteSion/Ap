@@ -10,7 +10,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use supersol_core::{Account, Block, Ledger, Poh, BASE_FEE_UNITS, MAX_RECENT_BLOCKS, TOTAL_SUPPLY_UNITS, UNITS_PER_SSOL};
+use supersol_core::{
+    Account, Block, Ledger, Poh, BASE_FEE_UNITS, MAX_RECENT_BLOCKS, STAKING_RESERVE_UNITS, TOTAL_SUPPLY_UNITS,
+    TREASURY_ALLOCATION_UNITS, UNITS_PER_SSOL,
+};
 use supersol_crypto::{Keypair, Pubkey};
 
 /// SuperSol validator node: ticks a Proof of History clock, applies
@@ -67,6 +70,19 @@ struct Args {
     /// this on very memory-constrained hardware.
     #[arg(long, default_value_t = MAX_RECENT_BLOCKS)]
     recent_blocks_window: usize,
+
+    /// Number of slots per staking-reward epoch: every this many slots, the
+    /// staking rewards reserve pays out to active stake accounts, pro-rata
+    /// by stake. A placeholder cadence for this MVP - real calibration is a
+    /// tokenomics decision, not something to trust a default for.
+    #[arg(long, default_value_t = 200)]
+    epoch_slots: u64,
+
+    /// Units distributed from the staking rewards reserve per epoch (split
+    /// pro-rata across active stakes), capped by the reserve's remaining
+    /// balance. 0 disables staking rewards entirely.
+    #[arg(long, default_value_t = 1_000 * UNITS_PER_SSOL)]
+    reward_units_per_epoch: u64,
 }
 
 #[tokio::main]
@@ -103,8 +119,12 @@ async fn main() -> anyhow::Result<()> {
     let is_fresh_ledger = !meta_path.exists();
     if is_fresh_ledger {
         // The one and only place the fixed 700,000,000 SSOL supply is ever
-        // created, and only on the very first boot of a brand new ledger.
-        ledger.genesis_mint(Pubkey::treasury(), TOTAL_SUPPLY_UNITS);
+        // created, and only on the very first boot of a brand new ledger:
+        // split between the faucet-disbursable treasury and the staking
+        // rewards reserve. Together they always sum to exactly
+        // TOTAL_SUPPLY_UNITS.
+        ledger.genesis_mint(Pubkey::treasury(), TREASURY_ALLOCATION_UNITS);
+        ledger.genesis_mint(Pubkey::staking_rewards_pool(), STAKING_RESERVE_UNITS);
     } else {
         if accounts_path.exists() {
             let bytes = std::fs::read(&accounts_path)?;
@@ -138,17 +158,32 @@ async fn main() -> anyhow::Result<()> {
     println!("  identity:      {identity}");
     println!("  ledger dir:    {}", args.ledger_dir.display());
     println!("  resumed slot:  {resumed_slot}");
-    println!(
-        "  total supply:  {} SSOL (treasury: {} SSOL)",
-        TOTAL_SUPPLY_UNITS / UNITS_PER_SSOL,
-        app_state.ledger.lock().unwrap().get_balance(&Pubkey::treasury()) / UNITS_PER_SSOL
-    );
+    {
+        let ledger = app_state.ledger.lock().unwrap();
+        println!(
+            "  total supply:  {} SSOL (treasury: {} SSOL, staking pool: {} SSOL, burned: {} SSOL)",
+            TOTAL_SUPPLY_UNITS / UNITS_PER_SSOL,
+            ledger.get_balance(&Pubkey::treasury()) / UNITS_PER_SSOL,
+            ledger.get_balance(&Pubkey::staking_rewards_pool()) / UNITS_PER_SSOL,
+            ledger.total_burned / UNITS_PER_SSOL
+        );
+    }
     println!("  faucet:        {}", if args.enable_faucet { "enabled" } else { "disabled" });
-    println!("  fee/tx:        {} photon", args.fee_units);
+    println!("  fee/tx:        {} photon (burned)", args.fee_units);
+    println!(
+        "  staking:       {} SSOL/epoch, every {} slots",
+        args.reward_units_per_epoch / UNITS_PER_SSOL,
+        args.epoch_slots
+    );
     println!("  rpc endpoint:  http://127.0.0.1:{}", args.rpc_port);
 
     spawn_poh_ticker(app_state.clone(), args.tick_ms);
-    spawn_block_producer(app_state.clone(), args.tick_ms * args.ticks_per_slot);
+    spawn_block_producer(
+        app_state.clone(),
+        args.tick_ms * args.ticks_per_slot,
+        args.epoch_slots,
+        args.reward_units_per_epoch,
+    );
 
     let app = rpc::router(app_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], args.rpc_port));
@@ -178,7 +213,8 @@ fn spawn_poh_ticker(state: Arc<AppState>, tick_ms: u64) {
 /// since the last slot boundary (ticks, applied transactions, airdrops) into
 /// an immutable, auditable Block and durably records it. Disk and memory
 /// cost per iteration stay flat as the chain grows - see `AppState::persist_block`.
-fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64) {
+/// Also triggers staking-reward distribution once per epoch boundary.
+fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64, epoch_slots: u64, reward_units_per_epoch: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(slot_ms.max(1)));
 
@@ -204,7 +240,20 @@ fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64) {
             airdrops,
         };
 
-        state.ledger.lock().unwrap().push_block(block.clone());
+        {
+            let mut ledger = state.ledger.lock().unwrap();
+            ledger.push_block(block.clone());
+            if epoch_slots > 0 && slot % epoch_slots == 0 {
+                let distributed =
+                    ledger.distribute_staking_rewards(supersol_crypto::Pubkey::staking_rewards_pool(), reward_units_per_epoch);
+                if distributed > 0 {
+                    println!(
+                        "epoch at slot {slot}: distributed {} SSOL in staking rewards",
+                        distributed / UNITS_PER_SSOL
+                    );
+                }
+            }
+        }
 
         if let Err(e) = state.persist_block(&block) {
             eprintln!("warning: failed to persist block/ledger snapshot: {e}");

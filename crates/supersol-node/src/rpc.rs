@@ -70,15 +70,23 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
     let id = req.id.clone();
     match req.method.as_str() {
         "getHealth" => Ok(ok(id, json!("ok"))),
+        "getIdentity" => Ok(ok(id, json!({ "identity": state.identity.to_string() }))),
         "getSlot" => Ok(ok(id, json!(state.slot()))),
         "getLatestBlockhash" => {
             let hash = state.latest_blockhash();
             Ok(ok(id, json!({ "blockhash": hex::encode(hash) })))
         }
         "getSupply" => {
-            let treasury_units = state.ledger.lock().unwrap().get_balance(&Pubkey::treasury());
+            let ledger = state.ledger.lock().unwrap();
+            let treasury_units = ledger.get_balance(&Pubkey::treasury());
+            let staking_pool_units = ledger.get_balance(&Pubkey::staking_rewards_pool());
+            let burned_units = ledger.total_burned;
+            drop(ledger);
             let total_units = supersol_core::TOTAL_SUPPLY_UNITS;
-            let circulating_units = total_units.saturating_sub(treasury_units);
+            let circulating_units = total_units
+                .saturating_sub(treasury_units)
+                .saturating_sub(staking_pool_units)
+                .saturating_sub(burned_units);
             let per_ssol = supersol_core::UNITS_PER_SSOL as f64;
             Ok(ok(
                 id,
@@ -89,6 +97,10 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
                     "circulating_ssol": circulating_units as f64 / per_ssol,
                     "treasury_units": treasury_units,
                     "treasury_ssol": treasury_units as f64 / per_ssol,
+                    "staking_pool_units": staking_pool_units,
+                    "staking_pool_ssol": staking_pool_units as f64 / per_ssol,
+                    "burned_units": burned_units,
+                    "burned_ssol": burned_units as f64 / per_ssol,
                 }),
             ))
         }
@@ -114,6 +126,30 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
                         "executable": acc.executable,
                     }),
                 )),
+                None => Ok(ok(id, Value::Null)),
+            }
+        }
+        "getStakeInfo" => {
+            use borsh::BorshDeserialize;
+            use supersol_core::StakeState;
+            let pubkey = parse_pubkey_param(&req.params, 0)?;
+            let ledger = state.ledger.lock().unwrap();
+            match ledger.get_account(&pubkey) {
+                Some(acc) if acc.owner == supersol_core::STAKE_PROGRAM_ID => {
+                    let stake_state = StakeState::try_from_slice(&acc.data)
+                        .map_err(|e| format!("corrupt stake account data: {e}"))?;
+                    Ok(ok(
+                        id,
+                        json!({
+                            "authority": stake_state.authority.to_string(),
+                            "validator": stake_state.validator.to_string(),
+                            "status": format!("{:?}", stake_state.status),
+                            "staked_units": acc.balance,
+                            "staked_ssol": acc.balance as f64 / supersol_core::UNITS_PER_SSOL as f64,
+                        }),
+                    ))
+                }
+                Some(_) => Err("account is not a stake account".to_string()),
                 None => Ok(ok(id, Value::Null)),
             }
         }
@@ -181,7 +217,7 @@ fn handle_send_transaction(state: &Arc<AppState>, params: &Value) -> Result<Valu
     {
         let mut ledger = state.ledger.lock().unwrap();
         ledger
-            .apply_transaction(&tx, &state.programs, &state.identity, state.fee_units)
+            .apply_transaction(&tx, &state.programs, state.fee_units)
             .map_err(|e| e.to_string())?;
     }
     let sig = hex::encode(tx.hash());
