@@ -8,6 +8,7 @@ members = [
     "crates/qchain-governance",
     "crates/qchain-consensus",
     "crates/qchain-simulation",
+    "crates/qchain-stark",
     "crates/qchain-network",
     "crates/qchain-node",
     "crates/qchain-cli",
@@ -37,3 +38,4 @@ wasmtime = "27"
 wat = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+winterfell = "0.13"

@@ -1,0 +1,7 @@
+[package]
+name = "qchain-stark"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+winterfell.workspace = true
