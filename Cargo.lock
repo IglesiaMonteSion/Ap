@@ -1913,6 +1913,7 @@ dependencies = [
 name = "qchain-stark"
 version = "0.1.0"
 dependencies = [
+ "thiserror 1.0.69",
  "winterfell",
 ]
 

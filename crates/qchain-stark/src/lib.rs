@@ -9,14 +9,6 @@
 //!
 //! What this v1 deliberately does NOT yet do, so scope is never
 //! ambiguous:
-//! - No range checks: balances are field elements; nothing here proves
-//!   `from_after >= 0` as a real (non-negative) integer, only that the
-//!   reported values satisfy the linear conservation equations as field
-//!   arithmetic. A malicious prover could report an "underflowed"
-//!   balance that wraps within the field. Closing this gap needs
-//!   bit-decomposition range-check columns for every value that must
-//!   stay within `u64` - a well-understood technique, not implemented
-//!   yet.
 //! - No Merkle tie-in: before/after balances are exposed as public
 //!   inputs directly (see `PublicInputs`), not bound to the real
 //!   SHA3-based sparse Merkle root `qchain-storage` maintains. A light
@@ -38,7 +30,64 @@
 //! independent of batch size), without re-executing the fee arithmetic
 //! for every transfer - the core value proposition of "compression for
 //! light clients" `ARCHITECTURE.md` §3 names, even before the
-//! range-check and Merkle-tie-in hardening land.
+//! Merkle-tie-in hardening lands.
+//!
+//! ## v2: real u64 range checks, without an in-circuit bit-decomposition gadget
+//!
+//! v1 shipped with an open gap: nothing proved `from_after >= 0` as a
+//! real non-negative integer, only that reported values satisfied the
+//! two conservation equations as field arithmetic - a malicious prover
+//! could report a value that "underflows" and wraps around the field,
+//! e.g. an `amount` that's secretly the field-negation of a real value
+//! (`0 - 500`, landing near the modulus), which still satisfies both
+//! linear equations while representing a reversed, illegitimate
+//! transfer.
+//!
+//! The obvious fix is the textbook one - bit-decompose every value into
+//! boolean columns and assert the weighted sum reconstructs it - but
+//! that's the wrong tool *here*, and worth explaining why rather than
+//! just not doing it. That gadget exists to prove range membership of a
+//! value the verifier never sees directly (hidden behind a commitment).
+//! In this circuit every trace cell is already a public input
+//! (`PublicInputs` exposes the whole trace, per the Merkle-tie-in gap
+//! above) - the verifier already holds the exact field element for
+//! every value in the plain. Given that, range-checking is not a
+//! circuit problem, it's a five-line post-verification bounds check:
+//! after `winterfell::verify` accepts the proof (which cryptographically
+//! binds every one of those public cells to the trace, boundary
+//! constraint by boundary constraint - see `get_assertions`), walk the
+//! six columns and reject if any cell's canonical integer value exceeds
+//! `u64::MAX`.
+//!
+//! This is sound, not a shortcut, because of the field/value size gap:
+//! `f128::BaseElement`'s modulus is `2^128 - 45*2^40 + 1` (~128 bits),
+//! while every genuine value here is u64-scale (at most ~2^64, and a
+//! batch's worth of linear combinations of such values stays nowhere
+//! near 128 bits). A real underflow (`from_before < amount + fee`)
+//! computed over the integers is negative with magnitude at most
+//! `2^64`; reduced mod a ~2^128 modulus, that lands within `2^64` of the
+//! modulus itself - i.e. an enormous field element, not a small
+//! plausible-looking one. There is no way to pick a genuinely
+//! out-of-range quantity (an underflowed balance, a field-negated
+//! "amount") that reduces to something `<= u64::MAX` without every
+//! *other* value in the same equation also having to compensate with
+//! its own out-of-range element - and every value in both equations is
+//! itself one of the six checked columns. See
+//! `an_out_of_range_disguised_negative_amount_is_rejected_even_though_the_stark_proof_alone_would_accept_it`
+//! for a concrete, previously-unclosed attack this catches: an `amount`
+//! set to the field negation of 500 makes both conservation equations
+//! hold exactly (the STARK proof verifies), while silently reversing
+//! the direction of value flow - caught only by the range check, not by
+//! the polynomial constraints.
+//!
+//! **This closure is conditional, not permanent**: it holds only as
+//! long as every value stays a direct public input. The moment a future
+//! version hides these values behind a Merkle commitment or otherwise
+//! stops exposing them in the clear (the Merkle-tie-in gap above, once
+//! closed with real data-hiding rather than a plain public root), this
+//! argument stops applying and an in-circuit bit-decomposition range
+//! check becomes necessary again - re-derive this reasoning at that
+//! point, don't assume the shortcut still holds.
 //!
 //! Behavior discovered by testing against the real Winterfell prover
 //! (not assumed from docs): `winter_prover::Trace::validate` runs an
@@ -57,7 +106,7 @@
 use winterfell::crypto::hashers::Blake3_256;
 use winterfell::crypto::{DefaultRandomCoin, MerkleTree};
 use winterfell::math::fields::f128::BaseElement;
-use winterfell::math::{FieldElement, ToElements};
+use winterfell::math::{FieldElement, StarkField, ToElements};
 use winterfell::matrix::ColMatrix;
 use winterfell::{
     Air, AirContext, Assertion, AuxRandElements, BatchingMethod, CompositionPoly, CompositionPolyTrace,
@@ -285,16 +334,44 @@ pub fn prove_batch_with_options(steps: &[TransferStep], options: ProofOptions) -
     Ok((proof, pub_inputs))
 }
 
+/// Everything that can make a claimed batch of transfers unacceptable:
+/// either the STARK proof itself doesn't check out, or it does but one
+/// of the public values it binds isn't a real `u64` (see the module
+/// docs' "v2: real u64 range checks" section for why this second check
+/// is necessary and why it's sound to do outside the circuit).
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyError {
+    #[error("STARK proof did not verify: {0}")]
+    Stark(#[from] winterfell::VerifierError),
+    #[error("public value at column {column}, step {step} exceeds u64::MAX - not a real non-negative u64")]
+    ValueOutOfU64Range { column: usize, step: usize },
+}
+
+fn is_valid_u64(value: BaseElement) -> bool {
+    value.as_int() <= u64::MAX as u128
+}
+
 /// Verifies a proof produced by [`prove_batch`]. Accepts proofs meeting
 /// or exceeding ~95-bit conjectured security - matches
-/// [`default_proof_options`]'s target.
-pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), winterfell::VerifierError> {
+/// [`default_proof_options`]'s target. Beyond the STARK proof itself,
+/// also rejects any public value that isn't representable as a real
+/// non-negative `u64` - closes the range-check gap described in the
+/// module docs without an in-circuit bit-decomposition gadget.
+pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), VerifyError> {
     let min_opts = winterfell::AcceptableOptions::MinConjecturedSecurity(95);
     winterfell::verify::<TransferAir, Blake3_256<BaseElement>, DefaultRandomCoin<Blake3_256<BaseElement>>, MerkleTree<Blake3_256<BaseElement>>>(
         proof,
-        pub_inputs,
+        pub_inputs.clone(),
         &min_opts,
-    )
+    )?;
+    for (column, values) in pub_inputs.columns.iter().enumerate() {
+        for (step, &value) in values.iter().enumerate() {
+            if !is_valid_u64(value) {
+                return Err(VerifyError::ValueOutOfU64Range { column, step });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -363,5 +440,59 @@ mod tests {
         let (proof, pub_inputs) = prove_batch(&steps).unwrap();
         assert_eq!(pub_inputs.columns[0].len(), 8, "3 real rows clamp up to MIN_TRACE_LENGTH (8)");
         verify_batch(proof, pub_inputs).unwrap();
+    }
+
+    #[test]
+    fn is_valid_u64_accepts_the_full_u64_range_and_rejects_beyond_it() {
+        assert!(is_valid_u64(BaseElement::ZERO));
+        assert!(is_valid_u64(BaseElement::new(u64::MAX as u128)));
+        assert!(!is_valid_u64(BaseElement::new(u64::MAX as u128 + 1)));
+        // The field's modulus itself, and a value just below it (as a
+        // field-negation of a small number would produce), are both
+        // enormously out of u64 range.
+        assert!(!is_valid_u64(BaseElement::ZERO - BaseElement::ONE));
+        assert!(!is_valid_u64(BaseElement::ZERO - BaseElement::new(500)));
+    }
+
+    #[test]
+    fn an_out_of_range_disguised_negative_amount_is_rejected_even_though_the_stark_proof_alone_would_accept_it() {
+        // The exact attack the module docs' "v2" section names: set
+        // `amount` to the field negation of 500 (a field element near
+        // the modulus, nowhere close to a real u64) instead of a real
+        // positive value. Both conservation equations still hold
+        // *exactly* as field arithmetic:
+        //   to_after   = to_before + amount   = to_before - 500 (mod p)
+        //   from_after = from_before - amount - fee = from_before + 500 - fee (mod p)
+        // and both results land on small, plausible-looking numbers -
+        // so the STARK's polynomial constraints are satisfied and the
+        // proof verifies. Only the post-verification range check (on
+        // `amount` itself, column 2) catches that this "transfer" was
+        // actually built from a value that isn't a real u64 at all.
+        let from_before = BaseElement::new(1_000);
+        let to_before = BaseElement::new(1_000);
+        let fee = BaseElement::new(10);
+        let amount = BaseElement::ZERO - BaseElement::new(500); // "-500", disguised as a huge field element
+        let from_after = from_before - amount - fee;
+        let to_after = to_before + amount;
+
+        let padded_len = TraceInfo::MIN_TRACE_LENGTH;
+        let mut columns: Vec<Vec<BaseElement>> = vec![vec![BaseElement::ZERO; padded_len]; TRACE_WIDTH];
+        columns[0][0] = from_before;
+        columns[1][0] = to_before;
+        columns[2][0] = amount;
+        columns[3][0] = fee;
+        columns[4][0] = from_after;
+        columns[5][0] = to_after;
+        let trace = TraceTable::init(columns);
+
+        let prover = TransferProver::new(default_proof_options());
+        let pub_inputs = prover.get_pub_inputs(&trace);
+        let proof = prover.prove(trace).expect("both conservation equations hold as field arithmetic, so the STARK proof itself succeeds");
+
+        match verify_batch(proof, pub_inputs) {
+            Err(VerifyError::ValueOutOfU64Range { column: 2, step: 0 }) => {} // caught exactly where expected
+            Err(other) => panic!("expected the range check on column 2 (amount) to reject this, got a different error: {other:?}"),
+            Ok(()) => panic!("a disguised out-of-range amount must never verify"),
+        }
     }
 }

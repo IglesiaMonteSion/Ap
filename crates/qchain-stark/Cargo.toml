@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 winterfell.workspace = true
+thiserror.workspace = true
