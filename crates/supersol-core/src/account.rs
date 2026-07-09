@@ -13,6 +13,15 @@ pub const UNITS_PER_SSOL: u64 = 1_000_000_000;
 /// compete for block space).
 pub const BASE_FEE_UNITS: u64 = 500; // 0.0000005 SSOL per transaction
 
+/// Total, permanently fixed supply: 700,000,000 SSOL, no more and no less.
+/// The entire amount is minted exactly once, at genesis, into the treasury
+/// account (`Pubkey::treasury()`) - see `Ledger::genesis_mint`. Nothing else
+/// in the codebase can create new units: `requestAirdrop` only *moves*
+/// units out of this fixed pool (`Ledger::disburse_from_treasury`), it never
+/// prints new ones.
+pub const TOTAL_SUPPLY_SSOL: u64 = 700_000_000;
+pub const TOTAL_SUPPLY_UNITS: u64 = TOTAL_SUPPLY_SSOL * UNITS_PER_SSOL;
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Account {
     /// Balance in base units ("photon").

@@ -70,13 +70,27 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
     let id = req.id.clone();
     match req.method.as_str() {
         "getHealth" => Ok(ok(id, json!("ok"))),
-        "getSlot" => {
-            let slot = *state.slot.lock().unwrap();
-            Ok(ok(id, json!(slot)))
-        }
+        "getSlot" => Ok(ok(id, json!(state.slot()))),
         "getLatestBlockhash" => {
             let hash = state.latest_blockhash();
             Ok(ok(id, json!({ "blockhash": hex::encode(hash) })))
+        }
+        "getSupply" => {
+            let treasury_units = state.ledger.lock().unwrap().get_balance(&Pubkey::treasury());
+            let total_units = supersol_core::TOTAL_SUPPLY_UNITS;
+            let circulating_units = total_units.saturating_sub(treasury_units);
+            let per_ssol = supersol_core::UNITS_PER_SSOL as f64;
+            Ok(ok(
+                id,
+                json!({
+                    "total_units": total_units,
+                    "total_ssol": total_units as f64 / per_ssol,
+                    "circulating_units": circulating_units,
+                    "circulating_ssol": circulating_units as f64 / per_ssol,
+                    "treasury_units": treasury_units,
+                    "treasury_ssol": treasury_units as f64 / per_ssol,
+                }),
+            ))
         }
         "getBalance" => {
             let pubkey = parse_pubkey_param(&req.params, 0)?;
@@ -84,7 +98,7 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
             let units = ledger.get_balance(&pubkey);
             Ok(ok(
                 id,
-                json!({ "units": units, "mtc": units as f64 / supersol_core::UNITS_PER_SSOL as f64 }),
+                json!({ "units": units, "ssol": units as f64 / supersol_core::UNITS_PER_SSOL as f64 }),
             ))
         }
         "getAccountInfo" => {
@@ -107,9 +121,8 @@ fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> Result<RpcResponse, Stri
         "sendTransaction" => handle_send_transaction(state, &req.params).map(|v| ok(id, v)),
         "getBlock" => {
             let slot = req.params.get(0).and_then(|v| v.as_u64()).ok_or("missing slot param")?;
-            let ledger = state.ledger.lock().unwrap();
-            match ledger.blocks.iter().find(|b| b.slot == slot) {
-                Some(block) => Ok(ok(id, serde_json::to_value(block).map_err(|e| e.to_string())?)),
+            match state.get_block(slot).map_err(|e| e.to_string())? {
+                Some(block) => Ok(ok(id, serde_json::to_value(&block).map_err(|e| e.to_string())?)),
                 None => Ok(ok(id, Value::Null)),
             }
         }
@@ -142,13 +155,17 @@ fn handle_airdrop(state: &Arc<AppState>, params: &Value) -> Result<Value, String
 
     {
         let mut ledger = state.ledger.lock().unwrap();
-        ledger.airdrop(pubkey, amount);
+        // Moves units out of the fixed-supply treasury - bounded by its
+        // balance, never mints new ones.
+        ledger
+            .disburse_from_treasury(Pubkey::treasury(), pubkey, amount)
+            .map_err(|e| e.to_string())?;
     }
     state.pending_airdrops.lock().unwrap().push((pubkey, amount));
     let sig = hex::encode(entry.hash);
     state.pending_poh_entries.lock().unwrap().push(entry);
 
-    Ok(json!({ "signature": sig, "slot": *state.slot.lock().unwrap() }))
+    Ok(json!({ "signature": sig, "slot": state.slot() }))
 }
 
 fn handle_send_transaction(state: &Arc<AppState>, params: &Value) -> Result<Value, String> {
@@ -171,5 +188,5 @@ fn handle_send_transaction(state: &Arc<AppState>, params: &Value) -> Result<Valu
     state.pending_txs.lock().unwrap().push(tx);
     state.pending_poh_entries.lock().unwrap().push(entry);
 
-    Ok(json!({ "signature": sig, "slot": *state.slot.lock().unwrap(), "fee": state.fee_units }))
+    Ok(json!({ "signature": sig, "slot": state.slot(), "fee": state.fee_units }))
 }

@@ -4,17 +4,22 @@ mod state;
 
 use clap::Parser;
 use genesis::Genesis;
-use supersol_core::{Block, Ledger, Poh, BASE_FEE_UNITS, UNITS_PER_SSOL};
-use supersol_crypto::Keypair;
-use state::AppState;
+use state::{AppState, MetaFile};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use supersol_core::{Account, Block, Ledger, Poh, BASE_FEE_UNITS, MAX_RECENT_BLOCKS, TOTAL_SUPPLY_UNITS, UNITS_PER_SSOL};
+use supersol_crypto::{Keypair, Pubkey};
 
 /// SuperSol validator node: ticks a Proof of History clock, applies
 /// transactions to an in-memory account ledger, and serves a Solana-style
-/// JSON-RPC API over HTTP.
+/// JSON-RPC API over HTTP. Deliberately lightweight to run: Proof of History
+/// here is a single SHA-256 per tick (negligible CPU even on very modest
+/// hardware), and persistence is O(1) per block rather than rewriting the
+/// whole chain history every slot - see the README for real hardware
+/// expectations.
 #[derive(Parser)]
 struct Args {
     /// Port to serve JSON-RPC on.
@@ -25,7 +30,9 @@ struct Args {
     #[arg(long, default_value = "./supersol-ledger")]
     ledger_dir: PathBuf,
 
-    /// Milliseconds between Proof of History ticks.
+    /// Milliseconds between Proof of History ticks. Each tick is one
+    /// SHA-256 hash - cheap enough that this rarely needs tuning even on
+    /// low-power hardware.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
 
@@ -44,7 +51,8 @@ struct Args {
     #[arg(long)]
     enable_faucet: bool,
 
-    /// Maximum units a single requestAirdrop call may mint.
+    /// Maximum units a single requestAirdrop call may disburse from the
+    /// fixed-supply treasury.
     #[arg(long, default_value_t = 10 * UNITS_PER_SSOL)]
     faucet_max_units: u64,
 
@@ -53,6 +61,12 @@ struct Args {
     /// per-signature fee.
     #[arg(long, default_value_t = BASE_FEE_UNITS)]
     fee_units: u64,
+
+    /// How many recent blocks to keep resident in memory (older blocks stay
+    /// on disk in the append-only block log, just not cached in RAM). Lower
+    /// this on very memory-constrained hardware.
+    #[arg(long, default_value_t = MAX_RECENT_BLOCKS)]
+    recent_blocks_window: usize,
 }
 
 #[tokio::main]
@@ -61,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&args.ledger_dir)?;
     let genesis_path = args.ledger_dir.join("genesis.json");
-    let ledger_path = args.ledger_dir.join("ledger.json");
+    let accounts_path = args.ledger_dir.join("accounts.json");
+    let meta_path = args.ledger_dir.join("meta.json");
+    let blocks_log_path = args.ledger_dir.join("blocks.log");
 
     let genesis = Genesis::load_or_create(&genesis_path)?;
 
@@ -80,13 +96,25 @@ async fn main() -> anyhow::Result<()> {
     };
     let identity = identity_keypair.pubkey();
 
-    let ledger: Ledger = if ledger_path.exists() {
-        let bytes = std::fs::read(&ledger_path)?;
-        serde_json::from_slice(&bytes)?
+    // Resuming an existing ledger only ever needs two small files - the
+    // current account balances and a chain-tip checkpoint - never the full
+    // block history, however long the chain has grown.
+    let mut ledger = Ledger::new(genesis.poh_seed).with_recent_blocks_window(args.recent_blocks_window);
+    let is_fresh_ledger = !meta_path.exists();
+    if is_fresh_ledger {
+        // The one and only place the fixed 700,000,000 SSOL supply is ever
+        // created, and only on the very first boot of a brand new ledger.
+        ledger.genesis_mint(Pubkey::treasury(), TOTAL_SUPPLY_UNITS);
     } else {
-        Ledger::new()
-    };
-    let resumed_slot = ledger.blocks.last().map(|b| b.slot).unwrap_or(0);
+        if accounts_path.exists() {
+            let bytes = std::fs::read(&accounts_path)?;
+            ledger.accounts = serde_json::from_slice::<HashMap<Pubkey, Account>>(&bytes)?;
+        }
+        let meta: MetaFile = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
+        ledger.slot = meta.slot;
+        ledger.last_blockhash = meta.last_blockhash;
+    }
+    let resumed_slot = ledger.slot;
 
     let poh = Poh::new(genesis.poh_seed);
 
@@ -97,19 +125,24 @@ async fn main() -> anyhow::Result<()> {
         pending_txs: Mutex::new(Vec::new()),
         pending_airdrops: Mutex::new(Vec::new()),
         pending_poh_entries: Mutex::new(Vec::new()),
-        slot: Mutex::new(resumed_slot),
-        genesis_seed: genesis.poh_seed,
         identity,
         faucet_enabled: args.enable_faucet,
         faucet_max_units: args.faucet_max_units,
         fee_units: args.fee_units,
-        ledger_path: ledger_path.clone(),
+        accounts_path,
+        meta_path,
+        blocks_log_path,
     });
 
     println!("SuperSol validator starting");
     println!("  identity:      {identity}");
     println!("  ledger dir:    {}", args.ledger_dir.display());
     println!("  resumed slot:  {resumed_slot}");
+    println!(
+        "  total supply:  {} SSOL (treasury: {} SSOL)",
+        TOTAL_SUPPLY_UNITS / UNITS_PER_SSOL,
+        app_state.ledger.lock().unwrap().get_balance(&Pubkey::treasury()) / UNITS_PER_SSOL
+    );
     println!("  faucet:        {}", if args.enable_faucet { "enabled" } else { "disabled" });
     println!("  fee/tx:        {} photon", args.fee_units);
     println!("  rpc endpoint:  http://127.0.0.1:{}", args.rpc_port);
@@ -128,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
 /// Background thread producing the steady heartbeat of Proof of History
 /// ticks, independent of whether any transactions arrive - this is what
 /// lets the chain order events in time even during otherwise-idle periods.
+/// Each tick is a single SHA-256 hash, so this thread's CPU footprint stays
+/// negligible regardless of hardware.
 fn spawn_poh_ticker(state: Arc<AppState>, tick_ms: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(tick_ms));
@@ -141,7 +176,8 @@ fn spawn_poh_ticker(state: Arc<AppState>, tick_ms: u64) {
 
 /// Background thread that periodically packages everything that happened
 /// since the last slot boundary (ticks, applied transactions, airdrops) into
-/// an immutable, auditable Block and persists a ledger snapshot to disk.
+/// an immutable, auditable Block and durably records it. Disk and memory
+/// cost per iteration stay flat as the chain grows - see `AppState::persist_block`.
 fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(slot_ms.max(1)));
@@ -156,11 +192,7 @@ fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64) {
 
         let previous_blockhash = state.latest_blockhash();
         let blockhash = entries.last().map(|e| e.hash).unwrap_or(previous_blockhash);
-
-        let mut slot_guard = state.slot.lock().unwrap();
-        *slot_guard += 1;
-        let slot = *slot_guard;
-        drop(slot_guard);
+        let slot = state.slot() + 1;
 
         let block = Block {
             slot,
@@ -172,10 +204,10 @@ fn spawn_block_producer(state: Arc<AppState>, slot_ms: u64) {
             airdrops,
         };
 
-        state.ledger.lock().unwrap().push_block(block);
+        state.ledger.lock().unwrap().push_block(block.clone());
 
-        if let Err(e) = state.persist() {
-            eprintln!("warning: failed to persist ledger snapshot: {e}");
+        if let Err(e) = state.persist_block(&block) {
+            eprintln!("warning: failed to persist block/ledger snapshot: {e}");
         }
     });
 }

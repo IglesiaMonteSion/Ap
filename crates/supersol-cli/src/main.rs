@@ -39,6 +39,9 @@ enum Command {
         to: String,
         amount_mtc: f64,
     },
+    /// Show the fixed total supply, how much is still in the treasury, and
+    /// how much is circulating.
+    Supply,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,6 +56,7 @@ fn main() -> anyhow::Result<()> {
             to,
             amount_mtc,
         } => transfer(&cli.url, &from_keypair, &to, amount_mtc),
+        Command::Supply => supply(&cli.url),
     }
 }
 
@@ -87,9 +91,18 @@ fn resolve_pubkey(s: &str) -> anyhow::Result<Pubkey> {
 fn balance(url: &str, address: &str) -> anyhow::Result<()> {
     let pubkey = resolve_pubkey(address)?;
     let result = rpc_call(url, "getBalance", json!([pubkey.to_string()]))?;
-    let mtc = result.get("mtc").and_then(Value::as_f64).unwrap_or(0.0);
+    let ssol = result.get("ssol").and_then(Value::as_f64).unwrap_or(0.0);
     let units = result.get("units").and_then(Value::as_u64).unwrap_or(0);
-    println!("{mtc} SSOL ({units} photon)");
+    println!("{ssol} SSOL ({units} photon)");
+    Ok(())
+}
+
+fn supply(url: &str) -> anyhow::Result<()> {
+    let result = rpc_call(url, "getSupply", json!([]))?;
+    let get = |key: &str| result.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+    println!("Total supply:       {} SSOL (fixed, never inflates)", get("total_ssol"));
+    println!("Circulating:        {} SSOL", get("circulating_ssol"));
+    println!("Still in treasury:  {} SSOL", get("treasury_ssol"));
     Ok(())
 }
 

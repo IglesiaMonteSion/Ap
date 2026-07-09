@@ -69,6 +69,20 @@ impl Pubkey {
         Pubkey([0u8; 32])
     }
 
+    /// The fixed-supply treasury account: holds the entire genesis mint
+    /// until it's disbursed (e.g. via a devnet faucet). No keypair hashes to
+    /// this address - it is a hardcoded sentinel, not derived from any real
+    /// ed25519/ML-DSA key pair - so it can never be the payer of an ordinary
+    /// signed transaction. The only way funds leave it is through whatever
+    /// explicit, policy-controlled disbursement path a validator chooses to
+    /// run (see `Ledger::disburse_from_treasury`), never a forged signature.
+    pub const fn treasury() -> Self {
+        Pubkey([
+            0x54, 0x52, 0x45, 0x41, 0x53, 0x55, 0x52, 0x59, // "TREASURY"
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+    }
+
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }

@@ -1,10 +1,19 @@
 use crate::account::Account;
 use crate::block::Block;
 use crate::transaction::{Instruction, Transaction};
-use supersol_crypto::Pubkey;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use supersol_crypto::Pubkey;
 use thiserror::Error;
+
+/// How many recent blocks a validator keeps resident in memory for serving
+/// `getBlock` on recent history. Older blocks are still durably recorded
+/// (see the node's append-only `blocks.log`) but aren't held in RAM, so a
+/// long-running node's memory use stays bounded instead of growing forever
+/// with the length of the chain - the same trade-off real Solana validators
+/// make by pruning old ledger data and leaving full-history queries to
+/// separate archive/RPC nodes.
+pub const MAX_RECENT_BLOCKS: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum TxError {
@@ -39,15 +48,35 @@ pub trait ProgramProcessor: Send + Sync {
 
 pub type ProgramRegistry = HashMap<Pubkey, Box<dyn ProgramProcessor>>;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct Ledger {
     pub accounts: HashMap<Pubkey, Account>,
-    pub blocks: Vec<Block>,
+    /// Bounded window of the most recently produced blocks, oldest first.
+    /// Full history is durably persisted elsewhere (see the node's
+    /// append-only block log) - this field intentionally does not grow
+    /// without bound.
+    pub recent_blocks: VecDeque<Block>,
+    pub last_blockhash: [u8; 32],
+    pub slot: u64,
+    recent_blocks_window: usize,
 }
 
 impl Ledger {
-    pub fn new() -> Self {
-        Ledger::default()
+    /// A fresh ledger, seeded with the genesis Proof of History hash (used
+    /// as the "recent blockhash" before any block has been produced yet).
+    pub fn new(genesis_seed: [u8; 32]) -> Self {
+        Ledger {
+            accounts: HashMap::new(),
+            recent_blocks: VecDeque::new(),
+            last_blockhash: genesis_seed,
+            slot: 0,
+            recent_blocks_window: MAX_RECENT_BLOCKS,
+        }
+    }
+
+    pub fn with_recent_blocks_window(mut self, window: usize) -> Self {
+        self.recent_blocks_window = window.max(1);
+        self
     }
 
     pub fn get_balance(&self, pubkey: &Pubkey) -> u64 {
@@ -102,23 +131,58 @@ impl Ledger {
         Ok(())
     }
 
-    /// Directly credit an account, bypassing signature/program checks. Only
-    /// meant to be called by a node configured with `--enable-faucet`
-    /// (devnet), never on a production validator.
-    pub fn airdrop(&mut self, pubkey: Pubkey, amount: u64) {
-        let account = self
-            .accounts
-            .entry(pubkey)
-            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-        account.balance = account.balance.saturating_add(amount);
+    /// One-time genesis issuance: mints `amount` into `treasury` out of
+    /// nothing. This is the *only* place new supply is ever created, and it
+    /// must only be invoked once, when a brand new ledger is created (the
+    /// node's startup code gates this behind "no prior snapshot exists on
+    /// disk"). Everything else that moves treasury funds
+    /// (`disburse_from_treasury`) only redistributes what was minted here.
+    pub fn genesis_mint(&mut self, treasury: Pubkey, amount: u64) {
+        self.accounts
+            .entry(treasury)
+            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()))
+            .balance += amount;
     }
 
+    /// Move `amount` out of the fixed-supply treasury and into `to`, bounded
+    /// by the treasury's actual balance. Used by a devnet faucet
+    /// (`requestAirdrop`) to hand out funds for testing without inflating
+    /// the total supply - unlike a naive faucet that credits balances out of
+    /// thin air, this can never mint a single new unit.
+    pub fn disburse_from_treasury(&mut self, treasury: Pubkey, to: Pubkey, amount: u64) -> Result<(), TxError> {
+        let treasury_balance = self.accounts.get(&treasury).map(|a| a.balance).unwrap_or(0);
+        if treasury_balance < amount {
+            return Err(TxError::InsufficientFunds);
+        }
+        self.accounts.get_mut(&treasury).unwrap().balance -= amount;
+        self.accounts
+            .entry(to)
+            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()))
+            .balance += amount;
+        Ok(())
+    }
+
+    /// Record a newly produced block as the new chain tip. The block is
+    /// still appended to the bounded `recent_blocks` window (for serving
+    /// `getBlock` on recent history); callers are responsible for durably
+    /// persisting it themselves (e.g. to an append-only log) if long-term
+    /// history is needed, since this in-memory window will eventually
+    /// evict it.
     pub fn push_block(&mut self, block: Block) {
-        self.blocks.push(block);
+        self.last_blockhash = block.blockhash;
+        self.slot = block.slot;
+        self.recent_blocks.push_back(block);
+        while self.recent_blocks.len() > self.recent_blocks_window {
+            self.recent_blocks.pop_front();
+        }
     }
 
-    pub fn latest_block(&self) -> Option<&Block> {
-        self.blocks.last()
+    pub fn latest_blockhash(&self) -> [u8; 32] {
+        self.last_blockhash
+    }
+
+    pub fn get_recent_block(&self, slot: u64) -> Option<&Block> {
+        self.recent_blocks.iter().find(|b| b.slot == slot)
     }
 }
 
@@ -145,7 +209,7 @@ mod tests {
         };
         let mut tx = Transaction::new_signed(&payer, [0u8; 32], vec![ix]);
         tx.message.recent_blockhash = [9u8; 32]; // mutate after signing
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::new([0u8; 32]);
         let mut programs: ProgramRegistry = HashMap::new();
         programs.insert(Pubkey::system_program_id(), Box::new(NoopProgram));
         let leader = Pubkey::system_program_id();
@@ -160,8 +224,8 @@ mod tests {
         use supersol_crypto::Keypair;
         let payer = Keypair::generate();
         let leader = Keypair::generate().pubkey();
-        let mut ledger = Ledger::new();
-        ledger.airdrop(payer.pubkey(), 10_000);
+        let mut ledger = Ledger::new([0u8; 32]);
+        ledger.genesis_mint(payer.pubkey(), 10_000);
 
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
@@ -182,8 +246,8 @@ mod tests {
         use supersol_crypto::Keypair;
         let payer = Keypair::generate();
         let leader = Keypair::generate().pubkey();
-        let mut ledger = Ledger::new();
-        ledger.airdrop(payer.pubkey(), 10_000);
+        let mut ledger = Ledger::new([0u8; 32]);
+        ledger.genesis_mint(payer.pubkey(), 10_000);
 
         struct FailingProgram;
         impl ProgramProcessor for FailingProgram {
@@ -207,28 +271,52 @@ mod tests {
     }
 
     #[test]
-    fn airdrop_credits_balance_directly() {
-        let mut ledger = Ledger::new();
-        let pk = supersol_crypto::Keypair::generate().pubkey();
-        ledger.airdrop(pk, 5_000);
-        assert_eq!(ledger.get_balance(&pk), 5_000);
+    fn genesis_mint_credits_treasury_exactly_once() {
+        let mut ledger = Ledger::new([0u8; 32]);
+        let treasury = Pubkey::treasury();
+        ledger.genesis_mint(treasury, 700_000_000);
+        assert_eq!(ledger.get_balance(&treasury), 700_000_000);
     }
 
     #[test]
-    fn block_bookkeeping() {
-        let mut ledger = Ledger::new();
-        assert!(ledger.latest_block().is_none());
+    fn disburse_from_treasury_is_bounded_by_its_balance() {
+        let mut ledger = Ledger::new([0u8; 32]);
+        let treasury = Pubkey::treasury();
+        ledger.genesis_mint(treasury, 1_000);
+        let alice = supersol_crypto::Keypair::generate().pubkey();
+
+        ledger.disburse_from_treasury(treasury, alice, 600).unwrap();
+        assert_eq!(ledger.get_balance(&alice), 600);
+        assert_eq!(ledger.get_balance(&treasury), 400);
+
+        // The treasury only has 400 left - asking for 600 more must fail
+        // rather than manufacturing new supply.
+        assert!(matches!(
+            ledger.disburse_from_treasury(treasury, alice, 600),
+            Err(TxError::InsufficientFunds)
+        ));
+        assert_eq!(ledger.get_balance(&alice), 600);
+    }
+
+    #[test]
+    fn recent_blocks_window_is_bounded() {
+        let mut ledger = Ledger::new([0u8; 32]).with_recent_blocks_window(2);
         let mut poh = Poh::new([0u8; 32]);
-        let entry: PohEntry = poh.tick();
-        ledger.push_block(Block {
-            slot: 1,
-            leader: supersol_crypto::Keypair::generate().pubkey(),
-            previous_blockhash: [0u8; 32],
-            blockhash: entry.hash,
-            poh_entries: vec![entry.clone()],
-            transactions: vec![],
-            airdrops: vec![],
-        });
-        assert_eq!(ledger.latest_block().unwrap().blockhash, entry.hash);
+        for slot in 1..=5u64 {
+            let entry: PohEntry = poh.tick();
+            ledger.push_block(Block {
+                slot,
+                leader: Pubkey::system_program_id(),
+                previous_blockhash: [0u8; 32],
+                blockhash: entry.hash,
+                poh_entries: vec![entry],
+                transactions: vec![],
+                airdrops: vec![],
+            });
+        }
+        assert_eq!(ledger.recent_blocks.len(), 2);
+        assert!(ledger.get_recent_block(1).is_none(), "oldest blocks should be evicted");
+        assert!(ledger.get_recent_block(5).is_some());
+        assert_eq!(ledger.slot, 5);
     }
 }
