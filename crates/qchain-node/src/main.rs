@@ -12,7 +12,10 @@ use clap::Parser;
 use config::NodeConfig;
 use engine::{Engine, EngineState};
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
-use qchain_execution::{Ledger, Program, SystemProgram};
+use qchain_execution::{
+    genesis_registry_account_data, GovernanceProgram, Ledger, Program, StakingProgram, SystemProgram, GOVERNANCE_PROGRAM_ID,
+    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
+};
 use qchain_network::{Network, PeerInfo};
 use qchain_storage::InMemoryStore;
 use std::collections::HashMap;
@@ -53,9 +56,23 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ledger = Ledger::new(Box::new(InMemoryStore::new()))?;
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
+    ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
+    ledger.register_program(GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(GovernanceProgram)));
     for alloc in &config.genesis {
         ledger.credit(alloc.address, alloc.balance);
     }
+    // Phase-2 governance prerequisites (§6/§5 - see `qchain-execution`'s
+    // `staking`/`governance` module docs): the staking-stats counter starts
+    // at zero, and the algorithm registry starts at its genesis contents
+    // (Ed25519 + ML-DSA-65, both Active).
+    ledger.seed_account(
+        STAKING_STATS_ID,
+        qchain_core::Account { data: borsh::to_vec(&0u64)?, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
+    );
+    ledger.seed_account(
+        REGISTRY_ACCOUNT_ID,
+        qchain_core::Account { data: genesis_registry_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+    );
 
     let engine = Arc::new(Engine {
         self_id,

@@ -6,7 +6,7 @@
 use crate::error::ExecError;
 use crate::native::NativeProgram;
 use crate::wasm::WasmExecutor;
-use qchain_core::{Account, Instruction, Transaction, BASE_FEE_PER_BYTE_UNITS, DUST_THRESHOLD_UNITS};
+use qchain_core::{Account, Instruction, Round, Transaction, BASE_FEE_PER_BYTE_UNITS, DUST_THRESHOLD_UNITS};
 use qchain_crypto::Pubkey;
 use qchain_storage::StateStore;
 use std::collections::HashMap;
@@ -49,6 +49,14 @@ impl Ledger {
         self.store.as_ref()
     }
 
+    /// Writes an account directly into the store - genesis-time seeding
+    /// of program-owned singleton accounts (the staking-stats counter,
+    /// the algorithm registry), not a user-facing operation like
+    /// `credit`.
+    pub fn seed_account(&mut self, pubkey: Pubkey, account: Account) {
+        self.store.set(pubkey, account);
+    }
+
     pub fn get_balance(&self, pk: &Pubkey) -> u64 {
         self.store.get(pk).map(|a| a.balance).unwrap_or(0)
     }
@@ -66,7 +74,7 @@ impl Ledger {
     /// transaction actually references - not a clone of the whole store -
     /// see the `blockchain-core-rust` skill for why that distinction is
     /// load-bearing, not just an optimization.
-    pub fn apply_transaction(&mut self, tx: &Transaction, fee_collector: &Pubkey) -> Result<u64, ExecError> {
+    pub fn apply_transaction(&mut self, tx: &Transaction, fee_collector: &Pubkey, current_round: Round) -> Result<u64, ExecError> {
         if !tx.verify_signature() {
             return Err(ExecError::InvalidSignature);
         }
@@ -112,7 +120,7 @@ impl Ledger {
         for ix in &tx.message.instructions {
             let program = self.programs.get(&ix.program_id).ok_or(ExecError::UnknownProgram(ix.program_id))?;
             match program {
-                Program::Native(native) => native.process(&mut working, ix, &tx.message.payer)?,
+                Program::Native(native) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
                 Program::Wasm { module_bytes, entry_point } => {
                     total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working)?;
                 }
@@ -209,7 +217,7 @@ mod tests {
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
 
-        let fee = ledger.apply_transaction(&tx, &validator).unwrap();
+        let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert!(fee > 0, "a multi-kilobyte hybrid-signed transaction must not be free");
 
         assert_eq!(ledger.get_balance(&bob), 100_000);
@@ -232,10 +240,10 @@ mod tests {
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
-        ledger.apply_transaction(&tx, &validator).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         // Same nonce again - the account has already moved to nonce 1.
-        assert!(ledger.apply_transaction(&tx, &validator).is_err());
+        assert!(ledger.apply_transaction(&tx, &validator, 0).is_err());
     }
 
     #[test]
@@ -262,7 +270,7 @@ mod tests {
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: send_amount }).unwrap(),
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], starting_balance, vec![ix]).unwrap();
-        ledger.apply_transaction(&tx, &validator).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         assert_eq!(ledger.get_balance(&alice.pubkey()), 0, "sub-threshold residue must be swept, not left dangling");
     }

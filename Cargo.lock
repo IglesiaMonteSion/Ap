@@ -1753,6 +1753,7 @@ dependencies = [
  "qchain-core",
  "qchain-crypto",
  "qchain-execution",
+ "qchain-governance",
  "reqwest",
  "serde",
  "serde_json",
@@ -1804,11 +1805,22 @@ dependencies = [
  "borsh",
  "qchain-core",
  "qchain-crypto",
+ "qchain-governance",
  "qchain-storage",
  "serde",
  "thiserror 1.0.69",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "qchain-governance"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "qchain-core",
+ "qchain-crypto",
+ "serde",
 ]
 
 [[package]]
@@ -1830,6 +1842,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "borsh",
  "clap",
  "hex",
  "qchain-consensus",

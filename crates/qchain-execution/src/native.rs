@@ -6,12 +6,24 @@
 //! transaction depends on it.
 
 use crate::error::ExecError;
-use qchain_core::{Account, Instruction};
+use qchain_core::{Account, Instruction, Round};
 use qchain_crypto::Pubkey;
 use std::collections::HashMap;
 
 pub trait NativeProgram: Send + Sync {
-    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey) -> Result<(), ExecError>;
+    /// `current_round` is the DAG round of the certificate whose batch
+    /// this instruction came from - the only notion of "now" available
+    /// to a native program, since wall-clock time would break
+    /// determinism across validators (see `qchain-governance`, which
+    /// uses it for voting-period/timelock checks). Programs that don't
+    /// need a clock (like `SystemProgram`) simply ignore it.
+    fn process(
+        &self,
+        accounts: &mut HashMap<Pubkey, Account>,
+        instruction: &Instruction,
+        payer: &Pubkey,
+        current_round: Round,
+    ) -> Result<(), ExecError>;
 }
 
 #[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
@@ -40,7 +52,7 @@ impl SystemProgram {
 }
 
 impl NativeProgram for SystemProgram {
-    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey) -> Result<(), ExecError> {
+    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, _current_round: Round) -> Result<(), ExecError> {
         let instr = SystemInstruction::try_from_slice(&instruction.data)
             .map_err(|e| ExecError::ProgramError(format!("bad instruction data: {e}")))?;
         match instr {
@@ -66,6 +78,18 @@ impl NativeProgram for SystemProgram {
                     .accounts
                     .get(1)
                     .ok_or_else(|| ExecError::ProgramError("Transfer requires accounts[1]".into()))?;
+                // Phase 1/2 transactions have exactly one authenticated
+                // party (the payer, checked by the transaction's own
+                // hybrid signature) - there is no separate per-instruction
+                // signer to check yet. So a Transfer's source account must
+                // be the payer itself; anything else would let any signed
+                // transaction move funds out of an account it never
+                // proved control of. Multi-signer transactions (checking
+                // an authority distinct from the payer) are a later
+                // increment, not present here.
+                if from != payer {
+                    return Err(ExecError::Unauthorized("Transfer's source account must be the transaction payer".into()));
+                }
                 Self::transfer_internal(accounts, from, to, amount)?;
             }
         }
@@ -91,9 +115,29 @@ mod tests {
             accounts: vec![from, to],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 400 }).unwrap(),
         };
-        SystemProgram.process(&mut accounts, &ix, &from).unwrap();
+        SystemProgram.process(&mut accounts, &ix, &from, 0).unwrap();
         assert_eq!(accounts[&from].balance, 600);
         assert_eq!(accounts[&to].balance, 400);
+    }
+
+    #[test]
+    fn transfer_from_an_account_other_than_the_payer_is_rejected() {
+        let victim = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let attacker = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let mut accounts = HashMap::new();
+        accounts.insert(victim, Account { balance: 1_000, ..Account::new_wallet(Pubkey::system_program_id()) });
+
+        // Attacker signs the transaction (so `payer` is the attacker) but
+        // names the victim as the Transfer's source account - this must
+        // never move the victim's funds.
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![victim, attacker],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_000 }).unwrap(),
+        };
+        let result = SystemProgram.process(&mut accounts, &ix, &attacker, 0);
+        assert!(matches!(result, Err(ExecError::Unauthorized(_))));
+        assert_eq!(accounts[&victim].balance, 1_000, "the victim's balance must be untouched");
     }
 
     #[test]
@@ -109,7 +153,7 @@ mod tests {
             accounts: vec![new_account],
             data: borsh::to_vec(&SystemInstruction::CreateAccount { units: 300, owner: program_owner }).unwrap(),
         };
-        SystemProgram.process(&mut accounts, &ix, &payer).unwrap();
+        SystemProgram.process(&mut accounts, &ix, &payer, 0).unwrap();
         assert_eq!(accounts[&new_account].owner, program_owner, "owner must be the one CreateAccount specified, not defaulted");
         assert_eq!(accounts[&new_account].balance, 300);
         assert_eq!(accounts[&payer].balance, 700);

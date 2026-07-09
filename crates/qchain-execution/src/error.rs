@@ -13,6 +13,8 @@ pub enum ExecError {
     UnknownProgram(Pubkey),
     #[error("program error: {0}")]
     ProgramError(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("wasm execution error: {0}")]
     Wasm(String),
     #[error("out of gas")]

@@ -5,6 +5,7 @@ members = [
     "crates/qchain-core",
     "crates/qchain-storage",
     "crates/qchain-execution",
+    "crates/qchain-governance",
     "crates/qchain-consensus",
     "crates/qchain-network",
     "crates/qchain-node",

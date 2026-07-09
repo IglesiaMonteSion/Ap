@@ -175,7 +175,7 @@ impl Engine {
                 continue;
             };
             for tx in &batch.transactions {
-                match state.ledger.apply_transaction(tx, &cert.vertex.author) {
+                match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
                     Ok(_) => state.executed += 1,
                     Err(e) => tracing::warn!("transaction execution failed: {e}"),
                 }

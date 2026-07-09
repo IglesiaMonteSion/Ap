@@ -30,7 +30,7 @@ pub const ALGORITHM_ML_DSA_65: AlgorithmId = AlgorithmId(2);
 /// they were created with until they migrate.
 pub const COMBO_HYBRID_ED25519_ML_DSA_65: AlgorithmId = AlgorithmId(1000);
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum AlgorithmStatus {
     /// Usable by new accounts.
     Active,
@@ -42,7 +42,7 @@ pub enum AlgorithmStatus {
     Retired,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct RegistryEntry {
     pub id: AlgorithmId,
     pub name: String,

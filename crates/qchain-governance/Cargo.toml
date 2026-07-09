@@ -1,0 +1,10 @@
+[package]
+name = "qchain-governance"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+serde.workspace = true
+borsh.workspace = true

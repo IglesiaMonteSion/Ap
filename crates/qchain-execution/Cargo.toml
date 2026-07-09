@@ -7,6 +7,7 @@ edition.workspace = true
 qchain-crypto = { path = "../qchain-crypto" }
 qchain-core = { path = "../qchain-core" }
 qchain-storage = { path = "../qchain-storage" }
+qchain-governance = { path = "../qchain-governance" }
 serde.workspace = true
 borsh.workspace = true
 thiserror.workspace = true
