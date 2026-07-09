@@ -8,16 +8,14 @@
 //! a valid vote outcome is*, given numbers, not *how state gets read or
 //! written*.
 //!
-//! Scope of this increment (phase 2, per `ARCHITECTURE.md`'s roadmap):
-//! only the `Registry` risk tier is implemented - algorithm registry
-//! activate/deprecate/retire actions, the concrete example the roadmap
-//! names ("Registro de algoritmos con flujo real de alta/baja vía
-//! gobernanza"). The `Low` risk tier (fee-curve constants, gas pricing)
-//! is a documented follow-up: those parameters are still compile-time
-//! constants in `qchain-core`, not on-chain mutable state, so there is
-//! nothing yet for a `Low`-tier proposal to actually change. Making them
-//! governable is a separate, cleanly-scoped increment, not bundled in
-//! here as a half-finished feature.
+//! Two risk tiers are implemented, per `ARCHITECTURE.md` §6: `Registry`
+//! (algorithm activate/deprecate/retire - supermajority + mandatory
+//! time-lock) and `Low` (economic parameters - base fee, dust threshold,
+//! gas price - simple majority, no time-lock). The on-chain accounts a
+//! `Low`-tier action actually mutates live in `qchain-execution`
+//! (`EconomicParams`), not here - same "this crate only decides what a
+//! valid vote outcome is" split as `Registry`-tier actions mutating the
+//! algorithm registry.
 
 use qchain_core::Round;
 use qchain_crypto::{AlgorithmId, Pubkey, RegistryEntry};
@@ -27,6 +25,11 @@ pub type ProposalId = u64;
 
 #[derive(Clone, Copy, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum RiskTier {
+    /// Economic parameters (fee curve constants, gas pricing table):
+    /// simple majority of participating stake, no mandatory time-lock -
+    /// `ARCHITECTURE.md` §6 doesn't require one for this tier, unlike
+    /// `Registry`.
+    Low,
     /// Algorithm registry changes: supermajority + mandatory time-lock
     /// review window (`ARCHITECTURE.md` §6, `blockchain-security-audit`
     /// #7 - never instant activation or instant invalidation).
@@ -60,6 +63,14 @@ pub struct QuorumRule {
 
 pub fn quorum_rule(tier: RiskTier) -> QuorumRule {
     match tier {
+        // Strict simple majority (5_001, not 5_000 - a 50/50 tie must not
+        // pass) of participating stake, per ARCHITECTURE.md §6 ("bajo
+        // riesgo ... mayoría simple del stake participante"). Lower
+        // participation floor and no time-lock, reflecting that this
+        // tier is deliberately meant to be easier to move than a
+        // registry change. All values are placeholders pending real
+        // testnet operating data, same as the Registry tier below.
+        RiskTier::Low => QuorumRule { min_participation_bps: 1_000, approval_threshold_bps: 5_001, voting_period_rounds: 100, timelock_rounds: 0 },
         // 2/3 supermajority per ARCHITECTURE.md §6 ("Cambios al registro
         // de algoritmos ... supermayoría (2/3) + ventana de revisión con
         // time-lock obligatorio"). Participation floor and round counts
@@ -81,6 +92,12 @@ pub enum ProposalAction {
     /// Moves a `Deprecated` entry to `Retired`. Fails at execution time
     /// if `retirement_round` hasn't been reached yet.
     RetireAlgorithm { id: AlgorithmId },
+    /// New value for the byte-scaled base fee (`ARCHITECTURE.md` §5).
+    SetBaseFeePerByte(u64),
+    /// New value for the dust-sweep threshold (`ARCHITECTURE.md` §5).
+    SetDustThreshold(u64),
+    /// New value for the WASM gas price (fuel-to-unit conversion).
+    SetGasPricePerFuel(u64),
 }
 
 impl ProposalAction {
@@ -89,6 +106,7 @@ impl ProposalAction {
             ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
                 RiskTier::Registry
             }
+            ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => RiskTier::Low,
         }
     }
 }
@@ -198,6 +216,10 @@ mod tests {
         ProposalAction::DeprecateAlgorithm { id: AlgorithmId(2), retirement_round: 1_000 }
     }
 
+    fn low_risk_action() -> ProposalAction {
+        ProposalAction::SetBaseFeePerByte(5)
+    }
+
     #[test]
     fn below_participation_floor_is_rejected_even_with_unanimous_yes() {
         let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
@@ -259,5 +281,33 @@ mod tests {
         let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 500);
         let rule = quorum_rule(RiskTier::Registry);
         assert_eq!(p.voting_ends_round, 500 + rule.voting_period_rounds);
+    }
+
+    #[test]
+    fn low_tier_passes_on_a_strict_simple_majority_not_a_tie() {
+        let mut tied = Proposal::new(1, Pubkey::system_program_id(), low_risk_action(), 0);
+        tied.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 50);
+        tied.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 50);
+        assert_eq!(tied.evaluate(100), ProposalStatus::Rejected, "a 50/50 tie must not pass a simple-majority vote");
+
+        let mut clear = Proposal::new(2, Pubkey::system_program_id(), low_risk_action(), 0);
+        clear.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 51);
+        clear.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 49);
+        assert_eq!(clear.evaluate(100), ProposalStatus::Passed);
+    }
+
+    #[test]
+    fn low_tier_has_a_lower_participation_floor_and_no_timelock_than_registry() {
+        let low_rule = quorum_rule(RiskTier::Low);
+        let registry_rule = quorum_rule(RiskTier::Registry);
+        assert!(low_rule.min_participation_bps < registry_rule.min_participation_bps);
+        assert_eq!(low_rule.timelock_rounds, 0, "ARCHITECTURE.md §6 doesn't require a time-lock for low-risk parameters");
+        assert!(registry_rule.timelock_rounds > 0);
+    }
+
+    #[test]
+    fn set_base_fee_action_is_low_risk_tier() {
+        assert_eq!(low_risk_action().risk_tier(), RiskTier::Low);
+        assert_eq!(sample_action().risk_tier(), RiskTier::Registry);
     }
 }

@@ -13,8 +13,8 @@ use config::NodeConfig;
 use engine::{Engine, EngineState};
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
 use qchain_execution::{
-    genesis_registry_account_data, GovernanceProgram, Ledger, Program, StakingProgram, SystemProgram, GOVERNANCE_PROGRAM_ID,
-    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
+    genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, StakingProgram, SystemProgram,
+    GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
 };
 use qchain_network::{Network, PeerInfo};
 use qchain_storage::InMemoryStore;
@@ -72,6 +72,14 @@ async fn main() -> anyhow::Result<()> {
     ledger.seed_account(
         REGISTRY_ACCOUNT_ID,
         qchain_core::Account { data: genesis_registry_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+    );
+    // Economic parameters (base fee, dust threshold, gas price) start at
+    // their compiled-in defaults and become governable (Low-tier
+    // proposals, no time-lock) from here - see `qchain-execution`'s
+    // `params`/`governance` module docs.
+    ledger.seed_account(
+        PARAMS_ACCOUNT_ID,
+        qchain_core::Account { data: genesis_params_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
     );
 
     let engine = Arc::new(Engine {

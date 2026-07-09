@@ -4,17 +4,17 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
+use crate::ids::PARAMS_ACCOUNT_ID;
 use crate::native::NativeProgram;
+use crate::params::EconomicParams;
 use crate::wasm::WasmExecutor;
-use qchain_core::{Account, Instruction, Round, Transaction, BASE_FEE_PER_BYTE_UNITS, DUST_THRESHOLD_UNITS};
+use borsh::BorshDeserialize;
+use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::Pubkey;
 use qchain_storage::StateStore;
 use std::collections::HashMap;
 use wasmtime::Val;
 
-/// Placeholder gas price - see `ARCHITECTURE.md` §5's tokenomics
-/// disclaimer: a starting point, not a modeled figure.
-pub const GAS_PRICE_UNITS_PER_FUEL: u64 = 1;
 /// Fuel budget for the WASM half of a transaction. A real deployment would
 /// derive this from `Message.fee_limit`; fixed here for phase 1 simplicity.
 pub const DEFAULT_FUEL_LIMIT: u64 = 5_000_000;
@@ -67,6 +67,21 @@ impl Ledger {
         self.store.set(pk, account);
     }
 
+    /// The economic parameters currently in effect - read live from
+    /// `PARAMS_ACCOUNT_ID` (governable via a `Low`-tier proposal, see
+    /// `governance.rs`), falling back to `EconomicParams::default()` if
+    /// that account hasn't been seeded (e.g. a bare `Ledger` built
+    /// directly in a test, never wired to `qchain-node`'s genesis
+    /// seeding). Read fresh on every `apply_transaction` call rather than
+    /// cached, so a passed-and-executed governance proposal takes effect
+    /// on the very next transaction, not after a restart.
+    fn current_params(&self) -> EconomicParams {
+        self.store
+            .get(&PARAMS_ACCOUNT_ID)
+            .and_then(|a| EconomicParams::try_from_slice(&a.data).ok())
+            .unwrap_or_default()
+    }
+
     /// Verify the transaction, charge the byte-scaled base fee (split
     /// between burning and `fee_collector`, per `ARCHITECTURE.md` §5),
     /// then dispatch every instruction to its program. Instruction
@@ -79,7 +94,8 @@ impl Ledger {
             return Err(ExecError::InvalidSignature);
         }
 
-        let byte_fee = BASE_FEE_PER_BYTE_UNITS * tx.byte_size() as u64;
+        let params = self.current_params();
+        let byte_fee = params.base_fee_per_byte * tx.byte_size() as u64;
         let mut payer_account = self.store.get(&tx.message.payer).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
         if payer_account.balance < byte_fee {
             return Err(ExecError::InsufficientFunds);
@@ -122,7 +138,7 @@ impl Ledger {
             match program {
                 Program::Native(native) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
                 Program::Wasm { module_bytes, entry_point } => {
-                    total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working)?;
+                    total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working, params.gas_price_per_fuel)?;
                 }
             }
         }
@@ -139,7 +155,7 @@ impl Ledger {
         }
 
         for (pk, mut account) in working {
-            if account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < DUST_THRESHOLD_UNITS {
+            if account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold {
                 self.total_burned += account.balance;
                 account.balance = 0;
             }
@@ -155,6 +171,7 @@ impl Ledger {
         entry_point: &str,
         ix: &Instruction,
         working: &mut HashMap<Pubkey, Account>,
+        gas_price_per_fuel: u64,
     ) -> Result<u64, ExecError> {
         let accounts: Vec<Account> = ix
             .accounts
@@ -183,7 +200,7 @@ impl Ledger {
             working.insert(*pk, account);
         }
 
-        Ok(result.fuel_consumed * GAS_PRICE_UNITS_PER_FUEL)
+        Ok(result.fuel_consumed * gas_price_per_fuel)
     }
 }
 
@@ -191,7 +208,7 @@ impl Ledger {
 mod tests {
     use super::*;
     use crate::native::{SystemInstruction, SystemProgram};
-    use qchain_core::Instruction;
+    use qchain_core::{Instruction, BASE_FEE_PER_BYTE_UNITS, DUST_THRESHOLD_UNITS};
     use qchain_crypto::Keypair;
     use qchain_storage::InMemoryStore;
 
@@ -273,5 +290,45 @@ mod tests {
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         assert_eq!(ledger.get_balance(&alice.pubkey()), 0, "sub-threshold residue must be swept, not left dangling");
+    }
+
+    /// Proves the governance wiring actually closes the loop: seeding
+    /// `PARAMS_ACCOUNT_ID` with a different `base_fee_per_byte` (exactly
+    /// what `GovernanceProgram::Execute` does for a passed `Low`-tier
+    /// proposal, see `governance.rs`) must change what the very next
+    /// `apply_transaction` call charges - not just mutate a data blob
+    /// nobody reads.
+    #[test]
+    fn apply_transaction_uses_the_live_on_chain_base_fee_not_the_compiled_in_default() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 10_000_000);
+
+        fn transfer_tx(alice: &Keypair, bob: Pubkey, nonce: u64) -> Transaction {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+            };
+            Transaction::new_signed(alice, nonce, [0u8; 32], 1_000_000, vec![ix]).unwrap()
+        }
+
+        let tx0 = transfer_tx(&alice, bob, 0);
+        let expected_byte_size = tx0.byte_size() as u64;
+        let fee_before = ledger.apply_transaction(&tx0, &validator, 0).unwrap();
+        assert_eq!(fee_before, BASE_FEE_PER_BYTE_UNITS * expected_byte_size, "starts at the compiled-in default");
+
+        // Simulate what GovernanceProgram::Execute does to a passed
+        // Low-tier SetBaseFeePerByte proposal: overwrite the params
+        // singleton directly.
+        let new_params = EconomicParams { base_fee_per_byte: BASE_FEE_PER_BYTE_UNITS * 10, ..EconomicParams::default() };
+        ledger.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&new_params).unwrap(), ..Account::new_wallet(Pubkey::new([3u8; 32])) });
+
+        let tx1 = transfer_tx(&alice, bob, 1);
+        let fee_after = ledger.apply_transaction(&tx1, &validator, 0).unwrap();
+        assert_eq!(fee_after, new_params.base_fee_per_byte * expected_byte_size);
+        assert!(fee_after > fee_before * 5, "the new on-chain rate must actually be what gets charged");
     }
 }

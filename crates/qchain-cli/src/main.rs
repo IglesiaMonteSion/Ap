@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{AlgorithmId, AlgorithmStatus, Keypair, Pubkey, RegistryEntry};
 use qchain_execution::{
-    GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID,
-    STAKING_STATS_ID,
+    EconomicParams, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
+    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
 };
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
@@ -146,6 +146,52 @@ enum Command {
         #[arg(long, default_value_t = 1_000_000)]
         fee_limit: u64,
     },
+    /// Propose a new byte-scaled base fee (Low risk tier: simple
+    /// majority, no time-lock).
+    ProposeSetBaseFee {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        proposal_id: ProposalId,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
+    /// Propose a new dust-sweep threshold (Low risk tier).
+    ProposeSetDustThreshold {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        proposal_id: ProposalId,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
+    /// Propose a new WASM gas price (Low risk tier).
+    ProposeSetGasPrice {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        proposal_id: ProposalId,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
     /// Cast a vote on a proposal, weighted by a stake account's balance.
     Vote {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -194,6 +240,11 @@ enum Command {
     },
     /// Print the on-chain algorithm registry.
     Registry {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+    },
+    /// Print the current on-chain economic parameters.
+    Params {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
     },
@@ -337,6 +388,33 @@ fn main() -> anyhow::Result<()> {
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
+        Command::ProposeSetBaseFee { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
+            let proposer = qchain_crypto::read_keypair_file(&keypair)?;
+            let proposal_pk = Keypair::generate()?.pubkey();
+            let action = ProposalAction::SetBaseFeePerByte(value);
+            let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposal account: {proposal_pk}");
+        }
+        Command::ProposeSetDustThreshold { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
+            let proposer = qchain_crypto::read_keypair_file(&keypair)?;
+            let proposal_pk = Keypair::generate()?.pubkey();
+            let action = ProposalAction::SetDustThreshold(value);
+            let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposal account: {proposal_pk}");
+        }
+        Command::ProposeSetGasPrice { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
+            let proposer = qchain_crypto::read_keypair_file(&keypair)?;
+            let proposal_pk = Keypair::generate()?.pubkey();
+            let action = ProposalAction::SetGasPricePerFuel(value);
+            let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposal account: {proposal_pk}");
+        }
         Command::Vote { rpc, keypair, proposal, stake_account, choice, nonce, fee_limit } => {
             let voter = qchain_crypto::read_keypair_file(&keypair)?;
             let proposal_pk: Pubkey = proposal.parse()?;
@@ -356,8 +434,22 @@ fn main() -> anyhow::Result<()> {
         Command::ExecuteProposal { rpc, keypair, proposal, nonce, fee_limit } => {
             let caller = qchain_crypto::read_keypair_file(&keypair)?;
             let proposal_pk: Pubkey = proposal.parse()?;
+            let account = fetch_account(&rpc, &proposal_pk)?.ok_or_else(|| anyhow::anyhow!("proposal account not found"))?;
+            let decoded: Proposal = borsh::from_slice(&account.data)?;
+            // Execute's target account depends on what kind of action the
+            // proposal carries - the registry singleton for a
+            // Registry-tier action, the economic-params singleton for a
+            // Low-tier one (see `qchain-execution`'s `governance.rs`).
+            let target = match decoded.action {
+                ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+                    REGISTRY_ACCOUNT_ID
+                }
+                ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
+                    PARAMS_ACCOUNT_ID
+                }
+            };
             let data = borsh::to_vec(&GovernanceInstruction::Execute)?;
-            let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, target], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::Registry { rpc } => {
@@ -366,6 +458,11 @@ fn main() -> anyhow::Result<()> {
             for entry in registry {
                 println!("id={} name={} status={:?}", entry.id.0, entry.name, entry.status);
             }
+        }
+        Command::Params { rpc } => {
+            let account = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?.ok_or_else(|| anyhow::anyhow!("params account not found - is genesis seeded?"))?;
+            let params: EconomicParams = borsh::from_slice(&account.data)?;
+            println!("{params:#?}");
         }
         Command::ProposalStatus { rpc, proposal } => {
             let proposal_pk: Pubkey = proposal.parse()?;

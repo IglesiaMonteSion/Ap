@@ -17,3 +17,8 @@ pub const GOVERNANCE_PROGRAM_ID: Pubkey = Pubkey::new([3u8; 32]);
 /// borsh-encoded `Vec<qchain_crypto::RegistryEntry>` - the on-chain
 /// algorithm registry a passed `Registry`-tier proposal mutates.
 pub const REGISTRY_ACCOUNT_ID: Pubkey = Pubkey::new([4u8; 32]);
+/// Singleton account (owned by `GOVERNANCE_PROGRAM_ID`) whose `data` is a
+/// borsh-encoded `crate::params::EconomicParams` - the on-chain economic
+/// parameters a passed `Low`-tier proposal mutates, and what `Ledger`
+/// reads fee/dust/gas pricing from at execution time.
+pub const PARAMS_ACCOUNT_ID: Pubkey = Pubkey::new([5u8; 32]);

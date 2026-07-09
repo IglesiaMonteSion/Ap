@@ -130,7 +130,14 @@ impl NativeProgram for GovernanceProgram {
 
             GovernanceInstruction::Execute => {
                 let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Execute requires accounts[0]".into()))?;
-                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[1]".into()))?;
+                // The account this action actually mutates - the
+                // algorithm registry for a Registry-tier action, the
+                // economic-params singleton for a Low-tier one. The
+                // caller (a CLI/client) is expected to have read the
+                // proposal first and pass the matching target; this
+                // program just applies whichever variant `proposal.action`
+                // turns out to be against whatever it's handed.
+                let target_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[1]".into()))?;
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Passed {
@@ -142,10 +149,20 @@ impl NativeProgram for GovernanceProgram {
                     return Err(ExecError::ProgramError("the mandatory review time-lock has not elapsed yet".into()));
                 }
 
-                let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
-                let mut registry: Vec<RegistryEntry> = Vec::try_from_slice(&registry_account.data).map_err(borsh_err)?;
-                apply_registry_action(&mut registry, &proposal.action, current_round)?;
-                accounts.get_mut(&registry_pk).unwrap().data = borsh::to_vec(&registry).map_err(borsh_err)?;
+                match &proposal.action {
+                    ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+                        let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
+                        let mut registry: Vec<RegistryEntry> = Vec::try_from_slice(&target_account.data).map_err(borsh_err)?;
+                        apply_registry_action(&mut registry, &proposal.action, current_round)?;
+                        accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&registry).map_err(borsh_err)?;
+                    }
+                    ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
+                        let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
+                        let mut params = crate::params::EconomicParams::try_from_slice(&target_account.data).map_err(borsh_err)?;
+                        apply_economic_action(&mut params, &proposal.action);
+                        accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&params).map_err(borsh_err)?;
+                    }
+                }
 
                 proposal.status = ProposalStatus::Executed;
                 write_proposal(accounts, &proposal_pk, &proposal)?;
@@ -182,8 +199,25 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
                 _ => return Err(ExecError::ProgramError("only a Deprecated entry can be retired".into())),
             }
         }
+        ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
+            unreachable!("Execute only calls apply_registry_action for Registry-tier actions")
+        }
     }
     Ok(())
+}
+
+/// Only ever called with a `Low`-tier action (the `Execute` match arm
+/// routes accordingly) - the other variants are unreachable here, which
+/// is why this doesn't return a `Result`.
+fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &ProposalAction) {
+    match action {
+        ProposalAction::SetBaseFeePerByte(v) => params.base_fee_per_byte = *v,
+        ProposalAction::SetDustThreshold(v) => params.dust_threshold = *v,
+        ProposalAction::SetGasPricePerFuel(v) => params.gas_price_per_fuel = *v,
+        ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+            unreachable!("Execute only calls apply_economic_action for Low-tier actions")
+        }
+    }
 }
 
 /// Builds the genesis algorithm-registry account contents - callers (node
@@ -192,10 +226,16 @@ pub fn genesis_registry_account_data() -> Vec<u8> {
     borsh::to_vec(&qchain_crypto::registry::genesis_registry()).expect("genesis registry always serializes")
 }
 
+/// Builds the genesis economic-params account contents - callers (node
+/// startup) write this into `PARAMS_ACCOUNT_ID` once, at genesis.
+pub fn genesis_params_account_data() -> Vec<u8> {
+    borsh::to_vec(&crate::params::EconomicParams::default()).expect("default economic params always serialize")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{REGISTRY_ACCOUNT_ID, STAKING_STATS_ID};
+    use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_STATS_ID};
     use crate::staking::StakingProgram;
     use qchain_crypto::{ALGORITHM_ED25519, ALGORITHM_ML_DSA_65};
 
@@ -218,6 +258,10 @@ mod tests {
 
     fn stats_account(total: u64) -> Account {
         Account { data: borsh::to_vec(&total).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
+    }
+
+    fn params_account() -> Account {
+        Account { data: genesis_params_account_data(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) }
     }
 
     fn new_slh_dsa_entry() -> RegistryEntry {
@@ -451,5 +495,73 @@ mod tests {
 
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.yes_stake, 5_000, "voting power must come from the real delegated amount");
+    }
+
+    /// The `Low` tier's whole point is to be cheap to move: no
+    /// supermajority, no time-lock. This proves `Execute` succeeds the
+    /// instant a `Low`-tier proposal is finalized, unlike the multi-round
+    /// wait `Registry`-tier actions require (see
+    /// `full_registry_activation_lifecycle_passes_and_executes`).
+    #[test]
+    fn low_tier_economic_parameter_change_passes_on_simple_majority_and_executes_immediately() {
+        let proposer = Pubkey::new([1u8; 32]);
+        let voter_a = Pubkey::new([2u8; 32]);
+        let voter_b = Pubkey::new([3u8; 32]);
+        let mut accounts = HashMap::from([
+            (proposer, wallet(0)),
+            (STAKE_PK, stake_account(voter_a, 510)),
+            (OTHER_STAKE_PK, stake_account(voter_b, 490)),
+            (STAKING_STATS_ID, stats_account(1_000)),
+            (PARAMS_ACCOUNT_ID, params_account()),
+        ]);
+
+        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(9), 0);
+        vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
+        vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
+
+        let rule = quorum_rule(qchain_governance::RiskTier::Low);
+        let finalize_round = rule.voting_period_rounds;
+        finalize(&mut accounts, proposer, finalize_round).unwrap();
+        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Passed, "51% is a strict simple majority");
+
+        // Zero time-lock: the very same round Finalize passed it, Execute
+        // must already succeed.
+        assert_eq!(rule.timelock_rounds, 0);
+        let execute_ix = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID],
+            data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
+        };
+        GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round).unwrap();
+
+        let params = crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap();
+        assert_eq!(params.base_fee_per_byte, 9);
+        assert_eq!(params.dust_threshold, crate::params::EconomicParams::default().dust_threshold, "unrelated params must be untouched");
+
+        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn low_tier_tie_is_rejected_and_registry_actions_reject_a_params_target_mismatch() {
+        let proposer = Pubkey::new([1u8; 32]);
+        let voter_a = Pubkey::new([2u8; 32]);
+        let voter_b = Pubkey::new([3u8; 32]);
+        let mut accounts = HashMap::from([
+            (proposer, wallet(0)),
+            (STAKE_PK, stake_account(voter_a, 500)),
+            (OTHER_STAKE_PK, stake_account(voter_b, 500)),
+            (STAKING_STATS_ID, stats_account(1_000)),
+            (PARAMS_ACCOUNT_ID, params_account()),
+        ]);
+        create_proposal(&mut accounts, proposer, ProposalAction::SetDustThreshold(1), 0);
+        vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
+        vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
+
+        let rule = quorum_rule(qchain_governance::RiskTier::Low);
+        finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
+        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Rejected, "a 500/500 tie is not a strict majority");
     }
 }
