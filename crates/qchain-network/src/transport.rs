@@ -144,4 +144,33 @@ mod tests {
         let kp = qchain_crypto::Keypair::generate().unwrap();
         kp.sign(b"test").unwrap()
     }
+
+    /// Real, measured wire-encoded certificate size vs. validator count -
+    /// not a literature estimate (see `project-lessons-learned`). A
+    /// quorum certificate carries one individual hybrid signature per
+    /// signer (no aggregation - see `ARCHITECTURE.md` §1's bandwidth
+    /// analysis and the pending lattice-aggregation research item), so
+    /// this should scale ~linearly with the quorum size, which itself
+    /// grows with the validator count.
+    #[test]
+    #[ignore]
+    fn certificate_wire_size_scales_with_validator_count() {
+        use qchain_core::{Certificate, Vertex};
+
+        for &n in &[3usize, 10, 20, 50] {
+            let keypairs: Vec<_> = (0..n).map(|_| qchain_crypto::Keypair::generate().unwrap()).collect();
+            let author = keypairs[0].pubkey();
+            let vertex = Vertex { round: 100, author, batch_digest: [7u8; 32], parents: vec![[1u8; 32], [2u8; 32]] };
+            let digest = vertex.digest();
+            // Quorum-sized: 2f+1 out of n=3f+1 - the minimum a real
+            // certificate would ever carry.
+            let quorum = (n * 2).div_ceil(3);
+            let signatures: Vec<_> = keypairs[..quorum.min(n)].iter().map(|kp| (kp.pubkey(), kp.sign(&digest[..]).unwrap())).collect();
+            let cert = Certificate { vertex, signatures };
+
+            let envelope = Envelope { from: author, message: NetMessage::CertificateBroadcast(cert) };
+            let bytes = serde_json::to_vec(&envelope).unwrap();
+            println!("n={n:>3} validators, quorum={quorum:>3} signatures -> certificate wire size = {} bytes ({:.1} KB)", bytes.len(), bytes.len() as f64 / 1024.0);
+        }
+    }
 }
