@@ -15,6 +15,9 @@ of History, ejecución de programas) pero con mejoras deliberadas:
    (0.0000005 SSOL) por transacción, ~10x más barato que el fee típico de
    Solana (~5000 lamports / 0.000005 SOL) - y en vez de pagarse a un
    validador, se destruye por completo (deflacionario), ver [Fees](#fees).
+   Los residuos ("dust") que quedan en una cuenta tras una transferencia
+   también se queman automáticamente en vez de quedar varados — ver
+   [Quema de residuos](#quema-automática-de-residuos-dust).
 3. **Suministro fijo de 700,000,000 SSOL, sin pre-mine a insiders.** Toda la
    emisión ocurre una sola vez, en el génesis, repartida entre una cuenta de
    tesoro y una reserva de recompensas de staking, ninguna con dueño (ninguna
@@ -81,6 +84,31 @@ directo para operarlo (más allá de que el propio operador puede stakear su
 SSOL y ganar recompensas de staking). Un esquema de recompensa de bloque más
 completo es un ítem de fase 2, cuando haya multi-validador y competencia real
 por producir bloques.
+
+## Quema automática de residuos ("dust")
+
+Inspirado en una molestia real de Solana: ahí, cada cuenta debe mantener un
+mínimo exento de renta, así que cuando intentas enviar "todo" el SOL de una
+cuenta, queda un residuo de unos centavos varado - no se puede enviar, no
+desaparece, simplemente se queda ahí. A escala de red, eso es SOL
+efectivamente inmovilizado en millones de cuentas.
+
+Aquí, en vez de dejarlo varado, se destruye. Después de aplicar una
+transacción, cualquier wallet (cuenta normal, dueña de sí misma el System
+Program) que quede con un balance mayor que cero pero por debajo de
+`DUST_THRESHOLD_UNITS` (10,000 photon = 0.00001 SSOL) se pone en cero
+automáticamente, y ese residuo se suma a `Ledger.total_burned` - la misma
+cuenta que ya usa el fee quemado. El tesoro y la reserva de staking están
+explícitamente protegidos y nunca se barren así, sin importar cuán bajo
+llegue su balance (eso sería un bug, no un residuo).
+
+Probado de punta a punta: enviar 9.9999965 de una cuenta con 10 SSOL (dejando
+0.000003 SSOL de residuo tras el fee) resultó en la cuenta origen quedando en
+exactamente 0, con `total_burned` reflejando el residuo + el fee.
+
+Esto compone con el fee quemado para hacer el supply circulante levemente
+deflacionario con el uso normal de la red, sin necesidad de tocar el tope
+fijo de 700M.
 
 ## Suministro fijo
 
@@ -312,15 +340,16 @@ correcta del estado tras reiniciar el proceso.
 cargo test --workspace
 ```
 
-28 pruebas cubren: cadena PoH verificable y detección de manipulación, firma
+31 pruebas cubren: cadena PoH verificable y detección de manipulación, firma
 y verificación híbrida (incluyendo intentos de falsificar el bundle de
 claves), aplicación de transacciones y rechazo de firmas inválidas (incluida
 la que confirma que una transacción solo toca las cuentas que referencia),
-quema de fee (incluso si la instrucción falla), acuñación de génesis y
-disburso acotado del tesoro, recompensas de staking pro-rata acotadas por la
-reserva, la ventana acotada de bloques recientes, y los programas
-nativos (transferencia, fondos insuficientes, memo, ciclo de vida completo de
-staking). Los benchmarks de rendimiento (ver
+quema de fee (incluso si la instrucción falla), quema automática de residuos
+(y que el tesoro/reserva de staking nunca se barren así), acuñación de
+génesis y disburso acotado del tesoro, recompensas de staking pro-rata
+acotadas por la reserva, la ventana acotada de bloques recientes, y los
+programas nativos (transferencia, fondos insuficientes, memo, ciclo de vida
+completo de staking). Los benchmarks de rendimiento (ver
 [Rendimiento](#rendimiento-cuántas-transacciones-por-segundo)) están
 marcados `#[ignore]` y se corren aparte, no como parte de esta suite.
 
@@ -400,3 +429,7 @@ benchmarks reales de rendimiento.
   época) son valores de partida razonables, no un resultado de modelado
   económico - fácilmente ajustables vía flags del nodo (`--epoch-slots`,
   `--reward-units-per-epoch`), pero pendientes de calibración real (fase 5).
+- `DUST_THRESHOLD_UNITS` (0.00001 SSOL) es también un valor de partida, hoy
+  una constante de compilación (no un flag de nodo todavía) - suficiente para
+  demostrar el mecanismo, pendiente de calibración junto con el resto de la
+  tokenomics.

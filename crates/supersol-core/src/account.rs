@@ -43,6 +43,15 @@ pub const STAKING_RESERVE_UNITS: u64 = STAKING_RESERVE_SSOL * UNITS_PER_SSOL;
 /// TOTAL_SUPPLY_UNITS`, always.
 pub const TREASURY_ALLOCATION_UNITS: u64 = TOTAL_SUPPLY_UNITS - STAKING_RESERVE_UNITS;
 
+/// Any wallet balance left over after a transaction that's above zero but
+/// below this is swept away entirely and burned, rather than lingering
+/// forever as an unspendable-in-practice residue. This is modeled on the
+/// real annoyance of sending "everything" out of a Solana account and having
+/// a few cents of un-sendable, rent-exempt-minimum dust stuck behind - here
+/// that residue is simply destroyed instead of stranded, which is also
+/// mildly deflationary (see `Ledger::apply_transaction`).
+pub const DUST_THRESHOLD_UNITS: u64 = 10_000; // 0.00001 SSOL
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Account {
     /// Balance in base units ("photon").

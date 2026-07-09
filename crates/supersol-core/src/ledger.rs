@@ -1,4 +1,4 @@
-use crate::account::Account;
+use crate::account::{Account, DUST_THRESHOLD_UNITS};
 use crate::block::Block;
 use crate::stake::{StakeState, StakeStatus, STAKE_PROGRAM_ID};
 use crate::transaction::{Instruction, Transaction};
@@ -165,7 +165,17 @@ impl Ledger {
             program.process(&mut working, ix, &tx.message.payer)?;
         }
 
-        for (pk, account) in working {
+        for (pk, mut account) in working {
+            // Sweep away and burn tiny leftover wallet balances instead of
+            // letting them linger forever - see `DUST_THRESHOLD_UNITS`. Never
+            // applies to the treasury or staking-rewards pool: those are
+            // expected to run low/empty legitimately, not "dust".
+            let is_plain_wallet = account.owner == Pubkey::system_program_id();
+            let is_protected_sentinel = pk == Pubkey::treasury() || pk == Pubkey::staking_rewards_pool();
+            if is_plain_wallet && !is_protected_sentinel && account.balance > 0 && account.balance < DUST_THRESHOLD_UNITS {
+                self.total_burned += account.balance;
+                account.balance = 0;
+            }
             self.accounts.insert(pk, account);
         }
         Ok(())
@@ -305,7 +315,9 @@ mod tests {
         use supersol_crypto::Keypair;
         let payer = Keypair::generate();
         let mut ledger = Ledger::new([0u8; 32]);
-        ledger.genesis_mint(payer.pubkey(), 10_000);
+        // Large enough to stay well above DUST_THRESHOLD_UNITS after the fee,
+        // so this test exercises fee-burning, not dust-sweeping.
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
 
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
@@ -317,7 +329,7 @@ mod tests {
         programs.insert(Pubkey::system_program_id(), Box::new(NoopProgram));
 
         ledger.apply_transaction(&tx, &programs, 500).unwrap();
-        assert_eq!(ledger.get_balance(&payer.pubkey()), 9_500);
+        assert_eq!(ledger.get_balance(&payer.pubkey()), 9_999_500);
         assert_eq!(ledger.total_burned, 500);
     }
 
@@ -326,7 +338,7 @@ mod tests {
         use supersol_crypto::Keypair;
         let payer = Keypair::generate();
         let mut ledger = Ledger::new([0u8; 32]);
-        ledger.genesis_mint(payer.pubkey(), 10_000);
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
 
         struct FailingProgram;
         impl ProgramProcessor for FailingProgram {
@@ -345,7 +357,7 @@ mod tests {
         programs.insert(program_id, Box::new(FailingProgram));
 
         assert!(ledger.apply_transaction(&tx, &programs, 500).is_err());
-        assert_eq!(ledger.get_balance(&payer.pubkey()), 9_500);
+        assert_eq!(ledger.get_balance(&payer.pubkey()), 9_999_500);
         assert_eq!(ledger.total_burned, 500);
     }
 
@@ -354,7 +366,7 @@ mod tests {
         use supersol_crypto::Keypair;
         let payer = Keypair::generate();
         let mut ledger = Ledger::new([0u8; 32]);
-        ledger.genesis_mint(payer.pubkey(), 10_000);
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
         // An unrelated account that no instruction in this transaction names.
         let bystander = Keypair::generate().pubkey();
         ledger.genesis_mint(bystander, 42);
@@ -370,6 +382,101 @@ mod tests {
         ledger.apply_transaction(&tx, &programs, 100).unwrap();
 
         assert_eq!(ledger.get_balance(&bystander), 42, "untouched account must be unaffected");
+    }
+
+    #[test]
+    fn dust_left_after_a_transaction_is_swept_and_burned() {
+        use supersol_crypto::Keypair;
+
+        struct LeaveDustProgram;
+        impl ProgramProcessor for LeaveDustProgram {
+            fn process(&self, accounts: &mut HashMap<Pubkey, Account>, _: &Instruction, payer: &Pubkey) -> Result<(), TxError> {
+                // Simulates "sent almost everything", leaving a tiny residue -
+                // the same annoyance as Solana's rent-exempt-minimum dust.
+                accounts.get_mut(payer).unwrap().balance = 5;
+                Ok(())
+            }
+        }
+
+        let payer = Keypair::generate();
+        let mut ledger = Ledger::new([0u8; 32]);
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
+
+        let program_id = Pubkey::new([7u8; 32]);
+        let ix = Instruction {
+            program_id,
+            accounts: vec![],
+            data: vec![],
+        };
+        let tx = Transaction::new_signed(&payer, [0u8; 32], vec![ix]);
+        let mut programs: ProgramRegistry = HashMap::new();
+        programs.insert(program_id, Box::new(LeaveDustProgram));
+
+        ledger.apply_transaction(&tx, &programs, 0).unwrap();
+        assert_eq!(ledger.get_balance(&payer.pubkey()), 0, "dust should be swept to zero");
+        assert_eq!(ledger.total_burned, 5, "swept dust must be counted as burned");
+    }
+
+    #[test]
+    fn balance_at_or_above_dust_threshold_is_left_alone() {
+        use supersol_crypto::Keypair;
+
+        struct LeaveBalanceProgram;
+        impl ProgramProcessor for LeaveBalanceProgram {
+            fn process(&self, accounts: &mut HashMap<Pubkey, Account>, _: &Instruction, payer: &Pubkey) -> Result<(), TxError> {
+                accounts.get_mut(payer).unwrap().balance = DUST_THRESHOLD_UNITS;
+                Ok(())
+            }
+        }
+
+        let payer = Keypair::generate();
+        let mut ledger = Ledger::new([0u8; 32]);
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
+
+        let program_id = Pubkey::new([8u8; 32]);
+        let ix = Instruction {
+            program_id,
+            accounts: vec![],
+            data: vec![],
+        };
+        let tx = Transaction::new_signed(&payer, [0u8; 32], vec![ix]);
+        let mut programs: ProgramRegistry = HashMap::new();
+        programs.insert(program_id, Box::new(LeaveBalanceProgram));
+
+        ledger.apply_transaction(&tx, &programs, 0).unwrap();
+        assert_eq!(ledger.get_balance(&payer.pubkey()), DUST_THRESHOLD_UNITS);
+        assert_eq!(ledger.total_burned, 0);
+    }
+
+    #[test]
+    fn treasury_and_staking_pool_are_never_swept_as_dust() {
+        use supersol_crypto::Keypair;
+
+        struct Noop;
+        impl ProgramProcessor for Noop {
+            fn process(&self, _: &mut HashMap<Pubkey, Account>, _: &Instruction, _: &Pubkey) -> Result<(), TxError> {
+                Ok(())
+            }
+        }
+
+        let payer = Keypair::generate();
+        let mut ledger = Ledger::new([0u8; 32]);
+        ledger.genesis_mint(payer.pubkey(), 10_000_000);
+        let treasury = Pubkey::treasury();
+        ledger.genesis_mint(treasury, 3); // tiny amount, would normally be dust
+
+        let program_id = Pubkey::new([9u8; 32]);
+        let ix = Instruction {
+            program_id,
+            accounts: vec![treasury],
+            data: vec![],
+        };
+        let tx = Transaction::new_signed(&payer, [0u8; 32], vec![ix]);
+        let mut programs: ProgramRegistry = HashMap::new();
+        programs.insert(program_id, Box::new(Noop));
+
+        ledger.apply_transaction(&tx, &programs, 0).unwrap();
+        assert_eq!(ledger.get_balance(&treasury), 3, "treasury dust must never be swept");
     }
 
     #[test]
