@@ -1,0 +1,19 @@
+[package]
+name = "supersol-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "supersol"
+path = "src/main.rs"
+
+[dependencies]
+supersol-crypto = { path = "../supersol-crypto" }
+supersol-core = { path = "../supersol-core" }
+supersol-runtime = { path = "../supersol-runtime" }
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+anyhow.workspace = true
+hex.workspace = true
