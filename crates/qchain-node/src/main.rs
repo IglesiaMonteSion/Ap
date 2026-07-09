@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             own_pending_vertex: None,
             next_round: 0,
             executed: 0,
+            voted_for: HashMap::new(),
         }),
     });
 

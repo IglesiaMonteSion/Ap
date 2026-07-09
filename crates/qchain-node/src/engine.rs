@@ -40,6 +40,15 @@ pub struct EngineState {
     pub own_pending_vertex: Option<Vertex>,
     pub next_round: Round,
     pub executed: u64,
+    /// Which vertex digest this validator has already voted for, per
+    /// (round, author) - the equivocation lock. Without it, a Byzantine
+    /// author could get two *different* vertices for the same round each
+    /// certified by an overlapping-but-distinct 2f+1 quorum, since with
+    /// n=3f+1 stake, any two 2f+1 quorums must share at least f+1
+    /// validators; refusing to sign a second, conflicting vertex for a
+    /// (round, author) already voted on keeps that overlap below what a
+    /// Byzantine minority (at most f) can supply on its own.
+    pub voted_for: HashMap<(Round, ValidatorId), Digest>,
 }
 
 pub struct Engine {
@@ -102,6 +111,23 @@ impl Engine {
                     return;
                 }
                 let digest = vertex.digest();
+                let key = (vertex.round, vertex.author);
+                {
+                    let mut state = self.state.lock().await;
+                    match state.voted_for.get(&key) {
+                        Some(existing) if *existing != digest => {
+                            tracing::warn!(
+                                "refusing to vote for a second, conflicting vertex from {from} at round {} - possible equivocation",
+                                vertex.round
+                            );
+                            return;
+                        }
+                        Some(_) => {} // already voted for exactly this vertex - re-signing is harmless, fall through
+                        None => {
+                            state.voted_for.insert(key, digest);
+                        }
+                    }
+                }
                 let sig = match self.keypair.sign(&digest[..]) {
                     Ok(s) => s,
                     Err(e) => {
@@ -226,6 +252,7 @@ impl Engine {
             state.batches.insert(batch_digest, batch.clone());
             state.own_pending_vertex = Some(vertex.clone());
             state.next_round = round + 1;
+            state.voted_for.insert((round, self.self_id), vertex.digest());
             (vertex, batch)
         };
 
