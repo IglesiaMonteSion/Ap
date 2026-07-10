@@ -69,6 +69,26 @@ async fn main() -> anyhow::Result<()> {
     };
     let is_fresh = store.iter().next().is_none();
 
+    // Real bug found while live-auditing the persistence work (see
+    // `engine.rs`'s `propose_round` doc comment for the full story): the
+    // account store isn't the only thing that needs to survive a restart.
+    // A restarted node's own `next_round` must resume past every round
+    // number it has ever used, or its first new proposal collides with
+    // what its peers already remember voting for it - permanently, via the
+    // equivocation lock, freezing not just this validator but (since
+    // quorum needs support from all but a small Byzantine minority) the
+    // whole network. `round_checkpoint_path` is `None` for an in-memory
+    // node - nothing to restore, since it's always fresh next process
+    // start anyway.
+    let (round_checkpoint_path, next_round) = match &config.data_dir {
+        Some(dir) => {
+            let path = dir.join("round_checkpoint");
+            let resumed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            (Some(path), resumed)
+        }
+        None => (None, 0),
+    };
+
     let mut ledger = Ledger::new(store)?;
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
     ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
@@ -114,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
             batches: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
-            next_round: 0,
+            next_round,
+            round_checkpoint_path,
             executed: 0,
             voted_for: HashMap::new(),
         }),

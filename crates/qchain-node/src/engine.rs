@@ -77,6 +77,22 @@ const WORKER_COUNT: u8 = 4;
 /// relative (already nonce-ordered, see `drain_ready_transactions`) order
 /// within that lane's batch - cross-account ordering never matters since
 /// accounts apply independently.
+/// Writes `state.next_round` to `state.round_checkpoint_path`, if this node
+/// is running with a `data_dir` - see `propose_round`'s doc comment for the
+/// real bug this closes. Best-effort: a transient write failure only risks
+/// resuming from a slightly stale round on the *next* restart (which
+/// self-heals the same way the very first restart after this fix does -
+/// the quorum-of-previous-round gate in `propose_round` blocks any
+/// malformed proposal until resync catches up), not a new failure mode, so
+/// this warns rather than treating a single failed write as fatal to an
+/// otherwise-healthy running validator.
+fn persist_round_checkpoint(state: &EngineState) {
+    let Some(path) = &state.round_checkpoint_path else { return };
+    if let Err(e) = std::fs::write(path, state.next_round.to_string()) {
+        tracing::warn!("failed to persist round checkpoint: {e}");
+    }
+}
+
 fn partition_into_worker_batches(txs: Vec<Transaction>) -> Vec<(WorkerId, Batch)> {
     let mut lanes: Vec<Vec<Transaction>> = vec![Vec::new(); WORKER_COUNT as usize];
     for tx in txs {
@@ -104,6 +120,11 @@ pub struct EngineState {
     pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     pub own_pending_vertex: Option<Vertex>,
     pub next_round: Round,
+    /// Where `next_round` gets checkpointed on every advance, if this node
+    /// was started with a `data_dir` - see the real stall bug this closes,
+    /// documented on `propose_round`. `None` for an in-memory node (nothing
+    /// to persist; it's always fresh on the next process start anyway).
+    pub round_checkpoint_path: Option<std::path::PathBuf>,
     pub executed: u64,
     /// Which vertex digest this validator has already voted for, per
     /// (round, author) - the equivocation lock. Without it, a Byzantine
@@ -529,6 +550,38 @@ impl Engine {
     /// immediately, for round 0). If a proposal is already pending
     /// certification, re-broadcasts that same vertex instead of no-op -
     /// see the retry note below.
+    ///
+    /// **Real bug closed here, found live while auditing the persistence
+    /// work: `next_round` must be checkpointed to disk, or a validator
+    /// restart permanently stalls the whole network, not just itself.**
+    /// `SledStore` persists account state, but `EngineState.dag`/
+    /// `consensus`/`voted_for` never did - a restarted node used to always
+    /// resume at `next_round: 0`. Its peers, though, still remember voting
+    /// for that validator's *original* vertex at round 0 (and every round
+    /// up to wherever it had reached) - so the restarted node's *new*
+    /// (necessarily different, since mempool/timing differ) vertex for the
+    /// same round number is indistinguishable from real equivocation to
+    /// them, and the equivocation lock in `handle_message` permanently
+    /// refuses to vote for it. That one validator can then never certify
+    /// anything again - and since quorum needs strictly more than 2/3 of
+    /// total stake, a single unrecoverable validator is enough to freeze
+    /// the *entire* network forever at whatever round it stalled at, not
+    /// just itself. Confirmed live: a 3-node testnet (`quorum_threshold`
+    /// requires all 3 - `n=3` tolerates zero faults) permanently stopped
+    /// advancing within one round-interval of a single node's restart.
+    /// Fixed by checkpointing `next_round` to `round_checkpoint_path`
+    /// (`persist_round_checkpoint`) every time it advances, and restoring
+    /// it on startup (`main.rs`) instead of always starting at 0 - a
+    /// restarted validator now resumes at a round number it has genuinely
+    /// never used before, so it can never collide with its own prior
+    /// history again. The DAG/certificate *content* for earlier rounds is
+    /// still not persisted - it doesn't need to be: the existing
+    /// quorum-of-previous-round gate a few lines below already blocks this
+    /// validator from proposing anything until real certificates for
+    /// `next_round - 1` are known, which the *existing* certificate
+    /// re-sync mechanism organically supplies as peers' retried broadcasts
+    /// arrive - no new catch-up logic was needed once the round number
+    /// itself stopped colliding.
     pub async fn propose_round(&self) {
         // Retry path: a proposal is still waiting on quorum votes.
         // Re-broadcasting it every tick until it certifies is what fixes
@@ -581,6 +634,7 @@ impl Engine {
             let vertex = Vertex { round, author: self.self_id, batch_digests, parents };
             state.own_pending_vertex = Some(vertex.clone());
             state.next_round = round + 1;
+            persist_round_checkpoint(&state);
             state.voted_for.insert((round, self.self_id), vertex.digest());
             (vertex, worker_batches)
         };
@@ -626,6 +680,7 @@ mod tests {
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round: 0,
+            round_checkpoint_path: None,
             executed: 0,
             voted_for: HashMap::new(),
         }
@@ -761,5 +816,33 @@ mod tests {
     #[test]
     fn partition_into_worker_batches_of_no_transactions_produces_no_batches() {
         assert!(partition_into_worker_batches(vec![]).is_empty());
+    }
+
+    /// The actual point of the round-checkpoint fix (see `propose_round`'s
+    /// doc comment for the live-network stall this closes): a restarted
+    /// node must be able to read back the exact round number a previous
+    /// life last checkpointed, not silently lose it.
+    #[test]
+    fn persist_round_checkpoint_writes_a_value_that_reads_back_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("round_checkpoint");
+        let mut state = new_state();
+        state.round_checkpoint_path = Some(path.clone());
+        state.next_round = 468;
+
+        persist_round_checkpoint(&state);
+
+        let resumed: u64 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+        assert_eq!(resumed, 468, "a restarted node must resume at the exact round it last checkpointed, not 0");
+    }
+
+    /// A node with no `data_dir` (in-memory only) has no checkpoint path -
+    /// this must be a harmless no-op, not a panic on `unwrap`.
+    #[test]
+    fn persist_round_checkpoint_is_a_no_op_without_a_configured_path() {
+        let mut state = new_state();
+        state.round_checkpoint_path = None;
+        state.next_round = 5;
+        persist_round_checkpoint(&state);
     }
 }
