@@ -381,20 +381,22 @@ mod tests {
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
 
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
+        // Must clear DUST_THRESHOLD_UNITS (1_000_000) - anything below it
+        // would be swept from bob immediately upon receipt.
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![alice.pubkey(), bob],
-            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 100_000 }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
 
         let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert!(fee > 0, "a multi-kilobyte hybrid-signed transaction must not be free");
 
-        assert_eq!(ledger.get_balance(&bob), 100_000);
-        assert_eq!(ledger.get_balance(&alice.pubkey()), 1_000_000 - 100_000 - fee);
+        assert_eq!(ledger.get_balance(&bob), 2_000_000);
+        assert_eq!(ledger.get_balance(&alice.pubkey()), 10_000_000 - 2_000_000 - fee);
         assert_eq!(ledger.get_balance(&validator), fee - fee / 2, "validator gets its half of the burned/split fee");
         assert_eq!(ledger.total_burned, fee / 2);
     }
@@ -405,7 +407,7 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
@@ -460,7 +462,7 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 10_000_000);
+        ledger.credit(alice.pubkey(), 50_000_000);
 
         fn transfer_tx(alice: &Keypair, bob: Pubkey, nonce: u64) -> Transaction {
             let ix = Instruction {
@@ -587,17 +589,20 @@ mod tests {
         let alice = Keypair::generate_with_slh_dsa().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        // SLH-DSA signatures are much larger than ML-DSA-65's (~29.8KB vs
+        // ~3.4KB, see `project-lessons-learned`), so this combo's byte fee
+        // is proportionally larger too - fund generously.
+        ledger.credit(alice.pubkey(), 50_000_000);
 
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![alice.pubkey(), bob],
-            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
 
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
-        assert_eq!(ledger.get_balance(&bob), 50_000, "the SLH-DSA-combo transaction must have actually executed");
+        assert_eq!(ledger.get_balance(&bob), 2_000_000, "the SLH-DSA-combo transaction must have actually executed");
     }
 
     /// A scheme that's been `Retired` must be rejected outright, even for
@@ -610,7 +615,7 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
         // First transaction succeeds normally (both schemes still Active).
         let ix0 = Instruction {
@@ -648,12 +653,16 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
+        // Each individual amount must clear DUST_THRESHOLD_UNITS on its
+        // own - the sweep runs at the end of every single
+        // `apply_transaction` call, not just once at the very end of this
+        // test, so bob's balance after tx0 alone must already survive it.
         let ix0 = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![alice.pubkey(), bob],
-            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_500_000 }).unwrap(),
         };
         let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix0]).unwrap();
         ledger.apply_transaction(&tx0, &validator, 0).unwrap();
@@ -665,11 +674,11 @@ mod tests {
         let ix1 = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![alice.pubkey(), bob],
-            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_500_000 }).unwrap(),
         };
         let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 100_000, vec![ix1]).unwrap();
         ledger.apply_transaction(&tx1, &validator, 0).unwrap();
-        assert_eq!(ledger.get_balance(&bob), 100_000, "an existing account must keep working through the deprecation grace period");
+        assert_eq!(ledger.get_balance(&bob), 3_000_000, "an existing account must keep working through the deprecation grace period");
     }
 
     /// The other half of the same rule: a *brand-new* account may not
@@ -703,7 +712,7 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
         let root_before = ledger.merkle_root();
         // `Ledger::merkle_root()` isn't a cached shortcut - it must
@@ -730,13 +739,17 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
         assert!(ledger.transfer_receipts().is_empty());
 
+        // Must clear DUST_THRESHOLD_UNITS (1_000_000), or bob's `to_after`
+        // snapshot below (captured pre-dust-sweep) would disagree with the
+        // real post-sweep store the final `ledger.merkle_root()` check
+        // reads from.
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![alice.pubkey(), bob],
-            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 300_000 }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
         let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
@@ -747,12 +760,12 @@ mod tests {
         assert_eq!(r.tx_hash, tx.hash());
         assert_eq!(r.from, alice.pubkey());
         assert_eq!(r.to, bob);
-        assert_eq!(r.amount, 300_000);
+        assert_eq!(r.amount, 2_000_000);
         assert_eq!(r.fee, fee);
-        assert_eq!(r.from_before.balance, 1_000_000);
-        assert_eq!(r.from_after.balance, 1_000_000 - 300_000 - fee);
+        assert_eq!(r.from_before.balance, 10_000_000);
+        assert_eq!(r.from_after.balance, 10_000_000 - 2_000_000 - fee);
         assert_eq!(r.to_before.balance, 0);
-        assert_eq!(r.to_after.balance, 300_000);
+        assert_eq!(r.to_after.balance, 2_000_000);
         assert_ne!(r.root_before, r.root_after);
 
         // The captured proofs must genuinely verify against their
@@ -785,7 +798,7 @@ mod tests {
         let bob = Keypair::generate().unwrap().pubkey();
         let carol = Keypair::generate().unwrap().pubkey();
         let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice.pubkey(), 1_000_000);
+        ledger.credit(alice.pubkey(), 10_000_000);
 
         let ix1 = Instruction {
             program_id: Pubkey::system_program_id(),
