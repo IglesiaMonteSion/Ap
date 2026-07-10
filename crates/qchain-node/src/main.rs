@@ -17,7 +17,7 @@ use qchain_execution::{
     GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
 };
 use qchain_network::{Network, PeerInfo};
-use qchain_storage::InMemoryStore;
+use qchain_storage::{InMemoryStore, SledStore, StateStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,33 +54,52 @@ async fn main() -> anyhow::Result<()> {
 
     let (network, mut rx) = Network::start(self_id, config.listen_addr, peers).await?;
 
-    let mut ledger = Ledger::new(Box::new(InMemoryStore::new()))?;
+    // A `SledStore` reopened at a path from a previous run already holds
+    // real state (balances, registry, params, staking stats) - re-running
+    // genesis seeding against it would double-credit `config.genesis`
+    // allocations via `credit`'s additive balance update, and would
+    // silently reset the registry/params/staking-stats accounts back to
+    // their genesis contents via `seed_account`'s unconditional overwrite,
+    // discarding any governance decisions made in a prior run. `is_fresh`
+    // (empty store) is what actually distinguishes "first boot" from
+    // "restart" - `InMemoryStore` is always fresh by construction.
+    let store: Box<dyn StateStore> = match &config.data_dir {
+        Some(dir) => Box::new(SledStore::open(dir)?),
+        None => Box::new(InMemoryStore::new()),
+    };
+    let is_fresh = store.iter().next().is_none();
+
+    let mut ledger = Ledger::new(store)?;
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
     ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
     ledger.register_program(GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(GovernanceProgram)));
-    for alloc in &config.genesis {
-        ledger.credit(alloc.address, alloc.balance);
+    if is_fresh {
+        for alloc in &config.genesis {
+            ledger.credit(alloc.address, alloc.balance);
+        }
+        // Phase-2 governance prerequisites (§6/§5 - see `qchain-execution`'s
+        // `staking`/`governance` module docs): the staking-stats counter starts
+        // at zero, and the algorithm registry starts at its genesis contents
+        // (Ed25519 + ML-DSA-65, both Active).
+        ledger.seed_account(
+            STAKING_STATS_ID,
+            qchain_core::Account { data: borsh::to_vec(&0u64)?, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        ledger.seed_account(
+            REGISTRY_ACCOUNT_ID,
+            qchain_core::Account { data: genesis_registry_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+        );
+        // Economic parameters (base fee, dust threshold, gas price) start at
+        // their compiled-in defaults and become governable (Low-tier
+        // proposals, no time-lock) from here - see `qchain-execution`'s
+        // `params`/`governance` module docs.
+        ledger.seed_account(
+            PARAMS_ACCOUNT_ID,
+            qchain_core::Account { data: genesis_params_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+        );
+    } else {
+        tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");
     }
-    // Phase-2 governance prerequisites (§6/§5 - see `qchain-execution`'s
-    // `staking`/`governance` module docs): the staking-stats counter starts
-    // at zero, and the algorithm registry starts at its genesis contents
-    // (Ed25519 + ML-DSA-65, both Active).
-    ledger.seed_account(
-        STAKING_STATS_ID,
-        qchain_core::Account { data: borsh::to_vec(&0u64)?, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
-    );
-    ledger.seed_account(
-        REGISTRY_ACCOUNT_ID,
-        qchain_core::Account { data: genesis_registry_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
-    );
-    // Economic parameters (base fee, dust threshold, gas price) start at
-    // their compiled-in defaults and become governable (Low-tier
-    // proposals, no time-lock) from here - see `qchain-execution`'s
-    // `params`/`governance` module docs.
-    ledger.seed_account(
-        PARAMS_ACCOUNT_ID,
-        qchain_core::Account { data: genesis_params_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
-    );
 
     let engine = Arc::new(Engine {
         self_id,

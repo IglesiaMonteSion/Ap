@@ -41,6 +41,14 @@ pub struct NodeConfig {
     /// Milliseconds between round-advancement attempts.
     #[serde(default = "default_round_interval_ms")]
     pub round_interval_ms: u64,
+    /// Directory for a real, disk-persistent `SledStore` (see
+    /// `qchain-storage`'s `store.rs` module docs for why `sled` rather
+    /// than RocksDB). Omitted (the default) keeps the phase-1 behavior of
+    /// an `InMemoryStore` that starts empty on every restart - existing
+    /// configs from earlier live tests in this session keep working
+    /// unchanged.
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
 }
 
 fn default_round_interval_ms() -> u64 {
