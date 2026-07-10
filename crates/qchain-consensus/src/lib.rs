@@ -216,4 +216,73 @@ mod tests {
 
         assert_eq!(combined, direct, "incremental advancement must match ordering the full DAG in one call");
     }
+
+    /// One validator never proposes at all (a crashed/silent validator) -
+    /// still gets a quorum-worth of the other 3 validators' signatures on
+    /// every *other* author's certificate (so the direct rule works fine
+    /// for rounds whose leader isn't the silent one), but never has a
+    /// certificate of its own in any round. `leader_for_round` rotates
+    /// deterministically across all 4 validators, so within enough rounds
+    /// the silent validator is guaranteed to be elected leader at least
+    /// once - exactly the real regression the indirect commit rule closes
+    /// (see `bullshark.rs` module docs and `project-lessons-learned`):
+    /// without it, that round's leader-slot can never satisfy the direct
+    /// rule, and stopping (rather than unsafely skipping) at an
+    /// unresolved round would otherwise halt the total order forever.
+    fn build_dag_with_one_silent_validator(tvs: &[TestValidator], rounds: u64, silent_idx: usize) -> DagStore {
+        let mut dag = DagStore::new();
+        let mut prev_round_digests: Vec<Digest> = Vec::new();
+        for round in 0..rounds {
+            let mut this_round_digests = Vec::new();
+            for (i, v) in tvs.iter().enumerate() {
+                if i == silent_idx {
+                    continue;
+                }
+                let mut batch_digest = Batch { transactions: vec![] }.digest();
+                batch_digest[0] = batch_digest[0].wrapping_add(i as u8);
+                let vertex = Vertex { round, author: v.id, batch_digest, parents: prev_round_digests.clone() };
+                let digest = vertex.digest();
+                let signatures: Vec<(qchain_core::ValidatorId, MultiSignature)> = tvs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != silent_idx)
+                    .map(|(_, signer)| (signer.id, signer.keypair.sign(&digest[..]).unwrap()))
+                    .collect();
+                let cert = Certificate { vertex, signatures };
+                this_round_digests.push(dag.insert(cert));
+            }
+            prev_round_digests = this_round_digests;
+        }
+        dag
+    }
+
+    #[test]
+    fn a_leader_slot_whose_validator_never_proposes_commits_indirectly_instead_of_stalling_forever() {
+        let (tvs, validators) = make_validators(4);
+        let empty_dag = DagStore::new();
+        let bullshark = Bullshark::new(&empty_dag, &validators);
+        // Find a round within the first 20 where the silent validator (index
+        // 0) is actually elected leader - guarantees this test exercises
+        // the indirect rule, not just the direct one.
+        let silent_id = tvs[0].id;
+        let silent_leader_round = (0..20u64).find(|&r| bullshark.leader_for_round(r) == Some(silent_id));
+        let silent_leader_round = silent_leader_round.expect("the silent validator must be elected leader within 20 rounds across a 4-validator set");
+
+        let dag = build_dag_with_one_silent_validator(&tvs, silent_leader_round + 5, 0);
+        let order = ConsensusState::new().advance(&dag, &validators);
+
+        assert!(!order.is_empty(), "3 honest, live validators (2f+1 for f=1) must still make progress despite one never proposing");
+        // The silent validator's own designated round must never appear in
+        // the order at all - there's no certificate for it anywhere, by
+        // construction, so it can only ever be legitimately skipped, never
+        // committed.
+        for digest in &order {
+            let cert = dag.get(digest).unwrap();
+            assert_ne!(
+                (cert.vertex.round, cert.vertex.author),
+                (silent_leader_round, silent_id),
+                "a certificate that was never actually created must never appear in the committed order"
+            );
+        }
+    }
 }

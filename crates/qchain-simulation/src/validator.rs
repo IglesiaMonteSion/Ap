@@ -30,6 +30,12 @@ pub enum SimMessage {
     VertexProposal(Vertex),
     Vote { vertex_digest: Digest, signature: MultiSignature },
     CertificateBroadcast(Certificate),
+    /// Mirrors `qchain_network::NetMessage::CertificateRequest` - see its
+    /// doc comment for why this exists (a dropped `CertificateBroadcast`
+    /// is otherwise unrecoverable, a real complete-stall bug found via
+    /// this exact harness).
+    CertificateRequest { digest: Digest },
+    CertificateResponse(Certificate),
 }
 
 pub struct SimValidator {
@@ -124,6 +130,14 @@ impl SimValidator {
         out
     }
 
+    /// Any `parents` digest not already in the local DAG, turned into a
+    /// `CertificateRequest` addressed to `from` - the peer who just sent a
+    /// message referencing it, and who therefore must have had it. See
+    /// `SimMessage::CertificateRequest`'s doc comment for why this exists.
+    fn missing_parent_requests(&self, parents: &[Digest], from: ValidatorId) -> Vec<(ValidatorId, SimMessage)> {
+        parents.iter().filter(|d| !self.dag.contains(d)).map(|&digest| (from, SimMessage::CertificateRequest { digest })).collect()
+    }
+
     /// Mirrors `engine.rs`'s `handle_message`, synchronously.
     pub fn handle_message(&mut self, from: ValidatorId, msg: SimMessage, validators: &ValidatorSet, peers: &[ValidatorId]) -> Vec<(ValidatorId, SimMessage)> {
         if self.behavior == ByzantineBehavior::Silent {
@@ -136,17 +150,19 @@ impl SimValidator {
                 }
                 let digest = vertex.digest();
                 let key = (vertex.round, vertex.author);
+                let mut out = self.missing_parent_requests(&vertex.parents, from);
                 match self.voted_for.get(&key) {
                     // Equivocation lock: refuse to sign a second, different
                     // vertex for a (round, author) already voted on.
-                    Some(existing) if *existing != digest => return vec![],
+                    Some(existing) if *existing != digest => return out,
                     Some(_) => {}
                     None => {
                         self.voted_for.insert(key, digest);
                     }
                 }
                 let sig = self.keypair.sign(&digest[..]).expect("signing never fails in this harness");
-                vec![(from, SimMessage::Vote { vertex_digest: digest, signature: sig })]
+                out.push((from, SimMessage::Vote { vertex_digest: digest, signature: sig }));
+                out
             }
             SimMessage::Vote { vertex_digest, signature } => {
                 if let Some(cert) = self.record_vote(vertex_digest, from, signature, validators) {
@@ -157,9 +173,25 @@ impl SimValidator {
             }
             SimMessage::CertificateBroadcast(cert) => {
                 if verify_certificate(&cert, validators) {
+                    let parents = cert.vertex.parents.clone();
                     self.dag.insert(cert);
+                    self.missing_parent_requests(&parents, from)
+                } else {
+                    vec![]
                 }
-                vec![]
+            }
+            SimMessage::CertificateRequest { digest } => match self.dag.get(&digest) {
+                Some(cert) => vec![(from, SimMessage::CertificateResponse(cert.clone()))],
+                None => vec![],
+            },
+            SimMessage::CertificateResponse(cert) => {
+                if verify_certificate(&cert, validators) {
+                    let parents = cert.vertex.parents.clone();
+                    self.dag.insert(cert);
+                    self.missing_parent_requests(&parents, from)
+                } else {
+                    vec![]
+                }
             }
         }
     }

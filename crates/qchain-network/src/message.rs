@@ -24,6 +24,18 @@ pub enum NetMessage {
     /// A quorum-certified vertex, broadcast once its author collects 2f+1
     /// vote stake.
     CertificateBroadcast(Certificate),
+    /// "I don't have this certificate" - sent when a peer references a
+    /// parent digest (in a `VertexProposal` or another `CertificateBroadcast`)
+    /// that's missing from the local DAG. `CertificateBroadcast` is a
+    /// one-shot send with no retry, so a single dropped copy otherwise
+    /// leaves the recipient permanently unable to resolve that digest -
+    /// found to be a real, complete-stall liveness bug via
+    /// `qchain-simulation` (see `project-lessons-learned`), not a
+    /// hypothetical gap.
+    CertificateRequest { digest: Digest },
+    /// Reply to a `CertificateRequest` - the certificate itself, re-sent
+    /// so the requester can insert it into its own DAG and resume.
+    CertificateResponse(Certificate),
 }
 
 /// Every message on the wire is wrapped with the sender's validator id -

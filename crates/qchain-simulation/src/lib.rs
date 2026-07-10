@@ -43,6 +43,14 @@ pub use validator::{ByzantineBehavior, SimMessage, SimValidator};
 pub struct FaultPolicy {
     /// Probability (0.0-1.0) any single message is dropped outright.
     pub drop_rate: f64,
+    /// If set, overrides `drop_rate` specifically for
+    /// `CertificateBroadcast` messages - lets a scenario isolate
+    /// certificate-broadcast loss from vote/proposal loss (which
+    /// `VertexProposal`'s retry-while-pending logic already recovers from
+    /// indirectly, see `project-lessons-learned`), to test whether a
+    /// dropped certificate broadcast - which nothing currently retries -
+    /// is a real safety/liveness problem on its own.
+    pub cert_drop_rate: Option<f64>,
     /// Extra ticks (0..=max) a surviving message may be delayed, chosen
     /// uniformly per message.
     pub max_delay_ticks: u64,
@@ -73,6 +81,10 @@ pub struct SimReport {
     pub equivocation_succeeded: Option<String>,
     pub honest_committed_counts: Vec<usize>,
     pub made_progress: bool,
+    /// Full committed order per validator index (honest and Byzantine
+    /// alike) - kept for debugging a reported `safety_violation` digest by
+    /// digest, not just knowing that one occurred.
+    pub committed_orders: Vec<Vec<Digest>>,
 }
 
 fn is_prefix_consistent(a: &[Digest], b: &[Digest]) -> bool {
@@ -118,7 +130,11 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
                     }
                 }
             }
-            if scenario.fault.drop_rate > 0.0 && rng.gen::<f64>() < scenario.fault.drop_rate {
+            let drop_rate = match (&msg, scenario.fault.cert_drop_rate) {
+                (SimMessage::CertificateBroadcast(_), Some(rate)) => rate,
+                _ => scenario.fault.drop_rate,
+            };
+            if drop_rate > 0.0 && rng.gen::<f64>() < drop_rate {
                 return;
             }
             let delay = if scenario.fault.max_delay_ticks > 0 { rng.gen_range(0..=scenario.fault.max_delay_ticks) } else { 0 };
@@ -183,8 +199,9 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
 
     let honest_committed_counts: Vec<usize> = honest_indices.iter().map(|&i| sims[i].committed_order.len()).collect();
     let made_progress = honest_committed_counts.iter().any(|&c| c > 0);
+    let committed_orders: Vec<Vec<Digest>> = sims.iter().map(|s| s.committed_order.clone()).collect();
 
-    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress }
+    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress, committed_orders }
 }
 
 #[cfg(test)]
@@ -201,7 +218,7 @@ mod tests {
 
     #[test]
     fn honest_network_under_message_loss_and_delay_stays_safe() {
-        let fault = FaultPolicy { drop_rate: 0.2, max_delay_ticks: 3, partition: None };
+        let fault = FaultPolicy { drop_rate: 0.2, max_delay_ticks: 3, ..Default::default() };
         let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 150 };
         for seed in 0..3 {
             let report = run_simulation(&scenario, seed);
@@ -242,11 +259,53 @@ mod tests {
     fn a_healing_partition_still_reaches_safety_and_resumes_progress() {
         // Split 4 validators 2-2 for the first 30 ticks (neither side has
         // quorum alone - 2 < quorum_threshold of 3), then heal.
-        let fault = FaultPolicy { drop_rate: 0.0, max_delay_ticks: 0, partition: Some((vec![0, 1], vec![2, 3], 30)) };
+        let fault = FaultPolicy { drop_rate: 0.0, max_delay_ticks: 0, partition: Some((vec![0, 1], vec![2, 3], 30)), ..Default::default() };
         let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 100 };
         let report = run_simulation(&scenario, 3);
         assert!(report.safety_violation.is_none());
         assert!(report.made_progress, "progress must resume once the partition heals");
+    }
+
+    /// Isolates *only* `CertificateBroadcast` loss (zero proposal/vote
+    /// loss, via `drop_rate: 0.0` alongside `cert_drop_rate`) - the one
+    /// message type nothing retried before `CertificateRequest`/
+    /// `CertificateResponse` re-sync existed (see `project-lessons-learned`
+    /// and the module docs on `cert_drop_rate`).
+    ///
+    /// This scenario, run while building the re-sync mechanism, found two
+    /// real, distinct bugs in sequence, both documented in
+    /// `project-lessons-learned`: (1) before re-sync existed, a dropped
+    /// certificate broadcast was simply unrecoverable - complete permanent
+    /// stall, zero commits ever, confirmed empirically before any fix
+    /// existed. (2) once re-sync started letting certificates arrive late
+    /// and out of order, `Bullshark::extend_order` turned out to have a
+    /// real safety bug: it skipped past a round whose leader hadn't yet
+    /// independently satisfied its own commit condition to check *later*
+    /// rounds, so two validators could walk the same later leader through
+    /// different locally-known ancestor sets and disagree on relative
+    /// order - fixed by making `extend_order` stop, not skip, at the first
+    /// uncommitted round (see `bullshark.rs`).
+    ///
+    /// That safety fix is asserted here unconditionally - it must never
+    /// regress. What it does *not* fully restore is *sustained* liveness
+    /// under heavy, ongoing certificate loss: stopping (rather than
+    /// skipping) at a round whose leader lacks direct round+1 support is
+    /// exactly the scenario the module's own docs already name as
+    /// deferred to phase 2 ("the indirect/fallback commit rule for a
+    /// leader that never gathers direct support"). Only `made_progress`
+    /// (weak - at least one commit) is asserted for now; a real
+    /// stronger bar (sustained progress despite ongoing loss) is the
+    /// concrete, empirically-motivated reason the indirect commit rule
+    /// is next, not a hypothetical roadmap item.
+    #[test]
+    fn certificate_broadcast_loss_alone_stays_safe_but_liveness_needs_the_indirect_commit_rule() {
+        let fault = FaultPolicy { drop_rate: 0.0, cert_drop_rate: Some(0.35), max_delay_ticks: 0, partition: None };
+        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 300 };
+        for seed in 0..5 {
+            let report = run_simulation(&scenario, seed);
+            assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
+            assert!(report.made_progress, "seed {seed}: expected at least some progress, got counts {:?}", report.honest_committed_counts);
+        }
     }
 
     /// Documentation test, not a guarantee: beyond the f < n/3 bound

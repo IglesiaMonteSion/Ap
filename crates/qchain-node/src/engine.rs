@@ -260,6 +260,7 @@ impl Engine {
                     tracing::warn!("dropping vertex proposal with mismatched author/sender");
                     return;
                 }
+                self.request_missing_parents(&vertex.parents, from).await;
                 let digest = vertex.digest();
                 let key = (vertex.round, vertex.author);
                 {
@@ -302,11 +303,63 @@ impl Engine {
                     tracing::warn!("dropping certificate that fails quorum verification");
                     return;
                 }
+                let parents = cert.vertex.parents.clone();
                 {
                     let mut state = self.state.lock().await;
                     state.dag.insert(cert);
                 }
+                self.request_missing_parents(&parents, from).await;
                 self.try_commit().await;
+            }
+            NetMessage::CertificateRequest { digest } => {
+                let found = {
+                    let state = self.state.lock().await;
+                    state.dag.get(&digest).cloned()
+                };
+                if let (Some(cert), Some(addr)) = (found, self.network.addr_of(&from)) {
+                    if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateResponse(cert)).await {
+                        tracing::warn!("failed to send certificate response to {from}: {e}");
+                    }
+                }
+            }
+            NetMessage::CertificateResponse(cert) => {
+                if !verify_certificate(&cert, &self.validators) {
+                    tracing::warn!("dropping certificate response that fails quorum verification");
+                    return;
+                }
+                let parents = cert.vertex.parents.clone();
+                {
+                    let mut state = self.state.lock().await;
+                    state.dag.insert(cert);
+                }
+                self.request_missing_parents(&parents, from).await;
+                self.try_commit().await;
+            }
+        }
+    }
+
+    /// Requests, from `from`, any of `parents` this validator doesn't
+    /// already have locally - see `NetMessage::CertificateRequest`'s doc
+    /// comment for why this exists: a `CertificateBroadcast` is a one-shot
+    /// send with no retry, so without this, a single dropped copy leaves
+    /// the missing certificate (and anything in the DAG only reachable
+    /// through it) permanently unrecoverable - a real, confirmed
+    /// complete-stall liveness bug found via `qchain-simulation` before
+    /// this existed (see `project-lessons-learned`), not a hypothetical
+    /// gap. `from` is asked because it just sent a message referencing
+    /// these digests as parents, so it must have had them itself.
+    async fn request_missing_parents(&self, parents: &[Digest], from: ValidatorId) {
+        let missing: Vec<Digest> = {
+            let state = self.state.lock().await;
+            parents.iter().copied().filter(|d| !state.dag.contains(d)).collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let Some(addr) = self.network.addr_of(&from) else { return };
+        for digest in missing {
+            if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
+                tracing::warn!("failed to request missing certificate {digest:?} from {from}: {e}");
             }
         }
     }
