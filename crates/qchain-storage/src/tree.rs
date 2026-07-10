@@ -23,7 +23,14 @@ use sha3::{Digest, Sha3_256};
 
 pub const KEY_BITS: usize = 256;
 
-fn hash_leaf(account: &Account) -> [u8; 32] {
+/// Real leaf-hashing function for the state tree - `SHA3-256` of a domain
+/// separator plus the full borsh-encoded `Account`. Exposed `pub` (not
+/// just crate-internal) so external verifiers that need to bind a claim
+/// about an account's contents to a real Merkle root - e.g.
+/// `qchain-stark`'s state-tie-in - can compute the exact same leaf hash
+/// this tree itself uses, rather than reimplementing (and risking
+/// drifting from) this logic in a second place.
+pub fn hash_leaf(account: &Account) -> [u8; 32] {
     let mut hasher = Sha3_256::new();
     hasher.update([0x00]); // domain separator: leaf
     if let Ok(bytes) = borsh::to_vec(account) {

@@ -9,16 +9,6 @@
 //!
 //! What this v1 deliberately does NOT yet do, so scope is never
 //! ambiguous:
-//! - No Merkle tie-in: before/after balances are exposed as public
-//!   inputs directly (see `PublicInputs`), not bound to the real
-//!   SHA3-based sparse Merkle root `qchain-storage` maintains. A light
-//!   client using this proof today would still need the actual
-//!   before/after values delivered out-of-band and trust they match the
-//!   real state tree - the proof only certifies the arithmetic given
-//!   those values, not that they're the *right* values. Real state
-//!   compression needs either an in-circuit Merkle-friendly hash
-//!   (Poseidon2/Rescue-Prime, per `ARCHITECTURE.md` §3) or an external
-//!   binding check.
 //! - Not wired into `qchain-execution`/`qchain-node` yet: this is a
 //!   standalone circuit operating on plain `u64` tuples, proven against
 //!   real Winterfell APIs - not yet connected to
@@ -83,11 +73,11 @@
 //! **This closure is conditional, not permanent**: it holds only as
 //! long as every value stays a direct public input. The moment a future
 //! version hides these values behind a Merkle commitment or otherwise
-//! stops exposing them in the clear (the Merkle-tie-in gap above, once
-//! closed with real data-hiding rather than a plain public root), this
-//! argument stops applying and an in-circuit bit-decomposition range
-//! check becomes necessary again - re-derive this reasoning at that
-//! point, don't assume the shortcut still holds.
+//! stops exposing them in the clear (data-hiding, not the "v3" external
+//! binding below, which keeps every value public), this argument stops
+//! applying and an in-circuit bit-decomposition range check becomes
+//! necessary again - re-derive this reasoning at that point, don't
+//! assume the shortcut still holds.
 //!
 //! Behavior discovered by testing against the real Winterfell prover
 //! (not assumed from docs): `winter_prover::Trace::validate` runs an
@@ -102,7 +92,74 @@
 //! proves "successfully" and the inconsistency only ever surfaces at
 //! `verify_batch` time. Either way, no inconsistent batch ends up with a
 //! proof that verifies - only the point of failure changes.
+//!
+//! ## v3: real Merkle tie-in via an external binding check, not an in-circuit hash
+//!
+//! v1/v2 proved a batch of transfers is arithmetically self-consistent,
+//! but the before/after balances were anonymous numbers - nothing tied
+//! `from_before`/`from_after` to a *specific account*, let alone to the
+//! real SHA3-256 sparse Merkle root `qchain-storage` actually maintains.
+//! A light client trusting this proof still had to take the claimed
+//! values on faith.
+//!
+//! Two ways to close that, named in v1's original docs: an in-circuit
+//! Merkle-friendly hash (Poseidon2/Rescue-Prime), or an external binding
+//! check. This project's real state tree (`qchain-storage::tree`) uses
+//! plain SHA3-256 - the conservative, non-arithmetization-friendly
+//! default this project deliberately chose for the outer state tree (see
+//! `stark-proofs-and-hash-commitments`) - so reimplementing SHA3-256 as
+//! AIR constraints would mean thousands of constraints per hash call,
+//! solving a problem by fighting the tree's own design choice rather
+//! than working with it. The external binding check is the honest fit:
+//! keep proving the arithmetic in-circuit (unchanged), and verify
+//! *outside* the circuit, via qchain-storage's own real
+//! `MerkleProof`/`hash_leaf`/`verify_proof`, that the specific accounts
+//! and balances the STARK's public inputs name are genuinely part of
+//! the real tree's transition from one root to the next.
+//!
+//! This requires the circuit to know *whose* balance each row is about,
+//! not just the numbers - so `TransferStep` gained `from_address`/
+//! `to_address` (`[u8; 32]`, the same raw bytes as `Pubkey::to_bytes()`),
+//! carried through the trace as two more sets of public-input columns
+//! (four `u64` limbs each, since a 32-byte address doesn't fit in one
+//! ~128-bit field element). No new transition constraints reference
+//! them - they're pure pass-through public data, asserted public the
+//! same way every other cell already is.
+//!
+//! `verify_batch_bound_to_state` composes the existing `verify_batch`
+//! (STARK + range check) with, per row, four real Merkle inclusion
+//! checks (from-before, from-after, to-before, to-after) against a
+//! caller-supplied `root_before`/`root_after` pair, plus a check that
+//! consecutive rows' roots actually chain (`root_after` of row *i* must
+//! equal `root_before` of row *i+1`) - without that, a prover could
+//! supply valid-looking but *disconnected* Merkle proofs for each row
+//! independently, never actually representing one coherent state
+//! transition.
+//!
+//! **Explicit, deliberate scope limits, not silently assumed away:**
+//! - Assumes every account in a bound batch already exists before *and*
+//!   after (both are real, non-empty leaves) - the new-account-creation
+//!   case (an exclusion proof for "before") isn't handled by this
+//!   function yet.
+//! - The caller supplies the full `Account` snapshots (not just a
+//!   balance) because the real tree's leaf hash commits to the whole
+//!   struct (`balance`, `nonce`, `algorithm_id`, `owner`, `code_hash`,
+//!   `data`) - this function only checks that the snapshot's `balance`
+//!   field matches what the STARK publicly proved, and that the
+//!   snapshot's full hash matches the supplied Merkle proof; it does
+//!   *not* independently verify nonce/fee bookkeeping matches
+//!   `Ledger::apply_transaction`'s real semantics (a real Transfer also
+//!   bumps the payer's nonce and deducts a byte-scaled fee separately
+//!   from `amount` - already an existing v1 simplification, not
+//!   reopened here).
+//! - Still not wired into `qchain-execution`/`qchain-node`/RPC - a real
+//!   light-client-facing endpoint needs the prover to actually walk a
+//!   live `Ledger`'s applied transactions and a real `StateTree`, which
+//!   is a separate, larger integration deliberately not started without
+//!   explicit confirmation, same as this gap itself was until asked for.
 
+use qchain_core::Account;
+use qchain_storage::{hash_leaf, verify_proof, MerkleProof, StateTree};
 use winterfell::crypto::hashers::Blake3_256;
 use winterfell::crypto::{DefaultRandomCoin, MerkleTree};
 use winterfell::math::fields::f128::BaseElement;
@@ -115,12 +172,36 @@ use winterfell::{
     TraceInfo, TracePolyTable, TraceTable, TransitionConstraintDegree,
 };
 
+/// Splits a 32-byte address into 4 big-endian `u64` limbs - each limb is
+/// always `< 2^64`, safely representable as an `f128::BaseElement`
+/// (modulus ~`2^128`) with no risk of the wraparound a naive 128-bit
+/// split could hit (the modulus is *slightly* below `2^128`).
+fn address_limbs(addr: &[u8; 32]) -> [u64; 4] {
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        *limb = u64::from_be_bytes(addr[i * 8..(i + 1) * 8].try_into().unwrap());
+    }
+    limbs
+}
+
+/// Inverse of [`address_limbs`].
+fn limbs_to_address(limbs: [u64; 4]) -> [u8; 32] {
+    let mut addr = [0u8; 32];
+    for (i, limb) in limbs.iter().enumerate() {
+        addr[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    addr
+}
+
 /// One System Program `Transfer`'s before/after state, as plain u64s -
 /// exactly the semantics of `qchain_execution::SystemInstruction::Transfer`
-/// plus the byte-scaled base fee, not yet the real `Account` type (see
-/// module docs on "not wired in yet").
+/// plus the byte-scaled base fee - plus which two addresses (raw
+/// `Pubkey::to_bytes()`) this row is about, for the real Merkle tie-in
+/// (`verify_batch_bound_to_state`, see module docs' "v3" section).
 #[derive(Clone, Copy, Debug)]
 pub struct TransferStep {
+    pub from_address: [u8; 32],
+    pub to_address: [u8; 32],
     pub from_before: u64,
     pub to_before: u64,
     pub amount: u64,
@@ -134,8 +215,10 @@ impl TransferStep {
     /// rather than requiring the caller to compute `from_after`/`to_after`
     /// by hand - a mismatch here is exactly what the AIR's transition
     /// constraints are meant to catch, so tests can deliberately break it.
-    pub fn conserving(from_before: u64, to_before: u64, amount: u64, fee: u64) -> Self {
+    pub fn conserving(from_address: [u8; 32], to_address: [u8; 32], from_before: u64, to_before: u64, amount: u64, fee: u64) -> Self {
         TransferStep {
+            from_address,
+            to_address,
             from_before,
             to_before,
             amount,
@@ -146,7 +229,20 @@ impl TransferStep {
     }
 }
 
-const TRACE_WIDTH: usize = 6;
+// Column layout: 0-5 are the numeric conservation-equation values
+// (unchanged since v1/v2 - `evaluate_transition` only ever reads these
+// six); 6-9 and 10-13 are `from_address`/`to_address`'s four `u64` limbs
+// each, added in v3 - pure public pass-through data, no transition
+// constraint references them.
+const COL_FROM_BEFORE: usize = 0;
+const COL_TO_BEFORE: usize = 1;
+const COL_AMOUNT: usize = 2;
+const COL_FEE: usize = 3;
+const COL_FROM_AFTER: usize = 4;
+const COL_TO_AFTER: usize = 5;
+const COL_FROM_ADDRESS: usize = 6;
+const COL_TO_ADDRESS: usize = 10;
+const TRACE_WIDTH: usize = 14;
 
 /// Builds the padded execution trace for a batch of transfers. Trace
 /// length is the next power of two strictly greater than `steps.len()`
@@ -160,12 +256,18 @@ fn build_trace(steps: &[TransferStep]) -> TraceTable<BaseElement> {
         .max(TraceInfo::MIN_TRACE_LENGTH);
     let mut columns: Vec<Vec<BaseElement>> = vec![vec![BaseElement::ZERO; padded_len]; TRACE_WIDTH];
     for (i, step) in steps.iter().enumerate() {
-        columns[0][i] = BaseElement::new(step.from_before as u128);
-        columns[1][i] = BaseElement::new(step.to_before as u128);
-        columns[2][i] = BaseElement::new(step.amount as u128);
-        columns[3][i] = BaseElement::new(step.fee as u128);
-        columns[4][i] = BaseElement::new(step.from_after as u128);
-        columns[5][i] = BaseElement::new(step.to_after as u128);
+        columns[COL_FROM_BEFORE][i] = BaseElement::new(step.from_before as u128);
+        columns[COL_TO_BEFORE][i] = BaseElement::new(step.to_before as u128);
+        columns[COL_AMOUNT][i] = BaseElement::new(step.amount as u128);
+        columns[COL_FEE][i] = BaseElement::new(step.fee as u128);
+        columns[COL_FROM_AFTER][i] = BaseElement::new(step.from_after as u128);
+        columns[COL_TO_AFTER][i] = BaseElement::new(step.to_after as u128);
+        for (limb_idx, limb) in address_limbs(&step.from_address).into_iter().enumerate() {
+            columns[COL_FROM_ADDRESS + limb_idx][i] = BaseElement::new(limb as u128);
+        }
+        for (limb_idx, limb) in address_limbs(&step.to_address).into_iter().enumerate() {
+            columns[COL_TO_ADDRESS + limb_idx][i] = BaseElement::new(limb as u128);
+        }
     }
     TraceTable::init(columns)
 }
@@ -204,7 +306,7 @@ impl Air for TransferAir {
     type PublicInputs = PublicInputs;
 
     fn new(trace_info: TraceInfo, pub_inputs: PublicInputs, options: ProofOptions) -> Self {
-        assert_eq!(TRACE_WIDTH, trace_info.width(), "this AIR always has a fixed 6-column trace");
+        assert_eq!(TRACE_WIDTH, trace_info.width(), "this AIR always has a fixed 14-column trace (6 numeric + 4+4 address limbs)");
         // Both conservation equations are linear (degree 1) in the
         // trace's current-row values.
         let degrees = vec![TransitionConstraintDegree::new(1), TransitionConstraintDegree::new(1)];
@@ -374,16 +476,135 @@ pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), Verify
     Ok(())
 }
 
+/// Ties one proven row to a real, sequential Merkle root transition in
+/// `qchain-storage`'s state tree - see module docs' "v3" section for
+/// exactly what this does and does not check (in particular: assumes
+/// every account already exists before *and* after, and only checks the
+/// `balance` field against the STARK's public values, not full
+/// nonce/fee bookkeeping).
+#[derive(Clone, Debug)]
+pub struct RowStateBinding {
+    pub root_before: [u8; 32],
+    pub root_after: [u8; 32],
+    pub from_before: Account,
+    pub from_after: Account,
+    pub to_before: Account,
+    pub to_after: Account,
+    pub from_proof_before: MerkleProof,
+    pub from_proof_after: MerkleProof,
+    pub to_proof_before: MerkleProof,
+    pub to_proof_after: MerkleProof,
+}
+
+/// Everything that can make a claimed state-bound batch unacceptable:
+/// the underlying STARK/range-check failing, a malformed binding list,
+/// or a binding that doesn't actually match what the STARK publicly
+/// proved or the real Merkle tree it claims to be rooted in.
+#[derive(Debug, thiserror::Error)]
+pub enum StateBindingError {
+    #[error(transparent)]
+    Stark(#[from] VerifyError),
+    #[error("expected at most {max} row bindings (one per real or padding row), got {got}")]
+    TooManyBindings { max: usize, got: usize },
+    #[error("row {row}: root_after does not chain into the next binding's root_before - not one coherent state transition")]
+    RootSequenceMismatch { row: usize },
+    #[error("row {row}: {field}'s balance in the supplied Account snapshot doesn't match the STARK's public value")]
+    BalanceMismatch { row: usize, field: &'static str },
+    #[error("row {row}: the supplied {field} Merkle proof's key doesn't match the address the STARK publicly proved")]
+    AddressMismatch { row: usize, field: &'static str },
+    #[error("row {row}: {field}'s Merkle inclusion proof does not verify against the claimed root")]
+    MerkleProofFailed { row: usize, field: &'static str },
+}
+
+/// Verifies a proof produced by [`prove_batch`] *and* that `bindings`
+/// genuinely ties each proven row's addresses/balances to a real
+/// `qchain-storage` state transition - the real Merkle tie-in named as
+/// an open gap in v1/v2's docs, now closed via an external binding check
+/// (see module docs' "v3" section for why that's the right tool here,
+/// not an in-circuit hash). `bindings` may cover fewer rows than the
+/// padded trace length (bind only the real steps, not the zero-padding);
+/// it may not cover more.
+pub fn verify_batch_bound_to_state(proof: Proof, pub_inputs: PublicInputs, bindings: &[RowStateBinding]) -> Result<(), StateBindingError> {
+    verify_batch(proof, pub_inputs.clone())?;
+
+    let max_rows = pub_inputs.columns[COL_FROM_BEFORE].len();
+    if bindings.len() > max_rows {
+        return Err(StateBindingError::TooManyBindings { max: max_rows, got: bindings.len() });
+    }
+
+    for (row, pair) in bindings.windows(2).enumerate() {
+        if pair[0].root_after != pair[1].root_before {
+            return Err(StateBindingError::RootSequenceMismatch { row });
+        }
+    }
+
+    let tree = StateTree::new();
+    let empty_leaf_hash = tree.empty_leaf_hash();
+
+    for (row, binding) in bindings.iter().enumerate() {
+        let from_addr = limbs_to_address(std::array::from_fn(|i| pub_inputs.columns[COL_FROM_ADDRESS + i][row].as_int() as u64));
+        let to_addr = limbs_to_address(std::array::from_fn(|i| pub_inputs.columns[COL_TO_ADDRESS + i][row].as_int() as u64));
+
+        let from_before_pub = pub_inputs.columns[COL_FROM_BEFORE][row].as_int() as u64;
+        let from_after_pub = pub_inputs.columns[COL_FROM_AFTER][row].as_int() as u64;
+        let to_before_pub = pub_inputs.columns[COL_TO_BEFORE][row].as_int() as u64;
+        let to_after_pub = pub_inputs.columns[COL_TO_AFTER][row].as_int() as u64;
+
+        if binding.from_before.balance != from_before_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "from_before" });
+        }
+        if binding.from_after.balance != from_after_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "from_after" });
+        }
+        if binding.to_before.balance != to_before_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "to_before" });
+        }
+        if binding.to_after.balance != to_after_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "to_after" });
+        }
+
+        if binding.from_proof_before.key != from_addr || binding.from_proof_after.key != from_addr {
+            return Err(StateBindingError::AddressMismatch { row, field: "from" });
+        }
+        if binding.to_proof_before.key != to_addr || binding.to_proof_after.key != to_addr {
+            return Err(StateBindingError::AddressMismatch { row, field: "to" });
+        }
+
+        let checks: [(&Account, &MerkleProof, [u8; 32], &'static str); 4] = [
+            (&binding.from_before, &binding.from_proof_before, binding.root_before, "from_before"),
+            (&binding.from_after, &binding.from_proof_after, binding.root_after, "from_after"),
+            (&binding.to_before, &binding.to_proof_before, binding.root_before, "to_before"),
+            (&binding.to_after, &binding.to_proof_after, binding.root_after, "to_after"),
+        ];
+        for (account, proof, root, field) in checks {
+            if proof.leaf_value_hash != Some(hash_leaf(account)) {
+                return Err(StateBindingError::MerkleProofFailed { row, field });
+            }
+            if !verify_proof(root, proof, empty_leaf_hash) {
+                return Err(StateBindingError::MerkleProofFailed { row, field });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A dummy, deterministic 32-byte address for tests that don't care
+    /// about the real Merkle tie-in - fills every byte with `n`.
+    fn addr(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
     #[test]
     fn a_valid_batch_of_transfers_proves_and_verifies() {
         let steps = vec![
-            TransferStep::conserving(1_000, 200, 300, 10),
-            TransferStep::conserving(500, 50, 100, 5),
-            TransferStep::conserving(2_000, 0, 1_500, 20),
+            TransferStep::conserving(addr(1), addr(2), 1_000, 200, 300, 10),
+            TransferStep::conserving(addr(3), addr(4), 500, 50, 100, 5),
+            TransferStep::conserving(addr(5), addr(6), 2_000, 0, 1_500, 20),
         ];
         let (proof, pub_inputs) = prove_batch(&steps).unwrap();
         verify_batch(proof, pub_inputs).expect("a genuinely conserving batch must verify");
@@ -391,13 +612,13 @@ mod tests {
 
     #[test]
     fn tampering_with_a_reported_balance_after_proving_is_rejected() {
-        let steps = vec![TransferStep::conserving(1_000, 200, 300, 10)];
+        let steps = vec![TransferStep::conserving(addr(1), addr(2), 1_000, 200, 300, 10)];
         let (proof, mut pub_inputs) = prove_batch(&steps).unwrap();
         // Flip the claimed from_after value (column 4, step 0) to
         // something that no longer satisfies the conservation equation -
         // the proof was computed against the *original* trace, so it
         // must not verify against these tampered public inputs.
-        pub_inputs.columns[4][0] += BaseElement::ONE;
+        pub_inputs.columns[COL_FROM_AFTER][0] += BaseElement::ONE;
         assert!(verify_batch(proof, pub_inputs).is_err(), "a forged public input must be rejected");
     }
 
@@ -411,7 +632,7 @@ mod tests {
         // (see module docs) - that panic is as acceptable a rejection as
         // an `Err` or a failed `verify_batch`, so it's caught here rather
         // than allowed to fail the test.
-        let mut steps = vec![TransferStep::conserving(1_000, 200, 300, 10)];
+        let mut steps = vec![TransferStep::conserving(addr(1), addr(2), 1_000, 200, 300, 10)];
         steps[0].from_after += 1; // break conservation
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_batch(&steps)));
@@ -433,12 +654,12 @@ mod tests {
         // break proving/verification even when padding is mostly
         // padding rather than real data.
         let steps = vec![
-            TransferStep::conserving(10, 10, 1, 0),
-            TransferStep::conserving(20, 20, 2, 0),
-            TransferStep::conserving(30, 30, 3, 0),
+            TransferStep::conserving(addr(1), addr(2), 10, 10, 1, 0),
+            TransferStep::conserving(addr(3), addr(4), 20, 20, 2, 0),
+            TransferStep::conserving(addr(5), addr(6), 30, 30, 3, 0),
         ];
         let (proof, pub_inputs) = prove_batch(&steps).unwrap();
-        assert_eq!(pub_inputs.columns[0].len(), 8, "3 real rows clamp up to MIN_TRACE_LENGTH (8)");
+        assert_eq!(pub_inputs.columns[COL_FROM_BEFORE].len(), 8, "3 real rows clamp up to MIN_TRACE_LENGTH (8)");
         verify_batch(proof, pub_inputs).unwrap();
     }
 
@@ -493,6 +714,314 @@ mod tests {
             Err(VerifyError::ValueOutOfU64Range { column: 2, step: 0 }) => {} // caught exactly where expected
             Err(other) => panic!("expected the range check on column 2 (amount) to reject this, got a different error: {other:?}"),
             Ok(()) => panic!("a disguised out-of-range amount must never verify"),
+        }
+    }
+
+    // --- v3: real Merkle tie-in, tested against a genuine qchain-storage StateTree ---
+
+    use qchain_crypto::{Keypair, Pubkey};
+    use qchain_storage::{InMemoryStore, StateStore};
+
+    fn wallet(balance: u64) -> Account {
+        Account { balance, nonce: 0, algorithm_id: qchain_crypto::COMBO_HYBRID_ED25519_ML_DSA_65, owner: Pubkey::system_program_id(), code_hash: [0u8; 32], data: vec![] }
+    }
+
+    #[test]
+    fn a_genuine_transfer_binds_to_a_real_merkle_root_transition() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+
+        // Apply the same transfer the STARK will prove: amount=300, fee=10.
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: bob_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        verify_batch_bound_to_state(proof, pub_inputs, &[binding]).expect("a genuine transfer must bind to the real Merkle root transition");
+    }
+
+    #[test]
+    fn a_sequence_of_two_transfers_chains_real_roots_correctly() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let carol = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        store.set(carol, wallet(50));
+
+        let tree = StateTree::new();
+        let root_0 = tree.root(&store);
+
+        // Row 0: alice -(300, fee 10)-> bob.
+        let alice_before_0 = store.get(&alice).unwrap();
+        let bob_before_0 = store.get(&bob).unwrap();
+        let proof_alice_before_0 = tree.prove(&store, &alice);
+        let proof_bob_before_0 = tree.prove(&store, &bob);
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_1 = tree.root(&store);
+        let alice_after_0 = store.get(&alice).unwrap();
+        let bob_after_0 = store.get(&bob).unwrap();
+        let proof_alice_after_0 = tree.prove(&store, &alice);
+        let proof_bob_after_0 = tree.prove(&store, &bob);
+
+        // Row 1: bob -(100, fee 5)-> carol - bob's "before" here is its
+        // real post-row-0 state (500), proving the roots genuinely chain.
+        let bob_before_1 = store.get(&bob).unwrap();
+        let carol_before_1 = store.get(&carol).unwrap();
+        let proof_bob_before_1 = tree.prove(&store, &bob);
+        let proof_carol_before_1 = tree.prove(&store, &carol);
+        store.set(bob, wallet(395));
+        store.set(carol, wallet(150));
+        let root_2 = tree.root(&store);
+        let bob_after_1 = store.get(&bob).unwrap();
+        let carol_after_1 = store.get(&carol).unwrap();
+        let proof_bob_after_1 = tree.prove(&store, &bob);
+        let proof_carol_after_1 = tree.prove(&store, &carol);
+
+        let steps = vec![
+            TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10),
+            TransferStep::conserving(bob.to_bytes(), carol.to_bytes(), 500, 50, 100, 5),
+        ];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let bindings = vec![
+            RowStateBinding {
+                root_before: root_0,
+                root_after: root_1,
+                from_before: alice_before_0,
+                from_after: alice_after_0,
+                to_before: bob_before_0,
+                to_after: bob_after_0,
+                from_proof_before: proof_alice_before_0,
+                from_proof_after: proof_alice_after_0,
+                to_proof_before: proof_bob_before_0,
+                to_proof_after: proof_bob_after_0,
+            },
+            RowStateBinding {
+                root_before: root_1,
+                root_after: root_2,
+                from_before: bob_before_1,
+                from_after: bob_after_1,
+                to_before: carol_before_1,
+                to_after: carol_after_1,
+                from_proof_before: proof_bob_before_1,
+                from_proof_after: proof_bob_after_1,
+                to_proof_before: proof_carol_before_1,
+                to_proof_after: proof_carol_after_1,
+            },
+        ];
+
+        verify_batch_bound_to_state(proof, pub_inputs, &bindings).expect("a real two-step chain of root transitions must bind successfully");
+    }
+
+    #[test]
+    fn a_binding_with_broken_root_sequencing_is_rejected() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![
+            TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10),
+            TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10),
+        ];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        // Both rows claim the *same* root_before/root_after pair instead
+        // of the second row's root_before chaining from the first row's
+        // root_after - two disconnected, independently-valid-looking
+        // proofs, not one coherent state transition.
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: bob_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+        let bindings = vec![binding.clone(), binding];
+
+        match verify_batch_bound_to_state(proof, pub_inputs, &bindings) {
+            Err(StateBindingError::RootSequenceMismatch { row: 0 }) => {}
+            other => panic!("expected a RootSequenceMismatch at row 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binding_whose_balance_doesnt_match_the_stark_is_rejected() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: wallet(999), // doesn't match the STARK's public from_before (1_000)
+            from_after: alice_after,
+            to_before: wallet(200),
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        match verify_batch_bound_to_state(proof, pub_inputs, &[binding]) {
+            Err(StateBindingError::BalanceMismatch { row: 0, field: "from_before" }) => {}
+            other => panic!("expected a BalanceMismatch on from_before at row 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binding_whose_merkle_proof_is_for_the_wrong_address_is_rejected() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let mallory = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        store.set(mallory, wallet(50));
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        // Wrong proof: mallory's inclusion proof, not alice's.
+        let proof_mallory_before = tree.prove(&store, &mallory);
+        let proof_bob_before = tree.prove(&store, &bob);
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: bob_before,
+            to_after: bob_after,
+            from_proof_before: proof_mallory_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        match verify_batch_bound_to_state(proof, pub_inputs, &[binding]) {
+            Err(StateBindingError::AddressMismatch { row: 0, field: "from" }) => {}
+            other => panic!("expected an AddressMismatch on 'from' at row 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binding_against_a_stale_root_is_rejected() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after: root_before, // wrong: claims the state never changed
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: bob_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        match verify_batch_bound_to_state(proof, pub_inputs, &[binding]) {
+            Err(StateBindingError::MerkleProofFailed { row: 0, .. }) => {}
+            other => panic!("expected a MerkleProofFailed (the 'after' proofs don't verify against the stale root), got {other:?}"),
         }
     }
 }

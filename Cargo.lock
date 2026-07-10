@@ -1913,6 +1913,9 @@ dependencies = [
 name = "qchain-stark"
 version = "0.1.0"
 dependencies = [
+ "qchain-core",
+ "qchain-crypto",
+ "qchain-storage",
  "thiserror 1.0.69",
  "winterfell",
 ]

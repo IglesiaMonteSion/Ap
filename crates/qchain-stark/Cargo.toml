@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 winterfell.workspace = true
 thiserror.workspace = true
+qchain-core = { path = "../qchain-core" }
+qchain-storage = { path = "../qchain-storage" }
+
+[dev-dependencies]
+qchain-crypto = { path = "../qchain-crypto" }
