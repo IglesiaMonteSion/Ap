@@ -3,10 +3,12 @@
 //! (including the equivocation lock, see `project-lessons-learned`),
 //! minus async/tokio/real-TCP, so a deterministic simulator can drive it
 //! tick-by-tick. Batches carry no transactions here (consensus safety
-//! doesn't depend on execution content) - a vertex's `batch_digest` is
-//! just `[0u8; 32]` for honest validators, or `[1u8; 32]` for an
-//! `Equivocator`'s second, conflicting vertex, purely so the two vertices
-//! hash differently.
+//! doesn't depend on execution content, and worker-tier batch dissemination
+//! is orthogonal to what this harness tests - see `qchain-node`'s
+//! `engine.rs` for the real multi-worker split) - a vertex's
+//! `batch_digests` is just a single `(0, [0u8; 32])` entry for honest
+//! validators, or `(0, [1u8; 32])` for an `Equivocator`'s second,
+//! conflicting vertex, purely so the two vertices hash differently.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Certificate, Digest, Round, ValidatorId, Vertex};
@@ -103,7 +105,7 @@ impl SimValidator {
             p.sort();
             p
         };
-        let vertex = Vertex { round, author: self.id, batch_digest: [0u8; 32], parents: parents.clone() };
+        let vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [0u8; 32])], parents: parents.clone() };
         let digest = vertex.digest();
         self.own_pending_vertex = Some(vertex.clone());
         self.next_round = round + 1;
@@ -121,7 +123,7 @@ impl SimValidator {
         }
 
         if self.behavior == ByzantineBehavior::Equivocator && !peers.is_empty() {
-            let evil_vertex = Vertex { round, author: self.id, batch_digest: [1u8; 32], parents };
+            let evil_vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [1u8; 32])], parents };
             let half = peers.len() / 2;
             for &peer in &peers[..half.max(1)] {
                 out.push((peer, SimMessage::VertexProposal(evil_vertex.clone())));

@@ -1,21 +1,28 @@
 //! Wire messages for the phase-1 P2P layer (design: `ARCHITECTURE.md` §1).
-//! Deliberately small: Narwhal's full protocol separates "workers" (batch
-//! dissemination) from "primaries" (vertex/certificate exchange); phase 1
-//! collapses that into a single per-validator process that gossips batches
-//! directly alongside vertices - real proposal/vote/certificate exchange,
-//! without the worker-tier scaling optimization (see the `dag-network`
-//! section of `blockchain-core-rust` skill and `ARCHITECTURE.md`'s phase-1
-//! out-of-scope list).
+//! Narwhal's full protocol separates "workers" (batch dissemination) from
+//! "primaries" (vertex/certificate exchange); this stays a single
+//! per-validator process (no separate worker subprocess/port per lane -
+//! that's a real deployment-topology simplification, not reopened here),
+//! but the *message* layer keeps the two roles distinct: `WorkerBatchGossip`
+//! (plus its request/response retry pair) is the worker-tier traffic, sent
+//! and handled independently of `VertexProposal`/`Vote`/
+//! `CertificateBroadcast` - a primary references multiple workers' batch
+//! digests in one vertex (`Vertex::batch_digests`) rather than gossiping a
+//! single inline batch alongside its vertex, so batch dissemination can
+//! genuinely happen over separate concurrent sends instead of serializing
+//! through one channel (see `ARCHITECTURE.md` §2's bandwidth analysis for
+//! why this separation exists at all).
 
-use qchain_core::{Batch, Certificate, Digest, ValidatorId, Vertex};
+use qchain_core::{Batch, Certificate, Digest, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::MultiSignature;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum NetMessage {
-    /// A proposer's batch of transactions, sent so peers can execute them
-    /// later once the corresponding vertex's certificate is ordered.
-    BatchGossip(Batch),
+    /// One worker lane's batch of transactions, sent independently of the
+    /// vertex that will later reference it, so peers can execute it once
+    /// the corresponding certificate is ordered.
+    WorkerBatchGossip { worker_id: WorkerId, batch: Batch },
     /// A proposer's round vertex, sent to every peer to be voted on.
     VertexProposal(Vertex),
     /// A peer's vote (signature over the vertex digest) sent back to the
@@ -36,6 +43,14 @@ pub enum NetMessage {
     /// Reply to a `CertificateRequest` - the certificate itself, re-sent
     /// so the requester can insert it into its own DAG and resume.
     CertificateResponse(Certificate),
+    /// "I don't have this worker batch" - the exact same real gap
+    /// `CertificateRequest` closes, one tier down: `WorkerBatchGossip` is
+    /// also a one-shot send, and a lost copy would otherwise leave the
+    /// referencing vertex's batch permanently unresolved (its transactions
+    /// silently skipped at commit time forever, not just delayed).
+    WorkerBatchRequest { worker_id: WorkerId, digest: Digest },
+    /// Reply to a `WorkerBatchRequest` - the batch itself.
+    WorkerBatchResponse { worker_id: WorkerId, batch: Batch },
 }
 
 /// Every message on the wire is wrapped with the sender's validator id -

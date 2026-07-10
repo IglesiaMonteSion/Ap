@@ -5,12 +5,37 @@
 //! Bullshark ordering to decide what gets executed and when.
 //!
 //! Phase-1 simplifications, called out explicitly rather than left
-//! implicit: no worker tier (a validator gossips its own batch directly
-//! alongside its vertex, see `qchain_network::message`), no retry/recovery
-//! if a certificate commits before its batch has arrived (the transactions
-//! are simply skipped and logged), and no garbage collection of stale vote
-//! entries for vertices that never reach quorum. All are noted as phase-2
-//! hardening work in the `blockchain-core-rust` skill.
+//! implicit: no garbage collection of stale vote entries for vertices that
+//! never reach quorum, and worker "processes" are simulated as concurrent
+//! lanes inside this same validator process rather than genuinely separate
+//! OS processes/ports (a real deployment-topology simplification - see the
+//! worker-tier paragraph below for what *is* real about it). Both are noted
+//! as later hardening work in the `blockchain-core-rust` skill.
+//!
+//! **Worker tier: batch dissemination is now genuinely separate from
+//! primary (vertex/certificate) exchange, not gossiped inline.** Each
+//! round, ready transactions are partitioned across `WORKER_COUNT` lanes
+//! (by payer address, so one account's transactions always land in the
+//! same lane and keep their relative order) into up to `WORKER_COUNT`
+//! independent `Batch`es, each gossiped as its own
+//! `NetMessage::WorkerBatchGossip { worker_id, batch }` - a small,
+//! separately-addressable message, not one bundled with the vertex. The
+//! vertex itself only ever carries `(WorkerId, Digest)` pairs
+//! (`Vertex::batch_digests`), keeping primary-tier messages small
+//! regardless of how much transaction data a round actually carries (see
+//! `ARCHITECTURE.md` §2's bandwidth analysis for why this separation
+//! exists at all). A lost `WorkerBatchGossip` gets the same real-retry
+//! treatment `CertificateRequest`/`CertificateResponse` already give lost
+//! certificates: `WorkerBatchRequest`/`WorkerBatchResponse`, triggered
+//! whenever a `VertexProposal` or certificate references a batch digest not
+//! yet locally known, and naturally retried on every occasion that
+//! referencing message itself gets retried (vertex-proposal retry,
+//! certificate re-sync) - no separate timer needed. `try_commit` still
+//! keeps its lenient warn-and-skip fallback for a batch that's missing at
+//! the exact moment of commit (the request/response round-trip is
+//! asynchronous and not guaranteed to finish first) - not a regression,
+//! the same real limitation phase 1 already had for a single inline batch,
+//! now applying per-worker-lane instead of to one batch at a time.
 //!
 //! **Mempool nonce-ordering bug (found via load testing, see
 //! `project-lessons-learned`) - fixed.** The mempool used to be a flat
@@ -30,13 +55,41 @@
 //! queued for a later round instead of being drained blindly.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
-use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex};
+use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::Mutex;
+
+/// How many worker lanes each validator partitions its ready transactions
+/// across per round - a per-validator implementation choice, not a
+/// consensus parameter (batches are content-addressed by digest, so
+/// different validators running different `WORKER_COUNT` values doesn't
+/// threaten agreement; it only changes how one validator's own
+/// dissemination load is spread). See the module docs above.
+const WORKER_COUNT: u8 = 4;
+
+/// Splits ready transactions into up to `WORKER_COUNT` batches, one per
+/// non-empty lane. Lane assignment is by the payer's address so a given
+/// account's transactions always land in the same lane and keep their
+/// relative (already nonce-ordered, see `drain_ready_transactions`) order
+/// within that lane's batch - cross-account ordering never matters since
+/// accounts apply independently.
+fn partition_into_worker_batches(txs: Vec<Transaction>) -> Vec<(WorkerId, Batch)> {
+    let mut lanes: Vec<Vec<Transaction>> = vec![Vec::new(); WORKER_COUNT as usize];
+    for tx in txs {
+        let lane = tx.message.payer.to_bytes()[0] as usize % WORKER_COUNT as usize;
+        lanes[lane].push(tx);
+    }
+    lanes
+        .into_iter()
+        .enumerate()
+        .filter(|(_, txs)| !txs.is_empty())
+        .map(|(worker_id, txs)| (worker_id as WorkerId, Batch { transactions: txs }))
+        .collect()
+}
 
 pub struct EngineState {
     pub ledger: Ledger,
@@ -250,7 +303,7 @@ impl Engine {
 
     pub async fn handle_message(&self, from: ValidatorId, msg: NetMessage) {
         match msg {
-            NetMessage::BatchGossip(batch) => {
+            NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
                 let digest = batch.digest();
                 let mut state = self.state.lock().await;
                 state.batches.entry(digest).or_insert(batch);
@@ -261,6 +314,7 @@ impl Engine {
                     return;
                 }
                 self.request_missing_parents(&vertex.parents, from).await;
+                self.request_missing_batches(&vertex.batch_digests, from).await;
                 let digest = vertex.digest();
                 let key = (vertex.round, vertex.author);
                 {
@@ -304,11 +358,13 @@ impl Engine {
                     return;
                 }
                 let parents = cert.vertex.parents.clone();
+                let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
                     state.dag.insert(cert);
                 }
                 self.request_missing_parents(&parents, from).await;
+                self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
             }
             NetMessage::CertificateRequest { digest } => {
@@ -328,12 +384,30 @@ impl Engine {
                     return;
                 }
                 let parents = cert.vertex.parents.clone();
+                let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
                     state.dag.insert(cert);
                 }
                 self.request_missing_parents(&parents, from).await;
+                self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
+            }
+            NetMessage::WorkerBatchRequest { worker_id, digest } => {
+                let found = {
+                    let state = self.state.lock().await;
+                    state.batches.get(&digest).cloned()
+                };
+                if let (Some(batch), Some(addr)) = (found, self.network.addr_of(&from)) {
+                    if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchResponse { worker_id, batch }).await {
+                        tracing::warn!("failed to send worker batch response to {from}: {e}");
+                    }
+                }
+            }
+            NetMessage::WorkerBatchResponse { worker_id: _, batch } => {
+                let digest = batch.digest();
+                let mut state = self.state.lock().await;
+                state.batches.entry(digest).or_insert(batch);
             }
         }
     }
@@ -360,6 +434,29 @@ impl Engine {
         for digest in missing {
             if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
                 tracing::warn!("failed to request missing certificate {digest:?} from {from}: {e}");
+            }
+        }
+    }
+
+    /// The worker-tier counterpart to `request_missing_parents`: requests,
+    /// from `from`, any batch digest referenced in `batch_digests` this
+    /// validator doesn't already have cached locally. Same rationale as
+    /// certificate re-sync - `WorkerBatchGossip` is a one-shot send with no
+    /// retry of its own, so a single dropped copy would otherwise leave the
+    /// referencing vertex's transactions permanently unresolved at commit
+    /// time (see the module docs).
+    async fn request_missing_batches(&self, batch_digests: &[(WorkerId, Digest)], from: ValidatorId) {
+        let missing: Vec<(WorkerId, Digest)> = {
+            let state = self.state.lock().await;
+            batch_digests.iter().copied().filter(|(_, d)| !state.batches.contains_key(d)).collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let Some(addr) = self.network.addr_of(&from) else { return };
+        for (worker_id, digest) in missing {
+            if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
+                tracing::warn!("failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
             }
         }
     }
@@ -402,20 +499,26 @@ impl Engine {
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
             // Not removed on use: an empty (or otherwise coincidentally
-            // identical) batch can be the `batch_digest` referenced by
-            // more than one certificate, so the cache is keyed by content,
-            // not by a single certificate's claim on it. Phase-1
-            // limitation: the cache is never pruned, so it grows with the
-            // number of distinct batches ever gossiped - fine at testnet
-            // scale, a real eviction policy is later work.
-            let Some(batch) = state.batches.get(&cert.vertex.batch_digest).cloned() else {
-                tracing::warn!("committed certificate references an unseen batch - skipping its transactions");
-                continue;
-            };
-            for tx in &batch.transactions {
-                match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
-                    Ok(_) => state.executed += 1,
-                    Err(e) => tracing::warn!("transaction execution failed: {e}"),
+            // identical) batch can be referenced by more than one
+            // certificate (from different workers, or even different
+            // vertices), so the cache is keyed by content, not by a single
+            // certificate's claim on it. Phase-1 limitation: the cache is
+            // never pruned, so it grows with the number of distinct
+            // batches ever gossiped - fine at testnet scale, a real
+            // eviction policy is later work. Applied in the vertex's own
+            // `batch_digests` order (worker lane order at proposal time) -
+            // every validator sees the identical certified list, so this
+            // order is already agreed, not re-derived locally.
+            for (worker_id, batch_digest) in &cert.vertex.batch_digests {
+                let Some(batch) = state.batches.get(batch_digest).cloned() else {
+                    tracing::warn!("committed certificate references an unseen batch from worker {worker_id} - skipping its transactions");
+                    continue;
+                };
+                for tx in &batch.transactions {
+                    match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
+                        Ok(_) => state.executed += 1,
+                        Err(e) => tracing::warn!("transaction execution failed: {e}"),
+                    }
                 }
             }
         }
@@ -448,7 +551,7 @@ impl Engine {
             return;
         }
 
-        let (vertex, batch) = {
+        let (vertex, worker_batches) = {
             let mut state = self.state.lock().await;
             let round = state.next_round;
             if round > 0 {
@@ -461,8 +564,13 @@ impl Engine {
             }
 
             let txs: Vec<Transaction> = drain_ready_transactions(&mut state);
-            let batch = Batch { transactions: txs };
-            let batch_digest = batch.digest();
+            let worker_batches = partition_into_worker_batches(txs);
+            let mut batch_digests: Vec<(WorkerId, Digest)> = Vec::with_capacity(worker_batches.len());
+            for (worker_id, batch) in &worker_batches {
+                let digest = batch.digest();
+                state.batches.insert(digest, batch.clone());
+                batch_digests.push((*worker_id, digest));
+            }
             let parents: Vec<Digest> = if round == 0 {
                 vec![]
             } else {
@@ -470,15 +578,19 @@ impl Engine {
                 p.sort();
                 p
             };
-            let vertex = Vertex { round, author: self.self_id, batch_digest, parents };
-            state.batches.insert(batch_digest, batch.clone());
+            let vertex = Vertex { round, author: self.self_id, batch_digests, parents };
             state.own_pending_vertex = Some(vertex.clone());
             state.next_round = round + 1;
             state.voted_for.insert((round, self.self_id), vertex.digest());
-            (vertex, batch)
+            (vertex, worker_batches)
         };
 
-        self.network.broadcast(&NetMessage::BatchGossip(batch)).await;
+        // Each worker lane's batch is its own small, independently
+        // retriable message - see the module docs for why this replaced a
+        // single inline batch gossiped alongside the vertex.
+        for (worker_id, batch) in worker_batches {
+            self.network.broadcast(&NetMessage::WorkerBatchGossip { worker_id, batch }).await;
+        }
         self.network.broadcast(&NetMessage::VertexProposal(vertex.clone())).await;
 
         let digest = vertex.digest();
@@ -613,5 +725,41 @@ mod tests {
         let ready = drain_ready_transactions(&mut state);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].message.payer, bob.pubkey());
+    }
+
+    /// A given account's transactions must always land in the same worker
+    /// lane, in their original (already nonce-ordered) relative order -
+    /// that's what keeps `try_commit`'s per-account application order
+    /// correct once transactions are split across independently-gossiped
+    /// batches instead of one inline batch.
+    #[test]
+    fn partition_into_worker_batches_groups_by_payer_and_preserves_order() {
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap();
+
+        let mut tx_alice_0 = tx(&alice, 0);
+        tx_alice_0.message.payer = Pubkey::new([0u8; 32]);
+        let mut tx_alice_1 = tx(&alice, 1);
+        tx_alice_1.message.payer = Pubkey::new([0u8; 32]);
+        let mut tx_bob_0 = tx(&bob, 0);
+        tx_bob_0.message.payer = Pubkey::new([1u8; 32]);
+
+        let batches = partition_into_worker_batches(vec![tx_alice_0, tx_alice_1, tx_bob_0]);
+
+        assert_eq!(batches.len(), 2, "two distinct payer lanes (byte 0 vs byte 1, mod WORKER_COUNT) must produce two batches");
+        let lane0 = &batches.iter().find(|(id, _)| *id == 0).expect("lane 0 must be present").1;
+        assert_eq!(lane0.transactions.len(), 2, "both of alice's transactions land in the same lane");
+        assert_eq!(lane0.transactions[0].message.nonce, 0);
+        assert_eq!(lane0.transactions[1].message.nonce, 1, "relative order within the lane must be preserved");
+        let lane1 = &batches.iter().find(|(id, _)| *id == 1).expect("lane 1 must be present").1;
+        assert_eq!(lane1.transactions.len(), 1);
+    }
+
+    /// Lanes with nothing assigned to them must not produce empty batches -
+    /// an empty round should gossip nothing, not `WORKER_COUNT` empty
+    /// `WorkerBatchGossip` messages.
+    #[test]
+    fn partition_into_worker_batches_of_no_transactions_produces_no_batches() {
+        assert!(partition_into_worker_batches(vec![]).is_empty());
     }
 }

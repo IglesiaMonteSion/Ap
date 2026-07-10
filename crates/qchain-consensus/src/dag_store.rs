@@ -73,7 +73,7 @@ mod tests {
     use qchain_crypto::Pubkey;
 
     fn cert(round: Round, author: ValidatorId, parents: Vec<Digest>) -> Certificate {
-        Certificate { vertex: Vertex { round, author, batch_digest: [round as u8; 32], parents }, signatures: vec![] }
+        Certificate { vertex: Vertex { round, author, batch_digests: vec![(0, [round as u8; 32])], parents }, signatures: vec![] }
     }
 
     #[test]

@@ -121,14 +121,14 @@ mod tests {
         let (net_a, mut rx_a) = Network::start(id_a, addr_a, vec![PeerInfo { id: id_b, addr: addr_b }]).await.unwrap();
         let (_net_b, mut rx_b) = Network::start(id_b, addr_b, vec![PeerInfo { id: id_a, addr: addr_a }]).await.unwrap();
 
-        net_a.broadcast(&NetMessage::BatchGossip(Batch { transactions: vec![] })).await;
+        net_a.broadcast(&NetMessage::WorkerBatchGossip { worker_id: 0, batch: Batch { transactions: vec![] } }).await;
 
         let (from, msg) = tokio::time::timeout(std::time::Duration::from_secs(2), rx_b.recv())
             .await
             .expect("message must arrive within the timeout")
             .expect("channel must not close");
         assert_eq!(from, id_a);
-        assert!(matches!(msg, NetMessage::BatchGossip(_)));
+        assert!(matches!(msg, NetMessage::WorkerBatchGossip { .. }));
 
         // No message was ever sent to A, so its receiver should stay empty.
         assert!(rx_a.try_recv().is_err());
@@ -160,7 +160,7 @@ mod tests {
         for &n in &[3usize, 10, 20, 50, 100, 200, 500] {
             let keypairs: Vec<_> = (0..n).map(|_| qchain_crypto::Keypair::generate().unwrap()).collect();
             let author = keypairs[0].pubkey();
-            let vertex = Vertex { round: 100, author, batch_digest: [7u8; 32], parents: vec![[1u8; 32], [2u8; 32]] };
+            let vertex = Vertex { round: 100, author, batch_digests: vec![(0, [7u8; 32])], parents: vec![[1u8; 32], [2u8; 32]] };
             let digest = vertex.digest();
             // Quorum-sized: 2f+1 out of n=3f+1 - the minimum a real
             // certificate would ever carry.

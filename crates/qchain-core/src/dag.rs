@@ -18,6 +18,13 @@ pub type Round = u64;
 /// scheme-agnostic address every account has.
 pub type ValidatorId = Pubkey;
 pub type Digest = [u8; 32];
+/// A primary runs several workers in parallel, each disseminating its own
+/// batches over its own network path (`ARCHITECTURE.md` §2: this is
+/// specifically what lets batch bandwidth scale across separate routes/cores
+/// instead of serializing through one channel). Just an index a primary
+/// assigns locally to its own worker lanes - not a cross-validator identity,
+/// so it doesn't need to be a `Pubkey` like `ValidatorId`.
+pub type WorkerId = u8;
 
 /// A batch of transactions a worker disseminates. Narwhal's primaries
 /// reference batch *digests* in vertices, never the batches themselves -
@@ -39,14 +46,21 @@ impl Batch {
     }
 }
 
-/// One validator's proposal for a DAG round: a reference to their certified
-/// batch, plus references to 2f+1 certificates from the previous round
-/// (their "parents" in the DAG). Round 0 vertices have no parents (genesis).
+/// One validator's proposal for a DAG round: references to the batches its
+/// own workers disseminated since its last vertex (one entry per worker
+/// that had something ready - workers with nothing to say this round
+/// contribute no entry, not an empty batch), plus references to 2f+1
+/// certificates from the previous round (their "parents" in the DAG).
+/// Round 0 vertices have no parents (genesis). `batch_digests` is the
+/// author's own choice, carried as-is in whatever order it built it in -
+/// unlike `parents` reachability (§`qchain-consensus`'s Bullshark), no
+/// other validator ever needs to independently reconstruct this list, so
+/// there's no canonical-ordering requirement to enforce here.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Vertex {
     pub round: Round,
     pub author: ValidatorId,
-    pub batch_digest: Digest,
+    pub batch_digests: Vec<(WorkerId, Digest)>,
     pub parents: Vec<Digest>,
 }
 
@@ -55,7 +69,10 @@ impl Vertex {
         let mut hasher = Sha3_256::new();
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.author.to_bytes());
-        hasher.update(self.batch_digest);
+        for (worker_id, digest) in &self.batch_digests {
+            hasher.update([*worker_id]);
+            hasher.update(digest);
+        }
         for p in &self.parents {
             hasher.update(p);
         }
@@ -92,12 +109,25 @@ mod tests {
         let v1 = Vertex {
             round: 1,
             author,
-            batch_digest: [1u8; 32],
+            batch_digests: vec![(0, [1u8; 32])],
             parents: vec![[2u8; 32]],
         };
         let mut v2 = v1.clone();
         v2.parents = vec![[3u8; 32]];
         assert_ne!(v1.digest(), v2.digest());
+    }
+
+    #[test]
+    fn vertex_digest_changes_with_batch_digests() {
+        let author = Pubkey::system_program_id();
+        let v1 = Vertex { round: 1, author, batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
+        let mut v2 = v1.clone();
+        v2.batch_digests = vec![(0, [1u8; 32]), (1, [9u8; 32])];
+        assert_ne!(v1.digest(), v2.digest());
+
+        let mut v3 = v1.clone();
+        v3.batch_digests = vec![(1, [1u8; 32])];
+        assert_ne!(v1.digest(), v3.digest(), "worker id must be part of the digest, not just the batch content");
     }
 
     #[test]

@@ -129,7 +129,7 @@ mod tests {
             for (i, v) in tvs.iter().enumerate() {
                 let mut batch_digest = Batch { transactions: vec![] }.digest();
                 batch_digest[0] = batch_digest[0].wrapping_add(i as u8);
-                let vertex = Vertex { round, author: v.id, batch_digest, parents: prev_round_digests.clone() };
+                let vertex = Vertex { round, author: v.id, batch_digests: vec![(0, batch_digest)], parents: prev_round_digests.clone() };
                 let cert = certify(vertex, tvs);
                 this_round_digests.push(dag.insert(cert));
             }
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn certificate_verification_rejects_insufficient_stake() {
         let (tvs, validators) = make_validators(4);
-        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digest: [0u8; 32], parents: vec![] };
+        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         // Only one signer - below the quorum threshold of 3.
         let cert = certify(vertex, &tvs[..1]);
         assert!(!verify_certificate(&cert, &validators));
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn certificate_verification_accepts_quorum_signatures() {
         let (tvs, validators) = make_validators(4);
-        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digest: [0u8; 32], parents: vec![] };
+        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let cert = certify(vertex, &tvs[..3]);
         assert!(verify_certificate(&cert, &validators));
     }
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn certificate_verification_rejects_forged_signatures() {
         let (tvs, validators) = make_validators(4);
-        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digest: [0u8; 32], parents: vec![] };
+        let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let mut cert = certify(vertex, &tvs[..3]);
         cert.signatures[0].1.components[0].bytes[0] ^= 0xFF;
         assert!(!verify_certificate(&cert, &validators), "a quorum count that includes a forged signature must not pass");
@@ -171,12 +171,12 @@ mod tests {
         assert!(!can_advance_round(&dag, &validators, 0));
 
         for v in &tvs[..2] {
-            let vertex = Vertex { round: 0, author: v.id, batch_digest: [0u8; 32], parents: vec![] };
+            let vertex = Vertex { round: 0, author: v.id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
             dag.insert(certify(vertex, &tvs));
         }
         assert!(!can_advance_round(&dag, &validators, 0), "2 of 4 is below the quorum threshold of 3");
 
-        let vertex = Vertex { round: 0, author: tvs[2].id, batch_digest: [0u8; 32], parents: vec![] };
+        let vertex = Vertex { round: 0, author: tvs[2].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         dag.insert(certify(vertex, &tvs));
         assert!(can_advance_round(&dag, &validators, 0), "3 of 4 meets the quorum threshold");
     }
@@ -240,7 +240,7 @@ mod tests {
                 }
                 let mut batch_digest = Batch { transactions: vec![] }.digest();
                 batch_digest[0] = batch_digest[0].wrapping_add(i as u8);
-                let vertex = Vertex { round, author: v.id, batch_digest, parents: prev_round_digests.clone() };
+                let vertex = Vertex { round, author: v.id, batch_digests: vec![(0, batch_digest)], parents: prev_round_digests.clone() };
                 let digest = vertex.digest();
                 let signatures: Vec<(qchain_core::ValidatorId, MultiSignature)> = tvs
                     .iter()
