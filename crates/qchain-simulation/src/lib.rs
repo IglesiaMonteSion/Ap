@@ -157,6 +157,10 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
                 }
                 enqueue(&mut queue, &mut seq, tick, i, to_idx, msg, &mut rng);
             }
+            for (to_id, msg) in sims[i].retry_pending_cert_requests() {
+                let to_idx = ids.iter().position(|x| *x == to_id).unwrap();
+                enqueue(&mut queue, &mut seq, tick, i, to_idx, msg, &mut rng);
+            }
         }
 
         let due_keys: Vec<(u64, u64)> = queue.range(..=(tick, u64::MAX)).map(|(k, _)| *k).collect();

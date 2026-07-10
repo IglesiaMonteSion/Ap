@@ -135,6 +135,15 @@ pub struct EngineState {
     /// (round, author) already voted on keeps that overlap below what a
     /// Byzantine minority (at most f) can supply on its own.
     pub voted_for: HashMap<(Round, ValidatorId), Digest>,
+    /// Outstanding `CertificateRequest`/`WorkerBatchRequest`s this
+    /// validator has sent but not yet gotten a response for, keyed by
+    /// what's missing, valued by who to (re-)ask - see
+    /// `Engine::retry_pending_resync_requests`'s doc comment for the real,
+    /// confirmed-live bug this closes: without an independent retry, a
+    /// single lost response (not just a lost original broadcast) left a
+    /// permanent gap.
+    pub pending_cert_requests: HashMap<Digest, ValidatorId>,
+    pub pending_batch_requests: HashMap<(WorkerId, Digest), ValidatorId>,
 }
 
 pub struct Engine {
@@ -445,8 +454,12 @@ impl Engine {
     /// these digests as parents, so it must have had them itself.
     async fn request_missing_parents(&self, parents: &[Digest], from: ValidatorId) {
         let missing: Vec<Digest> = {
-            let state = self.state.lock().await;
-            parents.iter().copied().filter(|d| !state.dag.contains(d)).collect()
+            let mut state = self.state.lock().await;
+            let missing: Vec<Digest> = parents.iter().copied().filter(|d| !state.dag.contains(d)).collect();
+            for &digest in &missing {
+                state.pending_cert_requests.insert(digest, from);
+            }
+            missing
         };
         if missing.is_empty() {
             return;
@@ -468,8 +481,12 @@ impl Engine {
     /// time (see the module docs).
     async fn request_missing_batches(&self, batch_digests: &[(WorkerId, Digest)], from: ValidatorId) {
         let missing: Vec<(WorkerId, Digest)> = {
-            let state = self.state.lock().await;
-            batch_digests.iter().copied().filter(|(_, d)| !state.batches.contains_key(d)).collect()
+            let mut state = self.state.lock().await;
+            let missing: Vec<(WorkerId, Digest)> = batch_digests.iter().copied().filter(|(_, d)| !state.batches.contains_key(d)).collect();
+            for &(worker_id, digest) in &missing {
+                state.pending_batch_requests.insert((worker_id, digest), from);
+            }
+            missing
         };
         if missing.is_empty() {
             return;
@@ -478,6 +495,75 @@ impl Engine {
         for (worker_id, digest) in missing {
             if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
                 tracing::warn!("failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
+            }
+        }
+    }
+
+    /// Re-sends any still-outstanding `CertificateRequest`/
+    /// `WorkerBatchRequest`s, called on the same tick as `propose_round`.
+    ///
+    /// **Real bug closed here, found live via a deeper adversarial audit
+    /// (rapid crash-loop of one validator, four kills/restarts within a
+    /// few seconds, on a network with real accumulated round history).**
+    /// `request_missing_parents`/`request_missing_batches` only ever fired
+    /// reactively - triggered by processing a *fresh* incoming message
+    /// that happened to reference the same missing digest again. That's
+    /// fine when the *original* request or its response is merely delayed
+    /// (a later message re-triggers a fresh request). It's not fine when
+    /// the *response* itself is lost and nothing else will ever reference
+    /// that exact digest again - which is exactly what a burst of catch-up
+    /// re-sync traffic can cause: confirmed live, the crash-loop's
+    /// resulting flood of `CertificateRequest`s exhausted the responder's
+    /// file descriptors (`qchain-network`'s transport opens a fresh
+    /// connection per send, a known, documented simplification), so over a
+    /// thousand `CertificateResponse` sends failed with "too many open
+    /// files." Each failure was for a specific digest with no other
+    /// message left anywhere in the system that would ever reference it
+    /// again - a permanent, silent gap. With quorum requiring support from
+    /// (near-)all validators, one validator permanently missing even one
+    /// certificate froze the *entire* network forever, confirmed by
+    /// watching `next_round`/`dag_certificates` sit completely frozen
+    /// across all three nodes for minutes while CPU usage stayed high (the
+    /// stuck validator's Bullshark ordering repeatedly re-walking the same
+    /// unresolved gap on every incoming message, silently, since a
+    /// re-walk that doesn't newly commit anything logs nothing).
+    ///
+    /// Fixed the same way `own_pending_vertex` already handles exactly
+    /// this class of problem: track every outstanding request
+    /// (`EngineState.pending_cert_requests`/`pending_batch_requests`,
+    /// populated wherever a request is first sent) and unconditionally
+    /// re-send anything still outstanding on every tick, independent of
+    /// whether any other message happens to reference it - pruning an
+    /// entry the moment the real content actually arrives, whichever way
+    /// it arrives.
+    pub async fn retry_pending_resync_requests(&self) {
+        let (cert_retries, batch_retries) = {
+            let mut state = self.state.lock().await;
+            let resolved_certs: Vec<Digest> = state.pending_cert_requests.keys().copied().filter(|d| state.dag.contains(d)).collect();
+            for digest in &resolved_certs {
+                state.pending_cert_requests.remove(digest);
+            }
+            let resolved_batches: Vec<(WorkerId, Digest)> =
+                state.pending_batch_requests.keys().copied().filter(|(_, d)| state.batches.contains_key(d)).collect();
+            for key in &resolved_batches {
+                state.pending_batch_requests.remove(key);
+            }
+            let cert_retries: Vec<(Digest, ValidatorId)> = state.pending_cert_requests.iter().map(|(&d, &from)| (d, from)).collect();
+            let batch_retries: Vec<(WorkerId, Digest, ValidatorId)> =
+                state.pending_batch_requests.iter().map(|(&(worker_id, d), &from)| (worker_id, d, from)).collect();
+            (cert_retries, batch_retries)
+        };
+
+        for (digest, from) in cert_retries {
+            let Some(addr) = self.network.addr_of(&from) else { continue };
+            if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
+                tracing::warn!("retry: failed to request missing certificate {digest:?} from {from}: {e}");
+            }
+        }
+        for (worker_id, digest, from) in batch_retries {
+            let Some(addr) = self.network.addr_of(&from) else { continue };
+            if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
+                tracing::warn!("retry: failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
             }
         }
     }
@@ -683,6 +769,8 @@ mod tests {
             round_checkpoint_path: None,
             executed: 0,
             voted_for: HashMap::new(),
+            pending_cert_requests: HashMap::new(),
+            pending_batch_requests: HashMap::new(),
         }
     }
 

@@ -49,6 +49,12 @@ pub struct SimValidator {
     own_pending_vertex: Option<Vertex>,
     pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     voted_for: HashMap<(Round, ValidatorId), Digest>,
+    /// Outstanding `CertificateRequest`s not yet answered - mirrors
+    /// `qchain-node::engine`'s `pending_cert_requests`, see
+    /// `retry_pending_cert_requests`'s doc comment for the real bug this
+    /// closes (found live, not via this harness - see
+    /// `project-lessons-learned`).
+    pending_cert_requests: HashMap<Digest, ValidatorId>,
     next_round: Round,
     /// Total order as this validator has observed it commit, in order -
     /// what the simulation's safety check compares across validators.
@@ -66,6 +72,7 @@ impl SimValidator {
             own_pending_vertex: None,
             pending_votes: HashMap::new(),
             voted_for: HashMap::new(),
+            pending_cert_requests: HashMap::new(),
             next_round: 0,
             committed_order: Vec::new(),
         }
@@ -136,8 +143,32 @@ impl SimValidator {
     /// `CertificateRequest` addressed to `from` - the peer who just sent a
     /// message referencing it, and who therefore must have had it. See
     /// `SimMessage::CertificateRequest`'s doc comment for why this exists.
-    fn missing_parent_requests(&self, parents: &[Digest], from: ValidatorId) -> Vec<(ValidatorId, SimMessage)> {
-        parents.iter().filter(|d| !self.dag.contains(d)).map(|&digest| (from, SimMessage::CertificateRequest { digest })).collect()
+    /// Also records each as outstanding in `pending_cert_requests` - see
+    /// `retry_pending_cert_requests`.
+    fn missing_parent_requests(&mut self, parents: &[Digest], from: ValidatorId) -> Vec<(ValidatorId, SimMessage)> {
+        let missing: Vec<Digest> = parents.iter().copied().filter(|d| !self.dag.contains(d)).collect();
+        for &digest in &missing {
+            self.pending_cert_requests.insert(digest, from);
+        }
+        missing.into_iter().map(|digest| (from, SimMessage::CertificateRequest { digest })).collect()
+    }
+
+    /// Re-sends any still-outstanding `CertificateRequest`s, called once
+    /// per validator per tick alongside `maybe_propose`. Mirrors
+    /// `qchain-node::engine::Engine::retry_pending_resync_requests` -
+    /// see its doc comment for the full story: `missing_parent_requests`
+    /// only ever fired reactively (triggered by a fresh incoming message
+    /// referencing the same missing digest again), which is not enough
+    /// when the response to a request is what's lost, not just the
+    /// original broadcast. Found live via a real crash-loop test, not via
+    /// this harness, but closed here too so the simulator stays faithful
+    /// to what the real node now does.
+    pub fn retry_pending_cert_requests(&mut self) -> Vec<(ValidatorId, SimMessage)> {
+        let resolved: Vec<Digest> = self.pending_cert_requests.keys().copied().filter(|d| self.dag.contains(d)).collect();
+        for digest in &resolved {
+            self.pending_cert_requests.remove(digest);
+        }
+        self.pending_cert_requests.iter().map(|(&digest, &from)| (from, SimMessage::CertificateRequest { digest })).collect()
     }
 
     /// Mirrors `engine.rs`'s `handle_message`, synchronously.

@@ -138,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
             round_checkpoint_path,
             executed: 0,
             voted_for: HashMap::new(),
+            pending_cert_requests: HashMap::new(),
+            pending_batch_requests: HashMap::new(),
         }),
     });
 
@@ -159,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 engine.propose_round().await;
+                engine.retry_pending_resync_requests().await;
             }
         });
     }
