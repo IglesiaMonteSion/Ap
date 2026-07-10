@@ -157,7 +157,7 @@ mod tests {
     fn certificate_wire_size_scales_with_validator_count() {
         use qchain_core::{Certificate, Vertex};
 
-        for &n in &[3usize, 10, 20, 50] {
+        for &n in &[3usize, 10, 20, 50, 100, 200, 500] {
             let keypairs: Vec<_> = (0..n).map(|_| qchain_crypto::Keypair::generate().unwrap()).collect();
             let author = keypairs[0].pubkey();
             let vertex = Vertex { round: 100, author, batch_digest: [7u8; 32], parents: vec![[1u8; 32], [2u8; 32]] };
