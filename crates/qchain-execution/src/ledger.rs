@@ -4,13 +4,13 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::PARAMS_ACCOUNT_ID;
+use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID};
 use crate::native::NativeProgram;
 use crate::params::EconomicParams;
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
-use qchain_crypto::Pubkey;
+use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
 use qchain_storage::StateStore;
 use std::collections::HashMap;
 use wasmtime::Val;
@@ -82,21 +82,80 @@ impl Ledger {
             .unwrap_or_default()
     }
 
-    /// Verify the transaction, charge the byte-scaled base fee (split
-    /// between burning and `fee_collector`, per `ARCHITECTURE.md` §5),
-    /// then dispatch every instruction to its program. Instruction
-    /// execution uses a *working set* scoped to the accounts this
-    /// transaction actually references - not a clone of the whole store -
-    /// see the `blockchain-core-rust` skill for why that distinction is
-    /// load-bearing, not just an optimization.
+    /// The live on-chain algorithm registry - real, governance-mutable
+    /// (see `governance.rs`'s `apply_registry_action`), falling back to
+    /// `genesis_registry()` if `REGISTRY_ACCOUNT_ID` hasn't been seeded
+    /// (e.g. a bare `Ledger` built directly in a test). Read fresh on
+    /// every `apply_transaction`, same rationale as `current_params()` -
+    /// a passed `ActivateAlgorithm`/`DeprecateAlgorithm`/`RetireAlgorithm`
+    /// proposal takes effect on the very next transaction.
+    fn current_registry(&self) -> Vec<RegistryEntry> {
+        self.store
+            .get(&REGISTRY_ACCOUNT_ID)
+            .and_then(|a| Vec::<RegistryEntry>::try_from_slice(&a.data).ok())
+            .unwrap_or_else(qchain_crypto::registry::genesis_registry)
+    }
+
+    /// The real closure of the "the registry is bookkeeping only" gap (see
+    /// `project-lessons-learned`): rejects a transaction whose payer combo
+    /// includes a scheme that isn't registered at all, is `Retired`
+    /// outright, or - for a brand-new account only - is `Deprecated`
+    /// (existing accounts keep working through a scheme's deprecation
+    /// grace period, matching `AlgorithmStatus::Deprecated`'s own
+    /// documented semantics; only new accounts are turned away from it).
+    fn check_registry_status(&self, tx: &Transaction, is_new_account: bool) -> Result<(), ExecError> {
+        let Some(combo) = tx.resolved_combo() else {
+            return Err(ExecError::AlgorithmNotAcceptable("payer key bundle does not resolve to any known combo".to_string()));
+        };
+        let components = qchain_crypto::combo_components(combo)
+            .ok_or_else(|| ExecError::AlgorithmNotAcceptable(format!("unknown combo {combo:?}")))?;
+        let registry = self.current_registry();
+        for scheme in components {
+            match registry.iter().find(|e| e.id == *scheme).map(|e| &e.status) {
+                None => return Err(ExecError::AlgorithmNotAcceptable(format!("scheme {scheme:?} is not registered"))),
+                Some(AlgorithmStatus::Retired) => {
+                    return Err(ExecError::AlgorithmNotAcceptable(format!("scheme {scheme:?} is retired")))
+                }
+                Some(AlgorithmStatus::Deprecated { .. }) if is_new_account => {
+                    return Err(ExecError::AlgorithmNotAcceptable(format!(
+                        "scheme {scheme:?} is deprecated; no new accounts may adopt it"
+                    )))
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify the transaction, confirm every scheme in the payer's combo is
+    /// still acceptable per the live registry, charge the byte-scaled base
+    /// fee (split between burning and `fee_collector`, per
+    /// `ARCHITECTURE.md` §5), then dispatch every instruction to its
+    /// program. Instruction execution uses a *working set* scoped to the
+    /// accounts this transaction actually references - not a clone of the
+    /// whole store - see the `blockchain-core-rust` skill for why that
+    /// distinction is load-bearing, not just an optimization.
     pub fn apply_transaction(&mut self, tx: &Transaction, fee_collector: &Pubkey, current_round: Round) -> Result<u64, ExecError> {
         if !tx.verify_signature() {
             return Err(ExecError::InvalidSignature);
         }
 
+        let mut payer_account = self.store.get(&tx.message.payer).unwrap_or_else(|| {
+            let combo = tx.resolved_combo().unwrap_or(qchain_crypto::COMBO_HYBRID_ED25519_ML_DSA_65);
+            Account { algorithm_id: combo, ..Account::new_wallet(Pubkey::system_program_id()) }
+        });
+        // "New account" for registry-gating purposes means this is the
+        // first transaction ever *signed by* this address as a payer
+        // (nonce still at its initial 0) - not merely "does an Account
+        // row exist," since an address commonly exists already from
+        // passively receiving a transfer (native.rs's Transfer creates
+        // the destination account with no signature/combo check at all)
+        // long before it ever signs anything itself.
+        let is_first_transaction_from_this_payer = payer_account.nonce == 0;
+        self.check_registry_status(tx, is_first_transaction_from_this_payer)?;
+
         let params = self.current_params();
         let byte_fee = params.base_fee_per_byte * tx.byte_size() as u64;
-        let mut payer_account = self.store.get(&tx.message.payer).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
         if payer_account.balance < byte_fee {
             return Err(ExecError::InsufficientFunds);
         }
@@ -207,6 +266,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::GOVERNANCE_PROGRAM_ID;
     use crate::native::{SystemInstruction, SystemProgram};
     use qchain_core::{Instruction, BASE_FEE_PER_BYTE_UNITS, DUST_THRESHOLD_UNITS};
     use qchain_crypto::Keypair;
@@ -387,5 +447,157 @@ mod tests {
             N as f64 / exec_elapsed.as_secs_f64()
         );
         println!("byte_size per tx: {} bytes, fee at default rate ({BASE_FEE_PER_BYTE_UNITS}/byte): {fee} units", signed[0].byte_size());
+    }
+
+    /// The real closure of the "registry is bookkeeping only" gap (see
+    /// `project-lessons-learned`): a brand-new account signing with the
+    /// SLH-DSA triple combo must be rejected while SLH-DSA hasn't been
+    /// registered on this ledger at all - `combo_from_components` resolves
+    /// the combo fine, but the registry lookup has nothing to match.
+    #[test]
+    fn a_new_account_using_an_unregistered_slh_dsa_combo_is_rejected() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate_with_slh_dsa().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        // Credit by address directly - `credit` doesn't go through
+        // `apply_transaction`'s registry gate, only real transactions do.
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+
+        let err = ledger.apply_transaction(&tx, &validator, 0).unwrap_err();
+        assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
+    }
+
+    /// Same transaction as above, but this time SLH-DSA has genuinely been
+    /// activated on this ledger's registry (exactly what a passed
+    /// `Registry`-tier `ActivateAlgorithm` proposal's `Execute` does to
+    /// `REGISTRY_ACCOUNT_ID`) - now it must succeed. This is the concrete,
+    /// end-to-end proof that "activating" a scheme via governance really
+    /// does change what a validator accepts, not just a bookkeeping list.
+    #[test]
+    fn a_new_account_using_slh_dsa_succeeds_once_the_scheme_is_actually_active() {
+        let mut ledger = new_test_ledger();
+        let mut registry = qchain_crypto::registry::genesis_registry();
+        registry.push(qchain_crypto::slh_dsa_registry_entry(0));
+        ledger.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&registry).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+
+        let alice = Keypair::generate_with_slh_dsa().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
+        assert_eq!(ledger.get_balance(&bob), 50_000, "the SLH-DSA-combo transaction must have actually executed");
+    }
+
+    /// A scheme that's been `Retired` must be rejected outright, even for
+    /// an account that's used it since before retirement - the whole point
+    /// of `Retired` (vs. `Deprecated`) is "no longer valid for signing at
+    /// all" per `AlgorithmStatus`'s own docs.
+    #[test]
+    fn an_existing_account_is_rejected_once_its_scheme_is_retired() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        // First transaction succeeds normally (both schemes still Active).
+        let ix0 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+        };
+        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix0]).unwrap();
+        ledger.apply_transaction(&tx0, &validator, 0).unwrap();
+
+        // Now retire ML-DSA-65 (as if a passed RetireAlgorithm proposal's
+        // grace period fully elapsed) and try a second transaction from
+        // the same, already-existing account.
+        let mut registry = qchain_crypto::registry::genesis_registry();
+        registry[1].status = qchain_crypto::AlgorithmStatus::Retired;
+        assert_eq!(registry[1].id, qchain_crypto::ALGORITHM_ML_DSA_65);
+        ledger.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&registry).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+
+        let ix1 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+        };
+        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 100_000, vec![ix1]).unwrap();
+        let err = ledger.apply_transaction(&tx1, &validator, 0).unwrap_err();
+        assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
+    }
+
+    /// `Deprecated` only blocks *new* accounts from adopting a scheme -
+    /// existing accounts keep working through the grace period, per
+    /// `AlgorithmStatus::Deprecated`'s own documented semantics.
+    #[test]
+    fn an_existing_account_keeps_working_while_its_scheme_is_only_deprecated() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let ix0 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+        };
+        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix0]).unwrap();
+        ledger.apply_transaction(&tx0, &validator, 0).unwrap();
+
+        let mut registry = qchain_crypto::registry::genesis_registry();
+        registry[1].status = qchain_crypto::AlgorithmStatus::Deprecated { retirement_epoch: 1_000 };
+        ledger.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&registry).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+
+        let ix1 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 50_000 }).unwrap(),
+        };
+        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 100_000, vec![ix1]).unwrap();
+        ledger.apply_transaction(&tx1, &validator, 0).unwrap();
+        assert_eq!(ledger.get_balance(&bob), 100_000, "an existing account must keep working through the deprecation grace period");
+    }
+
+    /// The other half of the same rule: a *brand-new* account may not
+    /// adopt a `Deprecated` scheme, even though an existing account using
+    /// it is still fine (previous test).
+    #[test]
+    fn a_new_account_cannot_adopt_a_deprecated_scheme() {
+        let mut ledger = new_test_ledger();
+        let mut registry = qchain_crypto::registry::genesis_registry();
+        registry[1].status = qchain_crypto::AlgorithmStatus::Deprecated { retirement_epoch: 1_000 };
+        ledger.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&registry).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let err = ledger.apply_transaction(&tx, &validator, 0).unwrap_err();
+        assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
     }
 }

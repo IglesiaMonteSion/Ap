@@ -88,7 +88,7 @@ pub fn can_advance_round(dag: &DagStore, validators: &ValidatorSet, round: Round
 mod tests {
     use super::*;
     use qchain_core::{Batch, Vertex};
-    use qchain_crypto::{HybridSignature, Keypair};
+    use qchain_crypto::{MultiSignature, Keypair};
 
     struct TestValidator {
         keypair: Keypair,
@@ -109,7 +109,7 @@ mod tests {
 
     fn certify(vertex: Vertex, signers: &[TestValidator]) -> Certificate {
         let digest = vertex.digest();
-        let signatures: Vec<(qchain_core::ValidatorId, HybridSignature)> =
+        let signatures: Vec<(qchain_core::ValidatorId, MultiSignature)> =
             signers.iter().map(|v| (v.id, v.keypair.sign(&digest[..]).unwrap())).collect();
         Certificate { vertex, signatures }
     }
@@ -160,7 +160,7 @@ mod tests {
         let (tvs, validators) = make_validators(4);
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digest: [0u8; 32], parents: vec![] };
         let mut cert = certify(vertex, &tvs[..3]);
-        cert.signatures[0].1.ed25519.0[0] ^= 0xFF;
+        cert.signatures[0].1.components[0].bytes[0] ^= 0xFF;
         assert!(!verify_certificate(&cert, &validators), "a quorum count that includes a forged signature must not pass");
     }
 

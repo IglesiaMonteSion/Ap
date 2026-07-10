@@ -23,7 +23,7 @@
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex};
-use qchain_crypto::{HybridSignature, Keypair, Pubkey};
+use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
 use serde::Serialize;
@@ -36,7 +36,7 @@ pub struct EngineState {
     pub consensus: ConsensusState,
     pub mempool: Vec<Transaction>,
     pub batches: HashMap<Digest, Batch>,
-    pub pending_votes: HashMap<Digest, HashMap<ValidatorId, HybridSignature>>,
+    pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     pub own_pending_vertex: Option<Vertex>,
     pub next_round: Round,
     pub executed: u64,
@@ -166,7 +166,7 @@ impl Engine {
     /// moment quorum stake is reached, `None` otherwise (including when the
     /// vote is for a vertex that isn't this validator's own proposal - only
     /// a vertex's author collects its votes).
-    async fn record_vote(&self, vertex_digest: Digest, voter: ValidatorId, sig: HybridSignature) -> Option<Certificate> {
+    async fn record_vote(&self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature) -> Option<Certificate> {
         let mut state = self.state.lock().await;
         state.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
 

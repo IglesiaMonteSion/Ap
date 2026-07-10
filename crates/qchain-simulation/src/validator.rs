@@ -10,7 +10,7 @@
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Certificate, Digest, Round, ValidatorId, Vertex};
-use qchain_crypto::{HybridSignature, Keypair};
+use qchain_crypto::{Keypair, MultiSignature};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub enum ByzantineBehavior {
 #[derive(Clone, Debug)]
 pub enum SimMessage {
     VertexProposal(Vertex),
-    Vote { vertex_digest: Digest, signature: HybridSignature },
+    Vote { vertex_digest: Digest, signature: MultiSignature },
     CertificateBroadcast(Certificate),
 }
 
@@ -39,7 +39,7 @@ pub struct SimValidator {
     pub dag: DagStore,
     pub consensus: ConsensusState,
     own_pending_vertex: Option<Vertex>,
-    pending_votes: HashMap<Digest, HashMap<ValidatorId, HybridSignature>>,
+    pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     voted_for: HashMap<(Round, ValidatorId), Digest>,
     next_round: Round,
     /// Total order as this validator has observed it commit, in order -
@@ -164,7 +164,7 @@ impl SimValidator {
         }
     }
 
-    fn record_vote(&mut self, vertex_digest: Digest, voter: ValidatorId, sig: HybridSignature, validators: &ValidatorSet) -> Option<Certificate> {
+    fn record_vote(&mut self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature, validators: &ValidatorSet) -> Option<Certificate> {
         self.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
         let vertex = self.own_pending_vertex.as_ref()?;
         if vertex.digest() != vertex_digest {

@@ -19,4 +19,6 @@ pub enum ExecError {
     Wasm(String),
     #[error("out of gas")]
     OutOfGas,
+    #[error("algorithm not acceptable: {0}")]
+    AlgorithmNotAcceptable(String),
 }

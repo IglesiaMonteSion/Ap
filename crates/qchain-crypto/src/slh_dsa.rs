@@ -1,17 +1,13 @@
-//! Real SLH-DSA (SPHINCS+) support via liboqs, added as an *opt-in*
-//! standalone scheme - registered as `ALGORITHM_SLH_DSA` in `registry.rs`,
-//! but (see that constant's doc comment) **not yet wired into**
-//! `Transaction`/`Certificate` signature verification, consensus vote
-//! verification, or the WASM `host_verify_signature` syscall. All three of
-//! those still hardcode exactly the Ed25519+ML-DSA-65 pair via
-//! `PublicKeyBundle`/`HybridSignature`, which are fixed two-field types, not
-//! a generic `{scheme_id, bytes}` shape - making SLH-DSA (or any third
-//! scheme) a real, accepted signature type for accounts/consensus is a
-//! separate, larger change (touches `qchain-core`, `qchain-consensus`,
-//! `qchain-network`, `qchain-execution`) deliberately deferred, not started
-//! here. What *is* real and tested here: genuine liboqs keygen/sign/verify
-//! for the chosen parameter set, ready to be plugged in once that wiring
-//! happens.
+//! Real SLH-DSA (SPHINCS+) support via liboqs - registered as
+//! `ALGORITHM_SLH_DSA` in `registry.rs`, and a real, selectable third
+//! factor via `COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA`
+//! (`Keypair::generate_with_slh_dsa`). `Transaction`/consensus vote
+//! verification (`qchain_crypto::verify`, via the generic
+//! `PublicKeyBundle`/`MultiSignature` types) and `Ledger::apply_transaction`
+//! (which checks the live on-chain registry's status for every component of
+//! the resolved combo) both actually accept it now - see
+//! `project-lessons-learned` for the finding that motivated wiring this in,
+//! and `registry::combo_components`/`verify`'s docs for exactly how.
 //!
 //! Parameter set: `SPHINCS+-SHA2-256s-simple` - NIST security level 5 (the
 //! highest available), "s" (small-signature, slower-signing) variant. Per
@@ -48,6 +44,17 @@ impl SlhDsaKeypair {
 
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.pk
+    }
+
+    pub fn secret_key_bytes(&self) -> &[u8] {
+        &self.sk
+    }
+
+    /// Reconstructs a keypair from raw key material - used when loading a
+    /// persisted keypair file (liboqs can't re-derive the public key from
+    /// the secret key alone, so both must round-trip together).
+    pub fn from_raw_parts(pk: Vec<u8>, sk: Vec<u8>) -> Self {
+        SlhDsaKeypair { pk, sk }
     }
 
     pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {

@@ -1,11 +1,17 @@
 //! The on-chain algorithm registry (design: `ARCHITECTURE.md` §2). Phase 1
 //! ships exactly two entries - Ed25519 (classical half) and ML-DSA-65 (PQC
 //! half) - and every account's signature is the mandatory combination of
-//! both (see `HybridSignature`/`verify`). The registry exists as a real,
+//! both (see `MultiSignature`/`verify`). The registry exists as a real,
 //! extensible data structure from day one so that adding a scheme later
 //! (SLH-DSA opt-in, ML-DSA-87 for higher-value accounts) or deprecating one
 //! is a governance action over this table, not a protocol rewrite - that's
 //! the whole point of "migración trivial, no hard fork."
+//!
+//! A **combo** (`AlgorithmId >= 1000`) names an ordered, fixed list of
+//! individual scheme components an account's key bundle must contain -
+//! `combo_components`/`combo_from_components` are the real, load-bearing
+//! link between the registry's `AlgorithmId`s and what `qchain_crypto::verify`
+//! actually accepts (see that function's docs for exactly how).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -22,11 +28,15 @@ pub const ALGORITHM_ML_DSA_65: AlgorithmId = AlgorithmId(2);
 /// hash-based/"s" was chosen: conservative opt-in fallback for
 /// high-value/long-lived accounts, where minimizing signature size matters
 /// more than signing speed). Real keygen/sign/verify functions live in
-/// `qchain_crypto::slh_dsa` - **not yet wired into `Transaction`, consensus
-/// vote signatures, or the WASM `host_verify_signature` syscall**, all of
-/// which still hardcode the Ed25519+ML-DSA-65 pair (see
-/// `project-lessons-learned` for why "activating" this id via governance
-/// today is bookkeeping only, not a change in what a validator accepts).
+/// `qchain_crypto::slh_dsa`, and it's a real, selectable third factor via
+/// `COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA` - `Transaction`/consensus vote
+/// verification actually accept it now (`qchain_crypto::verify` resolves the
+/// combo from the bundle's components, see that function's docs), and
+/// `Ledger::apply_transaction` (`qchain-execution`) rejects any transaction
+/// whose combo includes a `Retired` component per the live on-chain
+/// registry - "activating" this id via governance now has real teeth, not
+/// just bookkeeping (see `project-lessons-learned` for the finding that led
+/// here).
 pub const ALGORITHM_SLH_DSA: AlgorithmId = AlgorithmId(3);
 // Ids 4-999 are reserved for individual signature scheme components,
 // allocated by governance vote in later phases (other SLH-DSA parameter
@@ -34,13 +44,49 @@ pub const ALGORITHM_SLH_DSA: AlgorithmId = AlgorithmId(3);
 // retirement.
 
 /// Ids >= 1000 identify a *combination policy* an account can be under, not
-/// a single scheme - what `Account.algorithm_id` actually stores. Phase 1
-/// has exactly one: the mandatory Ed25519+ML-DSA-65 hybrid. The eventual
-/// "migración completa a solo-PQC" governance vote (`ARCHITECTURE.md` §6)
-/// activates a *new* combo id here (e.g. "ML-DSA-65 only") rather than
-/// redefining this one - existing accounts keep working under the combo
-/// they were created with until they migrate.
+/// a single scheme - what `Account.algorithm_id` actually stores, and what
+/// `qchain_crypto::verify` resolves a `PublicKeyBundle`/`MultiSignature`
+/// pair against (see `combo_components`). Phase 1 ships exactly one: the
+/// mandatory Ed25519+ML-DSA-65 hybrid. The eventual "migración completa a
+/// solo-PQC" governance vote (`ARCHITECTURE.md` §6) activates a *new* combo
+/// id here (e.g. "ML-DSA-65 only") rather than redefining this one -
+/// existing accounts keep working under the combo they were created with
+/// until they migrate.
 pub const COMBO_HYBRID_ED25519_ML_DSA_65: AlgorithmId = AlgorithmId(1000);
+/// Opt-in triple hybrid: the mandatory phase-1 pair, plus SLH-DSA as a third
+/// mandatory factor - all three components must independently verify. For
+/// high-value/long-lived accounts per `pqc-cryptography`'s SLH-DSA section;
+/// not the default (`Keypair::generate()` still produces the phase-1 pair -
+/// see `Keypair::generate_with_slh_dsa()` to opt in). Costs materially more
+/// in fees (`byte_size()` sums every component's real length, and SLH-DSA's
+/// signature alone is 29,792 bytes - see `qchain_crypto::slh_dsa`), which is
+/// the accepted trade for the extra hash-based conservative margin.
+pub const COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA: AlgorithmId = AlgorithmId(1001);
+
+/// The ordered list of individual scheme components a combo requires, or
+/// `None` if `id` isn't a known combo. Order matters: `verify` matches
+/// components positionally against this list, and `Keypair::sign`/
+/// `public_key_bundle` build components in this exact order.
+pub fn combo_components(id: AlgorithmId) -> Option<&'static [AlgorithmId]> {
+    if id == COMBO_HYBRID_ED25519_ML_DSA_65 {
+        Some(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65])
+    } else if id == COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA {
+        Some(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA])
+    } else {
+        None
+    }
+}
+
+/// Reverse lookup: which known combo (if any) requires exactly this
+/// ordered list of schemes. This is the real gate against an attacker
+/// self-declaring a bundle with a missing/extra/substituted component and
+/// having it accepted - `qchain_crypto::verify` calls this on every
+/// verification and rejects outright if no combo matches (see its docs).
+pub fn combo_from_components(schemes: &[AlgorithmId]) -> Option<AlgorithmId> {
+    [COMBO_HYBRID_ED25519_ML_DSA_65, COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA]
+        .into_iter()
+        .find(|&combo| combo_components(combo) == Some(schemes))
+}
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum AlgorithmStatus {
@@ -134,5 +180,31 @@ mod tests {
         assert_eq!(entry.max_sig_len, 29_792);
         assert_eq!(entry.activation_epoch, 42);
         assert_eq!(entry.status, AlgorithmStatus::Active);
+    }
+
+    #[test]
+    fn combo_components_are_ordered_and_known_combos_round_trip() {
+        assert_eq!(combo_components(COMBO_HYBRID_ED25519_ML_DSA_65), Some(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65][..]));
+        assert_eq!(
+            combo_components(COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA),
+            Some(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA][..])
+        );
+        assert_eq!(combo_components(AlgorithmId(9999)), None);
+
+        assert_eq!(combo_from_components(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65]), Some(COMBO_HYBRID_ED25519_ML_DSA_65));
+        assert_eq!(
+            combo_from_components(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA]),
+            Some(COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA)
+        );
+    }
+
+    #[test]
+    fn combo_from_components_rejects_missing_extra_or_reordered_schemes() {
+        // Dropping the mandatory PQC half.
+        assert_eq!(combo_from_components(&[ALGORITHM_ED25519]), None);
+        // Reordered - not the same combo even though the set matches.
+        assert_eq!(combo_from_components(&[ALGORITHM_ML_DSA_65, ALGORITHM_ED25519]), None);
+        // An extra, unregistered scheme appended.
+        assert_eq!(combo_from_components(&[ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, AlgorithmId(777)]), None);
     }
 }

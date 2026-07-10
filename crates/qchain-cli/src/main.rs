@@ -29,6 +29,15 @@ enum Command {
     Keygen {
         #[arg(short, long)]
         out: PathBuf,
+        /// Opt into the triple hybrid (Ed25519+ML-DSA-65+SLH-DSA) instead
+        /// of the default pair - see the `pqc-cryptography` skill for why
+        /// this costs materially more in fees (a ~29.8KB signature
+        /// component) and is meant for high-value/long-lived accounts,
+        /// not everyday wallets. Requires SLH-DSA to actually be `Active`
+        /// on the target node's registry before any transaction using it
+        /// will be accepted (see `qchain propose-activate`).
+        #[arg(long)]
+        slh_dsa: bool,
     },
     /// Print the address a keypair file corresponds to.
     Address {
@@ -334,11 +343,14 @@ fn parse_vote_choice(s: &str) -> anyhow::Result<VoteChoice> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Keygen { out } => {
-            let keypair = Keypair::generate()?;
+        Command::Keygen { out, slh_dsa } => {
+            let keypair = if slh_dsa { Keypair::generate_with_slh_dsa()? } else { Keypair::generate()? };
             qchain_crypto::write_keypair_file(&keypair, &out)?;
             println!("wrote keypair to {}", out.display());
             println!("address: {}", keypair.pubkey());
+            if slh_dsa {
+                println!("combo: triple hybrid (Ed25519+ML-DSA-65+SLH-DSA) - requires SLH-DSA to be Active on the target node's registry");
+            }
         }
         Command::Address { keypair } => {
             let kp = qchain_crypto::read_keypair_file(&keypair)?;

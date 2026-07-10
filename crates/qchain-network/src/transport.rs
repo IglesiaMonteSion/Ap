@@ -140,7 +140,7 @@ mod tests {
         assert!(matches!(msg2, NetMessage::Vote { .. }));
     }
 
-    fn sample_signature() -> qchain_crypto::HybridSignature {
+    fn sample_signature() -> qchain_crypto::MultiSignature {
         let kp = qchain_crypto::Keypair::generate().unwrap();
         kp.sign(b"test").unwrap()
     }

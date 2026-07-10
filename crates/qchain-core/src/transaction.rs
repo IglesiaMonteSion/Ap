@@ -1,5 +1,5 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use qchain_crypto::{HybridSignature, Keypair, PublicKeyBundle, Pubkey};
+use qchain_crypto::{Keypair, MultiSignature, PublicKeyBundle, Pubkey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
@@ -40,7 +40,7 @@ pub struct Message {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Transaction {
     pub message: Message,
-    pub signature: HybridSignature,
+    pub signature: MultiSignature,
 }
 
 impl Transaction {
@@ -67,8 +67,10 @@ impl Transaction {
     }
 
     /// Checks the attached key bundle hashes to the claimed payer address,
-    /// then verifies both signature halves. Both checks must pass - see
-    /// `ARCHITECTURE.md` §2's hybrid signature policy.
+    /// then verifies every signature component of the combo the bundle
+    /// resolves to. See `ARCHITECTURE.md` §2's hybrid signature policy and
+    /// `qchain_crypto::verify`'s docs for exactly how an incomplete or
+    /// substituted combo gets rejected, not silently accepted.
     pub fn verify_signature(&self) -> bool {
         if self.message.payer_keys.to_address() != self.message.payer {
             return false;
@@ -79,6 +81,17 @@ impl Transaction {
         }
     }
 
+    /// Which combo the payer's key bundle resolves to (`None` if it doesn't
+    /// resolve to any known combo at all). Callers that need this - e.g.
+    /// `Ledger::apply_transaction` checking the live on-chain registry's
+    /// status for each of the combo's component schemes - should still call
+    /// `verify_signature()` first; this alone does not check that the
+    /// attached signature actually verifies.
+    pub fn resolved_combo(&self) -> Option<qchain_crypto::AlgorithmId> {
+        let schemes: Vec<qchain_crypto::AlgorithmId> = self.message.payer_keys.components.iter().map(|c| c.scheme).collect();
+        qchain_crypto::combo_from_components(&schemes)
+    }
+
     /// Content-addressed id, used as the transaction's handle in RPC
     /// responses and as the digest included in a Narwhal batch.
     pub fn hash(&self) -> [u8; 32] {
@@ -86,18 +99,22 @@ impl Transaction {
         if let Ok(bytes) = borsh::to_vec(&self.message) {
             hasher.update(bytes);
         }
-        hasher.update(self.signature.ed25519.0);
-        hasher.update(&self.signature.mldsa);
+        for component in &self.signature.components {
+            hasher.update(component.scheme.0.to_le_bytes());
+            hasher.update(&component.bytes);
+        }
         hasher.finalize().into()
     }
 
     /// Serialized byte size - what the fee's byte-scaled component prices
-    /// (`ARCHITECTURE.md` §5). Dominated by the ML-DSA-65 signature and
-    /// (on first use of an address) the public key bundle.
+    /// (`ARCHITECTURE.md` §5). Dominated by the PQC signature component(s)
+    /// and (on first use of an address) the public key bundle - scales up
+    /// automatically for a triple-hybrid (SLH-DSA opt-in) combo, since it
+    /// sums every signature component's real length rather than assuming a
+    /// fixed two-component shape.
     pub fn byte_size(&self) -> usize {
         borsh::to_vec(&self.message).map(|b| b.len()).unwrap_or(0)
-            + 64
-            + self.signature.mldsa.len()
+            + self.signature.components.iter().map(|c| c.bytes.len()).sum::<usize>()
     }
 }
 

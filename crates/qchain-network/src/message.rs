@@ -8,7 +8,7 @@
 //! out-of-scope list).
 
 use qchain_core::{Batch, Certificate, Digest, ValidatorId, Vertex};
-use qchain_crypto::HybridSignature;
+use qchain_crypto::MultiSignature;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -20,7 +20,7 @@ pub enum NetMessage {
     VertexProposal(Vertex),
     /// A peer's vote (signature over the vertex digest) sent back to the
     /// vertex's author.
-    Vote { vertex_digest: Digest, signature: HybridSignature },
+    Vote { vertex_digest: Digest, signature: MultiSignature },
     /// A quorum-certified vertex, broadcast once its author collects 2f+1
     /// vote stake.
     CertificateBroadcast(Certificate),

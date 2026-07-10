@@ -8,7 +8,7 @@
 //! edges" convention.
 
 use crate::transaction::Transaction;
-use qchain_crypto::HybridSignature;
+use qchain_crypto::MultiSignature;
 use qchain_crypto::Pubkey;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Sha3_256};
@@ -73,7 +73,7 @@ impl Vertex {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Certificate {
     pub vertex: Vertex,
-    pub signatures: Vec<(ValidatorId, HybridSignature)>,
+    pub signatures: Vec<(ValidatorId, MultiSignature)>,
 }
 
 impl Certificate {
