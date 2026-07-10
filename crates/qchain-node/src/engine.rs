@@ -12,14 +12,22 @@
 //! entries for vertices that never reach quorum. All are noted as phase-2
 //! hardening work in the `blockchain-core-rust` skill.
 //!
-//! **Known liveness gap (found via load testing, see
-//! `project-lessons-learned`):** a transaction whose nonce is ahead of its
-//! account's current nonce at commit time (e.g. several transactions from
-//! one account submitted concurrently, arriving at the mempool out of
-//! order) fails in `try_commit` below and is silently dropped forever -
-//! there is no per-account mempool ordering and no retry queue. Any client
-//! issuing more than one transaction per account without waiting for each
-//! to confirm first risks losing transactions, not just delaying them.
+//! **Mempool nonce-ordering bug (found via load testing, see
+//! `project-lessons-learned`) - fixed.** The mempool used to be a flat
+//! `Vec<Transaction>`, drained wholesale into a batch every round in
+//! whatever order transactions happened to arrive. Two transactions from
+//! the same account submitted concurrently could land in mempool - and
+//! therefore in the same batch - out of nonce order; `try_commit` applies
+//! a batch's transactions in order and never retries a failure, so a
+//! higher-nonce transaction processed before its lower-nonce predecessor
+//! failed with a nonce mismatch and was silently dropped forever. Worse,
+//! a transaction that simply hadn't arrived at this validator yet by the
+//! time its round's batch was formed suffered the same fate: included
+//! without its predecessor, rejected, gone. Fixed by keying the mempool
+//! per-account and by nonce (`drain_ready_transactions`) - a transaction
+//! only ever enters a batch once every lower nonce for its account is
+//! already accounted for, and anything with a gap ahead of it just stays
+//! queued for a later round instead of being drained blindly.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex};
@@ -27,14 +35,18 @@ use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::Mutex;
 
 pub struct EngineState {
     pub ledger: Ledger,
     pub dag: DagStore,
     pub consensus: ConsensusState,
-    pub mempool: Vec<Transaction>,
+    /// Per-account, nonce-ordered mempool - see the module docs above for
+    /// the real bug a flat `Vec` had. Keyed by payer, then by nonce; a
+    /// resubmission for a (payer, nonce) pair that's already queued is
+    /// ignored, keeping whichever transaction arrived first.
+    pub mempool: HashMap<Pubkey, BTreeMap<u64, Transaction>>,
     pub batches: HashMap<Digest, Batch>,
     pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     pub own_pending_vertex: Option<Vertex>,
@@ -99,6 +111,38 @@ pub enum StarkProofError {
     ChainBroken(String),
 }
 
+/// Pulls every transaction that's actually ready to execute out of the
+/// mempool, per account, in nonce order - see the module docs for the real
+/// bug this replaces. For each account with queued transactions: first
+/// drop anything at or below the account's current on-chain nonce (already
+/// applied, whether by this validator or - in a multi-node network - by
+/// whichever validator's batch got committed first; it can never apply
+/// again), then consume consecutive nonces starting from the account's
+/// current nonce for as long as they're present. The first gap stops that
+/// account's contribution for this round; everything after the gap stays
+/// queued, not silently dropped.
+fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
+    let mut ready = Vec::new();
+    let mut empty_accounts = Vec::new();
+    for (payer, queue) in state.mempool.iter_mut() {
+        let mut expected_nonce = state.ledger.store().get(payer).map(|a| a.nonce).unwrap_or(0);
+        while queue.keys().next().is_some_and(|&n| n < expected_nonce) {
+            queue.pop_first();
+        }
+        while let Some(tx) = queue.remove(&expected_nonce) {
+            ready.push(tx);
+            expected_nonce += 1;
+        }
+        if queue.is_empty() {
+            empty_accounts.push(*payer);
+        }
+    }
+    for payer in empty_accounts {
+        state.mempool.remove(&payer);
+    }
+    ready
+}
+
 impl Engine {
     /// Admits a client-submitted transaction into the local mempool once
     /// its hybrid signature checks out. No nonce/balance admission control
@@ -111,7 +155,7 @@ impl Engine {
         }
         let hash = tx.hash();
         let mut state = self.state.lock().await;
-        state.mempool.push(tx);
+        state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx);
         Ok(hash)
     }
 
@@ -363,7 +407,7 @@ impl Engine {
                 }
             }
 
-            let txs: Vec<Transaction> = state.mempool.drain(..).collect();
+            let txs: Vec<Transaction> = drain_ready_transactions(&mut state);
             let batch = Batch { transactions: txs };
             let batch_digest = batch.digest();
             let parents: Vec<Digest> = if round == 0 {
@@ -396,5 +440,125 @@ impl Engine {
             self.network.broadcast(&NetMessage::CertificateBroadcast(cert)).await;
             self.try_commit().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qchain_core::{Account, Transaction};
+    use qchain_crypto::Keypair;
+    use qchain_execution::Ledger;
+    use qchain_storage::InMemoryStore;
+
+    fn new_state() -> EngineState {
+        EngineState {
+            ledger: Ledger::new(Box::new(InMemoryStore::new())).unwrap(),
+            dag: DagStore::new(),
+            consensus: ConsensusState::new(),
+            mempool: HashMap::new(),
+            batches: HashMap::new(),
+            pending_votes: HashMap::new(),
+            own_pending_vertex: None,
+            next_round: 0,
+            executed: 0,
+            voted_for: HashMap::new(),
+        }
+    }
+
+    fn tx(payer: &Keypair, nonce: u64) -> Transaction {
+        Transaction::new_signed(payer, nonce, [0u8; 32], 1, vec![]).unwrap()
+    }
+
+    /// The exact bug this replaces: two transactions from the same account
+    /// arrive out of nonce order (a real race under concurrent submission).
+    /// The old flat-`Vec` mempool would include both in whatever order they
+    /// landed - if the higher nonce came first in the batch, it failed and
+    /// was dropped forever. The fixed mempool must always emit them in
+    /// ascending nonce order regardless of arrival/insertion order.
+    #[test]
+    fn transactions_are_emitted_in_ascending_nonce_order_regardless_of_arrival_order() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+
+        // Insert nonce 1 before nonce 0 - simulating the exact race that
+        // used to lose a transaction.
+        let tx1 = tx(&alice, 1);
+        let tx0 = tx(&alice, 0);
+        state.mempool.entry(alice.pubkey()).or_default().insert(1, tx1.clone());
+        state.mempool.entry(alice.pubkey()).or_default().insert(0, tx0.clone());
+
+        let ready = drain_ready_transactions(&mut state);
+        assert_eq!(ready.len(), 2, "both transactions must be included, not just one");
+        assert_eq!(ready[0].message.nonce, 0);
+        assert_eq!(ready[1].message.nonce, 1);
+    }
+
+    /// A transaction whose predecessor hasn't arrived yet must stay queued,
+    /// not be dropped - it should surface in a later round once the gap is
+    /// filled, rather than vanishing.
+    #[test]
+    fn a_transaction_with_a_missing_predecessor_stays_queued_instead_of_being_dropped() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+
+        // Only nonce 1 has arrived; nonce 0 (the account's current expected
+        // nonce) is still missing.
+        state.mempool.entry(alice.pubkey()).or_default().insert(1, tx(&alice, 1));
+
+        let ready = drain_ready_transactions(&mut state);
+        assert!(ready.is_empty(), "a transaction with a gap ahead of it must not be included yet");
+        assert_eq!(state.mempool.get(&alice.pubkey()).map(|q| q.len()), Some(1), "it must remain queued, not be dropped");
+
+        // Once the missing nonce 0 arrives, both become ready together.
+        state.mempool.entry(alice.pubkey()).or_default().insert(0, tx(&alice, 0));
+        let ready = drain_ready_transactions(&mut state);
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].message.nonce, 0);
+        assert_eq!(ready[1].message.nonce, 1);
+    }
+
+    /// Entries at or below the account's current on-chain nonce (already
+    /// applied, e.g. via another validator's batch in a multi-node
+    /// network) must be garbage-collected rather than left to accumulate
+    /// or block newer nonces forever.
+    #[test]
+    fn stale_entries_below_the_current_nonce_are_garbage_collected() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        // Account's on-chain nonce is already 2 - nonce 0 and 1 are stale.
+        state.ledger.seed_account(
+            alice.pubkey(),
+            Account { nonce: 2, ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
+        );
+        state.mempool.entry(alice.pubkey()).or_default().insert(0, tx(&alice, 0));
+        state.mempool.entry(alice.pubkey()).or_default().insert(1, tx(&alice, 1));
+        state.mempool.entry(alice.pubkey()).or_default().insert(2, tx(&alice, 2));
+
+        let ready = drain_ready_transactions(&mut state);
+        assert_eq!(ready.len(), 1, "only the one transaction matching the real current nonce should be ready");
+        assert_eq!(ready[0].message.nonce, 2);
+        assert!(!state.mempool.contains_key(&alice.pubkey()), "the now-empty per-account queue must be cleaned up too");
+    }
+
+    /// Different accounts are independent - a gap in one account's nonce
+    /// sequence must not block another account's ready transactions.
+    #[test]
+    fn independent_accounts_dont_block_each_other() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+        state.ledger.seed_account(bob.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+
+        // Alice has a gap (missing nonce 0); Bob is ready at nonce 0.
+        state.mempool.entry(alice.pubkey()).or_default().insert(1, tx(&alice, 1));
+        state.mempool.entry(bob.pubkey()).or_default().insert(0, tx(&bob, 0));
+
+        let ready = drain_ready_transactions(&mut state);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].message.payer, bob.pubkey());
     }
 }

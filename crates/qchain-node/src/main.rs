@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             ledger,
             dag: DagStore::new(),
             consensus: ConsensusState::new(),
-            mempool: Vec::new(),
+            mempool: HashMap::new(),
             batches: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
