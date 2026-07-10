@@ -12,6 +12,7 @@ qchain-core = { path = "../qchain-core" }
 qchain-crypto = { path = "../qchain-crypto" }
 qchain-execution = { path = "../qchain-execution" }
 qchain-governance = { path = "../qchain-governance" }
+qchain-stark = { path = "../qchain-stark" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

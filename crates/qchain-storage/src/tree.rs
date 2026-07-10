@@ -113,7 +113,10 @@ fn compute_proof(leaves: &[Leaf], depth: usize, target: &[u8; 32], empty: &[[u8;
     leaf_hash
 }
 
-#[derive(Clone, Debug)]
+/// Serialize/Deserialize added for real transport - a light client
+/// receiving a `qchain-stark` state-bound proof over RPC needs these
+/// over the wire, not just in-process.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MerkleProof {
     pub key: [u8; 32],
     /// `None` if this proves the account does *not* exist (exclusion

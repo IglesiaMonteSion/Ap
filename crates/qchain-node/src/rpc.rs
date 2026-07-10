@@ -2,8 +2,8 @@
 //! wallet/client traffic - what `qchain-cli` talks to. Deliberately small:
 //! submit a transaction, read an account, read node status.
 
-use crate::engine::{Engine, StatusResponse};
-use axum::extract::{Path, State};
+use crate::engine::{Engine, StarkProofError, StarkProofResponse, StatusResponse};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -17,6 +17,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/tx", post(submit_tx))
         .route("/account/:address", get(get_account))
         .route("/status", get(status))
+        .route("/root", get(root))
+        .route("/stark_proof", get(stark_proof))
         .with_state(engine)
 }
 
@@ -32,4 +34,28 @@ async fn get_account(State(engine): State<Arc<Engine>>, Path(address): Path<Stri
 
 async fn status(State(engine): State<Arc<Engine>>) -> Json<StatusResponse> {
     Json(engine.status().await)
+}
+
+async fn root(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    let (root, receipt_count) = engine.merkle_root().await;
+    Json(json!({ "root": hex::encode(root), "receipt_count": receipt_count }))
+}
+
+#[derive(serde::Deserialize)]
+struct StarkProofQuery {
+    /// Prove only the most recent `limit` captured transfer receipts
+    /// instead of every one ever captured - bounds proving cost for a
+    /// caller that only wants recent history. Omit for "all of them".
+    limit: Option<usize>,
+}
+
+async fn stark_proof(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<StarkProofQuery>,
+) -> Result<Json<StarkProofResponse>, (StatusCode, String)> {
+    engine.stark_proof(query.limit).await.map(Json).map_err(|e| match e {
+        StarkProofError::NoReceipts => (StatusCode::NOT_FOUND, e.to_string()),
+        StarkProofError::Prove(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        StarkProofError::ChainBroken(_) => (StatusCode::CONFLICT, e.to_string()),
+    })
 }

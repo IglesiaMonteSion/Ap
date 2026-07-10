@@ -5,13 +5,14 @@
 
 use crate::error::ExecError;
 use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID};
-use crate::native::NativeProgram;
+use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
+use crate::receipt::{OverlayStore, TransferReceipt};
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
-use qchain_storage::StateStore;
+use qchain_storage::{MerkleProof, StateStore, StateTree};
 use std::collections::HashMap;
 use wasmtime::Val;
 
@@ -29,6 +30,12 @@ pub struct Ledger {
     programs: HashMap<Pubkey, Program>,
     wasm: WasmExecutor,
     pub total_burned: u64,
+    tree: StateTree,
+    /// Real captured before/after state for every single-instruction
+    /// `Transfer` this ledger has applied - see `receipt.rs` module docs
+    /// for exactly what's captured, why it's scoped this narrowly, and
+    /// the deliberate "unbounded in-memory `Vec`" limitation.
+    transfer_receipts: Vec<TransferReceipt>,
 }
 
 impl Ledger {
@@ -38,6 +45,8 @@ impl Ledger {
             programs: HashMap::new(),
             wasm: WasmExecutor::new()?,
             total_burned: 0,
+            tree: StateTree::new(),
+            transfer_receipts: Vec::new(),
         })
     }
 
@@ -47,6 +56,22 @@ impl Ledger {
 
     pub fn store(&self) -> &dyn StateStore {
         self.store.as_ref()
+    }
+
+    /// The live root of the real state tree (`qchain-storage`'s
+    /// SHA3-256 sparse Merkle tree) over whatever this ledger currently
+    /// holds - recomputed from the full leaf set on every call (a
+    /// documented, accepted `qchain-storage` simplification, not new
+    /// here; see `tree.rs`'s own module docs).
+    pub fn merkle_root(&self) -> [u8; 32] {
+        self.tree.root(self.store.as_ref())
+    }
+
+    /// Every `Transfer` receipt captured so far, oldest first - the raw
+    /// material a light-client-facing RPC endpoint proves a
+    /// `qchain-stark` batch from. See `receipt.rs` for scope.
+    pub fn transfer_receipts(&self) -> &[TransferReceipt] {
+        &self.transfer_receipts
     }
 
     /// Writes an account directly into the store - genesis-time seeding
@@ -165,6 +190,44 @@ impl Ledger {
                 payer_account.nonce, tx.message.nonce
             )));
         }
+        // Snapshot "before" state for a `qchain-stark` receipt *here* -
+        // strictly before the byte-scaled fee is deducted below - because
+        // the STARK's conservation equation is
+        // `from_after == from_before - amount - fee`: it subtracts the fee
+        // itself, so `from_before` must be the balance *prior to* the fee
+        // deduction too, not just prior to the `Transfer` instruction. A
+        // previous version of this code captured `from_before`/`root_before`
+        // from the post-fee-deduction store (via the `working` set built
+        // below, which is only ever populated from `self.store` after the
+        // fee was already committed to it) - real bug caught by
+        // `a_single_instruction_transfer_captures_a_real_verifiable_receipt`
+        // failing with the fee silently double-counted in the conservation
+        // check. Only the exact shape `qchain-stark`'s AIR models applies:
+        // a single-instruction transaction whose one instruction is a
+        // `Transfer` (see `receipt.rs` module docs for why - `SystemProgram`
+        // already enforces `from == payer`, so this covers every real
+        // self-paying transfer). `self.store` is still untouched at this
+        // point, so no overlay is needed - a direct read is the real
+        // pre-transaction state.
+        #[allow(clippy::type_complexity)]
+        let pre_capture: Option<(Pubkey, Pubkey, u64, Account, Account, [u8; 32], MerkleProof, MerkleProof)> =
+            if tx.message.instructions.len() == 1 && tx.message.instructions[0].program_id == Pubkey::system_program_id() {
+                let ix = &tx.message.instructions[0];
+                match (SystemInstruction::try_from_slice(&ix.data), ix.accounts.first(), ix.accounts.get(1)) {
+                    (Ok(SystemInstruction::Transfer { amount }), Some(&from), Some(&to)) => {
+                        let root_before = self.tree.root(self.store.as_ref());
+                        let from_proof_before = self.tree.prove(self.store.as_ref(), &from);
+                        let to_proof_before = self.tree.prove(self.store.as_ref(), &to);
+                        let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                        let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                        Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
         payer_account.balance -= byte_fee;
         payer_account.nonce += 1;
         self.store.set(tx.message.payer, payer_account.clone());
@@ -200,6 +263,39 @@ impl Ledger {
                     total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working, params.gas_price_per_fuel)?;
                 }
             }
+        }
+
+        // Capture the "after" half now - deliberately *before* the dust
+        // sweep below, since the STARK's conservation equations model
+        // the transfer's own raw arithmetic, not the dust-sweep
+        // adjustment that may still zero a resulting balance
+        // afterward - same class of documented simplification as
+        // `qchain-stark`'s own "doesn't re-derive full Ledger fee/nonce
+        // semantics" scope note.
+        if let Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before)) = pre_capture {
+            let overlay = OverlayStore { base: self.store.as_ref(), overlay: &working };
+            let root_after = self.tree.root(&overlay);
+            let from_proof_after = self.tree.prove(&overlay, &from);
+            let to_proof_after = self.tree.prove(&overlay, &to);
+            let from_after = working.get(&from).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+            let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+            self.transfer_receipts.push(TransferReceipt {
+                tx_hash: tx.hash(),
+                from,
+                to,
+                amount,
+                fee: byte_fee,
+                root_before,
+                root_after,
+                from_before,
+                from_after,
+                to_before,
+                to_after,
+                from_proof_before,
+                from_proof_after,
+                to_proof_before,
+                to_proof_after,
+            });
         }
 
         if total_gas_fee > 0 {
@@ -599,5 +695,111 @@ mod tests {
         let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
         let err = ledger.apply_transaction(&tx, &validator, 0).unwrap_err();
         assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
+    }
+
+    #[test]
+    fn merkle_root_changes_after_a_real_transfer_and_matches_an_independent_computation() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let root_before = ledger.merkle_root();
+        // `Ledger::merkle_root()` isn't a cached shortcut - it must
+        // agree with a fresh `StateTree` computed directly over the
+        // same store.
+        assert_eq!(root_before, qchain_storage::StateTree::new().root(ledger.store()));
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 100_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
+
+        let root_after = ledger.merkle_root();
+        assert_ne!(root_before, root_after, "a real balance change must change the root");
+        assert_eq!(root_after, qchain_storage::StateTree::new().root(ledger.store()));
+    }
+
+    #[test]
+    fn a_single_instruction_transfer_captures_a_real_verifiable_receipt() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+        assert!(ledger.transfer_receipts().is_empty());
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 300_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
+
+        let receipts = ledger.transfer_receipts();
+        assert_eq!(receipts.len(), 1);
+        let r = &receipts[0];
+        assert_eq!(r.tx_hash, tx.hash());
+        assert_eq!(r.from, alice.pubkey());
+        assert_eq!(r.to, bob);
+        assert_eq!(r.amount, 300_000);
+        assert_eq!(r.fee, fee);
+        assert_eq!(r.from_before.balance, 1_000_000);
+        assert_eq!(r.from_after.balance, 1_000_000 - 300_000 - fee);
+        assert_eq!(r.to_before.balance, 0);
+        assert_eq!(r.to_after.balance, 300_000);
+        assert_ne!(r.root_before, r.root_after);
+
+        // The captured proofs must genuinely verify against their
+        // claimed roots and hash exactly the claimed Account snapshots -
+        // not just plausible-looking placeholders.
+        let empty_leaf_hash = qchain_storage::StateTree::new().empty_leaf_hash();
+        assert_eq!(r.from_proof_before.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_before)));
+        assert!(qchain_storage::verify_proof(r.root_before, &r.from_proof_before, empty_leaf_hash));
+        assert_eq!(r.from_proof_after.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_after)));
+        assert!(qchain_storage::verify_proof(r.root_after, &r.from_proof_after, empty_leaf_hash));
+        // Bob didn't exist before this transfer - a real exclusion proof.
+        assert_eq!(r.to_proof_before.leaf_value_hash, None);
+        assert!(qchain_storage::verify_proof(r.root_before, &r.to_proof_before, empty_leaf_hash));
+        assert_eq!(r.to_proof_after.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.to_after)));
+        assert!(qchain_storage::verify_proof(r.root_after, &r.to_proof_after, empty_leaf_hash));
+
+        // And the roots themselves must be the real, independently
+        // computable roots before/after this exact transaction.
+        assert_eq!(r.root_after, ledger.merkle_root());
+    }
+
+    #[test]
+    fn a_multi_instruction_transaction_does_not_capture_a_receipt() {
+        // Out of scope by design (see receipt.rs module docs): a
+        // multi-instruction transaction doesn't match the single-row
+        // shape qchain-stark's AIR models, so no receipt is captured
+        // for it, silently or otherwise.
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let carol = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000);
+
+        let ix1 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_000 }).unwrap(),
+        };
+        let ix2 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), carol],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix1, ix2]).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
+
+        assert!(ledger.transfer_receipts().is_empty(), "a multi-instruction transaction must not produce a receipt");
     }
 }

@@ -67,6 +67,38 @@ pub struct StatusResponse {
     pub executed_transactions: u64,
 }
 
+/// What `GET /stark_proof` hands back to a light client - a real
+/// Winterfell proof (hex-encoded via its own `to_bytes`, since `Proof`
+/// itself has no serde impl) alongside the public inputs and Merkle
+/// bindings needed to call `qchain_stark::verify_batch_bound_to_state`
+/// independently.
+#[derive(Serialize)]
+pub struct StarkProofResponse {
+    #[serde(serialize_with = "serialize_proof_as_hex")]
+    pub proof: qchain_stark::Proof,
+    pub pub_inputs: qchain_stark::PublicInputs,
+    pub bindings: Vec<qchain_stark::RowStateBinding>,
+    pub row_count: usize,
+}
+
+fn serialize_proof_as_hex<S: serde::Serializer>(proof: &qchain_stark::Proof, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex::encode(proof.to_bytes()))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StarkProofError {
+    #[error("no transfer receipts captured yet - nothing to prove")]
+    NoReceipts,
+    #[error("failed to build STARK proof: {0}")]
+    Prove(String),
+    /// See `Engine::stark_proof`'s doc comment for the real, non-hypothetical
+    /// way this fires: a non-transfer transaction executed between two
+    /// included transfer receipts, breaking the contiguous root chain
+    /// `verify_batch_bound_to_state` requires.
+    #[error("captured receipts don't form one contiguous state transition: {0}")]
+    ChainBroken(String),
+}
+
 impl Engine {
     /// Admits a client-submitted transaction into the local mempool once
     /// its hybrid signature checks out. No nonce/balance admission control
@@ -86,6 +118,80 @@ impl Engine {
     pub async fn get_account(&self, pk: &Pubkey) -> Option<qchain_core::Account> {
         let state = self.state.lock().await;
         state.ledger.store().get(pk)
+    }
+
+    /// Current state-tree Merkle root, plus how many `TransferReceipt`s
+    /// this validator has captured so far - what a light client polls to
+    /// notice the root has advanced before asking for a proof.
+    pub async fn merkle_root(&self) -> ([u8; 32], usize) {
+        let state = self.state.lock().await;
+        (state.ledger.merkle_root(), state.ledger.transfer_receipts().len())
+    }
+
+    /// Builds a real `qchain-stark` proof over the most recent `limit`
+    /// captured transfer receipts (all of them if `limit` is `None`),
+    /// binds it to the real Merkle root transitions those receipts
+    /// recorded, and self-verifies via `verify_batch_bound_to_state`
+    /// before ever handing it to a caller - a validator should never
+    /// serve a proof it hasn't itself confirmed verifies.
+    ///
+    /// Real limitation, not silently glossed over: `verify_batch_bound_to_state`
+    /// requires the bound rows to be one *contiguous* run of state
+    /// transitions (each row's `root_after` must equal the next row's
+    /// `root_before`). Receipts are only captured for single-instruction
+    /// `Transfer` transactions (see `qchain_execution::receipt`'s module
+    /// docs) - if any other transaction (staking, governance, a
+    /// multi-instruction transaction) executed in between two included
+    /// transfers, the real root moved without a receipt recording it, and
+    /// self-verification below fails with `RootSequenceMismatch`. That is
+    /// surfaced as `StarkProofError::ChainBroken`, not swallowed.
+    pub async fn stark_proof(&self, limit: Option<usize>) -> Result<StarkProofResponse, StarkProofError> {
+        let receipts: Vec<qchain_execution::TransferReceipt> = {
+            let state = self.state.lock().await;
+            let all = state.ledger.transfer_receipts();
+            match limit {
+                Some(n) if n < all.len() => all[all.len() - n..].to_vec(),
+                _ => all.to_vec(),
+            }
+        };
+        if receipts.is_empty() {
+            return Err(StarkProofError::NoReceipts);
+        }
+
+        let steps: Vec<qchain_stark::TransferStep> = receipts
+            .iter()
+            .map(|r| {
+                qchain_stark::TransferStep::conserving(
+                    r.from.to_bytes(),
+                    r.to.to_bytes(),
+                    r.from_before.balance,
+                    r.to_before.balance,
+                    r.amount,
+                    r.fee,
+                )
+            })
+            .collect();
+        let bindings: Vec<qchain_stark::RowStateBinding> = receipts
+            .iter()
+            .map(|r| qchain_stark::RowStateBinding {
+                root_before: r.root_before,
+                root_after: r.root_after,
+                from_before: r.from_before.clone(),
+                from_after: r.from_after.clone(),
+                to_before: r.to_before.clone(),
+                to_after: r.to_after.clone(),
+                from_proof_before: r.from_proof_before.clone(),
+                from_proof_after: r.from_proof_after.clone(),
+                to_proof_before: r.to_proof_before.clone(),
+                to_proof_after: r.to_proof_after.clone(),
+            })
+            .collect();
+
+        let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).map_err(|e| StarkProofError::Prove(e.to_string()))?;
+        qchain_stark::verify_batch_bound_to_state(proof.clone(), pub_inputs.clone(), &bindings)
+            .map_err(|e| StarkProofError::ChainBroken(e.to_string()))?;
+
+        Ok(StarkProofResponse { proof, pub_inputs, bindings, row_count: receipts.len() })
     }
 
     pub async fn status(&self) -> StatusResponse {

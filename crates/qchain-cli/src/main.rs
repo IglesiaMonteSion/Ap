@@ -283,6 +283,20 @@ enum Command {
         #[arg(long = "monitor")]
         monitor: Vec<String>,
     },
+    /// Real light-client verification: fetches a `qchain-stark` proof plus
+    /// its Merkle-root bindings from `GET /stark_proof` and checks it
+    /// *locally*, independent of the node's own claim - this command
+    /// trusts nothing the node says beyond the raw proof bytes and public
+    /// inputs, unlike `balance`/`params`/etc., which just print whatever
+    /// the node reports.
+    LightClientVerify {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// Verify only the most recent `limit` captured transfer receipts
+        /// instead of every one the node has ever recorded.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 fn fetch_account(rpc: &str, address: &Pubkey) -> anyhow::Result<Option<Account>> {
@@ -298,6 +312,18 @@ fn fetch_account(rpc: &str, address: &Pubkey) -> anyhow::Result<Option<Account>>
 #[derive(serde::Deserialize)]
 struct NodeStatus {
     executed_transactions: u64,
+}
+
+/// Wire shape of `qchain-node`'s `GET /stark_proof` response - the proof
+/// itself travels as a hex string (`qchain_stark::Proof` has no serde impl
+/// of its own, see `qchain-node`'s `engine.rs`), everything else uses
+/// `qchain-stark`'s own real serde impls directly.
+#[derive(serde::Deserialize)]
+struct StarkProofWire {
+    proof: String,
+    pub_inputs: qchain_stark::PublicInputs,
+    bindings: Vec<qchain_stark::RowStateBinding>,
+    row_count: usize,
 }
 
 fn fetch_executed_count(rpc: &str) -> anyhow::Result<u64> {
@@ -637,6 +663,27 @@ fn main() -> anyhow::Result<()> {
                     count as f64 / total_elapsed.as_secs_f64()
                 );
             }
+        }
+        Command::LightClientVerify { rpc, limit } => {
+            let mut url = format!("{rpc}/stark_proof");
+            if let Some(limit) = limit {
+                url = format!("{url}?limit={limit}");
+            }
+            let resp = reqwest::blocking::get(&url)?;
+            if !resp.status().is_success() {
+                anyhow::bail!("node refused to serve a proof: {}", resp.text()?);
+            }
+            let wire: StarkProofWire = resp.json()?;
+
+            // Everything past this point is checked locally, not just
+            // printed - a light client that only parsed and echoed the
+            // response back wouldn't be verifying anything at all.
+            let proof_bytes = hex::decode(&wire.proof)?;
+            let proof = qchain_stark::Proof::from_bytes(&proof_bytes).map_err(|e| anyhow::anyhow!("malformed proof bytes: {e}"))?;
+
+            println!("fetched a proof over {} row(s) ({} proof bytes) from {rpc}", wire.row_count, proof_bytes.len());
+            qchain_stark::verify_batch_bound_to_state(proof, wire.pub_inputs, &wire.bindings)?;
+            println!("verified locally: every row's conservation equation, u64 range check, and real Merkle root transition checks out");
         }
     }
     Ok(())

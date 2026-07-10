@@ -168,9 +168,14 @@ use winterfell::matrix::ColMatrix;
 use winterfell::{
     Air, AirContext, Assertion, AuxRandElements, BatchingMethod, CompositionPoly, CompositionPolyTrace,
     ConstraintCompositionCoefficients, DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde,
-    EvaluationFrame, FieldExtension, PartitionOptions, Proof, ProofOptions, Prover, ProverError, StarkDomain,
+    EvaluationFrame, FieldExtension, PartitionOptions, ProofOptions, Prover, ProverError, StarkDomain,
     TraceInfo, TracePolyTable, TraceTable, TransitionConstraintDegree,
 };
+
+// Re-exported so a downstream consumer (RPC serving/light-client verifying
+// code, e.g. `qchain-node`/`qchain-cli`) can name this type without also
+// taking a direct `winterfell` dependency of its own.
+pub use winterfell::Proof;
 
 /// Splits a 32-byte address into 4 big-endian `u64` limbs - each limb is
 /// always `< 2^64`, safely representable as an `f128::BaseElement`
@@ -287,6 +292,34 @@ impl PublicInputs {
             *col = trace.get_column(c).to_vec();
         }
         PublicInputs { columns }
+    }
+}
+
+// `BaseElement` (Winterfell's f128 field element) has no serde impl of its
+// own, so `PublicInputs` can't just `#[derive(Serialize, Deserialize)]` -
+// every value here is a real, already-range-checked `u64` by the time
+// `verify_batch` accepts it (see the v2 module docs), and `as_int()`/`new()`
+// round-trip a field element through its underlying `u128` losslessly, so
+// the wire format is just nested `u128` arrays - a light client over RPC
+// needs this to receive `PublicInputs` at all, not just use it in-process.
+impl serde::Serialize for PublicInputs {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let raw: Vec<Vec<u128>> = self.columns.iter().map(|col| col.iter().map(|e| e.as_int()).collect()).collect();
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PublicInputs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: Vec<Vec<u128>> = serde::Deserialize::deserialize(deserializer)?;
+        if raw.len() != TRACE_WIDTH {
+            return Err(serde::de::Error::custom(format!("expected {TRACE_WIDTH} PublicInputs columns, got {}", raw.len())));
+        }
+        let mut columns: [Vec<BaseElement>; TRACE_WIDTH] = Default::default();
+        for (col, raw_col) in columns.iter_mut().zip(raw) {
+            *col = raw_col.into_iter().map(BaseElement::new).collect();
+        }
+        Ok(PublicInputs { columns })
     }
 }
 
@@ -481,8 +514,10 @@ pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), Verify
 /// exactly what this does and does not check (in particular: assumes
 /// every account already exists before *and* after, and only checks the
 /// `balance` field against the STARK's public values, not full
-/// nonce/fee bookkeeping).
-#[derive(Clone, Debug)]
+/// nonce/fee bookkeeping). Serialize/Deserialize added for real RPC
+/// transport - every field is already serde-capable (`Account`,
+/// `qchain_storage::MerkleProof`, `[u8; 32]`), so this derives cleanly.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RowStateBinding {
     pub root_before: [u8; 32],
     pub root_after: [u8; 32],
@@ -514,6 +549,16 @@ pub enum StateBindingError {
     AddressMismatch { row: usize, field: &'static str },
     #[error("row {row}: {field}'s Merkle inclusion proof does not verify against the claimed root")]
     MerkleProofFailed { row: usize, field: &'static str },
+    /// A real, non-hypothetical case: a first-ever transfer *to* an
+    /// address means `to_before`'s proof is a genuine *exclusion* proof
+    /// (the address has no row in the tree yet) - `leaf_value_hash` is
+    /// `None`, so there is no real leaf hash to compare the snapshot
+    /// against. The only claim that can be soundly checked against an
+    /// absent leaf is "the true prior balance is zero" (nothing there
+    /// means nothing to have a balance) - a snapshot claiming otherwise
+    /// for an excluded key is rejected here, not silently accepted.
+    #[error("row {row}: {field}'s Merkle proof claims the account doesn't exist yet, but the supplied snapshot claims a non-zero balance")]
+    ExclusionProofClaimsNonzeroBalance { row: usize, field: &'static str },
 }
 
 /// Verifies a proof produced by [`prove_batch`] *and* that `bindings`
@@ -577,8 +622,19 @@ pub fn verify_batch_bound_to_state(proof: Proof, pub_inputs: PublicInputs, bindi
             (&binding.to_after, &binding.to_proof_after, binding.root_after, "to_after"),
         ];
         for (account, proof, root, field) in checks {
-            if proof.leaf_value_hash != Some(hash_leaf(account)) {
-                return Err(StateBindingError::MerkleProofFailed { row, field });
+            // A proof with `leaf_value_hash: None` is a real exclusion
+            // proof - the account genuinely has no row in the tree yet
+            // (e.g. `to_before` on the very first transfer an address
+            // ever receives, see `qchain-execution`'s receipt-capture
+            // docs). There is no leaf to hash-compare the snapshot
+            // against in that case; the only thing that can be soundly
+            // required is that the claimed balance is zero, since an
+            // absent key cannot hold a real positive balance.
+            match proof.leaf_value_hash {
+                Some(h) if h == hash_leaf(account) => {}
+                Some(_) => return Err(StateBindingError::MerkleProofFailed { row, field }),
+                None if account.balance == 0 => {}
+                None => return Err(StateBindingError::ExclusionProofClaimsNonzeroBalance { row, field }),
             }
             if !verify_proof(root, proof, empty_leaf_hash) {
                 return Err(StateBindingError::MerkleProofFailed { row, field });
@@ -767,6 +823,106 @@ mod tests {
         };
 
         verify_batch_bound_to_state(proof, pub_inputs, &[binding]).expect("a genuine transfer must bind to the real Merkle root transition");
+    }
+
+    /// Real, non-hypothetical case found via a live 3-node testnet run: the
+    /// very first transfer to a brand-new address means `to_before` is a
+    /// genuine *exclusion* proof (the address has no row in the tree at
+    /// all yet), not merely "an inclusion proof for a zero balance." An
+    /// earlier version of `verify_batch_bound_to_state` unconditionally
+    /// compared `leaf_value_hash` against `Some(hash_leaf(account))`,
+    /// which can never equal `None` - so this exact (extremely common)
+    /// case always failed with a spurious `MerkleProofFailed` on
+    /// `to_before`, even though everything about the transfer was genuine.
+    #[test]
+    fn a_transfer_to_a_brand_new_recipient_binds_correctly() {
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey(); // never set in the store - genuinely new
+        store.set(alice, wallet(1_000));
+
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let to_before = Account::new_wallet(Pubkey::system_program_id()); // balance 0, matching the exclusion proof
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+        assert!(proof_bob_before.leaf_value_hash.is_none(), "bob must not have a row yet - this test only means something if he's genuinely absent");
+
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(300));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 0, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        verify_batch_bound_to_state(proof, pub_inputs, &[binding])
+            .expect("a transfer to a genuinely brand-new recipient must bind correctly via its real exclusion proof");
+    }
+
+    #[test]
+    fn an_exclusion_proof_claiming_a_nonzero_balance_is_rejected() {
+        // A malicious/buggy binding: `to_before`'s proof is a real
+        // exclusion proof (bob has no row), but the supplied snapshot
+        // claims he already had a balance - unsound if accepted, since an
+        // absent key cannot hold a real positive balance.
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let forged_to_before = wallet(500); // claims bob already had 500, despite no real row
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(800));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 500, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: forged_to_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        match verify_batch_bound_to_state(proof, pub_inputs, &[binding]) {
+            Err(StateBindingError::ExclusionProofClaimsNonzeroBalance { row: 0, field: "to_before" }) => {}
+            other => panic!("expected ExclusionProofClaimsNonzeroBalance on to_before, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1023,5 +1179,66 @@ mod tests {
             Err(StateBindingError::MerkleProofFailed { row: 0, .. }) => {}
             other => panic!("expected a MerkleProofFailed (the 'after' proofs don't verify against the stale root), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn public_inputs_and_row_state_binding_round_trip_through_real_json_and_a_verify_call() {
+        // Exercises exactly what `qchain-node`'s RPC layer will do: prove
+        // and bind against a real Merkle transition, serialize everything
+        // to JSON (including the `Proof` itself via its real
+        // `to_bytes`/`from_bytes`, hex-encoded - the wire format a light
+        // client actually receives), deserialize it back, and confirm
+        // `verify_batch_bound_to_state` still accepts the round-tripped
+        // values. A derive that merely compiles wouldn't catch a lossy
+        // conversion (e.g. `BaseElement`'s u128 truncating through a
+        // smaller wire type) - only an end-to-end verify call would.
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+
+        let tree = StateTree::new();
+        let root_before = tree.root(&store);
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let proof_alice_before = tree.prove(&store, &alice);
+        let proof_bob_before = tree.prove(&store, &bob);
+
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = tree.root(&store);
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let proof_alice_after = tree.prove(&store, &alice);
+        let proof_bob_after = tree.prove(&store, &bob);
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+        let binding = RowStateBinding {
+            root_before,
+            root_after,
+            from_before: alice_before,
+            from_after: alice_after,
+            to_before: bob_before,
+            to_after: bob_after,
+            from_proof_before: proof_alice_before,
+            from_proof_after: proof_alice_after,
+            to_proof_before: proof_bob_before,
+            to_proof_after: proof_bob_after,
+        };
+
+        // Round-trip the proof bytes, the public inputs, and the binding
+        // through real JSON - the same serialization RPC/HTTP transport uses.
+        let proof_hex = hex::encode(proof.to_bytes());
+        let pub_inputs_json = serde_json::to_string(&pub_inputs).unwrap();
+        let bindings_json = serde_json::to_string(&std::slice::from_ref(&binding)).unwrap();
+
+        let round_tripped_proof = Proof::from_bytes(&hex::decode(&proof_hex).unwrap()).unwrap();
+        let round_tripped_pub_inputs: PublicInputs = serde_json::from_str(&pub_inputs_json).unwrap();
+        let round_tripped_bindings: Vec<RowStateBinding> = serde_json::from_str(&bindings_json).unwrap();
+
+        verify_batch_bound_to_state(round_tripped_proof, round_tripped_pub_inputs, &round_tripped_bindings)
+            .expect("a proof/public-inputs/binding round-tripped through real JSON must still verify");
     }
 }

@@ -6,8 +6,11 @@ edition.workspace = true
 [dependencies]
 winterfell.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 qchain-core = { path = "../qchain-core" }
 qchain-storage = { path = "../qchain-storage" }
 
 [dev-dependencies]
 qchain-crypto = { path = "../qchain-crypto" }
+serde_json.workspace = true
+hex.workspace = true
