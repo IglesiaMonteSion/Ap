@@ -37,39 +37,7 @@
 
 use qchain_core::Account;
 use qchain_crypto::Pubkey;
-use qchain_storage::{MerkleProof, StateStore};
-use std::collections::HashMap;
-
-/// A read-only overlay over a real store: reads consult `overlay` first,
-/// falling back to `base`. Used to compute a Merkle root/proof "as if"
-/// `overlay`'s in-progress mutations had already been committed, without
-/// actually writing them into `base` yet - `Ledger::apply_transaction`
-/// only commits its working set to the real store once, at the very end
-/// of the call, so this is the only way to snapshot an intermediate
-/// (mid-transaction) state for a receipt.
-pub struct OverlayStore<'a> {
-    pub base: &'a dyn StateStore,
-    pub overlay: &'a HashMap<Pubkey, Account>,
-}
-
-impl StateStore for OverlayStore<'_> {
-    fn get(&self, key: &Pubkey) -> Option<Account> {
-        self.overlay.get(key).cloned().or_else(|| self.base.get(key))
-    }
-
-    fn set(&mut self, _key: Pubkey, _account: Account) {
-        unreachable!("OverlayStore is read-only - only StateTree::root/prove (which never call set) ever see it")
-    }
-
-    fn remove(&mut self, _key: &Pubkey) {
-        unreachable!("OverlayStore is read-only - only StateTree::root/prove (which never call remove) ever see it")
-    }
-
-    fn iter(&self) -> Box<dyn Iterator<Item = (Pubkey, Account)> + '_> {
-        let overlaid: std::collections::HashSet<Pubkey> = self.overlay.keys().copied().collect();
-        Box::new(self.overlay.iter().map(|(k, v)| (*k, v.clone())).chain(self.base.iter().filter(move |(k, _)| !overlaid.contains(k))))
-    }
-}
+use qchain_storage::MerkleProof;
 
 /// Real before/after state for one `SystemProgram::Transfer`, captured
 /// live as it executed - see module docs for exactly what's captured and

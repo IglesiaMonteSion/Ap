@@ -7,12 +7,12 @@ use crate::error::ExecError;
 use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
-use crate::receipt::{OverlayStore, TransferReceipt};
+use crate::receipt::TransferReceipt;
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
-use qchain_storage::{MerkleProof, StateStore, StateTree};
+use qchain_storage::{IncrementalStateTree, MerkleProof, StateStore};
 use std::collections::HashMap;
 use wasmtime::Val;
 
@@ -30,7 +30,21 @@ pub struct Ledger {
     programs: HashMap<Pubkey, Program>,
     wasm: WasmExecutor,
     pub total_burned: u64,
-    tree: StateTree,
+    /// Real, live-maintained incremental sparse Merkle tree - see
+    /// `qchain-storage::tree`'s `IncrementalStateTree` doc comment for
+    /// the measured performance problem this closes (a single validator
+    /// under real transfer load saturating a full CPU core, root-caused
+    /// to the plain `StateTree`'s full-recompute-on-every-call design,
+    /// not PQC signature verification as initially suspected - see
+    /// `project-lessons-learned`). Every real write this `Ledger` makes
+    /// to `self.store` is paired with a `self.tree.note_set(...)` call at
+    /// the same call site (`write_account`, the one and only place a raw
+    /// `self.store.set` is allowed below - enforced by convention and by
+    /// this doc comment, not by the type system, so any future new write
+    /// site must go through it too) - this pairing is the whole
+    /// correctness invariant this type depends on: `self.tree` only ever
+    /// answers correctly for keys this exact `Ledger` has itself written.
+    tree: IncrementalStateTree,
     /// Real captured before/after state for every single-instruction
     /// `Transfer` this ledger has applied - see `receipt.rs` module docs
     /// for exactly what's captured, why it's scoped this narrowly, and
@@ -40,14 +54,16 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn new(store: Box<dyn StateStore>) -> anyhow::Result<Self> {
-        Ok(Ledger {
-            store,
-            programs: HashMap::new(),
-            wasm: WasmExecutor::new()?,
-            total_burned: 0,
-            tree: StateTree::new(),
-            transfer_receipts: Vec::new(),
-        })
+        let mut tree = IncrementalStateTree::new();
+        // A store opened from a prior run (`SledStore` pointed at an
+        // existing `data_dir`) already holds real accounts the tree has
+        // never seen - prime the cache from the store's own contents
+        // once at construction so `note_set` alone is sufficient from
+        // here on. A fresh/empty store makes this a no-op loop.
+        for (pk, account) in store.iter() {
+            tree.note_set(&pk, &account);
+        }
+        Ok(Ledger { store, programs: HashMap::new(), wasm: WasmExecutor::new()?, total_burned: 0, tree, transfer_receipts: Vec::new() })
     }
 
     pub fn register_program(&mut self, id: Pubkey, program: Program) {
@@ -58,13 +74,19 @@ impl Ledger {
         self.store.as_ref()
     }
 
+    /// The only place this `Ledger` is allowed to write to `self.store` -
+    /// see `tree`'s doc comment for why every write must go through here
+    /// rather than calling `self.store.set` directly.
+    fn write_account(&mut self, pubkey: Pubkey, account: Account) {
+        self.tree.note_set(&pubkey, &account);
+        self.store.set(pubkey, account);
+    }
+
     /// The live root of the real state tree (`qchain-storage`'s
-    /// SHA3-256 sparse Merkle tree) over whatever this ledger currently
-    /// holds - recomputed from the full leaf set on every call (a
-    /// documented, accepted `qchain-storage` simplification, not new
-    /// here; see `tree.rs`'s own module docs).
+    /// SHA3-256 sparse Merkle tree) - an `O(1)` read of the incrementally
+    /// maintained `IncrementalStateTree` above, not a recompute.
     pub fn merkle_root(&self) -> [u8; 32] {
-        self.tree.root(self.store.as_ref())
+        self.tree.root()
     }
 
     /// Every `Transfer` receipt captured so far, oldest first - the raw
@@ -79,7 +101,7 @@ impl Ledger {
     /// the algorithm registry), not a user-facing operation like
     /// `credit`.
     pub fn seed_account(&mut self, pubkey: Pubkey, account: Account) {
-        self.store.set(pubkey, account);
+        self.write_account(pubkey, account);
     }
 
     pub fn get_balance(&self, pk: &Pubkey) -> u64 {
@@ -89,7 +111,7 @@ impl Ledger {
     pub fn credit(&mut self, pk: Pubkey, amount: u64) {
         let mut account = self.store.get(&pk).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
         account.balance = account.balance.saturating_add(amount);
-        self.store.set(pk, account);
+        self.write_account(pk, account);
     }
 
     /// Splits the validator's post-burn share of `base_fee` between direct
@@ -120,7 +142,7 @@ impl Ledger {
         let credited = crate::staking::accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, pool_share)?;
         if credited {
             if let Some(pool) = accounts.remove(&STAKING_REWARDS_POOL_ID) {
-                self.store.set(STAKING_REWARDS_POOL_ID, pool);
+                self.write_account(STAKING_REWARDS_POOL_ID, pool);
             }
             self.credit(fee_collector, commission);
         } else {
@@ -252,9 +274,9 @@ impl Ledger {
                 let ix = &tx.message.instructions[0];
                 match (SystemInstruction::try_from_slice(&ix.data), ix.accounts.first(), ix.accounts.get(1)) {
                     (Ok(SystemInstruction::Transfer { amount }), Some(&from), Some(&to)) => {
-                        let root_before = self.tree.root(self.store.as_ref());
-                        let from_proof_before = self.tree.prove(self.store.as_ref(), &from);
-                        let to_proof_before = self.tree.prove(self.store.as_ref(), &to);
+                        let root_before = self.tree.root();
+                        let from_proof_before = self.tree.prove(&from);
+                        let to_proof_before = self.tree.prove(&to);
                         let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
                         let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
                         Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
@@ -267,7 +289,7 @@ impl Ledger {
 
         payer_account.balance -= byte_fee;
         payer_account.nonce += 1;
-        self.store.set(tx.message.payer, payer_account.clone());
+        self.write_account(tx.message.payer, payer_account.clone());
 
         let burn_share = byte_fee / 2;
         let validator_share = byte_fee - burn_share;
@@ -310,10 +332,18 @@ impl Ledger {
         // `qchain-stark`'s own "doesn't re-derive full Ledger fee/nonce
         // semantics" scope note.
         if let Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before)) = pre_capture {
-            let overlay = OverlayStore { base: self.store.as_ref(), overlay: &working };
-            let root_after = self.tree.root(&overlay);
-            let from_proof_after = self.tree.prove(&overlay, &from);
-            let to_proof_after = self.tree.prove(&overlay, &to);
+            // Same real semantics the old `OverlayStore { base: self.store,
+            // overlay: &working }` gave: "the committed store as of right
+            // now (already includes this transaction's fee deduction,
+            // written above), with `working`'s in-flight instruction
+            // results layered on top" - just computed as a small,
+            // `working`-sized pending-change set against the incremental
+            // tree's cache instead of re-scanning every account through an
+            // overlay wrapper.
+            let working_changes: Vec<(Pubkey, Account)> = working.iter().map(|(k, v)| (*k, v.clone())).collect();
+            let root_after = self.tree.root_with_pending(&working_changes);
+            let from_proof_after = self.tree.prove_with_pending(&from, &working_changes);
+            let to_proof_after = self.tree.prove_with_pending(&to, &working_changes);
             let from_after = working.get(&from).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             self.transfer_receipts.push(TransferReceipt {
@@ -351,7 +381,7 @@ impl Ledger {
                 self.total_burned += account.balance;
                 account.balance = 0;
             }
-            self.store.set(pk, account);
+            self.write_account(pk, account);
         }
 
         Ok(byte_fee + total_gas_fee)
