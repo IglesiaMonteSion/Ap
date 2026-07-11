@@ -1939,10 +1939,9 @@ name = "qchain-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "borsh",
  "qchain-core",
  "qchain-crypto",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]

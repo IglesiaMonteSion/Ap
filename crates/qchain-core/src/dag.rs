@@ -8,6 +8,7 @@
 //! edges" convention.
 
 use crate::transaction::Transaction;
+use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_crypto::MultiSignature;
 use qchain_crypto::Pubkey;
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ pub type WorkerId = u8;
 /// this is what keeps consensus-layer messages small even though the
 /// underlying transaction data can be large (heavy with PQC signatures,
 /// see `ARCHITECTURE.md` §2's bandwidth analysis).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Batch {
     pub transactions: Vec<Transaction>,
 }
@@ -56,7 +57,7 @@ impl Batch {
 /// unlike `parents` reachability (§`qchain-consensus`'s Bullshark), no
 /// other validator ever needs to independently reconstruct this list, so
 /// there's no canonical-ordering requirement to enforce here.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct Vertex {
     pub round: Round,
     pub author: ValidatorId,
@@ -87,7 +88,7 @@ impl Vertex {
 /// sign one vertex per author per round; any pair of conflicting *signed*
 /// vertices from the same author is self-contained slashable evidence (see
 /// `blockchain-security-audit` #3).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Certificate {
     pub vertex: Vertex,
     pub signatures: Vec<(ValidatorId, MultiSignature)>,

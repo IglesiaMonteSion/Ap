@@ -37,7 +37,7 @@ pub struct Message {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Transaction {
     pub message: Message,
     pub signature: MultiSignature,

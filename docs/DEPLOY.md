@@ -214,13 +214,11 @@ específico por CLI — usar `qchain-cli`.
   cualquiera que lo alcance puede enviar transacciones (pagan su propio
   fee) y leer balances. Aceptable para un testnet público; no exponer así
   si alguna vez hay valor real detrás.
-- El transporte P2P (`qchain-network`) abre una conexión TCP nueva por
-  mensaje — una simplificación de fase 1 documentada (ver
-  `ARCHITECTURE.md`); bajo tráfico de ataque real esto puede agotar file
-  descriptors (ver el hallazgo real documentado en
-  `project-lessons-learned`). No es una preocupación nueva de este
-  despliegue, pero un testnet *público* es la primera vez que tráfico
-  hostil real es plausible, no solo hipotético.
+- El transporte P2P (`qchain-network`) ya no abre una conexión TCP nueva
+  por mensaje — cierra una conexión persistente por peer (ver
+  `ARCHITECTURE.md` §1), lo cual además cierra en la práctica el riesgo
+  de agotamiento de file descriptors bajo tráfico real que la versión
+  anterior tenía documentado.
 - El faucet es un wallet caliente con clave privada en el disco de quien
   lo opera — tratalo como cualquier hot wallet, no como un archivo
   cualquiera.

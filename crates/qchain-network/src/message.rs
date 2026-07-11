@@ -13,11 +13,11 @@
 //! through one channel (see `ARCHITECTURE.md` §2's bandwidth analysis for
 //! why this separation exists at all).
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Batch, Certificate, Digest, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::MultiSignature;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
 pub enum NetMessage {
     /// One worker lane's batch of transactions, sent independently of the
     /// vertex that will later reference it, so peers can execute it once
@@ -58,7 +58,7 @@ pub enum NetMessage {
 /// not yet authenticate the transport itself, only the application-level
 /// signatures inside votes/certificates - see `ARCHITECTURE.md`'s phase-1
 /// out-of-scope list for transport-layer auth).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Envelope {
     pub from: ValidatorId,
     pub message: NetMessage,
