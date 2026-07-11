@@ -1,0 +1,50 @@
+# Local Docker smoke test of the qchain-node image on ONE host - NOT the
+# real multi-region topology (see docs/DEPLOY.md). Real deployments run
+# one container per real machine/region, each with its own public IP; this
+# file exists to prove the image itself works end-to-end before
+# provisioning real servers. Validator peer addresses (`config.json`'s
+# `validators[].addr`) must be literal, dialable IP:port pairs - not
+# Docker service-name DNS - hence the static IPs on the dedicated bridge
+# network below. Run `./setup-local-demo.sh` first to generate
+# v1/v2/v3/faucet's config+keypair files.
+services:
+  v1:
+    build: ../..
+    command: ["qchain-node", "--config", "config.json"]
+    volumes: ["./v1:/qchain"]
+    networks:
+      qchain:
+        ipv4_address: 172.28.0.11
+    ports: ["8081:8080"]
+
+  v2:
+    build: ../..
+    command: ["qchain-node", "--config", "config.json"]
+    volumes: ["./v2:/qchain"]
+    networks:
+      qchain:
+        ipv4_address: 172.28.0.12
+    ports: ["8082:8080"]
+
+  v3:
+    build: ../..
+    command: ["qchain-node", "--config", "config.json"]
+    volumes: ["./v3:/qchain"]
+    networks:
+      qchain:
+        ipv4_address: 172.28.0.13
+    ports: ["8083:8080"]
+
+  faucet:
+    build: ../..
+    command: ["qchain-faucet", "--rpc", "http://172.28.0.11:8080", "--keypair", "keypair.json", "--listen", "0.0.0.0:9090"]
+    volumes: ["./faucet:/qchain"]
+    networks: ["qchain"]
+    ports: ["9090:9090"]
+    depends_on: ["v1"]
+
+networks:
+  qchain:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

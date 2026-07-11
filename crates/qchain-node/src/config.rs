@@ -6,24 +6,24 @@
 //! feature for a later phase).
 
 use qchain_crypto::{Pubkey, PublicKeyBundle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ValidatorConfig {
     pub pubkey_bundle: PublicKeyBundle,
     pub addr: SocketAddr,
     pub stake: u64,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GenesisAllocation {
     pub address: Pubkey,
     pub balance: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Path to this validator's own keypair file (see
     /// `qchain_crypto::write_keypair_file` / the `qchain keygen` CLI

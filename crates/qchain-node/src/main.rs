@@ -4,19 +4,16 @@
 //! server (`rpc.rs`) for wallet traffic. See `ARCHITECTURE.md` §1/§4 and
 //! the `blockchain-core-rust` skill.
 
-mod config;
-mod engine;
-mod rpc;
-
 use clap::Parser;
-use config::NodeConfig;
-use engine::{Engine, EngineState};
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
 use qchain_execution::{
     genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, RewardPoolData, StakingProgram, SystemProgram,
     GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
 };
 use qchain_network::{Network, PeerInfo};
+use qchain_node::config::NodeConfig;
+use qchain_node::engine::{Engine, EngineState};
+use qchain_node::rpc;
 use qchain_storage::{InMemoryStore, SledStore, StateStore};
 use std::collections::HashMap;
 use std::path::PathBuf;

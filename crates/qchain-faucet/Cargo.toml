@@ -1,0 +1,23 @@
+[package]
+name = "qchain-faucet"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "qchain-faucet"
+path = "src/main.rs"
+
+[dependencies]
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-execution = { path = "../qchain-execution" }
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

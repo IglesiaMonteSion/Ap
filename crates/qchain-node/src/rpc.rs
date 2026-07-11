@@ -5,6 +5,7 @@
 use crate::engine::{Engine, StarkProofError, StarkProofResponse, StatusResponse};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use qchain_core::{Account, Transaction};
@@ -14,12 +15,25 @@ use std::sync::Arc;
 
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
+        .route("/", get(explorer))
         .route("/tx", post(submit_tx))
         .route("/account/:address", get(get_account))
         .route("/status", get(status))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
         .with_state(engine)
+}
+
+/// A minimal, self-contained status page - not a real block explorer (no
+/// transaction history browsing, no search across the network), just
+/// enough for a public-testnet participant to sanity-check a validator
+/// from a browser without installing `qchain-cli`: this validator's own
+/// status, its live Merkle root, and a one-off account balance lookup.
+/// Plain `fetch()` against this same origin's `/status`/`/root`/
+/// `/account/:address` - no build step, no dependency, works from the
+/// bare HTML file.
+async fn explorer() -> Html<&'static str> {
+    Html(include_str!("explorer.html"))
 }
 
 async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {

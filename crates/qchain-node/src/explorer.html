@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qchain validator status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-width: 720px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.1rem; margin-bottom: 0.25rem; }
+  .sub { opacity: 0.6; font-size: 0.85rem; margin-bottom: 1.5rem; }
+  section {
+    border: 1px solid currentColor;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    opacity: 0.95;
+  }
+  section h2 { margin: 0 0 0.75rem; font-size: 0.95rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+  dt { opacity: 0.6; }
+  dd { margin: 0; word-break: break-all; }
+  input, button {
+    font: inherit;
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid currentColor;
+    background: transparent;
+    color: inherit;
+  }
+  input { width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
+  button { cursor: pointer; }
+  .err { color: #c0392b; }
+  pre { white-space: pre-wrap; word-break: break-all; margin: 0.5rem 0 0; }
+</style>
+</head>
+<body>
+  <h1>qchain validator status</h1>
+  <div class="sub">Not a full block explorer - a live status page for this one validator. See <code>qchain-cli</code> for transfers, staking, and governance.</div>
+
+  <section>
+    <h2>node</h2>
+    <dl id="status-fields"><dt>loading</dt><dd>...</dd></dl>
+  </section>
+
+  <section>
+    <h2>state root</h2>
+    <dl id="root-fields"><dt>loading</dt><dd>...</dd></dl>
+  </section>
+
+  <section>
+    <h2>account lookup</h2>
+    <input id="addr" placeholder="paste an address (base58)">
+    <button id="lookup">look up</button>
+    <pre id="account-result"></pre>
+  </section>
+
+<script>
+async function getJson(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function renderDl(el, obj) {
+  el.innerHTML = Object.entries(obj).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+
+async function refresh() {
+  try {
+    const status = await getJson("/status");
+    renderDl(document.getElementById("status-fields"), status);
+  } catch (e) {
+    document.getElementById("status-fields").innerHTML = `<dt class="err">error</dt><dd class="err">${e.message}</dd>`;
+  }
+  try {
+    const root = await getJson("/root");
+    renderDl(document.getElementById("root-fields"), root);
+  } catch (e) {
+    document.getElementById("root-fields").innerHTML = `<dt class="err">error</dt><dd class="err">${e.message}</dd>`;
+  }
+}
+
+document.getElementById("lookup").addEventListener("click", async () => {
+  const addr = document.getElementById("addr").value.trim();
+  const out = document.getElementById("account-result");
+  out.textContent = "looking up...";
+  if (!addr) { out.textContent = ""; return; }
+  try {
+    out.textContent = JSON.stringify(await getJson(`/account/${addr}`), null, 2);
+  } catch (e) {
+    out.textContent = "not found (or invalid address)";
+  }
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
