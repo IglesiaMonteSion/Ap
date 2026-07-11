@@ -76,6 +76,17 @@ async fn fetch_nonce(client: &reqwest::Client, rpc: &str, pk: &Pubkey) -> anyhow
     Ok(account.nonce)
 }
 
+/// Real, live-confirmed cross-network replay gap this closes (see
+/// `qchain_core::Message::chain_id`'s doc comment) - fetched fresh per
+/// request, same as `fetch_nonce`, so the faucet always signs for whatever
+/// network `--rpc` actually points at.
+async fn fetch_chain_id(client: &reqwest::Client, rpc: &str) -> anyhow::Result<[u8; 32]> {
+    let resp: serde_json::Value = client.get(format!("{rpc}/chain_id")).send().await?.error_for_status()?.json().await?;
+    let hex_str = resp["chain_id"].as_str().ok_or_else(|| anyhow::anyhow!("malformed /chain_id response"))?;
+    let bytes = hex::decode(hex_str)?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("chain_id must be 32 bytes"))
+}
+
 async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<FaucetRequest>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let to: Pubkey = req.address.parse().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -94,13 +105,14 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
     let client = reqwest::Client::new();
     let from = state.keypair.pubkey();
     let nonce = fetch_nonce(&client, &state.rpc, &from).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let chain_id = fetch_chain_id(&client, &state.rpc).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
     let ix = Instruction {
         program_id: Pubkey::system_program_id(),
         accounts: vec![from, to],
         data: borsh::to_vec(&SystemInstruction::Transfer { amount: state.amount }).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
-    let tx = Transaction::new_signed(&state.keypair, nonce, [0u8; 32], state.fee_limit, vec![ix])
+    let tx = Transaction::new_signed(&state.keypair, nonce, chain_id, state.fee_limit, vec![ix])
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let resp = client.post(format!("{}/tx", state.rpc)).json(&tx).send().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;

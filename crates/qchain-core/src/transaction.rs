@@ -21,17 +21,34 @@ pub struct Instruction {
 /// `nonce` (not just a recency anchor) matters more here than in a
 /// single-leader chain: DAG-ordered transactions don't have one linear
 /// "block height" the way a sequential chain does until Bullshark commits
-/// an order, so explicit per-account nonces are the primary replay defense,
-/// with `recent_cert_ref` as a secondary recency bound.
+/// an order, so explicit per-account nonces are the primary replay defense
+/// *within* one network - `chain_id` is what stops the identical signed
+/// bytes from also being valid on a *different* one.
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Message {
     pub version: u8,
     pub payer: Pubkey,
     pub payer_keys: PublicKeyBundle,
     pub nonce: u64,
-    /// Digest of a recently-seen DAG certificate, binding this transaction
-    /// to a point in time it was constructed at.
-    pub recent_cert_ref: [u8; 32],
+    /// A real, live-confirmed cross-network replay gap this closes (see
+    /// `project-lessons-learned`): this field used to be an unused
+    /// recency-anchor placeholder (`recent_cert_ref`, always `[0u8; 32]`
+    /// everywhere in this codebase - nothing ever populated it with an
+    /// actual certificate digest). Since `nonce` was the *only* real
+    /// replay defense, a transaction signed once validated identically on
+    /// any other independent network sharing the same validator set and
+    /// payer nonce state - confirmed live by replaying one signed transfer
+    /// verbatim across two genuinely separate testnet processes. Now the
+    /// hash of the network's own genesis data (`NodeConfig::chain_id`,
+    /// computed identically by every validator from `validators`+`genesis`,
+    /// no coordination round-trip needed) - checked at admission
+    /// (`Engine::submit_transaction`/`TransactionGossip`, the same layer
+    /// that already gates on signature validity) against the receiving
+    /// network's own chain_id. A genuine recency anchor (binding to a
+    /// specific recently-seen certificate, not just a network identity) is
+    /// still a separate, not-yet-built concern - this only closes the
+    /// cross-network case.
+    pub chain_id: [u8; 32],
     /// Maximum total fee (base + priority + gas) the payer authorizes.
     pub fee_limit: u64,
     pub instructions: Vec<Instruction>,
@@ -47,7 +64,7 @@ impl Transaction {
     pub fn new_signed(
         payer: &Keypair,
         nonce: u64,
-        recent_cert_ref: [u8; 32],
+        chain_id: [u8; 32],
         fee_limit: u64,
         instructions: Vec<Instruction>,
     ) -> anyhow::Result<Self> {
@@ -57,7 +74,7 @@ impl Transaction {
             payer: payer_keys.to_address(),
             payer_keys,
             nonce,
-            recent_cert_ref,
+            chain_id,
             fee_limit,
             instructions,
         };

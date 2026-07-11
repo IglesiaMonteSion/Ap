@@ -25,7 +25,16 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers", get(list_transfers))
         .route("/transfers/:hash", get(get_transfer))
         .route("/equivocation_evidence", get(equivocation_evidence))
+        .route("/chain_id", get(chain_id))
         .with_state(engine)
+}
+
+/// This network's genesis-derived identity (`NodeConfig::chain_id`'s doc
+/// comment) - a client fetches this before signing so its transactions
+/// are bound to the network it actually intends, closing the
+/// cross-network replay gap documented on `qchain_core::Message::chain_id`.
+async fn chain_id(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    Json(json!({ "chain_id": hex::encode(engine.chain_id) }))
 }
 
 /// A minimal, self-contained status page - not a real block explorer (no

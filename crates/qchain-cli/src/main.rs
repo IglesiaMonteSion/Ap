@@ -418,6 +418,18 @@ fn fetch_account(rpc: &str, address: &Pubkey) -> anyhow::Result<Option<Account>>
     Ok(Some(account))
 }
 
+/// Real, live-confirmed cross-network replay gap this closes (see
+/// `qchain_core::Message::chain_id`'s doc comment and
+/// `project-lessons-learned`): fetched fresh before signing every
+/// transaction, rather than assumed or hardcoded, so a transaction is
+/// always bound to whatever network `--rpc` actually points at.
+fn fetch_chain_id(rpc: &str) -> anyhow::Result<[u8; 32]> {
+    let resp: serde_json::Value = reqwest::blocking::get(format!("{rpc}/chain_id"))?.error_for_status()?.json()?;
+    let hex_str = resp["chain_id"].as_str().ok_or_else(|| anyhow::anyhow!("malformed /chain_id response"))?;
+    let bytes = hex::decode(hex_str)?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("chain_id must be 32 bytes"))
+}
+
 #[derive(serde::Deserialize)]
 struct NodeStatus {
     executed_transactions: u64,
@@ -454,10 +466,8 @@ fn submit_instruction(
         None => fetch_account(rpc, &payer.pubkey())?.map(|a| a.nonce).unwrap_or(0),
     };
     let ix = Instruction { program_id, accounts, data };
-    // No recent-certificate anchor is fetched yet (phase-1 simplification
-    // - see `qchain-node`'s RPC surface): nonce is this transaction's only
-    // replay defense for now.
-    let tx = Transaction::new_signed(payer, nonce, [0u8; 32], fee_limit, vec![ix])?;
+    let chain_id = fetch_chain_id(rpc)?;
+    let tx = Transaction::new_signed(payer, nonce, chain_id, fee_limit, vec![ix])?;
 
     let resp = reqwest::blocking::Client::new().post(format!("{rpc}/tx")).json(&tx).send()?;
     if !resp.status().is_success() {
@@ -715,6 +725,7 @@ fn main() -> anyhow::Result<()> {
             // separate, sequential, un-timed setup phase for exactly this
             // reason.
             println!("funding {count} fresh accounts (sequential setup, not timed)...");
+            let chain_id = fetch_chain_id(&rpc)?;
             let senders: Vec<Keypair> = (0..count).map(|_| Keypair::generate().unwrap()).collect();
             let start_nonce = fetch_account(&rpc, &payer.pubkey())?.map(|a| a.nonce).unwrap_or(0);
             // Reads the live `base_fee_per_byte` instead of a hardcoded
@@ -738,7 +749,7 @@ fn main() -> anyhow::Result<()> {
                     accounts: vec![payer.pubkey(), sender.pubkey()],
                     data: borsh::to_vec(&SystemInstruction::Transfer { amount: fund_amount })?,
                 };
-                let tx = Transaction::new_signed(&payer, start_nonce + i as u64, [0u8; 32], 10_000_000, vec![ix])?;
+                let tx = Transaction::new_signed(&payer, start_nonce + i as u64, chain_id, 10_000_000, vec![ix])?;
                 let resp = client.post(format!("{rpc}/tx")).json(&tx).send()?;
                 if !resp.status().is_success() {
                     anyhow::bail!("funding transaction rejected: {}", resp.text()?);
@@ -770,7 +781,7 @@ fn main() -> anyhow::Result<()> {
                         accounts: vec![sender.pubkey(), to],
                         data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
                     };
-                    Transaction::new_signed(sender, 0, [0u8; 32], fund_amount, vec![ix]).unwrap()
+                    Transaction::new_signed(sender, 0, chain_id, fund_amount, vec![ix]).unwrap()
                 })
                 .collect();
             let sign_elapsed = sign_start.elapsed();

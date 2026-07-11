@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         keypair,
         validators,
         network,
+        chain_id: config.chain_id(),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
             dag: DagStore::new(),

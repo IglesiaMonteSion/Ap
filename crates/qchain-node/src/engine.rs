@@ -180,6 +180,13 @@ pub struct Engine {
     pub validators: ValidatorSet,
     pub network: Network,
     pub state: Mutex<EngineState>,
+    /// This network's own genesis-derived identity - see
+    /// `qchain_node::config::NodeConfig::chain_id`'s doc comment. Checked
+    /// against every transaction at admission (`submit_transaction`/the
+    /// `TransactionGossip` handler), the real, live-confirmed fix for the
+    /// cross-network replay gap documented on `qchain_core::Message::
+    /// chain_id`.
+    pub chain_id: [u8; 32],
 }
 
 #[derive(Serialize)]
@@ -298,6 +305,14 @@ impl Engine {
     pub async fn submit_transaction(&self, tx: Transaction) -> anyhow::Result<[u8; 32]> {
         if !tx.verify_signature() {
             anyhow::bail!("invalid transaction signature");
+        }
+        // Real, live-confirmed cross-network replay gap closed here - see
+        // `qchain_core::Message::chain_id`'s doc comment for the full
+        // reproduction (one signed transfer, replayed verbatim across two
+        // genuinely separate testnet processes, executed identically on
+        // both).
+        if tx.message.chain_id != self.chain_id {
+            anyhow::bail!("transaction's chain_id does not match this network");
         }
         let hash = tx.hash();
         {
@@ -446,6 +461,10 @@ impl Engine {
                 // RPC-submitted transactions.
                 if !tx.verify_signature() {
                     tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
+                    return;
+                }
+                if tx.message.chain_id != self.chain_id {
+                    tracing::warn!("dropping gossiped transaction from {from} with a mismatched chain_id");
                     return;
                 }
                 let mut state = self.state.lock().await;
