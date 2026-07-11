@@ -243,6 +243,18 @@ impl Ledger {
         if payer_account.balance < byte_fee {
             return Err(ExecError::InsufficientFunds);
         }
+        // Real enforcement of a field that used to be signed and
+        // transmitted but never checked (found live during the security
+        // review - see `project-lessons-learned`): reject before any state
+        // is touched if even the byte fee alone already exceeds what the
+        // payer capped. The real, documented scenario this protects
+        // against is `propose-set-base-fee` governance repricing the byte
+        // fee while a transaction sits in the mempool - the payer's own
+        // declared ceiling from when they signed, not the network's
+        // current price, is what should decide whether it still executes.
+        if byte_fee > tx.message.fee_limit {
+            return Err(ExecError::FeeExceedsLimit { actual: byte_fee, limit: tx.message.fee_limit });
+        }
         if payer_account.nonce != tx.message.nonce {
             return Err(ExecError::ProgramError(format!(
                 "nonce mismatch: account is at {}, transaction has {}",
@@ -391,6 +403,21 @@ impl Ledger {
             });
         }
 
+        // The byte fee alone was already checked against `fee_limit` above,
+        // before it was committed to the store - gas fee is only known
+        // after the instructions actually ran, so the *combined* total is
+        // checked here, before any of `working`'s changes (including the
+        // WASM contracts' own state mutations) are committed below. The
+        // already-committed byte fee itself is not reverted on this path -
+        // consistent with this project's existing "you pay for attempted
+        // execution" behavior (a failed WASM call already keeps the byte
+        // fee, see the security-review entry in `project-lessons-learned`),
+        // so declaring too-low a `fee_limit` for a WASM call still costs
+        // the byte fee, same as any other rejected transaction.
+        if byte_fee + total_gas_fee > tx.message.fee_limit {
+            return Err(ExecError::FeeExceedsLimit { actual: byte_fee + total_gas_fee, limit: tx.message.fee_limit });
+        }
+
         if total_gas_fee > 0 {
             let payer_after = working.get_mut(&tx.message.payer).ok_or(ExecError::AccountNotFound(tx.message.payer))?;
             if payer_after.balance < total_gas_fee {
@@ -493,7 +520,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
 
         let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert!(fee > 0, "a multi-kilobyte hybrid-signed transaction must not be free");
@@ -502,6 +529,34 @@ mod tests {
         assert_eq!(ledger.get_balance(&alice.pubkey()), 10_000_000 - 2_000_000 - fee);
         assert_eq!(ledger.get_balance(&validator), fee - fee / 2, "validator gets its half of the burned/split fee");
         assert_eq!(ledger.total_burned, fee / 2);
+    }
+
+    /// A real, live-confirmed gap this closes (see `project-lessons-learned`):
+    /// `Message.fee_limit` used to be signed and transmitted but never
+    /// checked at all - confirmed live by submitting a real transfer with
+    /// `fee_limit=1` that was accepted and charged the real fee anyway.
+    #[test]
+    fn a_transaction_whose_real_fee_exceeds_its_declared_fee_limit_is_rejected() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 10_000_000);
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+        };
+        // The real byte fee for a transaction this size is always far
+        // above 1 unit - this must be rejected before any state changes,
+        // not accepted and silently charged more than the payer capped.
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 1, vec![ix]).unwrap();
+
+        let result = ledger.apply_transaction(&tx, &validator, 0);
+        assert!(matches!(result, Err(ExecError::FeeExceedsLimit { .. })), "a fee above fee_limit must be rejected, got {result:?}");
+        assert_eq!(ledger.get_balance(&alice.pubkey()), 10_000_000, "alice must not be charged anything for a rejected transaction");
+        assert_eq!(ledger.get_balance(&bob), 0, "bob must never have received the transfer");
     }
 
     #[test]
@@ -517,7 +572,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         // Same nonce again - the account has already moved to nonce 1.
@@ -573,7 +628,7 @@ mod tests {
                 accounts: vec![alice.pubkey(), bob],
                 data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
             };
-            Transaction::new_signed(alice, nonce, [0u8; 32], 1_000_000, vec![ix]).unwrap()
+            Transaction::new_signed(alice, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
         }
 
         let tx0 = transfer_tx(&alice, bob, 0);
@@ -622,7 +677,7 @@ mod tests {
                     accounts: vec![payer.pubkey(), bob],
                     data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
                 };
-                Transaction::new_signed(&payer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap()
+                Transaction::new_signed(&payer, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap()
             })
             .collect();
         let sign_elapsed = sign_start.elapsed();
@@ -670,7 +725,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
 
         let err = ledger.apply_transaction(&tx, &validator, 0).unwrap_err();
         assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
@@ -702,7 +757,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
 
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert_eq!(ledger.get_balance(&bob), 2_000_000, "the SLH-DSA-combo transaction must have actually executed");
@@ -726,7 +781,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
-        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix0]).unwrap();
+        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix0]).unwrap();
         ledger.apply_transaction(&tx0, &validator, 0).unwrap();
 
         // Now retire ML-DSA-65 (as if a passed RetireAlgorithm proposal's
@@ -742,7 +797,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
-        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 100_000, vec![ix1]).unwrap();
+        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 50_000_000, vec![ix1]).unwrap();
         let err = ledger.apply_transaction(&tx1, &validator, 0).unwrap_err();
         assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
     }
@@ -767,7 +822,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_500_000 }).unwrap(),
         };
-        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix0]).unwrap();
+        let tx0 = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix0]).unwrap();
         ledger.apply_transaction(&tx0, &validator, 0).unwrap();
 
         let mut registry = qchain_crypto::registry::genesis_registry();
@@ -779,7 +834,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1_500_000 }).unwrap(),
         };
-        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 100_000, vec![ix1]).unwrap();
+        let tx1 = Transaction::new_signed(&alice, 1, [0u8; 32], 50_000_000, vec![ix1]).unwrap();
         ledger.apply_transaction(&tx1, &validator, 0).unwrap();
         assert_eq!(ledger.get_balance(&bob), 3_000_000, "an existing account must keep working through the deprecation grace period");
     }
@@ -804,7 +859,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let err = ledger.apply_transaction(&tx, &validator, 0).unwrap_err();
         assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "expected AlgorithmNotAcceptable, got {err:?}");
     }
@@ -828,7 +883,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 100_000 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         let root_after = ledger.merkle_root();
@@ -854,7 +909,7 @@ mod tests {
             accounts: vec![alice.pubkey(), bob],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         let receipts = ledger.transfer_receipts();
@@ -913,7 +968,7 @@ mod tests {
             accounts: vec![alice.pubkey(), carol],
             data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000 }).unwrap(),
         };
-        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 100_000, vec![ix1, ix2]).unwrap();
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix1, ix2]).unwrap();
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         assert!(ledger.transfer_receipts().is_empty(), "a multi-instruction transaction must not produce a receipt");
@@ -961,7 +1016,7 @@ mod tests {
             accounts: vec![program_pk],
             data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
         };
-        let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 1_000_000, vec![deploy_ix]).unwrap();
+        let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
         ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
         program_pk
     }
@@ -998,7 +1053,7 @@ mod tests {
         call_data.extend_from_slice(&1i64.to_le_bytes()); // index 1 = bob
         call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
         let call_ix = Instruction { program_id: program_pk, accounts: vec![alice.pubkey(), bob], data: call_data };
-        let call_tx = Transaction::new_signed(&alice, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
+        let call_tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
         let fee = ledger.apply_transaction(&call_tx, &validator, 0).unwrap();
         assert!(fee > 0, "a WASM call must still charge the byte fee (gas was 0 for this cheap contract, which is fine)");
 
@@ -1039,7 +1094,7 @@ mod tests {
         call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
         let call_ix = Instruction { program_id: program_pk, accounts: vec![victim.pubkey(), attacker.pubkey()], data: call_data };
         // Signed only by the attacker - the victim never authorized this.
-        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
+        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
 
         let result = ledger.apply_transaction(&call_tx, &validator, 0);
         assert!(result.is_err(), "a contract call naming a non-signer as the funds source must be rejected, not silently drain the victim");
@@ -1065,7 +1120,7 @@ mod tests {
             accounts: vec![victim],
             data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
         };
-        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
         assert!(result.is_err(), "deploying over an existing account must be rejected");
         assert_eq!(ledger.get_balance(&victim), 5_000_000, "the victim account must be completely untouched");
@@ -1086,7 +1141,7 @@ mod tests {
             accounts: vec![program_pk],
             data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: oversized, entry_point: "x".into() }).unwrap(),
         };
-        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
         assert!(result.is_err(), "oversized bytecode must be rejected before it's ever stored");
         assert!(ledger.store().get(&program_pk).is_none(), "a rejected deploy must leave no trace of the account");
@@ -1103,7 +1158,7 @@ mod tests {
         // not a loader-owned account either.
         let nonexistent_program = Keypair::generate().unwrap().pubkey();
         let ix = Instruction { program_id: nonexistent_program, accounts: vec![], data: vec![] };
-        let tx = Transaction::new_signed(&caller, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
         assert!(matches!(result, Err(ExecError::UnknownProgram(_))));
     }

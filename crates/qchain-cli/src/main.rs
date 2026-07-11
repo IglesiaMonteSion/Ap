@@ -68,7 +68,7 @@ enum Command {
         amount: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Bond funds to a validator, opening a new stake account (prints its
@@ -84,7 +84,7 @@ enum Command {
         amount: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Close a stake account, returning its funds plus any pending reward
@@ -99,7 +99,7 @@ enum Command {
         stake_account: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Claim this stake position's pending staking reward without closing
@@ -114,7 +114,7 @@ enum Command {
         stake_account: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose activating a new algorithm registry entry.
@@ -135,7 +135,7 @@ enum Command {
         max_sig_len: usize,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose deprecating an active algorithm registry entry.
@@ -152,7 +152,7 @@ enum Command {
         retirement_round: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose retiring a deprecated algorithm registry entry (only takes
@@ -168,7 +168,7 @@ enum Command {
         algorithm_id: u16,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose a new byte-scaled base fee (Low risk tier: simple
@@ -184,7 +184,7 @@ enum Command {
         value: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose a new dust-sweep threshold (Low risk tier).
@@ -199,7 +199,7 @@ enum Command {
         value: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose a new WASM gas price (Low risk tier).
@@ -214,7 +214,7 @@ enum Command {
         value: u64,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Propose a new validator commission (basis points, out of 10,000) on
@@ -230,7 +230,7 @@ enum Command {
         value: u16,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Cast a vote on a proposal, weighted by a stake account's balance.
@@ -248,7 +248,7 @@ enum Command {
         choice: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Tally a proposal's votes once its voting period has ended.
@@ -262,7 +262,7 @@ enum Command {
         proposal: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Execute a passed proposal once its review time-lock has elapsed.
@@ -276,7 +276,7 @@ enum Command {
         proposal: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Print the on-chain algorithm registry.
@@ -334,7 +334,7 @@ enum Command {
         entry_point: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Call a deployed contract. `--args` are packed as little-endian i64s
@@ -358,7 +358,7 @@ enum Command {
         args: String,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// Real light-client verification: fetches a `qchain-stark` proof plus

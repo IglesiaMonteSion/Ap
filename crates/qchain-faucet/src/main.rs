@@ -46,7 +46,7 @@ struct Cli {
     /// never an amount, so nobody can drain the faucet in one call.
     #[arg(long, default_value_t = 10_000_000)]
     amount: u64,
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = 10_000_000)]
     fee_limit: u64,
     /// Minimum seconds between payouts to the same address.
     #[arg(long, default_value_t = 60)]

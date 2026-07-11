@@ -21,4 +21,6 @@ pub enum ExecError {
     OutOfGas,
     #[error("algorithm not acceptable: {0}")]
     AlgorithmNotAcceptable(String),
+    #[error("fee {actual} exceeds the transaction's declared fee_limit {limit}")]
+    FeeExceedsLimit { actual: u64, limit: u64 },
 }
