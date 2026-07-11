@@ -26,6 +26,14 @@ pub struct WasmCallResult {
 
 struct HostState {
     accounts: Vec<Account>,
+    /// `is_signer[i]` is true when `accounts[i]` is the transaction's
+    /// authenticated payer - the only notion of "signer" this single-signer
+    /// execution model has (same limitation `native.rs`'s `SystemProgram`
+    /// already documents). Exposed to contracts via `host_is_signer` so a
+    /// contract *can* refuse to move funds out of an account nothing
+    /// authorized - see that syscall's own doc comment for the real
+    /// vulnerability this closed.
+    is_signer: Vec<bool>,
     log: Vec<String>,
 }
 
@@ -88,6 +96,26 @@ impl WasmExecutor {
                     acc.balance = new_balance as u64;
                 }
             }
+        })?;
+
+        // Real fix for a real, live-confirmed vulnerability (see
+        // `project-lessons-learned`): `host_get_balance`/`host_set_balance`
+        // give a contract access to any account *declared* in the
+        // instruction, by index, with no way to tell whether the entity at
+        // that index actually authorized this call. A contract that trusts
+        // caller-supplied indices for authorization (the only pattern the
+        // host API allowed before this syscall existed) let anyone name any
+        // victim's address as an instruction account and drain it, with
+        // only the attacker's own signature - the exact same class of bug
+        // `SystemProgram::Transfer` already had to fix for the native
+        // System Program (`from != payer` check in `native.rs`), just
+        // unfixed here because WASM contracts are a separate code path with
+        // no equivalent primitive. A contract that wants "the caller must
+        // own this account" semantics now can check `host_is_signer(idx)`
+        // before debiting - it did not exist previously, so no prior
+        // contract's logic could have relied on it.
+        linker.func_wrap("env", "host_is_signer", |caller: Caller<'_, HostState>, idx: i32| -> i32 {
+            i32::from(caller.data().is_signer.get(idx as usize).copied().unwrap_or(false))
         })?;
 
         linker.func_wrap("env", "host_log", |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
@@ -159,19 +187,21 @@ impl WasmExecutor {
     /// `params`, metered to `fuel_limit` units of fuel. `accounts` are the
     /// instruction's declared accounts, in order, exposed to the contract
     /// only via `host_get_balance`/`host_set_balance` by index - never
-    /// directly.
+    /// directly. `is_signer` (same length/order as `accounts`) is what
+    /// `host_is_signer` reports back to the contract.
     pub fn call(
         &self,
         wasm_bytes: &[u8],
         entry_point: &str,
         params: &[Val],
         accounts: Vec<Account>,
+        is_signer: Vec<bool>,
         fuel_limit: u64,
     ) -> anyhow::Result<WasmCallResult> {
         let module = Module::new(&self.engine, wasm_bytes)?;
         let linker = self.build_linker()?;
 
-        let host_state = HostState { accounts, log: Vec::new() };
+        let host_state = HostState { accounts, is_signer, log: Vec::new() };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
 
@@ -245,6 +275,7 @@ mod tests {
                 "transfer",
                 &[Val::I32(0), Val::I32(1), Val::I64(300)],
                 accounts,
+                vec![true, false],
                 1_000_000,
             )
             .unwrap();
@@ -260,8 +291,40 @@ mod tests {
         let executor = WasmExecutor::new().unwrap();
         let accounts = vec![wallet(1_000), wallet(0)];
 
-        let result = executor.call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], accounts, 1);
+        let result = executor.call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], accounts, vec![true, false], 1);
         assert!(result.is_err(), "1 unit of fuel must not be enough to complete a real call");
+    }
+
+    const IS_SIGNER_WAT: &str = r#"
+        (module
+            (import "env" "host_is_signer" (func $is_signer (param i32) (result i32)))
+            (func (export "check") (param $idx i32) (result i32)
+                (call $is_signer (local.get $idx))
+            )
+        )
+    "#;
+
+    #[test]
+    fn host_is_signer_reports_the_real_signer_index_and_rejects_out_of_range() {
+        let wasm_bytes = wat::parse_str(IS_SIGNER_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
+        let linker = executor.build_linker().unwrap();
+        let accounts = vec![wallet(0), wallet(0)];
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![true, false], log: vec![] });
+        store.set_fuel(1_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let func = instance.get_func(&mut store, "check").unwrap();
+
+        let call = |store: &mut wasmtime::Store<HostState>, idx: i32| -> i32 {
+            let mut results = vec![Val::I32(0)];
+            func.call(&mut *store, &[Val::I32(idx)], &mut results).unwrap();
+            results[0].i32().unwrap()
+        };
+
+        assert_eq!(call(&mut store, 0), 1, "index 0 is the real signer");
+        assert_eq!(call(&mut store, 1), 0, "index 1 was only declared, never signed");
+        assert_eq!(call(&mut store, 99), 0, "an out-of-range index must fail closed, not panic or trap");
     }
 
     const VERIFY_WAT: &str = r#"
@@ -299,7 +362,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(VERIFY_WAT).unwrap();
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, log: vec![] });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![], log: vec![] });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();

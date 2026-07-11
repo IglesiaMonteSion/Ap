@@ -318,7 +318,8 @@ impl Ledger {
             match self.programs.get(&ix.program_id) {
                 Some(Program::Native(native)) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
                 Some(Program::Wasm { module_bytes, entry_point }) => {
-                    total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working, params.gas_price_per_fuel)?;
+                    total_gas_fee +=
+                        self.run_wasm_instruction(module_bytes, entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel)?;
                 }
                 // Not one of the fixed native programs - check whether a
                 // real `SystemInstruction::DeployProgram` deployed a WASM
@@ -341,6 +342,7 @@ impl Ledger {
                         &program_data.module_bytes,
                         &program_data.entry_point,
                         ix,
+                        &tx.message.payer,
                         &mut working,
                         params.gas_price_per_fuel,
                     )?;
@@ -416,6 +418,7 @@ impl Ledger {
         module_bytes: &[u8],
         entry_point: &str,
         ix: &Instruction,
+        payer: &Pubkey,
         working: &mut HashMap<Pubkey, Account>,
         gas_price_per_fuel: u64,
     ) -> Result<u64, ExecError> {
@@ -424,6 +427,15 @@ impl Ledger {
             .iter()
             .map(|pk| working.get(pk).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())))
             .collect();
+        // A real, live-confirmed vulnerability closed here (see
+        // `project-lessons-learned`): without this, a contract had no way
+        // to tell whether an account it was about to debit had actually
+        // authorized the call, so anyone could name any victim's address
+        // as an instruction account and drain it with only their own
+        // signature. `is_signer[i]` tells the contract whether
+        // `ix.accounts[i]` is this transaction's authenticated payer - the
+        // only notion of "signer" this single-signer execution model has.
+        let is_signer: Vec<bool> = ix.accounts.iter().map(|pk| pk == payer).collect();
 
         // Phase-1 simplification: instruction args are passed as up to two
         // little-endian u64s taken from the tail of `ix.data`, rather than a
@@ -439,7 +451,7 @@ impl Ledger {
 
         let result = self
             .wasm
-            .call(module_bytes, entry_point, &args, accounts, DEFAULT_FUEL_LIMIT)
+            .call(module_bytes, entry_point, &args, accounts, is_signer, DEFAULT_FUEL_LIMIT)
             .map_err(|e| ExecError::Wasm(e.to_string()))?;
 
         for (pk, account) in ix.accounts.iter().zip(result.accounts.into_iter()) {
@@ -913,14 +925,26 @@ mod tests {
     /// `TRANSFER_WAT`, which calls `WasmExecutor::call` directly with
     /// hand-picked `Val::I32`/`Val::I64` params and so never exercises
     /// this project's actual instruction-data-to-args decoding at all.
+    ///
+    /// Checks `host_is_signer` on the source account before debiting - a
+    /// real, live-confirmed vulnerability (see `project-lessons-learned`)
+    /// was found and closed here: an earlier version of this exact
+    /// contract had no such check, which let anyone name any funded
+    /// account as `from` and drain it using only their own signature,
+    /// mirroring the bug `SystemProgram::Transfer` already had to fix in
+    /// `native.rs` (`transfer_from_an_account_other_than_the_payer_is_rejected`
+    /// above) for the native System Program specifically.
     const I64_TRANSFER_WAT: &str = r#"
         (module
             (import "env" "host_get_balance" (func $get_balance (param i32) (result i64)))
             (import "env" "host_set_balance" (func $set_balance (param i32 i64)))
+            (import "env" "host_is_signer" (func $is_signer (param i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "transfer") (param $from i64) (param $to i64) (param $amount i64)
                 (local $from_balance i64)
                 (local $to_balance i64)
+                (if (i32.eqz (call $is_signer (i32.wrap_i64 (local.get $from))))
+                    (then unreachable))
                 (local.set $from_balance (call $get_balance (i32.wrap_i64 (local.get $from))))
                 (local.set $to_balance (call $get_balance (i32.wrap_i64 (local.get $to))))
                 (call $set_balance (i32.wrap_i64 (local.get $from)) (i64.sub (local.get $from_balance) (local.get $amount)))
@@ -929,15 +953,7 @@ mod tests {
         )
     "#;
 
-    #[test]
-    fn deploy_program_then_call_it_moves_balances_through_the_real_dispatch_path() {
-        let mut ledger = new_test_ledger();
-        let deployer = Keypair::generate().unwrap();
-        let caller = Keypair::generate().unwrap();
-        let validator = Keypair::generate().unwrap().pubkey();
-        ledger.credit(deployer.pubkey(), 50_000_000);
-        ledger.credit(caller.pubkey(), 50_000_000);
-
+    fn deploy_i64_transfer_contract(ledger: &mut Ledger, deployer: &Keypair, validator: &Pubkey) -> Pubkey {
         let program_pk = Keypair::generate().unwrap().pubkey();
         let module_bytes = wat::parse_str(I64_TRANSFER_WAT).unwrap();
         let deploy_ix = Instruction {
@@ -945,8 +961,19 @@ mod tests {
             accounts: vec![program_pk],
             data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
         };
-        let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![deploy_ix]).unwrap();
-        ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();
+        let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 1_000_000, vec![deploy_ix]).unwrap();
+        ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
+        program_pk
+    }
+
+    #[test]
+    fn deploy_program_then_call_it_moves_balances_through_the_real_dispatch_path() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+
+        let program_pk = deploy_i64_transfer_contract(&mut ledger, &deployer, &validator);
 
         // Deployment itself must not have created a wallet balance for
         // the program address, and it must be owned by the loader, not
@@ -958,22 +985,65 @@ mod tests {
         // Fund two ordinary wallets, then call the deployed contract to
         // move value between them - the exact same operation `wasm.rs`'s
         // unit test proves in isolation, now proven through the real
-        // dispatch path a live validator actually runs.
-        let alice = Keypair::generate().unwrap().pubkey();
+        // dispatch path a live validator actually runs. `alice` must be
+        // the transaction's own payer (accounts[0]/"from" must be the
+        // signer), matching this project's single-signer authorization
+        // model - see `host_is_signer` in the contract above.
+        let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap().pubkey();
-        ledger.credit(alice, 5_000_000);
+        ledger.credit(alice.pubkey(), 5_000_000);
 
         let mut call_data = Vec::new();
         call_data.extend_from_slice(&0i64.to_le_bytes()); // index 0 = alice
         call_data.extend_from_slice(&1i64.to_le_bytes()); // index 1 = bob
         call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
-        let call_ix = Instruction { program_id: program_pk, accounts: vec![alice, bob], data: call_data };
-        let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![alice.pubkey(), bob], data: call_data };
+        let call_tx = Transaction::new_signed(&alice, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
         let fee = ledger.apply_transaction(&call_tx, &validator, 0).unwrap();
         assert!(fee > 0, "a WASM call must still charge the byte fee (gas was 0 for this cheap contract, which is fine)");
 
-        assert_eq!(ledger.get_balance(&alice), 5_000_000 - 2_000_000);
+        // Alice is both the payer (pays `fee`) and the contract's funds
+        // source (pays the 2,000,000 the contract itself moves) - unlike
+        // the pre-fix version of this test, where a separate `caller`
+        // could debit alice's account without ever being her, which is
+        // exactly the vulnerability this fix closed.
+        assert_eq!(ledger.get_balance(&alice.pubkey()), 5_000_000 - fee - 2_000_000);
         assert_eq!(ledger.get_balance(&bob), 2_000_000);
+    }
+
+    /// The real, live-confirmed attack this session found on an actual
+    /// 3-validator testnet: an attacker with no relationship to the
+    /// victim's funds names the victim's address as `accounts[0]` ("from")
+    /// and their own address as `accounts[1]` ("to"), signs the call
+    /// transaction with only their own key, and the pre-fix contract
+    /// drained the victim's entire balance - confirmed live against the
+    /// deployed contract before this fix existed. Proves the fixed
+    /// contract's `host_is_signer` check rejects it.
+    #[test]
+    fn calling_a_contract_naming_a_non_signer_account_as_the_funds_source_is_rejected() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+
+        let program_pk = deploy_i64_transfer_contract(&mut ledger, &deployer, &validator);
+
+        let victim = Keypair::generate().unwrap();
+        let attacker = Keypair::generate().unwrap();
+        ledger.credit(victim.pubkey(), 2_000_000);
+        ledger.credit(attacker.pubkey(), 5_000_000);
+
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes()); // index 0 = victim, never signed
+        call_data.extend_from_slice(&1i64.to_le_bytes()); // index 1 = attacker
+        call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![victim.pubkey(), attacker.pubkey()], data: call_data };
+        // Signed only by the attacker - the victim never authorized this.
+        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
+
+        let result = ledger.apply_transaction(&call_tx, &validator, 0);
+        assert!(result.is_err(), "a contract call naming a non-signer as the funds source must be rejected, not silently drain the victim");
+        assert_eq!(ledger.get_balance(&victim.pubkey()), 2_000_000, "the victim's balance must be untouched");
     }
 
     #[test]
