@@ -315,6 +315,52 @@ enum Command {
         #[arg(long = "monitor")]
         monitor: Vec<String>,
     },
+    /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
+    /// see `qchain-execution::native`). Prints the fresh address the
+    /// program now lives at - save it, later `call-program` invocations
+    /// need it as `--program`. No separate deploy fee: the byte-scaled
+    /// base fee already charges proportionally more for larger bytecode.
+    DeployProgram {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Path to a compiled `.wasm` module.
+        #[arg(long)]
+        wasm_file: PathBuf,
+        /// Exported function name later `call-program` invocations will
+        /// call.
+        #[arg(long)]
+        entry_point: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
+    /// Call a deployed contract. `--args` are packed as little-endian i64s
+    /// back to back into the instruction data - the real on-chain calling
+    /// convention `run_wasm_instruction` decodes (see its doc comment):
+    /// every exported function a contract wants callable this way must
+    /// declare all-i64 parameters, matching how the args are packed.
+    CallProgram {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        program: String,
+        /// Comma-separated account addresses, in the order the contract
+        /// expects to index them via `host_get_balance`/`host_set_balance`.
+        #[arg(long, default_value = "")]
+        accounts: String,
+        /// Comma-separated i64 arguments.
+        #[arg(long, default_value = "")]
+        args: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
     /// Real light-client verification: fetches a `qchain-stark` proof plus
     /// its Merkle-root bindings from `GET /stark_proof` and checks it
     /// *locally*, independent of the node's own claim - this command
@@ -733,6 +779,31 @@ fn main() -> anyhow::Result<()> {
                     count as f64 / total_elapsed.as_secs_f64()
                 );
             }
+        }
+        Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
+            let payer = qchain_crypto::read_keypair_file(&keypair)?;
+            let module_bytes = std::fs::read(&wasm_file)?;
+            // Only needs a fresh, unique address - nobody ever signs *as*
+            // a program account (see `native.rs`'s `DeployProgram`), so
+            // the private key is discarded immediately, same pattern as
+            // `stake-delegate`'s stake account.
+            let program_pk = Keypair::generate()?.pubkey();
+            let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point })?;
+            let body = submit_instruction(&rpc, &payer, Pubkey::system_program_id(), vec![program_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("program address: {program_pk}");
+        }
+        Command::CallProgram { rpc, keypair, program, accounts, args, nonce, fee_limit } => {
+            let payer = qchain_crypto::read_keypair_file(&keypair)?;
+            let program_pk: Pubkey = program.parse()?;
+            let account_pks: Vec<Pubkey> =
+                accounts.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;
+            let mut data = Vec::new();
+            for arg in args.split(',').filter(|s| !s.is_empty()) {
+                data.extend_from_slice(&arg.parse::<i64>()?.to_le_bytes());
+            }
+            let body = submit_instruction(&rpc, &payer, program_pk, account_pks, data, nonce, fee_limit)?;
+            println!("submitted: {body}");
         }
         Command::LightClientVerify { rpc, limit } => {
             let mut url = format!("{rpc}/stark_proof");

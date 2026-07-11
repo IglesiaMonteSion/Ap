@@ -6,9 +6,31 @@
 //! transaction depends on it.
 
 use crate::error::ExecError;
+use crate::ids::LOADER_PROGRAM_ID;
 use qchain_core::{Account, Instruction, Round};
 use qchain_crypto::Pubkey;
+use sha3::{Digest as _, Sha3_256};
 use std::collections::HashMap;
+
+/// Real, adjustable-by-recompiling resource cap on deployed contract
+/// bytecode - a placeholder in the same spirit as the other economic
+/// constants in `qchain-core::account` (documented, not arbitrary-but-
+/// hidden), sized to comfortably fit a real hand-written contract (the
+/// test contracts in `wasm.rs` are a few hundred bytes) while bounding
+/// how much state/bandwidth one `DeployProgram` can add - unbounded
+/// bytecode size is a real state-bloat/gossip-bandwidth DoS vector, not
+/// a hypothetical one.
+pub const MAX_PROGRAM_BYTECODE_BYTES: usize = 256 * 1024;
+
+/// What a `DeployProgram`-created account's `data` holds - the WASM
+/// module bytes plus which export to call, read back by
+/// `Ledger::apply_transaction`'s dispatch fallback on every later
+/// instruction naming this program as `program_id`.
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct WasmProgramData {
+    pub entry_point: String,
+    pub module_bytes: Vec<u8>,
+}
 
 pub trait NativeProgram: Send + Sync {
     /// `current_round` is the DAG round of the certificate whose batch
@@ -32,6 +54,14 @@ pub enum SystemInstruction {
     CreateAccount { units: u64, owner: Pubkey },
     /// accounts[0] = from, accounts[1] = to.
     Transfer { amount: u64 },
+    /// accounts[0] = the fresh address this program will live at - must
+    /// not already hold an account (deploy-once, same "create if absent"
+    /// discipline `CreateAccount` already follows; this never overwrites
+    /// an existing wallet or program). No separate deploy fee: the
+    /// existing byte-scaled base fee already charges proportionally more
+    /// for a larger `module_bytes`, since it's part of this instruction's
+    /// data and therefore of `tx.byte_size()`.
+    DeployProgram { module_bytes: Vec<u8>, entry_point: String },
 }
 
 pub struct SystemProgram;
@@ -91,6 +121,36 @@ impl NativeProgram for SystemProgram {
                     return Err(ExecError::Unauthorized("Transfer's source account must be the transaction payer".into()));
                 }
                 Self::transfer_internal(accounts, from, to, amount)?;
+            }
+            SystemInstruction::DeployProgram { module_bytes, entry_point } => {
+                if module_bytes.len() > MAX_PROGRAM_BYTECODE_BYTES {
+                    return Err(ExecError::ProgramError(format!(
+                        "program bytecode too large: {} bytes (max {MAX_PROGRAM_BYTECODE_BYTES})",
+                        module_bytes.len()
+                    )));
+                }
+                let program_pubkey = instruction
+                    .accounts
+                    .first()
+                    .ok_or_else(|| ExecError::ProgramError("DeployProgram requires accounts[0]".into()))?;
+                // Working-set membership here means exactly "an account
+                // already exists at this address in the persisted store"
+                // (see `Ledger::apply_transaction`'s working-set
+                // construction) - reject rather than silently overwrite
+                // whatever's already there, whether a wallet or another
+                // deployed program.
+                if accounts.contains_key(program_pubkey) {
+                    return Err(ExecError::ProgramError(
+                        "an account already exists at the target program address".into(),
+                    ));
+                }
+                let code_hash: [u8; 32] = Sha3_256::digest(&module_bytes).into();
+                let data = borsh::to_vec(&WasmProgramData { entry_point, module_bytes })
+                    .map_err(|e| ExecError::ProgramError(format!("failed to encode program data: {e}")))?;
+                accounts.insert(
+                    *program_pubkey,
+                    Account { code_hash, data, owner: LOADER_PROGRAM_ID, ..Account::new_wallet(LOADER_PROGRAM_ID) },
+                );
             }
         }
         Ok(())

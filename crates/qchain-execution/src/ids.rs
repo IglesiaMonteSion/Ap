@@ -27,3 +27,14 @@ pub const PARAMS_ACCOUNT_ID: Pubkey = Pubkey::new([5u8; 32]);
 /// the real QCH held for delegators to claim - see `staking.rs`'s module
 /// docs for the reward-per-share accrual mechanism this backs.
 pub const STAKING_REWARDS_POOL_ID: Pubkey = Pubkey::new([6u8; 32]);
+
+/// Owner of every account created by `SystemInstruction::DeployProgram`
+/// (see `native.rs`) - a deployed contract's bytecode lives in that
+/// account's `data` (borsh-encoded `native::WasmProgramData`), the same
+/// way any other program-owned account works, so it persists through
+/// `SledStore` like everything else instead of living only in the
+/// in-memory `Ledger::programs` registry the three built-in native
+/// programs use. `Ledger::apply_transaction`'s instruction dispatch falls
+/// back to reading this owner + deserializing this data whenever
+/// `ix.program_id` isn't one of the fixed native ids.
+pub const LOADER_PROGRAM_ID: Pubkey = Pubkey::new([7u8; 32]);

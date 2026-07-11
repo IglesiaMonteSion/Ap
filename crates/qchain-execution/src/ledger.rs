@@ -315,11 +315,35 @@ impl Ledger {
 
         let mut total_gas_fee = 0u64;
         for ix in &tx.message.instructions {
-            let program = self.programs.get(&ix.program_id).ok_or(ExecError::UnknownProgram(ix.program_id))?;
-            match program {
-                Program::Native(native) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
-                Program::Wasm { module_bytes, entry_point } => {
+            match self.programs.get(&ix.program_id) {
+                Some(Program::Native(native)) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
+                Some(Program::Wasm { module_bytes, entry_point }) => {
                     total_gas_fee += self.run_wasm_instruction(module_bytes, entry_point, ix, &mut working, params.gas_price_per_fuel)?;
+                }
+                // Not one of the fixed native programs - check whether a
+                // real `SystemInstruction::DeployProgram` deployed a WASM
+                // contract at this address (see `native.rs`'s
+                // `WasmProgramData`/`LOADER_PROGRAM_ID`). A direct store
+                // read, not `working`, since `ix.accounts` (what
+                // `working` is populated from) never includes
+                // `ix.program_id` itself - a program's own account is
+                // read-only from the invoking instruction's perspective,
+                // not part of the mutable working set.
+                None => {
+                    let program_account = self
+                        .store
+                        .get(&ix.program_id)
+                        .filter(|a| a.owner == crate::ids::LOADER_PROGRAM_ID)
+                        .ok_or(ExecError::UnknownProgram(ix.program_id))?;
+                    let program_data = crate::native::WasmProgramData::try_from_slice(&program_account.data)
+                        .map_err(|e| ExecError::ProgramError(format!("corrupt deployed program data: {e}")))?;
+                    total_gas_fee += self.run_wasm_instruction(
+                        &program_data.module_bytes,
+                        &program_data.entry_point,
+                        ix,
+                        &mut working,
+                        params.gas_price_per_fuel,
+                    )?;
                 }
             }
         }
@@ -881,5 +905,136 @@ mod tests {
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         assert!(ledger.transfer_receipts().is_empty(), "a multi-instruction transaction must not produce a receipt");
+    }
+
+    /// Minimal contract exercising the *real* on-chain calling convention
+    /// (`run_wasm_instruction`'s doc comment: every argument arrives as an
+    /// `i64`, packed back-to-back from `ix.data`) - unlike `wasm.rs`'s own
+    /// `TRANSFER_WAT`, which calls `WasmExecutor::call` directly with
+    /// hand-picked `Val::I32`/`Val::I64` params and so never exercises
+    /// this project's actual instruction-data-to-args decoding at all.
+    const I64_TRANSFER_WAT: &str = r#"
+        (module
+            (import "env" "host_get_balance" (func $get_balance (param i32) (result i64)))
+            (import "env" "host_set_balance" (func $set_balance (param i32 i64)))
+            (memory (export "memory") 1)
+            (func (export "transfer") (param $from i64) (param $to i64) (param $amount i64)
+                (local $from_balance i64)
+                (local $to_balance i64)
+                (local.set $from_balance (call $get_balance (i32.wrap_i64 (local.get $from))))
+                (local.set $to_balance (call $get_balance (i32.wrap_i64 (local.get $to))))
+                (call $set_balance (i32.wrap_i64 (local.get $from)) (i64.sub (local.get $from_balance) (local.get $amount)))
+                (call $set_balance (i32.wrap_i64 (local.get $to)) (i64.add (local.get $to_balance) (local.get $amount)))
+            )
+        )
+    "#;
+
+    #[test]
+    fn deploy_program_then_call_it_moves_balances_through_the_real_dispatch_path() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let caller = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        ledger.credit(caller.pubkey(), 50_000_000);
+
+        let program_pk = Keypair::generate().unwrap().pubkey();
+        let module_bytes = wat::parse_str(I64_TRANSFER_WAT).unwrap();
+        let deploy_ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![program_pk],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
+        };
+        let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![deploy_ix]).unwrap();
+        ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();
+
+        // Deployment itself must not have created a wallet balance for
+        // the program address, and it must be owned by the loader, not
+        // the system program.
+        let program_account = ledger.store().get(&program_pk).expect("program account must exist after deploy");
+        assert_eq!(program_account.owner, crate::ids::LOADER_PROGRAM_ID);
+        assert_eq!(program_account.balance, 0);
+
+        // Fund two ordinary wallets, then call the deployed contract to
+        // move value between them - the exact same operation `wasm.rs`'s
+        // unit test proves in isolation, now proven through the real
+        // dispatch path a live validator actually runs.
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice, 5_000_000);
+
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes()); // index 0 = alice
+        call_data.extend_from_slice(&1i64.to_le_bytes()); // index 1 = bob
+        call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![alice, bob], data: call_data };
+        let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 1_000_000, vec![call_ix]).unwrap();
+        let fee = ledger.apply_transaction(&call_tx, &validator, 0).unwrap();
+        assert!(fee > 0, "a WASM call must still charge the byte fee (gas was 0 for this cheap contract, which is fine)");
+
+        assert_eq!(ledger.get_balance(&alice), 5_000_000 - 2_000_000);
+        assert_eq!(ledger.get_balance(&bob), 2_000_000);
+    }
+
+    #[test]
+    fn deploy_program_refuses_to_overwrite_an_existing_account() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 10_000_000);
+
+        // An address that already holds a real account (a funded
+        // wallet) - deploying a program there must be refused, not
+        // silently clobber its existing balance/owner/data.
+        let victim = Keypair::generate().unwrap().pubkey();
+        ledger.credit(victim, 5_000_000);
+
+        let module_bytes = wat::parse_str(I64_TRANSFER_WAT).unwrap();
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![victim],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let result = ledger.apply_transaction(&tx, &validator, 0);
+        assert!(result.is_err(), "deploying over an existing account must be rejected");
+        assert_eq!(ledger.get_balance(&victim), 5_000_000, "the victim account must be completely untouched");
+        assert_eq!(ledger.store().get(&victim).unwrap().owner, Pubkey::system_program_id(), "still an ordinary wallet, not hijacked into a program account");
+    }
+
+    #[test]
+    fn deploy_program_rejects_bytecode_over_the_size_cap() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 1_000_000_000);
+
+        let program_pk = Keypair::generate().unwrap().pubkey();
+        let oversized = vec![0u8; crate::native::MAX_PROGRAM_BYTECODE_BYTES + 1];
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![program_pk],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: oversized, entry_point: "x".into() }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let result = ledger.apply_transaction(&tx, &validator, 0);
+        assert!(result.is_err(), "oversized bytecode must be rejected before it's ever stored");
+        assert!(ledger.store().get(&program_pk).is_none(), "a rejected deploy must leave no trace of the account");
+    }
+
+    #[test]
+    fn calling_a_pubkey_with_no_deployed_program_and_no_native_program_is_rejected() {
+        let mut ledger = new_test_ledger();
+        let caller = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(caller.pubkey(), 5_000_000);
+
+        // A fresh, never-deployed-to pubkey - not a native program id,
+        // not a loader-owned account either.
+        let nonexistent_program = Keypair::generate().unwrap().pubkey();
+        let ix = Instruction { program_id: nonexistent_program, accounts: vec![], data: vec![] };
+        let tx = Transaction::new_signed(&caller, 0, [0u8; 32], 1_000_000, vec![ix]).unwrap();
+        let result = ledger.apply_transaction(&tx, &validator, 0);
+        assert!(matches!(result, Err(ExecError::UnknownProgram(_))));
     }
 }

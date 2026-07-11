@@ -1900,6 +1900,7 @@ dependencies = [
  "qchain-governance",
  "qchain-storage",
  "serde",
+ "sha3",
  "thiserror 1.0.69",
  "wasmtime",
  "wat",

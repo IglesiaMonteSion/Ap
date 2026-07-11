@@ -93,6 +93,8 @@ Winterfell (librería Rust embebible) sobre el stack de StarkWare, específicame
 
 **Riesgos y mitigación.** Ver `wasm-vm-integration` y `blockchain-security-audit` #1/#8.
 
+**Despliegue de contratos — cerrado (`CLAUDE.md` tiene el párrafo completo con las mediciones en vivo).** El bytecode desplegado vive en `Account.data` de una cuenta nueva creada por `SystemInstruction::DeployProgram`, con `owner: LOADER_PROGRAM_ID` — persiste vía el mismo `write_account`/`SledStore` que cualquier otra cuenta, en vez de un registro `programs` transitorio en memoria (lo que había en el código antes de este cierre, sin llenarse nunca desde una transacción real). Deploy-once (rechaza si la dirección destino ya tiene cuenta), tope de tamaño real de bytecode (`MAX_PROGRAM_BYTECODE_BYTES`) como mitigación explícita de bloat de estado/bandwidth de gossip. `Ledger::apply_transaction` despacha a una cuenta `LOADER_PROGRAM_ID`-owned cuando `program_id` no es uno de los programas nativos fijos, reusando el `WasmExecutor` ya existente — ningún cambio a la convención de gas/fuel ya descrita arriba.
+
 **Fuera de alcance en fase 1.** Backend LLVM/Wasmer como alternativa (Wasmtime cubre las necesidades). Punto flotante en contratos. Programación completamente automática de paralelismo especulativo (se empieza con detección de conflictos declarada explícitamente vía las cuentas listadas, no inferencia dinámica).
 
 ---
