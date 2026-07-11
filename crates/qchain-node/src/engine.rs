@@ -55,7 +55,7 @@
 //! queued for a later round instead of being drained blindly.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
-use qchain_core::{Batch, Certificate, Digest, Round, Transaction, ValidatorId, Vertex, WorkerId};
+use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
@@ -118,7 +118,7 @@ pub struct EngineState {
     pub mempool: HashMap<Pubkey, BTreeMap<u64, Transaction>>,
     pub batches: HashMap<Digest, Batch>,
     pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
-    pub own_pending_vertex: Option<Vertex>,
+    pub own_pending_vertex: Option<(Vertex, MultiSignature)>,
     pub next_round: Round,
     /// Where `next_round` gets checkpointed on every advance, if this node
     /// was started with a `data_dir` - see the real stall bug this closes,
@@ -161,6 +161,17 @@ pub struct EngineState {
     /// parent - which never happens for the very first round, since
     /// nothing has proposed a next round yet).
     pub own_last_certificate: Option<Certificate>,
+    /// The first validly author-signed vertex seen per (round, author) -
+    /// purely for equivocation-evidence purposes, decoupled from
+    /// `voted_for`'s voting-lock role. See `handle_message`'s
+    /// `VertexProposal` arm for how a conflicting second arrival turns
+    /// this into an `EquivocationEvidence`.
+    pub first_seen_vertex: HashMap<(Round, ValidatorId), (Vertex, MultiSignature)>,
+    /// Real, independently-verifiable equivocation evidence this validator
+    /// has observed, served via `GET /equivocation_evidence` so anyone can
+    /// fetch it and submit `StakingInstruction::ReportEquivocation` to
+    /// slash the offending validator's self-stake.
+    pub equivocation_evidence: HashMap<(Round, ValidatorId), EquivocationEvidence>,
 }
 
 pub struct Engine {
@@ -300,6 +311,14 @@ impl Engine {
         state.ledger.transfer_receipts().iter().find(|r| r.tx_hash == tx_hash).cloned()
     }
 
+    /// Every equivocation this validator has independently witnessed and
+    /// cryptographically verified so far - see `handle_message`'s
+    /// `VertexProposal` arm for how each entry gets constructed.
+    pub async fn equivocation_evidence(&self) -> Vec<EquivocationEvidence> {
+        let state = self.state.lock().await;
+        state.equivocation_evidence.values().cloned().collect()
+    }
+
     /// Builds a real `qchain-stark` proof over the most recent `limit`
     /// captured transfer receipts (all of them if `limit` is `None`),
     /// binds it to the real Merkle root transitions those receipts
@@ -383,17 +402,58 @@ impl Engine {
                 let mut state = self.state.lock().await;
                 state.batches.entry(digest).or_insert(batch);
             }
-            NetMessage::VertexProposal(vertex) => {
+            NetMessage::VertexProposal { vertex, author_signature } => {
                 if vertex.author != from {
                     tracing::warn!("dropping vertex proposal with mismatched author/sender");
                     return;
                 }
+                // Verified *before* anything else: `NetMessage::VertexProposal`'s
+                // doc comment has the full rationale - without this check, a
+                // forged or misattributed vertex could never be told apart
+                // from a genuine one, and no equivocation evidence could ever
+                // be trusted (see `EquivocationEvidence` below).
+                let digest = vertex.digest();
+                let Some(author_info) = self.validators.get(&vertex.author) else {
+                    tracing::warn!("dropping vertex proposal from unknown validator {from}");
+                    return;
+                };
+                if !qchain_crypto::verify(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                    tracing::warn!("dropping vertex proposal from {from} - author_signature does not verify");
+                    return;
+                }
                 self.request_missing_parents(&vertex.parents, from).await;
                 self.request_missing_batches(&vertex.batch_digests, from).await;
-                let digest = vertex.digest();
                 let key = (vertex.round, vertex.author);
                 {
                     let mut state = self.state.lock().await;
+                    // Real equivocation evidence, not just a local defense:
+                    // the *first* validly-signed vertex seen for this
+                    // (round, author) is kept around so that if a second,
+                    // different one ever arrives, both signed vertices can
+                    // be packaged into an `EquivocationEvidence` that anyone
+                    // can verify independently and submit on-chain to slash
+                    // the offending validator's self-stake (see
+                    // `qchain-execution::staking::StakingInstruction::ReportEquivocation`).
+                    let prior = state.first_seen_vertex.get(&key).cloned();
+                    match prior {
+                        Some((prior_vertex, prior_signature)) if prior_vertex.digest() != digest => {
+                            tracing::error!(
+                                "equivocation detected: {from} signed two different vertices for round {} - evidence captured",
+                                vertex.round
+                            );
+                            state.equivocation_evidence.entry(key).or_insert_with(|| EquivocationEvidence {
+                                vertex_a: prior_vertex,
+                                signature_a: prior_signature,
+                                vertex_b: vertex.clone(),
+                                signature_b: author_signature.clone(),
+                                author_bundle: author_info.pubkey_bundle.clone(),
+                            });
+                        }
+                        Some(_) => {} // the exact same vertex, seen again - not new evidence
+                        None => {
+                            state.first_seen_vertex.insert(key, (vertex.clone(), author_signature.clone()));
+                        }
+                    }
                     match state.voted_for.get(&key) {
                         Some(existing) if *existing != digest => {
                             tracing::warn!(
@@ -721,7 +781,7 @@ impl Engine {
         let mut state = self.state.lock().await;
         state.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
 
-        let vertex = state.own_pending_vertex.as_ref()?;
+        let (vertex, _) = state.own_pending_vertex.as_ref()?;
         if vertex.digest() != vertex_digest {
             return None;
         }
@@ -731,7 +791,7 @@ impl Engine {
             return None;
         }
 
-        let vertex = state.own_pending_vertex.take().unwrap();
+        let (vertex, _) = state.own_pending_vertex.take().unwrap();
         let signatures = state.pending_votes.remove(&vertex_digest).unwrap().into_iter().collect();
         let cert = Certificate { vertex, signatures };
         state.dag.insert(cert.clone());
@@ -830,12 +890,12 @@ impl Engine {
             let state = self.state.lock().await;
             state.own_pending_vertex.clone()
         };
-        if let Some(vertex) = retry_vertex {
-            self.network.broadcast(&NetMessage::VertexProposal(vertex)).await;
+        if let Some((vertex, author_signature)) = retry_vertex {
+            self.network.broadcast(&NetMessage::VertexProposal { vertex, author_signature }).await;
             return;
         }
 
-        let (vertex, worker_batches) = {
+        let (vertex, sig, worker_batches) = {
             let mut state = self.state.lock().await;
             let round = state.next_round;
             if round > 0 {
@@ -863,11 +923,29 @@ impl Engine {
                 p
             };
             let vertex = Vertex { round, author: self.self_id, batch_digests, parents };
-            state.own_pending_vertex = Some(vertex.clone());
+            // Signed *before* anything is committed to state, so a signing
+            // failure (never expected in practice, but not assumed away)
+            // leaves `next_round`/`voted_for`/`own_pending_vertex`
+            // untouched rather than advancing them with nothing actually
+            // broadcast. This is the one and only signature this validator
+            // produces over its own vertex - reused as both the wire-level
+            // `author_signature` (`NetMessage::VertexProposal`) and this
+            // validator's own self-vote (`record_vote` below), since both
+            // are mathematically the same thing: this validator's
+            // signature over this vertex's digest.
+            let digest = vertex.digest();
+            let sig = match self.keypair.sign(&digest[..]) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to sign proposed vertex: {e}");
+                    return;
+                }
+            };
+            state.own_pending_vertex = Some((vertex.clone(), sig.clone()));
             state.next_round = round + 1;
             persist_round_checkpoint(&state);
-            state.voted_for.insert((round, self.self_id), vertex.digest());
-            (vertex, worker_batches)
+            state.voted_for.insert((round, self.self_id), digest);
+            (vertex, sig, worker_batches)
         };
 
         // Each worker lane's batch is its own small, independently
@@ -876,16 +954,9 @@ impl Engine {
         for (worker_id, batch) in worker_batches {
             self.network.broadcast(&NetMessage::WorkerBatchGossip { worker_id, batch }).await;
         }
-        self.network.broadcast(&NetMessage::VertexProposal(vertex.clone())).await;
-
         let digest = vertex.digest();
-        let sig = match self.keypair.sign(&digest[..]) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("failed to self-sign proposed vertex: {e}");
-                return;
-            }
-        };
+        self.network.broadcast(&NetMessage::VertexProposal { vertex, author_signature: sig.clone() }).await;
+
         if let Some(cert) = self.record_vote(digest, self.self_id, sig).await {
             self.network.broadcast(&NetMessage::CertificateBroadcast(cert)).await;
             self.try_commit().await;
@@ -918,6 +989,8 @@ mod tests {
             pending_batch_requests: HashMap::new(),
             pending_votes_to_send: HashMap::new(),
             own_last_certificate: None,
+            first_seen_vertex: HashMap::new(),
+            equivocation_evidence: HashMap::new(),
         }
     }
 

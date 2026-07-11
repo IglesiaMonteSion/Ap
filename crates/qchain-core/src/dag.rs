@@ -100,6 +100,26 @@ impl Certificate {
     }
 }
 
+/// Self-contained proof that a validator equivocated - the "conflicting
+/// *signed* vertices from the same author" this module's own doc comment
+/// above already named as slashable, now actually constructible. Anyone can
+/// verify it independently, with no other on-chain state needed: check
+/// `author_bundle.to_address() == vertex_a.author == vertex_b.author`,
+/// `vertex_a.round == vertex_b.round`, `vertex_a.digest() != vertex_b.digest()`,
+/// and that both `signature_a`/`signature_b` verify under `author_bundle`
+/// over their own vertex's digest (`qchain_crypto::verify`). See
+/// `qchain-execution::staking::StakingInstruction::ReportEquivocation` for
+/// where that verification actually runs, and `qchain-node::engine` for how
+/// this gets constructed from two conflicting `VertexProposal`s.
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
+pub struct EquivocationEvidence {
+    pub vertex_a: Vertex,
+    pub signature_a: MultiSignature,
+    pub vertex_b: Vertex,
+    pub signature_b: MultiSignature,
+    pub author_bundle: qchain_crypto::PublicKeyBundle,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

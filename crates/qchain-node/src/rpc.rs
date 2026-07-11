@@ -24,6 +24,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/stark_proof", get(stark_proof))
         .route("/transfers", get(list_transfers))
         .route("/transfers/:hash", get(get_transfer))
+        .route("/equivocation_evidence", get(equivocation_evidence))
         .with_state(engine)
 }
 
@@ -126,4 +127,14 @@ async fn get_transfer(State(engine): State<Arc<Engine>>, Path(hash): Path<String
     let bytes = hex::decode(&hash).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let tx_hash: [u8; 32] = bytes.try_into().map_err(|_| (StatusCode::BAD_REQUEST, "transaction hash must be 32 bytes".to_string()))?;
     engine.get_transfer(tx_hash).await.map(Json).ok_or((StatusCode::NOT_FOUND, "no receipt captured for that transaction hash".to_string()))
+}
+
+/// Every equivocation this validator has independently witnessed and
+/// verified (see `Engine::handle_message`'s `VertexProposal` arm) - each
+/// entry is fully self-verifying (`qchain_core::EquivocationEvidence`), so
+/// `qchain-cli report-equivocation` trusts nothing this endpoint says
+/// beyond the raw signed vertices, the same "don't trust the node, verify
+/// the bytes" posture `/stark_proof` already established.
+async fn equivocation_evidence(State(engine): State<Arc<Engine>>) -> Json<Vec<qchain_core::EquivocationEvidence>> {
+    Json(engine.equivocation_evidence().await)
 }

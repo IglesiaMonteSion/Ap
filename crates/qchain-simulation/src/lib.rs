@@ -85,6 +85,13 @@ pub struct SimReport {
     /// alike) - kept for debugging a reported `safety_violation` digest by
     /// digest, not just knowing that one occurred.
     pub committed_orders: Vec<Vec<Digest>>,
+    /// True if any honest validator captured a real, independently
+    /// verifiable `EquivocationEvidence` during the run - the DST-side
+    /// proof that `SimValidator::handle_message`'s evidence-capture logic
+    /// (mirroring `qchain-node::engine`) actually fires against a real
+    /// `ByzantineBehavior::Equivocator`, not just that the equivocation
+    /// lock kept it from succeeding.
+    pub equivocation_evidence_captured: bool,
 }
 
 fn is_prefix_consistent(a: &[Digest], b: &[Digest]) -> bool {
@@ -204,8 +211,9 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
     let honest_committed_counts: Vec<usize> = honest_indices.iter().map(|&i| sims[i].committed_order.len()).collect();
     let made_progress = honest_committed_counts.iter().any(|&c| c > 0);
     let committed_orders: Vec<Vec<Digest>> = sims.iter().map(|s| s.committed_order.clone()).collect();
+    let equivocation_evidence_captured = honest_indices.iter().any(|&i| !sims[i].equivocation_evidence.is_empty());
 
-    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress, committed_orders }
+    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress, committed_orders, equivocation_evidence_captured }
 }
 
 #[cfg(test)]
@@ -256,6 +264,13 @@ mod tests {
             let report = run_simulation(&scenario, seed);
             assert!(report.equivocation_succeeded.is_none(), "seed {seed}: {:?}", report.equivocation_succeeded);
             assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
+            // Not just "the equivocation lock kept it from succeeding" -
+            // real, independently-verifiable evidence must have actually
+            // been captured, since honest validators inevitably split on
+            // which of the equivocator's two vertices they saw first (the
+            // evil vertex only reaches half the peers - see
+            // `SimValidator::maybe_propose`).
+            assert!(report.equivocation_evidence_captured, "seed {seed}: no honest validator captured equivocation evidence");
         }
     }
 

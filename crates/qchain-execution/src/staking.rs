@@ -19,12 +19,30 @@
 //! account is zeroed rather than deleted, since this execution model has
 //! no account-deletion primitive yet (see `Ledger`'s working-set
 //! commit loop) - a documented phase-2 limitation, not an oversight.
+//!
+//! `ReportEquivocation` slashes a proven-Byzantine validator's *own*
+//! self-stake (a `StakeAccountData` where `owner == validator ==` the
+//! accused address) - real, found-during-a-security-review scope: this
+//! project's BFT quorum weight (`qchain-consensus::ValidatorSet`) is a
+//! static, config-loaded list, entirely disconnected from this delegated
+//! staking module (see `StakeAccountData::validator`'s own doc comment).
+//! Slashing here is therefore a real economic penalty - the validator
+//! permanently loses bonded QCH and any pending reward - not an ejection
+//! from the active validator set, which would need that quorum-weighting
+//! disconnect closed first (a much larger change, not this one). Burns
+//! the *entire* self-staked position, not a partial percentage: no
+//! `slash_bps`-style tunable exists yet (unlike `staking_commission_bps`),
+//! a deliberate placeholder simplicity choice given this is the first
+//! slashing mechanism this project has ever had. Delegators are never
+//! touched - only a position where `owner == validator` (the validator's
+//! own money, not money entrusted to them) can be slashed, so nobody
+//! else's stake is put at risk by another party's misbehavior.
 
 use crate::error::ExecError;
 use crate::ids::STAKING_PROGRAM_ID;
 use crate::native::NativeProgram;
 use borsh::{BorshDeserialize, BorshSerialize};
-use qchain_core::{Account, Instruction, Round};
+use qchain_core::{Account, EquivocationEvidence, Instruction, Round};
 use qchain_crypto::Pubkey;
 use std::collections::HashMap;
 
@@ -91,6 +109,15 @@ pub enum StakingInstruction {
     /// reward pool singleton. Pays any pending reward to the payer's
     /// wallet and resets `reward_debt`; the position itself is untouched.
     ClaimReward,
+    /// accounts[0] = the self-stake account to slash - its stored `owner`
+    /// *and* `validator` must both equal the accused validator's address
+    /// (a genuine self-delegation; a delegator's position is never
+    /// touched by someone else's misbehavior). Permissionless: anyone
+    /// holding valid `evidence` can call this, not just the accused
+    /// validator's peers - see `EquivocationEvidence`'s doc comment for
+    /// what makes it independently verifiable. See module docs below for
+    /// why this burns the whole position rather than a partial fraction.
+    ReportEquivocation { evidence: Box<EquivocationEvidence> },
 }
 
 fn read_stats(account: &Account) -> Result<u64, ExecError> {
@@ -248,6 +275,59 @@ impl NativeProgram for StakingProgram {
                     pool_account.balance = pool_account.balance.saturating_sub(reward);
                     accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id())).balance += reward;
                 }
+            }
+            StakingInstruction::ReportEquivocation { evidence } => {
+                let stake_pk =
+                    *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[0]".into()))?;
+
+                if evidence.vertex_a.round != evidence.vertex_b.round || evidence.vertex_a.author != evidence.vertex_b.author {
+                    return Err(ExecError::ProgramError("evidence must reference the same (round, author)".into()));
+                }
+                let author = evidence.vertex_a.author;
+                if evidence.vertex_a.digest() == evidence.vertex_b.digest() {
+                    return Err(ExecError::ProgramError("evidence vertices are identical - not a conflict".into()));
+                }
+                // The bundle must genuinely be the accused validator's own
+                // - otherwise anyone could submit two arbitrary signed
+                // vertices under a bundle they control and frame someone
+                // else's address.
+                if evidence.author_bundle.to_address() != author {
+                    return Err(ExecError::ProgramError("author_bundle does not match the accused validator's address".into()));
+                }
+                // What actually makes this evidence, not merely an
+                // accusation: both signatures must independently verify
+                // under the accused's own registered bundle, each over its
+                // own vertex's digest.
+                if !qchain_crypto::verify(&evidence.author_bundle, &evidence.vertex_a.digest(), &evidence.signature_a) {
+                    return Err(ExecError::ProgramError("evidence signature_a does not verify".into()));
+                }
+                if !qchain_crypto::verify(&evidence.author_bundle, &evidence.vertex_b.digest(), &evidence.signature_b) {
+                    return Err(ExecError::ProgramError("evidence signature_b does not verify".into()));
+                }
+
+                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let mut data = StakeAccountData::try_from_slice(&stake_account.data)
+                    .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
+                if data.owner != author || data.validator != author {
+                    return Err(ExecError::Unauthorized(
+                        "the named stake account is not the accused validator's own self-stake - delegators can't be slashed for a validator's misbehavior".into(),
+                    ));
+                }
+                if data.amount == 0 {
+                    return Err(ExecError::ProgramError("nothing to slash - this self-stake position is already empty".into()));
+                }
+
+                // Burn the whole position - see module docs for why this
+                // is a full slash, not a partial percentage. No one is
+                // credited the slashed amount (not the reporter, not other
+                // validators): it simply leaves circulating supply, same
+                // as the existing burn-half-of-fees pattern elsewhere in
+                // this codebase.
+                data.amount = 0;
+                data.reward_debt = 0;
+                let stake_account = accounts.get_mut(&stake_pk).unwrap();
+                stake_account.balance = 0;
+                stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
             }
         }
         Ok(())
@@ -487,5 +567,147 @@ mod tests {
         };
         StakingProgram.process(&mut accounts, &claim_early_ix, &early, 0).unwrap();
         assert_eq!(accounts[&early].balance, 9_000 + 100, "the pre-existing delegator must earn the entire prior accrual alone");
+    }
+
+    /// Builds two genuinely conflicting, validly author-signed vertices for
+    /// the same (round, author) - the real shape `qchain-node::engine`
+    /// constructs from two conflicting live `VertexProposal`s.
+    fn conflicting_evidence(author_kp: &qchain_crypto::Keypair, round: qchain_core::Round) -> EquivocationEvidence {
+        let vertex_a = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
+        let vertex_b = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
+        let signature_a = author_kp.sign(&vertex_a.digest()[..]).unwrap();
+        let signature_b = author_kp.sign(&vertex_b.digest()[..]).unwrap();
+        EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: author_kp.public_key_bundle() }
+    }
+
+    #[test]
+    fn report_equivocation_slashes_the_validators_own_self_stake() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([30u8; 32]);
+        let reporter = Pubkey::new([31u8; 32]);
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        let evidence = conflicting_evidence(&validator_kp, 7);
+        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        // Permissionless: signed/paid by an unrelated reporter, not the
+        // accused validator and not the stake account's owner via any
+        // special relationship - the evidence alone is what authorizes this.
+        StakingProgram.process(&mut accounts, &ix, &reporter, 0).unwrap();
+
+        assert_eq!(accounts[&stake_pk].balance, 0, "the whole self-staked position must be burned");
+        let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
+        assert_eq!(data.amount, 0);
+        assert_eq!(data.reward_debt, 0);
+    }
+
+    #[test]
+    fn report_equivocation_rejects_a_delegators_position_not_the_validators_own_self_stake() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let delegator = Pubkey::new([32u8; 32]);
+        let stake_pk = Pubkey::new([33u8; 32]);
+        let reporter = Pubkey::new([34u8; 32]);
+        // A real delegator's position: owner is the delegator, not the
+        // validator - must never be touched by the validator's own
+        // misbehavior.
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        let evidence = conflicting_evidence(&validator_kp, 7);
+        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
+
+        assert!(matches!(result, Err(ExecError::Unauthorized(_))));
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "a delegator's funds must be untouched by someone else's equivocation");
+    }
+
+    #[test]
+    fn report_equivocation_rejects_a_tampered_signature() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([35u8; 32]);
+        let reporter = Pubkey::new([36u8; 32]);
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        let mut evidence = conflicting_evidence(&validator_kp, 7);
+        evidence.signature_b.components[0].bytes[0] ^= 0xFF;
+        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
+
+        assert!(matches!(result, Err(ExecError::ProgramError(_))));
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "a forged/tampered signature must never slash anything");
+    }
+
+    #[test]
+    fn report_equivocation_rejects_identical_vertices_as_not_a_real_conflict() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([37u8; 32]);
+        let reporter = Pubkey::new([38u8; 32]);
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        let mut evidence = conflicting_evidence(&validator_kp, 7);
+        evidence.vertex_b = evidence.vertex_a.clone();
+        evidence.signature_b = evidence.signature_a.clone();
+        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
+
+        assert!(matches!(result, Err(ExecError::ProgramError(_))));
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the exact same vertex twice is not equivocation");
+    }
+
+    #[test]
+    fn report_equivocation_rejects_mismatched_rounds() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([39u8; 32]);
+        let reporter = Pubkey::new([40u8; 32]);
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        let vertex_a = qchain_core::Vertex { round: 7, author: validator, batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
+        let vertex_b = qchain_core::Vertex { round: 8, author: validator, batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
+        let signature_a = validator_kp.sign(&vertex_a.digest()[..]).unwrap();
+        let signature_b = validator_kp.sign(&vertex_b.digest()[..]).unwrap();
+        let evidence = EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: validator_kp.public_key_bundle() };
+        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
+
+        assert!(matches!(result, Err(ExecError::ProgramError(_))));
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "two different validators' or rounds' vertices prove nothing about either one equivocating");
     }
 }

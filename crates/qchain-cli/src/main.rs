@@ -117,6 +117,37 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// Slash a validator's own self-stake for a proven equivocation.
+    /// Fetches real evidence from `GET /equivocation_evidence` (this
+    /// validator's own witnessed conflict, or the one matching
+    /// `--round`/`--author` if given) and submits it - permissionless,
+    /// signed by whoever's reporting it, not necessarily the accused
+    /// validator's peer or the stake account's owner. See
+    /// `qchain-execution::staking`'s module docs for what "self-stake"
+    /// means here and why delegators are never touched.
+    ReportEquivocation {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The accused validator's own self-stake account to slash (its
+        /// stored `owner` and `validator` must both equal the accused
+        /// address).
+        #[arg(long)]
+        stake_account: String,
+        /// Which round's evidence to submit, if this node has witnessed
+        /// more than one - omit when there's exactly one.
+        #[arg(long)]
+        round: Option<u64>,
+        /// Which accused validator's evidence to submit, if this node has
+        /// witnessed more than one - omit when there's exactly one.
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
     /// Propose activating a new algorithm registry entry.
     ProposeActivate {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -512,6 +543,33 @@ fn main() -> anyhow::Result<()> {
             let stake_pk: Pubkey = stake_account.parse()?;
             let data = borsh::to_vec(&StakingInstruction::ClaimReward)?;
             let body = submit_instruction(&rpc, &staker, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_REWARDS_POOL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+        }
+        Command::ReportEquivocation { rpc, keypair, stake_account, round, author, nonce, fee_limit } => {
+            let reporter = qchain_crypto::read_keypair_file(&keypair)?;
+            let stake_pk: Pubkey = stake_account.parse()?;
+            let author_filter: Option<Pubkey> = author.map(|a| a.parse()).transpose()?;
+
+            let all: Vec<qchain_core::EquivocationEvidence> = reqwest::blocking::get(format!("{rpc}/equivocation_evidence"))?.error_for_status()?.json()?;
+            let matching: Vec<_> = all
+                .into_iter()
+                .filter(|e| round.is_none_or(|r| e.vertex_a.round == r) && author_filter.is_none_or(|a| e.vertex_a.author == a))
+                .collect();
+            let evidence = match matching.len() {
+                0 => anyhow::bail!("this node has no equivocation evidence matching the given filters"),
+                1 => matching.into_iter().next().unwrap(),
+                n => anyhow::bail!("{n} matching pieces of evidence found - narrow with --round/--author"),
+            };
+            println!(
+                "reporting equivocation by {} at round {} (vertex digests {} vs {})",
+                evidence.vertex_a.author,
+                evidence.vertex_a.round,
+                hex::encode(evidence.vertex_a.digest()),
+                hex::encode(evidence.vertex_b.digest())
+            );
+
+            let data = borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) })?;
+            let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {

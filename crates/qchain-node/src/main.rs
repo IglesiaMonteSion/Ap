@@ -147,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
             pending_batch_requests: HashMap::new(),
             pending_votes_to_send: HashMap::new(),
             own_last_certificate: None,
+            first_seen_vertex: HashMap::new(),
+            equivocation_evidence: HashMap::new(),
         }),
     });
 

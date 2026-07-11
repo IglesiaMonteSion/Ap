@@ -11,7 +11,7 @@
 //! conflicting vertex, purely so the two vertices hash differently.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
-use qchain_core::{Certificate, Digest, Round, ValidatorId, Vertex};
+use qchain_core::{Certificate, Digest, EquivocationEvidence, Round, ValidatorId, Vertex};
 use qchain_crypto::{Keypair, MultiSignature};
 use std::collections::HashMap;
 
@@ -29,7 +29,10 @@ pub enum ByzantineBehavior {
 
 #[derive(Clone, Debug)]
 pub enum SimMessage {
-    VertexProposal(Vertex),
+    /// Mirrors `qchain_network::NetMessage::VertexProposal` - see its doc
+    /// comment for why `author_signature` exists at all (equivocation
+    /// evidence needs to be attributable, not just locally refused).
+    VertexProposal { vertex: Vertex, author_signature: MultiSignature },
     Vote { vertex_digest: Digest, signature: MultiSignature },
     CertificateBroadcast(Certificate),
     /// Mirrors `qchain_network::NetMessage::CertificateRequest` - see its
@@ -46,9 +49,16 @@ pub struct SimValidator {
     pub behavior: ByzantineBehavior,
     pub dag: DagStore,
     pub consensus: ConsensusState,
-    own_pending_vertex: Option<Vertex>,
+    own_pending_vertex: Option<(Vertex, MultiSignature)>,
     pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     voted_for: HashMap<(Round, ValidatorId), Digest>,
+    /// The first validly author-signed vertex seen per (round, author) -
+    /// mirrors `qchain-node::engine::EngineState::first_seen_vertex`.
+    first_seen_vertex: HashMap<(Round, ValidatorId), (Vertex, MultiSignature)>,
+    /// Real equivocation evidence this validator has independently
+    /// verified - mirrors `EngineState::equivocation_evidence`. Public so
+    /// the simulation driver's test assertions can inspect it directly.
+    pub equivocation_evidence: HashMap<(Round, ValidatorId), EquivocationEvidence>,
     /// Outstanding `CertificateRequest`s not yet answered - mirrors
     /// `qchain-node::engine`'s `pending_cert_requests`, see
     /// `retry_pending_cert_requests`'s doc comment for the real bug this
@@ -72,6 +82,8 @@ impl SimValidator {
             own_pending_vertex: None,
             pending_votes: HashMap::new(),
             voted_for: HashMap::new(),
+            first_seen_vertex: HashMap::new(),
+            equivocation_evidence: HashMap::new(),
             pending_cert_requests: HashMap::new(),
             next_round: 0,
             committed_order: Vec::new(),
@@ -85,7 +97,7 @@ impl SimValidator {
         if self.behavior == ByzantineBehavior::Silent {
             return vec![];
         }
-        if let Some(pending) = &self.own_pending_vertex {
+        if let Some((pending, author_signature)) = &self.own_pending_vertex {
             // Retry: re-broadcast our still-uncertified proposal every
             // tick. Without this, a single dropped copy (e.g. a transient
             // network partition active only when we first proposed)
@@ -95,7 +107,10 @@ impl SimValidator {
             // scenario (see project-lessons-learned); idempotent for
             // peers who already voted (the equivocation lock's "same
             // digest again" branch is a harmless no-op).
-            return peers.iter().map(|&peer| (peer, SimMessage::VertexProposal(pending.clone()))).collect();
+            return peers
+                .iter()
+                .map(|&peer| (peer, SimMessage::VertexProposal { vertex: pending.clone(), author_signature: author_signature.clone() }))
+                .collect();
         }
         let round = self.next_round;
         if round > 0 {
@@ -114,15 +129,18 @@ impl SimValidator {
         };
         let vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [0u8; 32])], parents: parents.clone() };
         let digest = vertex.digest();
-        self.own_pending_vertex = Some(vertex.clone());
+        // One signature, reused for both the wire-level `author_signature`
+        // and this validator's own self-vote - mirrors
+        // `qchain-node::engine::propose_round`'s identical reuse.
+        let sig = self.keypair.sign(&digest[..]).expect("signing never fails in this harness");
+        self.own_pending_vertex = Some((vertex.clone(), sig.clone()));
         self.next_round = round + 1;
         self.voted_for.insert((round, self.id), digest);
 
         let mut out = Vec::new();
         for &peer in peers {
-            out.push((peer, SimMessage::VertexProposal(vertex.clone())));
+            out.push((peer, SimMessage::VertexProposal { vertex: vertex.clone(), author_signature: sig.clone() }));
         }
-        let sig = self.keypair.sign(&digest[..]).expect("signing never fails in this harness");
         if let Some(cert) = self.record_vote(digest, self.id, sig, validators) {
             for &peer in peers {
                 out.push((peer, SimMessage::CertificateBroadcast(cert.clone())));
@@ -131,9 +149,10 @@ impl SimValidator {
 
         if self.behavior == ByzantineBehavior::Equivocator && !peers.is_empty() {
             let evil_vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [1u8; 32])], parents };
+            let evil_signature = self.keypair.sign(&evil_vertex.digest()[..]).expect("signing never fails in this harness");
             let half = peers.len() / 2;
             for &peer in &peers[..half.max(1)] {
-                out.push((peer, SimMessage::VertexProposal(evil_vertex.clone())));
+                out.push((peer, SimMessage::VertexProposal { vertex: evil_vertex.clone(), author_signature: evil_signature.clone() }));
             }
         }
         out
@@ -177,12 +196,42 @@ impl SimValidator {
             return vec![];
         }
         match msg {
-            SimMessage::VertexProposal(vertex) => {
+            SimMessage::VertexProposal { vertex, author_signature } => {
                 if vertex.author != from {
                     return vec![];
                 }
+                // Mirrors `engine.rs`'s `handle_message`: verify the
+                // author's signature before trusting anything about this
+                // vertex, since it's what makes equivocation evidence
+                // attributable at all.
+                let Some(author_info) = validators.get(&vertex.author) else {
+                    return vec![];
+                };
                 let digest = vertex.digest();
+                if !qchain_crypto::verify(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                    return vec![];
+                }
                 let key = (vertex.round, vertex.author);
+                // Real equivocation-evidence capture, mirroring
+                // `engine.rs` exactly: the first validly-signed vertex
+                // seen per (round, author) is kept; a second, different
+                // one turns into `EquivocationEvidence`.
+                let prior = self.first_seen_vertex.get(&key).cloned();
+                match prior {
+                    Some((prior_vertex, prior_signature)) if prior_vertex.digest() != digest => {
+                        self.equivocation_evidence.entry(key).or_insert_with(|| EquivocationEvidence {
+                            vertex_a: prior_vertex,
+                            signature_a: prior_signature,
+                            vertex_b: vertex.clone(),
+                            signature_b: author_signature.clone(),
+                            author_bundle: author_info.pubkey_bundle.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.first_seen_vertex.insert(key, (vertex.clone(), author_signature.clone()));
+                    }
+                }
                 let mut out = self.missing_parent_requests(&vertex.parents, from);
                 match self.voted_for.get(&key) {
                     // Equivocation lock: refuse to sign a second, different
@@ -231,7 +280,7 @@ impl SimValidator {
 
     fn record_vote(&mut self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature, validators: &ValidatorSet) -> Option<Certificate> {
         self.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
-        let vertex = self.own_pending_vertex.as_ref()?;
+        let (vertex, _) = self.own_pending_vertex.as_ref()?;
         if vertex.digest() != vertex_digest {
             return None;
         }
@@ -239,7 +288,7 @@ impl SimValidator {
         if stake < validators.quorum_threshold() {
             return None;
         }
-        let vertex = self.own_pending_vertex.take().unwrap();
+        let (vertex, _) = self.own_pending_vertex.take().unwrap();
         let signatures = self.pending_votes.remove(&vertex_digest).unwrap().into_iter().collect();
         let cert = Certificate { vertex, signatures };
         self.dag.insert(cert.clone());

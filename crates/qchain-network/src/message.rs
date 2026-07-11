@@ -23,8 +23,20 @@ pub enum NetMessage {
     /// vertex that will later reference it, so peers can execute it once
     /// the corresponding certificate is ordered.
     WorkerBatchGossip { worker_id: WorkerId, batch: Batch },
-    /// A proposer's round vertex, sent to every peer to be voted on.
-    VertexProposal(Vertex),
+    /// A proposer's round vertex, sent to every peer to be voted on -
+    /// `author_signature` is the proposer's own signature over
+    /// `vertex.digest()` (the same signature it also casts as its own
+    /// self-vote, see `qchain-node::engine::propose_round`), verified by
+    /// every recipient against the claimed author's registered
+    /// `PublicKeyBundle` before anything else happens with the message.
+    /// Without this, two conflicting vertices for the same (round, author)
+    /// were unattributable - anyone relaying a forged vertex could frame
+    /// another validator, and no cryptographic evidence of real
+    /// equivocation could ever be constructed (see
+    /// `qchain_core::EquivocationEvidence` and `blockchain-security-audit`
+    /// #3, which had already named "conflicting signed vertices" as
+    /// slashable evidence before this field made that signature exist).
+    VertexProposal { vertex: Vertex, author_signature: MultiSignature },
     /// A peer's vote (signature over the vertex digest) sent back to the
     /// vertex's author.
     Vote { vertex_digest: Digest, signature: MultiSignature },
