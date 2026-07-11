@@ -159,7 +159,7 @@ impl Ledger {
     /// seeding). Read fresh on every `apply_transaction` call rather than
     /// cached, so a passed-and-executed governance proposal takes effect
     /// on the very next transaction, not after a restart.
-    fn current_params(&self) -> EconomicParams {
+    pub fn current_params(&self) -> EconomicParams {
         self.store
             .get(&PARAMS_ACCOUNT_ID)
             .and_then(|a| EconomicParams::try_from_slice(&a.data).ok())

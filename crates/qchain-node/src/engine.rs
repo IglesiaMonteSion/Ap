@@ -222,6 +222,32 @@ pub enum StarkProofError {
     ChainBroken(String),
 }
 
+/// A real, live-confirmed mempool-spam gap this closes (see
+/// `project-lessons-learned`): `submit_transaction`/the `TransactionGossip`
+/// handler used to admit anything with a valid signature, no balance check
+/// at all - a freshly generated, never-funded keypair could sign an
+/// unbounded run of consecutive-nonce garbage transfers (each one
+/// individually cheap to produce, no PoW or stake required) and have every
+/// single one accepted, gossiped to every validator (amplifying the cost,
+/// not just to the one RPC it targeted), batched, and only rejected at
+/// execution time with `InsufficientFunds` - real signature-verification
+/// and batch-construction CPU spent network-wide for zero attacker cost.
+/// Confirmed live: 5,000 transfers signed by an unfunded keypair were all
+/// accepted by one validator, and CPU rose measurably on all three
+/// validators in the testnet, not just the one whose RPC received them.
+/// Closed by requiring the payer to currently afford at least this
+/// transaction's own byte fee before it's admitted anywhere - it doesn't
+/// (and can't, without duplicating `Ledger::apply_transaction`'s full nonce
+/// bookkeeping here) guarantee every queued transaction for an account will
+/// still be affordable by the time its turn comes, only that an account
+/// with no funds at all can never get even one transaction into any
+/// validator's mempool, which is what the demonstrated attack needed.
+fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
+    let balance = state.ledger.store().get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
+    let byte_fee = state.ledger.current_params().base_fee_per_byte * tx.byte_size() as u64;
+    balance >= byte_fee
+}
+
 /// Pulls every transaction that's actually ready to execute out of the
 /// mempool, per account, in nonce order - see the module docs for the real
 /// bug this replaces. For each account with queued transactions: first
@@ -256,8 +282,10 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
 
 impl Engine {
     /// Admits a client-submitted transaction into the local mempool once
-    /// its hybrid signature checks out. No nonce/balance admission control
-    /// here - that happens once for real at execution time
+    /// its hybrid signature checks out and its payer can currently afford
+    /// its own byte fee (see `payer_can_afford_admission`'s doc comment for
+    /// the real mempool-spam gap this closes). Full nonce/balance
+    /// correctness is still only checked once for real at execution time
     /// (`Ledger::apply_transaction`); a transaction that turns out invalid
     /// once its batch is ordered is simply skipped (see `try_commit`).
     ///
@@ -274,6 +302,9 @@ impl Engine {
         let hash = tx.hash();
         {
             let mut state = self.state.lock().await;
+            if !payer_can_afford_admission(&state, &tx) {
+                anyhow::bail!("payer cannot afford this transaction's byte fee");
+            }
             state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx.clone());
         }
         self.network.broadcast(&NetMessage::TransactionGossip(tx)).await;
@@ -418,6 +449,15 @@ impl Engine {
                     return;
                 }
                 let mut state = self.state.lock().await;
+                // Same admission check `submit_transaction` applies to its
+                // own RPC-submitted transactions (see
+                // `payer_can_afford_admission`'s doc comment) - a peer
+                // re-broadcasting spam it should have rejected itself
+                // doesn't get a free pass here.
+                if !payer_can_afford_admission(&state, &tx) {
+                    tracing::warn!("dropping gossiped transaction from {from} whose payer cannot afford its byte fee");
+                    return;
+                }
                 state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx);
                 // Not re-broadcast further - this project's validator sets
                 // are fully connected (see `NetMessage::TransactionGossip`'s
@@ -1179,5 +1219,36 @@ mod tests {
         state.round_checkpoint_path = None;
         state.next_round = 5;
         persist_round_checkpoint(&state);
+    }
+
+    /// The exact live-confirmed attack `payer_can_afford_admission` closes
+    /// (see its doc comment): a freshly generated keypair with no seeded
+    /// account at all - no funds, ever - must be rejected at admission, not
+    /// let through to waste every validator's CPU on a doomed execution
+    /// attempt.
+    #[test]
+    fn a_never_funded_payer_cannot_get_a_transaction_admitted() {
+        let state = new_state();
+        let attacker = Keypair::generate().unwrap();
+        assert!(
+            !payer_can_afford_admission(&state, &tx(&attacker, 0)),
+            "an account with no balance at all must not pass the admission check"
+        );
+    }
+
+    /// A legitimately funded payer must still be admitted - the fix
+    /// shouldn't reject transactions that can actually pay their own fee.
+    #[test]
+    fn a_funded_payer_can_get_a_transaction_admitted() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(
+            alice.pubkey(),
+            Account { balance: 10_000_000, ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
+        );
+        assert!(
+            payer_can_afford_admission(&state, &tx(&alice, 0)),
+            "an account with real balance covering its byte fee must be admitted"
+        );
     }
 }
