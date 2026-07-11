@@ -330,8 +330,12 @@ impl Ledger {
             match self.programs.get(&ix.program_id) {
                 Some(Program::Native(native)) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
                 Some(Program::Wasm { module_bytes, entry_point }) => {
-                    total_gas_fee +=
-                        self.run_wasm_instruction(module_bytes, entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel)?;
+                    let module_bytes = module_bytes.clone();
+                    let entry_point = entry_point.clone();
+                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel) {
+                        Ok(fee) => total_gas_fee += fee,
+                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
+                    }
                 }
                 // Not one of the fixed native programs - check whether a
                 // real `SystemInstruction::DeployProgram` deployed a WASM
@@ -350,14 +354,17 @@ impl Ledger {
                         .ok_or(ExecError::UnknownProgram(ix.program_id))?;
                     let program_data = crate::native::WasmProgramData::try_from_slice(&program_account.data)
                         .map_err(|e| ExecError::ProgramError(format!("corrupt deployed program data: {e}")))?;
-                    total_gas_fee += self.run_wasm_instruction(
+                    match self.run_wasm_instruction(
                         &program_data.module_bytes,
                         &program_data.entry_point,
                         ix,
                         &tx.message.payer,
                         &mut working,
                         params.gas_price_per_fuel,
-                    )?;
+                    ) {
+                        Ok(fee) => total_gas_fee += fee,
+                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
+                    }
                 }
             }
         }
@@ -440,6 +447,42 @@ impl Ledger {
         Ok(byte_fee + total_gas_fee)
     }
 
+    /// Bills the payer for fuel actually consumed by a WASM instruction
+    /// that trapped, before the caller propagates the failure - see
+    /// `ExecError::Wasm`'s doc comment for the real vulnerability this
+    /// closes. Charged directly to the store (same "sticks regardless of
+    /// the rest of the transaction" treatment the byte fee already gets in
+    /// `apply_transaction`, since `working`'s other changes are about to be
+    /// discarded by the early return this feeds into). Capped at the
+    /// payer's current balance rather than allowed to underflow - this is
+    /// billing for real work already done, not a fresh solvency check, so
+    /// there's nothing to reject here, only an amount to collect.
+    fn bill_trapped_wasm_fuel(&mut self, payer: &Pubkey, fee_collector: &Pubkey, working: &HashMap<Pubkey, Account>, err: ExecError) -> ExecError {
+        if let ExecError::Wasm { fuel_consumed, .. } = &err {
+            if *fuel_consumed > 0 {
+                let params = self.current_params();
+                let trap_fee = fuel_consumed.saturating_mul(params.gas_price_per_fuel);
+                if let Some(mut payer_account) = working.get(payer).cloned() {
+                    let charge = trap_fee.min(payer_account.balance);
+                    payer_account.balance -= charge;
+                    self.write_account(*payer, payer_account);
+                    let burn_share = charge / 2;
+                    let validator_share = charge - burn_share;
+                    self.total_burned += burn_share;
+                    // Same "attempted-execution byte fee already stuck, so
+                    // fold this trap fee's own credit failure into the
+                    // returned error rather than swallowing it" posture as
+                    // everywhere else `credit_validator_share` is called -
+                    // if it errors, that error is arguably more informative
+                    // than the original trap, but the trap is what the
+                    // caller actually asked about, so it still wins.
+                    let _ = self.credit_validator_share(*fee_collector, validator_share, &params);
+                }
+            }
+        }
+        err
+    }
+
     fn run_wasm_instruction(
         &self,
         module_bytes: &[u8],
@@ -476,10 +519,30 @@ impl Ledger {
             }
         }
 
+        // Setup-level failures (bad module, missing entry point) never
+        // spend fuel - real execution hasn't started yet.
         let result = self
             .wasm
             .call(module_bytes, entry_point, &args, accounts, is_signer, DEFAULT_FUEL_LIMIT)
-            .map_err(|e| ExecError::Wasm(e.to_string()))?;
+            .map_err(|e| ExecError::Wasm { message: e.to_string(), fuel_consumed: 0 })?;
+
+        // Real, live-confirmed vulnerability closed here (see
+        // `project-lessons-learned`): a contract that burns real fuel (up
+        // to `DEFAULT_FUEL_LIMIT`) and then traps - deliberately, via
+        // `unreachable`, or by simply running out of fuel - used to report
+        // success or failure with no distinction from an instant trap,
+        // because `WasmExecutor::call` never surfaced fuel spent before a
+        // trap. Confirmed live: a deployed contract with an expensive loop
+        // before a deliberate `unreachable` was charged the exact same fee
+        // as one that traps immediately, regardless of how much of the
+        // fuel budget it burned - free, bounded-but-real CPU for the
+        // network, forever, one call at a time. `fuel_consumed` here is
+        // propagated to `apply_transaction`, which bills for it directly
+        // even though the rest of this transaction's effects still get
+        // discarded (same as any other failed instruction).
+        if let Some(trap_message) = result.trap {
+            return Err(ExecError::Wasm { message: trap_message, fuel_consumed: result.fuel_consumed });
+        }
 
         for (pk, account) in ix.accounts.iter().zip(result.accounts.into_iter()) {
             working.insert(*pk, account);
@@ -1161,5 +1224,67 @@ mod tests {
         let tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
         assert!(matches!(result, Err(ExecError::UnknownProgram(_))));
+    }
+
+    /// The real, live-confirmed gas-metering-bypass this session found and
+    /// closed (see `project-lessons-learned`): a contract that burns real
+    /// fuel and then traps used to be billed identically to one that traps
+    /// instantly - confirmed live by deploying both to a real testnet and
+    /// seeing the exact same fee charged regardless of how many WASM
+    /// iterations ran first. This proves the fix at the `Ledger` level: a
+    /// deliberately expensive-then-trapping call must cost strictly more
+    /// than a cheap-then-trapping one.
+    #[test]
+    fn a_wasm_call_that_burns_fuel_before_trapping_is_billed_for_that_fuel_not_just_the_byte_fee() {
+        const CHEAP_TRAP_WAT: &str = r#"(module (func (export "go") unreachable))"#;
+        const EXPENSIVE_TRAP_WAT: &str = r#"
+            (module
+                (func (export "go")
+                    (local $i i64)
+                    (local.set $i (i64.const 0))
+                    (block $done
+                        (loop $burn
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br_if $done (i64.ge_s (local.get $i) (i64.const 500000)))
+                            (br $burn)
+                        )
+                    )
+                    unreachable
+                )
+            )
+        "#;
+
+        fn deploy_and_call(wat_src: &str) -> u64 {
+            let mut ledger = new_test_ledger();
+            let deployer = Keypair::generate().unwrap();
+            let validator = Keypair::generate().unwrap().pubkey();
+            ledger.credit(deployer.pubkey(), 50_000_000);
+
+            let program_pk = Keypair::generate().unwrap().pubkey();
+            let module_bytes = wat::parse_str(wat_src).unwrap();
+            let deploy_ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![program_pk],
+                data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into() }).unwrap(),
+            };
+            let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
+            ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();
+
+            let caller = Keypair::generate().unwrap();
+            ledger.credit(caller.pubkey(), 5_000_000);
+            let call_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+            let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+            let before = ledger.get_balance(&caller.pubkey());
+            let result = ledger.apply_transaction(&call_tx, &validator, 0);
+            assert!(result.is_err(), "a trapping call must still fail overall");
+            before - ledger.get_balance(&caller.pubkey())
+        }
+
+        let cheap_cost = deploy_and_call(CHEAP_TRAP_WAT);
+        let expensive_cost = deploy_and_call(EXPENSIVE_TRAP_WAT);
+        assert!(
+            expensive_cost > cheap_cost,
+            "a call that burns real fuel before trapping ({expensive_cost}) must cost more than one that traps instantly ({cheap_cost}), not the same flat byte fee"
+        );
     }
 }

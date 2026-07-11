@@ -15,8 +15,13 @@ pub enum ExecError {
     ProgramError(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
-    #[error("wasm execution error: {0}")]
-    Wasm(String),
+    /// `fuel_consumed` is real fuel spent before the trap, not zero - see
+    /// `qchain_execution::wasm::WasmCallResult::trap`'s doc comment and
+    /// `Ledger::apply_transaction`'s handling of this variant for the real,
+    /// live-confirmed gas-metering-bypass this closes: a contract that
+    /// burns fuel and then traps must still be billed for it.
+    #[error("wasm execution error: {message}")]
+    Wasm { message: String, fuel_consumed: u64 },
     #[error("out of gas")]
     OutOfGas,
     #[error("algorithm not acceptable: {0}")]

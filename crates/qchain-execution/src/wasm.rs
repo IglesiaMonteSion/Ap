@@ -22,6 +22,15 @@ pub struct WasmCallResult {
     pub accounts: Vec<Account>,
     pub log: Vec<String>,
     pub fuel_consumed: u64,
+    /// `Some(message)` when the call itself trapped (an explicit
+    /// `unreachable`, an out-of-fuel abort, or any other WASM execution
+    /// error) - `fuel_consumed` is still populated in this case, real fuel
+    /// spent computing up to the point of the trap. See `Ledger::
+    /// run_wasm_instruction`'s doc comment for the real, live-confirmed gas-
+    /// metering-bypass this distinction closes: a contract that burns fuel
+    /// and then traps must still be billed for it, not treated as if no
+    /// computation happened at all.
+    pub trap: Option<String>,
 }
 
 struct HostState {
@@ -212,17 +221,22 @@ impl WasmExecutor {
 
         let result_count = func.ty(&store).results().len();
         let mut results = vec![Val::I64(0); result_count];
-        func.call(&mut store, params, &mut results)?;
+        // Deliberately not `?` here (see `WasmCallResult::trap`'s doc
+        // comment): a trap - an explicit `unreachable`, running out of the
+        // fuel budget, or any other execution error - still leaves the
+        // store's remaining-fuel counter meaningful, since Wasmtime doesn't
+        // poison the `Store` on a trap. Capturing that instead of
+        // early-returning is what lets the caller bill for fuel actually
+        // spent computing up to the point of failure, rather than treating
+        // a trapped call as if it cost nothing.
+        let call_result = func.call(&mut store, params, &mut results);
 
         let remaining = store.get_fuel()?;
         let fuel_consumed = fuel_limit.saturating_sub(remaining);
+        let trap = call_result.err().map(|e| e.to_string());
         let host_state = store.into_data();
 
-        Ok(WasmCallResult {
-            accounts: host_state.accounts,
-            log: host_state.log,
-            fuel_consumed,
-        })
+        Ok(WasmCallResult { accounts: host_state.accounts, log: host_state.log, fuel_consumed, trap })
     }
 }
 
@@ -291,8 +305,46 @@ mod tests {
         let executor = WasmExecutor::new().unwrap();
         let accounts = vec![wallet(1_000), wallet(0)];
 
-        let result = executor.call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], accounts, vec![true, false], 1);
-        assert!(result.is_err(), "1 unit of fuel must not be enough to complete a real call");
+        // The call itself traps (`Ok(..)` with `trap: Some(..)`, not `Err`)
+        // - see `WasmCallResult::trap`'s doc comment for why this is no
+        // longer a hard `Err`: the caller needs `fuel_consumed` even when
+        // the call fails, to bill for fuel actually spent, not just detect
+        // failure.
+        let result = executor
+            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], accounts, vec![true, false], 1)
+            .unwrap();
+        assert!(result.trap.is_some(), "1 unit of fuel must not be enough to complete a real call");
+    }
+
+    /// The exact live-confirmed gas-metering-bypass this closes (see
+    /// `project-lessons-learned`): a contract that burns real fuel and then
+    /// deliberately traps must report that fuel as consumed, not zero -
+    /// otherwise the caller (`Ledger::run_wasm_instruction`) has no way to
+    /// bill for the computation that actually happened.
+    #[test]
+    fn fuel_consumed_before_a_deliberate_trap_is_still_reported() {
+        const BURN_THEN_TRAP_WAT: &str = r#"
+            (module
+                (func (export "burn_then_trap")
+                    (local $i i64)
+                    (local.set $i (i64.const 0))
+                    (block $done
+                        (loop $burn
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br_if $done (i64.ge_s (local.get $i) (i64.const 1000)))
+                            (br $burn)
+                        )
+                    )
+                    unreachable
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(BURN_THEN_TRAP_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+
+        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], vec![], vec![], 1_000_000).unwrap();
+        assert!(result.trap.is_some(), "the deliberate `unreachable` must be reported as a trap");
+        assert!(result.fuel_consumed > 0, "fuel spent looping before the trap must not be reported as zero");
     }
 
     const IS_SIGNER_WAT: &str = r#"
