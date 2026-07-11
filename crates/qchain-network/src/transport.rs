@@ -74,6 +74,11 @@ async fn write_envelope(stream: &mut TcpStream, envelope: &Envelope) -> anyhow::
     Ok(())
 }
 
+/// How long a freshly-accepted connection has to send its first complete
+/// envelope before it's dropped - see `handle_inbound`'s doc comment for
+/// the real vulnerability this closes.
+const FIRST_ENVELOPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Reads every envelope a peer sends over one persistent inbound
 /// connection, dispatching each into `tx`, until the peer closes the
 /// connection or a framing error occurs. Replaces the phase-1 design that
@@ -81,7 +86,39 @@ async fn write_envelope(stream: &mut TcpStream, envelope: &Envelope) -> anyhow::
 /// the necessary server-side half of persistent connections; the
 /// old one-shot version would silently reject every message past the
 /// first one a peer's persistent connection tried to send.
-async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>) {
+///
+/// A real, live-confirmed connection-exhaustion gap this closes (see
+/// `project-lessons-learned`): `accept_loop` spawns one of these per
+/// accepted connection with no cap and no timeout, and this function used
+/// to block on `read_envelope` indefinitely - a connection that never
+/// sends anything at all held one file descriptor and one task open
+/// forever, for free, with no signature or admission check of any kind
+/// (that only happens once real envelope bytes arrive). Confirmed live:
+/// 1,000 raw TCP connections opened to a validator's P2P port and never
+/// used for anything drove its open file descriptor count from 15 to
+/// 1,015, bounded only by the OS file-descriptor limit. Only the *first*
+/// read on a connection is timed out, not every subsequent one - a
+/// legitimate persistent connection (this transport's whole design,
+/// see the module docs above) can and does sit idle between real
+/// messages once it's proven itself with at least one, and timing out
+/// *that* would fight the persistent-connection optimization instead of
+/// the actual attack (open many connections, send nothing, ever).
+async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration) {
+    let first = match tokio::time::timeout(first_envelope_timeout, read_envelope(&mut stream)).await {
+        Ok(Ok(envelope)) => envelope,
+        Ok(Err(e)) => {
+            tracing::debug!("inbound connection closed: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("dropping a connection that sent nothing within {first_envelope_timeout:?}");
+            return;
+        }
+    };
+    if tx.send((first.from, first.message)).await.is_err() {
+        return; // engine shut down
+    }
+
     loop {
         match read_envelope(&mut stream).await {
             Ok(envelope) => {
@@ -105,7 +142,7 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMe
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let tx = tx.clone();
-        tokio::spawn(handle_inbound(stream, tx));
+        tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT));
     }
 }
 
@@ -293,6 +330,36 @@ mod tests {
             NetMessage::Vote { vertex_digest, .. } => assert_eq!(vertex_digest, [2u8; 32]),
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// The real, live-confirmed connection-exhaustion gap this closes (see
+    /// `handle_inbound`'s doc comment): a connection that never sends
+    /// anything must be dropped, not held open (one file descriptor, one
+    /// task) forever. Uses a tiny timeout directly rather than the real
+    /// 30s `FIRST_ENVELOPE_TIMEOUT` so the test doesn't have to wait 30
+    /// real seconds to observe it.
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_is_dropped_after_the_first_envelope_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_inbound(stream, tx, std::time::Duration::from_millis(200)).await;
+        });
+
+        // Connect but deliberately never write anything - the exact
+        // attack shape confirmed live (1,000 of these drove one
+        // validator's open file descriptors from 15 to 1,015).
+        let _silent_conn = TcpStream::connect(addr).await.unwrap();
+
+        // No envelope ever arrives, and - the actual point - the receiver
+        // closes (handle_inbound returned) once the timeout fires, rather
+        // than the task and its file descriptor staying alive forever.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert!(outcome.is_ok(), "handle_inbound must return within the timeout window, not hang forever");
+        assert!(outcome.unwrap().is_none(), "a silent connection must never produce a message");
     }
 
     fn sample_signature() -> qchain_crypto::MultiSignature {
