@@ -8,7 +8,7 @@
   :root { color-scheme: light dark; }
   body {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    max-width: 720px;
+    max-width: 860px;
     margin: 2rem auto;
     padding: 0 1rem;
     line-height: 1.5;
@@ -38,11 +38,19 @@
   button { cursor: pointer; }
   .err { color: #c0392b; }
   pre { white-space: pre-wrap; word-break: break-all; margin: 0.5rem 0 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid currentColor; border-bottom-color: color-mix(in srgb, currentColor 20%, transparent); }
+  th { opacity: 0.6; font-weight: normal; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+  .mono-cell { font-variant-numeric: tabular-nums; }
+  .empty-note { opacity: 0.6; font-size: 0.85rem; }
+  .table-wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
   <h1>qchain validator status</h1>
-  <div class="sub">Not a full block explorer - a live status page for this one validator. See <code>qchain-cli</code> for transfers, staking, and governance.</div>
+  <div class="sub">Live status and recent real activity for this one validator - not a network-wide indexer (each validator only knows the transfers it itself executed). See <code>qchain-cli</code> for submitting transfers, staking, and governance.</div>
 
   <section>
     <h2>node</h2>
@@ -52,6 +60,19 @@
   <section>
     <h2>state root</h2>
     <dl id="root-fields"><dt>loading</dt><dd>...</dd></dl>
+  </section>
+
+  <section>
+    <h2>recent transfers</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>hash</th><th>from</th><th>to</th><th>amount</th><th>fee</th></tr></thead>
+        <tbody id="transfers-body"></tbody>
+      </table>
+    </div>
+    <p id="transfers-empty" class="empty-note" style="display:none">no transfers captured yet on this validator</p>
+    <button id="load-more" style="margin-top:0.5rem">load more</button>
+    <pre id="transfer-detail"></pre>
   </section>
 
   <section>
@@ -72,7 +93,11 @@ function renderDl(el, obj) {
   el.innerHTML = Object.entries(obj).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
 
-async function refresh() {
+function short(s) {
+  return s && s.length > 14 ? s.slice(0, 6) + "…" + s.slice(-4) : s;
+}
+
+async function refreshStatus() {
   try {
     const status = await getJson("/status");
     renderDl(document.getElementById("status-fields"), status);
@@ -87,6 +112,48 @@ async function refresh() {
   }
 }
 
+let transfersOffset = 0;
+const TRANSFERS_PAGE = 20;
+
+async function loadTransfers() {
+  const body = document.getElementById("transfers-body");
+  const emptyNote = document.getElementById("transfers-empty");
+  try {
+    const rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=${transfersOffset}`);
+    if (transfersOffset === 0 && rows.length === 0) {
+      emptyNote.style.display = "block";
+      document.getElementById("load-more").style.display = "none";
+      return;
+    }
+    emptyNote.style.display = "none";
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="mono-cell">${short(r.tx_hash)}</td><td class="mono-cell">${short(r.from)}</td><td class="mono-cell">${short(r.to)}</td><td class="mono-cell">${r.amount}</td><td class="mono-cell">${r.fee}</td>`;
+      tr.addEventListener("click", () => showTransfer(r.tx_hash));
+      body.appendChild(tr);
+    }
+    transfersOffset += rows.length;
+    if (rows.length < TRANSFERS_PAGE) {
+      document.getElementById("load-more").style.display = "none";
+    }
+  } catch (e) {
+    emptyNote.textContent = `error loading transfers: ${e.message}`;
+    emptyNote.style.display = "block";
+  }
+}
+
+async function showTransfer(hash) {
+  const out = document.getElementById("transfer-detail");
+  out.textContent = "loading...";
+  try {
+    out.textContent = JSON.stringify(await getJson(`/transfers/${hash}`), null, 2);
+  } catch (e) {
+    out.textContent = `error: ${e.message}`;
+  }
+}
+
+document.getElementById("load-more").addEventListener("click", loadTransfers);
+
 document.getElementById("lookup").addEventListener("click", async () => {
   const addr = document.getElementById("addr").value.trim();
   const out = document.getElementById("account-result");
@@ -99,8 +166,9 @@ document.getElementById("lookup").addEventListener("click", async () => {
   }
 });
 
-refresh();
-setInterval(refresh, 3000);
+refreshStatus();
+loadTransfers();
+setInterval(refreshStatus, 3000);
 </script>
 </body>
 </html>

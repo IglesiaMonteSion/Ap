@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use qchain_core::{Account, Transaction};
 use qchain_crypto::Pubkey;
+use qchain_execution::TransferReceipt;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/status", get(status))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
+        .route("/transfers", get(list_transfers))
+        .route("/transfers/:hash", get(get_transfer))
         .with_state(engine)
 }
 
@@ -72,4 +75,55 @@ async fn stark_proof(
         StarkProofError::Prove(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         StarkProofError::ChainBroken(_) => (StatusCode::CONFLICT, e.to_string()),
     })
+}
+
+/// The light, list-view shape of a captured transfer - just enough to
+/// render a real "recent activity" table (Qscan's whole reason to exist
+/// over the older single-screen status page). Full before/after
+/// balances and Merkle proofs are only served per-transaction, by hash,
+/// via `GET /transfers/:hash` - a list of dozens of those would be most
+/// of a light client's proof payload repeated for no reason.
+#[derive(serde::Serialize)]
+struct TransferSummary {
+    tx_hash: String,
+    from: Pubkey,
+    to: Pubkey,
+    amount: u64,
+    fee: u64,
+}
+
+impl From<&TransferReceipt> for TransferSummary {
+    fn from(r: &TransferReceipt) -> Self {
+        TransferSummary { tx_hash: hex::encode(r.tx_hash), from: r.from, to: r.to, amount: r.amount, fee: r.fee }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ListTransfersQuery {
+    #[serde(default = "default_transfers_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_transfers_limit() -> usize {
+    20
+}
+
+/// Real recent-activity list, newest first - see `Engine::list_transfers`
+/// for what backs it (the same in-memory receipt log `/stark_proof`
+/// already reads, not a new indexer).
+async fn list_transfers(State(engine): State<Arc<Engine>>, Query(query): Query<ListTransfersQuery>) -> Json<Vec<TransferSummary>> {
+    let receipts = engine.list_transfers(query.limit, query.offset).await;
+    Json(receipts.iter().map(TransferSummary::from).collect())
+}
+
+/// Full detail for one transfer by its transaction hash (hex) - the
+/// before/after balances and Merkle proofs a light client would want to
+/// inspect for that specific transaction, without fetching (and
+/// re-verifying) a whole STARK batch just to look at one row.
+async fn get_transfer(State(engine): State<Arc<Engine>>, Path(hash): Path<String>) -> Result<Json<TransferReceipt>, (StatusCode, String)> {
+    let bytes = hex::decode(&hash).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tx_hash: [u8; 32] = bytes.try_into().map_err(|_| (StatusCode::BAD_REQUEST, "transaction hash must be 32 bytes".to_string()))?;
+    engine.get_transfer(tx_hash).await.map(Json).ok_or((StatusCode::NOT_FOUND, "no receipt captured for that transaction hash".to_string()))
 }

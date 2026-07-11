@@ -255,6 +255,34 @@ impl Engine {
         (state.ledger.merkle_root(), state.ledger.transfer_receipts().len())
     }
 
+    /// The most recent `limit` captured `TransferReceipt`s (newest
+    /// first), skipping `offset` from the newest end first - the real
+    /// "recent activity" list a Qscan-style status page paginates
+    /// through. Backed by the same in-memory, unbounded `Vec` `Ledger`
+    /// already keeps for `/stark_proof` (see `qchain-execution::receipt`'s
+    /// module docs on that limitation) - this endpoint doesn't add any
+    /// new persistence, just a paginated read of what was already there.
+    pub async fn list_transfers(&self, limit: usize, offset: usize) -> Vec<qchain_execution::TransferReceipt> {
+        let state = self.state.lock().await;
+        let all = state.ledger.transfer_receipts();
+        if offset >= all.len() {
+            return Vec::new();
+        }
+        let end = all.len() - offset;
+        let start = end.saturating_sub(limit);
+        all[start..end].iter().rev().cloned().collect()
+    }
+
+    /// A single captured receipt by its transaction hash, full detail
+    /// (before/after balances and Merkle proofs) - `O(receipts)` linear
+    /// scan, acceptable for the same reason the list above is: this is a
+    /// read over an already-bounded-by-session in-memory `Vec`, not a
+    /// real indexed store.
+    pub async fn get_transfer(&self, tx_hash: [u8; 32]) -> Option<qchain_execution::TransferReceipt> {
+        let state = self.state.lock().await;
+        state.ledger.transfer_receipts().iter().find(|r| r.tx_hash == tx_hash).cloned()
+    }
+
     /// Builds a real `qchain-stark` proof over the most recent `limit`
     /// captured transfer receipts (all of them if `limit` is `None`),
     /// binds it to the real Merkle root transitions those receipts

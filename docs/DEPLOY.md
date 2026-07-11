@@ -133,13 +133,28 @@ llama — así nadie puede vaciar el faucet en un solo pedido. Rate-limit
 por dirección vía `--cooldown-secs` (en memoria, no persiste un
 reinicio del faucet — aceptable para un testnet).
 
-## Página de estado
+## Página de estado (Qscan)
 
 Visitar `http://<ip-de-un-validador>:8080/` en un navegador muestra el
-estado de ese nodo (ronda actual, certificados, raíz de estado) y permite
-buscar el balance de una dirección. No es un explorador de bloques
-completo (sin historial de transacciones navegable) — para eso usar
-`qchain-cli`.
+estado de ese nodo (ronda actual, certificados, raíz de estado), una
+lista real de las transferencias más recientes que *ese* validador
+ejecutó (con detalle completo — balances antes/después, pruebas Merkle
+— al hacer clic en una fila), y permite buscar el balance de una
+dirección. Los mismos datos están disponibles como JSON real vía RPC:
+
+```
+GET /transfers?limit=20&offset=0   # lista, más reciente primero
+GET /transfers/<hash-hex>          # detalle completo de una transferencia
+```
+
+**Sigue sin ser un explorador de red completo** — cada validador solo
+conoce las transferencias que *él mismo* ejecutó (no hay un indexador
+centralizado agregando los datos de todos los nodos), el log es un
+`Vec` en memoria sin persistencia ni límite (mismo `TransferReceipt`
+que ya usaba `/stark_proof`, no una tabla nueva), y solo cubre
+transacciones `Transfer` de una sola instrucción (staking/gobernanza no
+generan un recibo). Para eso — o para consultar contra un nodo
+específico por CLI — usar `qchain-cli`.
 
 ## Seguridad real, no cosmética
 
