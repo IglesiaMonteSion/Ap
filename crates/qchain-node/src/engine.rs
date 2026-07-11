@@ -260,13 +260,23 @@ impl Engine {
     /// here - that happens once for real at execution time
     /// (`Ledger::apply_transaction`); a transaction that turns out invalid
     /// once its batch is ordered is simply skipped (see `try_commit`).
+    ///
+    /// Broadcasts it to every peer immediately afterward (see
+    /// `NetMessage::TransactionGossip`'s doc comment for the real
+    /// censorship gap this closes) - the client only ever talks to this
+    /// one validator's RPC, but every validator now learns about the
+    /// transaction regardless of whether this one later includes it in a
+    /// worker batch.
     pub async fn submit_transaction(&self, tx: Transaction) -> anyhow::Result<[u8; 32]> {
         if !tx.verify_signature() {
             anyhow::bail!("invalid transaction signature");
         }
         let hash = tx.hash();
-        let mut state = self.state.lock().await;
-        state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx);
+        {
+            let mut state = self.state.lock().await;
+            state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx.clone());
+        }
+        self.network.broadcast(&NetMessage::TransactionGossip(tx)).await;
         Ok(hash)
     }
 
@@ -397,6 +407,23 @@ impl Engine {
 
     pub async fn handle_message(&self, from: ValidatorId, msg: NetMessage) {
         match msg {
+            NetMessage::TransactionGossip(tx) => {
+                // Real defense-in-depth, not just trusting a peer: verify
+                // the signature independently rather than assuming a peer
+                // only ever gossips what it already checked - the same
+                // posture `submit_transaction` already has for its own
+                // RPC-submitted transactions.
+                if !tx.verify_signature() {
+                    tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
+                    return;
+                }
+                let mut state = self.state.lock().await;
+                state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx);
+                // Not re-broadcast further - this project's validator sets
+                // are fully connected (see `NetMessage::TransactionGossip`'s
+                // doc comment), so the originating validator's own
+                // broadcast already reached every peer in one hop.
+            }
             NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
                 let digest = batch.digest();
                 let mut state = self.state.lock().await;

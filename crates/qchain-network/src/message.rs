@@ -14,11 +14,30 @@
 //! why this separation exists at all).
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use qchain_core::{Batch, Certificate, Digest, ValidatorId, Vertex, WorkerId};
+use qchain_core::{Batch, Certificate, Digest, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::MultiSignature;
 
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
 pub enum NetMessage {
+    /// A real, honestly-confirmed censorship gap this closes (see
+    /// `project-lessons-learned`): a client submits a transaction to
+    /// exactly one validator's RPC, which only ever entered its own local
+    /// mempool - raw transactions were never gossiped between validators
+    /// at all, only *already-assembled* worker batches were. That gave the
+    /// one validator a client happened to submit to unilateral,
+    /// undetectable power to censor it forever, with no other validator
+    /// ever learning it existed. Broadcast once, immediately, by whichever
+    /// validator's RPC first admits a real transaction - every other
+    /// validator receiving it can now include it in its own worker batch
+    /// even if the original recipient refuses to, so no single validator
+    /// can silently drop it. Not re-broadcast on receipt (this project's
+    /// validator sets are fully connected - `Network::broadcast` already
+    /// reaches every peer directly in one hop, see `transport.rs`), and
+    /// deliberately not modeled by `qchain-simulation`'s DST harness (its
+    /// vertices never carry real transaction content - consensus
+    /// safety/liveness doesn't depend on mempool population, see its own
+    /// module docs).
+    TransactionGossip(Transaction),
     /// One worker lane's batch of transactions, sent independently of the
     /// vertex that will later reference it, so peers can execute it once
     /// the corresponding certificate is ordered.
