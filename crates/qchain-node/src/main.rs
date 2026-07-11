@@ -13,8 +13,8 @@ use config::NodeConfig;
 use engine::{Engine, EngineState};
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
 use qchain_execution::{
-    genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, StakingProgram, SystemProgram,
-    GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
+    genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, RewardPoolData, StakingProgram, SystemProgram,
+    GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
 };
 use qchain_network::{Network, PeerInfo};
 use qchain_storage::{InMemoryStore, SledStore, StateStore};
@@ -116,6 +116,14 @@ async fn main() -> anyhow::Result<()> {
         ledger.seed_account(
             PARAMS_ACCOUNT_ID,
             qchain_core::Account { data: genesis_params_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+        );
+        // Shared delegator staking-reward pool (`ARCHITECTURE.md` §5's
+        // staking-rewards paragraph, `qchain-execution::staking`'s module
+        // docs for the reward-per-share accrual mechanism): starts empty,
+        // `balance` accrues from every transaction's fee split from here.
+        ledger.seed_account(
+            STAKING_REWARDS_POOL_ID,
+            qchain_core::Account { data: borsh::to_vec(&RewardPoolData::default())?, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
         );
     } else {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");

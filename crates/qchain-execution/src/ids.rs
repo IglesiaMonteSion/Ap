@@ -22,3 +22,8 @@ pub const REGISTRY_ACCOUNT_ID: Pubkey = Pubkey::new([4u8; 32]);
 /// parameters a passed `Low`-tier proposal mutates, and what `Ledger`
 /// reads fee/dust/gas pricing from at execution time.
 pub const PARAMS_ACCOUNT_ID: Pubkey = Pubkey::new([5u8; 32]);
+/// Singleton account (owned by `STAKING_PROGRAM_ID`) whose `data` is a
+/// borsh-encoded `crate::staking::RewardPoolData` and whose `balance` is
+/// the real QCH held for delegators to claim - see `staking.rs`'s module
+/// docs for the reward-per-share accrual mechanism this backs.
+pub const STAKING_REWARDS_POOL_ID: Pubkey = Pubkey::new([6u8; 32]);

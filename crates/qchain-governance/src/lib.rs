@@ -98,6 +98,10 @@ pub enum ProposalAction {
     SetDustThreshold(u64),
     /// New value for the WASM gas price (fuel-to-unit conversion).
     SetGasPricePerFuel(u64),
+    /// New validator commission (basis points, out of 10,000) on the
+    /// staking-reward share of `base_fee` (`ARCHITECTURE.md` §5's staking
+    /// rewards paragraph).
+    SetStakingCommissionBps(u16),
 }
 
 impl ProposalAction {
@@ -106,7 +110,10 @@ impl ProposalAction {
             ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
                 RiskTier::Registry
             }
-            ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => RiskTier::Low,
+            ProposalAction::SetBaseFeePerByte(_)
+            | ProposalAction::SetDustThreshold(_)
+            | ProposalAction::SetGasPricePerFuel(_)
+            | ProposalAction::SetStakingCommissionBps(_) => RiskTier::Low,
         }
     }
 }

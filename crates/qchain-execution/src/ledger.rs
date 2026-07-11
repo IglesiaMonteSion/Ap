@@ -4,7 +4,7 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID};
+use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
 use crate::receipt::{OverlayStore, TransferReceipt};
@@ -90,6 +90,43 @@ impl Ledger {
         let mut account = self.store.get(&pk).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
         account.balance = account.balance.saturating_add(amount);
         self.store.set(pk, account);
+    }
+
+    /// Splits the validator's post-burn share of `base_fee` between direct
+    /// commission (`fee_collector`, paid immediately, same as before this
+    /// mechanism existed) and the shared delegator reward pool
+    /// (`STAKING_REWARDS_POOL_ID`), per the live `staking_commission_bps`.
+    /// See `staking.rs`'s module docs for the reward-per-share accumulator
+    /// this feeds, and `ARCHITECTURE.md` §5 for the design. Falls back to
+    /// crediting `fee_collector` with the whole share, exactly like
+    /// pre-staking-reward behavior, whenever nothing is delegated yet
+    /// (`staking::accrue_reward_pool` reports this via its `bool` return
+    /// rather than this method re-deriving total stake).
+    fn credit_validator_share(&mut self, fee_collector: Pubkey, validator_share: u64, params: &EconomicParams) -> Result<(), ExecError> {
+        if validator_share == 0 {
+            return Ok(());
+        }
+        let commission = (validator_share as u128 * params.staking_commission_bps as u128 / 10_000) as u64;
+        let pool_share = validator_share - commission;
+
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        if let Some(stats) = self.store.get(&STAKING_STATS_ID) {
+            accounts.insert(STAKING_STATS_ID, stats);
+        }
+        if let Some(pool) = self.store.get(&STAKING_REWARDS_POOL_ID) {
+            accounts.insert(STAKING_REWARDS_POOL_ID, pool);
+        }
+
+        let credited = crate::staking::accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, pool_share)?;
+        if credited {
+            if let Some(pool) = accounts.remove(&STAKING_REWARDS_POOL_ID) {
+                self.store.set(STAKING_REWARDS_POOL_ID, pool);
+            }
+            self.credit(fee_collector, commission);
+        } else {
+            self.credit(fee_collector, validator_share);
+        }
+        Ok(())
     }
 
     /// The economic parameters currently in effect - read live from
@@ -235,7 +272,7 @@ impl Ledger {
         let burn_share = byte_fee / 2;
         let validator_share = byte_fee - burn_share;
         self.total_burned += burn_share;
-        self.credit(*fee_collector, validator_share);
+        self.credit_validator_share(*fee_collector, validator_share, &params)?;
 
         // Working set: the payer is always included (implicit participant,
         // e.g. as CreateAccount's funding source, even when no instruction

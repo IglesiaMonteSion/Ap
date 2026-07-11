@@ -11,7 +11,7 @@ use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{AlgorithmId, AlgorithmStatus, Keypair, Pubkey, RegistryEntry};
 use qchain_execution::{
     EconomicParams, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
-    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_STATS_ID,
+    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
 };
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
@@ -87,9 +87,25 @@ enum Command {
         #[arg(long, default_value_t = 1_000_000)]
         fee_limit: u64,
     },
-    /// Close a stake account, returning its funds. No unbonding delay in
-    /// this increment (see `qchain-execution`'s `staking` module docs).
+    /// Close a stake account, returning its funds plus any pending reward
+    /// (auto-paid, see `qchain-execution`'s `staking` module docs). No
+    /// unbonding delay in this increment.
     StakeUndelegate {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        stake_account: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
+    /// Claim this stake position's pending staking reward without closing
+    /// it (see `qchain-execution`'s `staking` module docs for the
+    /// reward-per-share accrual mechanism).
+    ClaimReward {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
         #[arg(short, long)]
@@ -196,6 +212,22 @@ enum Command {
         proposal_id: ProposalId,
         #[arg(long)]
         value: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 1_000_000)]
+        fee_limit: u64,
+    },
+    /// Propose a new validator commission (basis points, out of 10,000) on
+    /// the staking-reward share of `base_fee` (Low risk tier).
+    ProposeSetStakingCommission {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        proposal_id: ProposalId,
+        #[arg(long)]
+        value: u16,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 1_000_000)]
@@ -409,8 +441,15 @@ fn main() -> anyhow::Result<()> {
             // discarded immediately.
             let stake_pk = Keypair::generate()?.pubkey();
             let data = borsh::to_vec(&StakingInstruction::Delegate { validator: validator_pk, amount })?;
-            let body =
-                submit_instruction(&rpc, &staker, STAKING_PROGRAM_ID, vec![staker.pubkey(), stake_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
+            let body = submit_instruction(
+                &rpc,
+                &staker,
+                STAKING_PROGRAM_ID,
+                vec![staker.pubkey(), stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
             println!("submitted: {body}");
             println!("stake account: {stake_pk}");
         }
@@ -418,7 +457,15 @@ fn main() -> anyhow::Result<()> {
             let staker = qchain_crypto::read_keypair_file(&keypair)?;
             let stake_pk: Pubkey = stake_account.parse()?;
             let data = borsh::to_vec(&StakingInstruction::Undelegate)?;
-            let body = submit_instruction(&rpc, &staker, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
+            let body =
+                submit_instruction(&rpc, &staker, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+        }
+        Command::ClaimReward { rpc, keypair, stake_account, nonce, fee_limit } => {
+            let staker = qchain_crypto::read_keypair_file(&keypair)?;
+            let stake_pk: Pubkey = stake_account.parse()?;
+            let data = borsh::to_vec(&StakingInstruction::ClaimReward)?;
+            let body = submit_instruction(&rpc, &staker, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_REWARDS_POOL_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {
@@ -483,6 +530,15 @@ fn main() -> anyhow::Result<()> {
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
+        Command::ProposeSetStakingCommission { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
+            let proposer = qchain_crypto::read_keypair_file(&keypair)?;
+            let proposal_pk = Keypair::generate()?.pubkey();
+            let action = ProposalAction::SetStakingCommissionBps(value);
+            let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposal account: {proposal_pk}");
+        }
         Command::Vote { rpc, keypair, proposal, stake_account, choice, nonce, fee_limit } => {
             let voter = qchain_crypto::read_keypair_file(&keypair)?;
             let proposal_pk: Pubkey = proposal.parse()?;
@@ -512,9 +568,10 @@ fn main() -> anyhow::Result<()> {
                 ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
                     REGISTRY_ACCOUNT_ID
                 }
-                ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
-                    PARAMS_ACCOUNT_ID
-                }
+                ProposalAction::SetBaseFeePerByte(_)
+                | ProposalAction::SetDustThreshold(_)
+                | ProposalAction::SetGasPricePerFuel(_)
+                | ProposalAction::SetStakingCommissionBps(_) => PARAMS_ACCOUNT_ID,
             };
             let data = borsh::to_vec(&GovernanceInstruction::Execute)?;
             let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, target], data, nonce, fee_limit)?;

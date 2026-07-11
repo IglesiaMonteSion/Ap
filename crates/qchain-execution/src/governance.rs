@@ -156,10 +156,13 @@ impl NativeProgram for GovernanceProgram {
                         apply_registry_action(&mut registry, &proposal.action, current_round)?;
                         accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&registry).map_err(borsh_err)?;
                     }
-                    ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
+                    ProposalAction::SetBaseFeePerByte(_)
+                    | ProposalAction::SetDustThreshold(_)
+                    | ProposalAction::SetGasPricePerFuel(_)
+                    | ProposalAction::SetStakingCommissionBps(_) => {
                         let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
                         let mut params = crate::params::EconomicParams::try_from_slice(&target_account.data).map_err(borsh_err)?;
-                        apply_economic_action(&mut params, &proposal.action);
+                        apply_economic_action(&mut params, &proposal.action)?;
                         accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&params).map_err(borsh_err)?;
                     }
                 }
@@ -199,7 +202,10 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
                 _ => return Err(ExecError::ProgramError("only a Deprecated entry can be retired".into())),
             }
         }
-        ProposalAction::SetBaseFeePerByte(_) | ProposalAction::SetDustThreshold(_) | ProposalAction::SetGasPricePerFuel(_) => {
+        ProposalAction::SetBaseFeePerByte(_)
+        | ProposalAction::SetDustThreshold(_)
+        | ProposalAction::SetGasPricePerFuel(_)
+        | ProposalAction::SetStakingCommissionBps(_) => {
             unreachable!("Execute only calls apply_registry_action for Registry-tier actions")
         }
     }
@@ -207,17 +213,27 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
 }
 
 /// Only ever called with a `Low`-tier action (the `Execute` match arm
-/// routes accordingly) - the other variants are unreachable here, which
-/// is why this doesn't return a `Result`.
-fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &ProposalAction) {
+/// routes accordingly) - the other variants are unreachable here.
+/// Returns an error for a commission above 100% (10,000 bps) - the one
+/// `Low`-tier value with a real invariant to violate (unlike a fee/dust
+/// constant, which is just a placeholder number with no upper bound that
+/// would break arithmetic elsewhere).
+fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &ProposalAction) -> Result<(), ExecError> {
     match action {
         ProposalAction::SetBaseFeePerByte(v) => params.base_fee_per_byte = *v,
         ProposalAction::SetDustThreshold(v) => params.dust_threshold = *v,
         ProposalAction::SetGasPricePerFuel(v) => params.gas_price_per_fuel = *v,
+        ProposalAction::SetStakingCommissionBps(v) => {
+            if *v > 10_000 {
+                return Err(ExecError::ProgramError("staking commission cannot exceed 10,000 bps (100%)".into()));
+            }
+            params.staking_commission_bps = *v;
+        }
         ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
             unreachable!("Execute only calls apply_economic_action for Low-tier actions")
         }
     }
+    Ok(())
 }
 
 /// Builds the genesis algorithm-registry account contents - callers (node
@@ -235,7 +251,7 @@ pub fn genesis_params_account_data() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_STATS_ID};
+    use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
     use crate::staking::StakingProgram;
     use qchain_crypto::{ALGORITHM_ED25519, ALGORITHM_ML_DSA_65};
 
@@ -248,7 +264,7 @@ mod tests {
     }
 
     fn stake_account(owner: Pubkey, amount: u64) -> Account {
-        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount };
+        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0 };
         Account { balance: amount, data: borsh::to_vec(&data).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
     }
 
@@ -258,6 +274,10 @@ mod tests {
 
     fn stats_account(total: u64) -> Account {
         Account { data: borsh::to_vec(&total).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
+    }
+
+    fn pool_account() -> Account {
+        Account { data: borsh::to_vec(&crate::staking::RewardPoolData::default()).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
     }
 
     fn params_account() -> Account {
@@ -475,12 +495,16 @@ mod tests {
     #[test]
     fn delegated_stake_from_the_staking_program_can_vote() {
         let staker = Pubkey::new([1u8; 32]);
-        let mut accounts =
-            HashMap::from([(staker, wallet(10_000)), (STAKING_STATS_ID, stats_account(0)), (REGISTRY_ACCOUNT_ID, registry_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet(10_000)),
+            (STAKING_STATS_ID, stats_account(0)),
+            (REGISTRY_ACCOUNT_ID, registry_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
 
         let delegate_ix = Instruction {
             program_id: crate::ids::STAKING_PROGRAM_ID,
-            accounts: vec![staker, STAKE_PK, STAKING_STATS_ID],
+            accounts: vec![staker, STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate { validator: Pubkey::new([50u8; 32]), amount: 5_000 }).unwrap(),
         };
         StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
