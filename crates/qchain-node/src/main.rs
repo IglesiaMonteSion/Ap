@@ -145,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
             voted_for: HashMap::new(),
             pending_cert_requests: HashMap::new(),
             pending_batch_requests: HashMap::new(),
+            pending_votes_to_send: HashMap::new(),
+            own_last_certificate: None,
         }),
     });
 

@@ -613,7 +613,20 @@ fn main() -> anyhow::Result<()> {
             println!("funding {count} fresh accounts (sequential setup, not timed)...");
             let senders: Vec<Keypair> = (0..count).map(|_| Keypair::generate().unwrap()).collect();
             let start_nonce = fetch_account(&rpc, &payer.pubkey())?.map(|a| a.nonce).unwrap_or(0);
-            let fund_amount = 1_000_000u64;
+            // Reads the live `base_fee_per_byte` instead of a hardcoded
+            // guess - a fixed constant here previously went stale the
+            // moment governance (or a fresh calibration, as already
+            // happened once - see `ARCHITECTURE.md` §5) moved the real
+            // fee, and every measured transaction then failed with
+            // "insufficient funds" instead of measuring anything. `* 10`
+            // is safety margin (real fee ~1x this per hybrid-signed
+            // transfer), not a tight estimate - this only needs to cover
+            // "the second transaction's own fee," never the timed path.
+            let base_fee_per_byte = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?
+                .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
+                .map(|p| p.base_fee_per_byte)
+                .unwrap_or(180);
+            let fund_amount = base_fee_per_byte.saturating_mul(6000).max(1_000_000);
             let client = reqwest::blocking::Client::new();
             for (i, sender) in senders.iter().enumerate() {
                 let ix = Instruction {

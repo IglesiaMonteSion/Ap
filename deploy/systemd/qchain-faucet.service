@@ -1,0 +1,26 @@
+[Unit]
+Description=qchain faucet
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+# Expects /opt/qchain-faucet to contain faucet-keypair.json - see
+# docs/DEPLOY.md for --amount/--cooldown-secs tuning and the RPC target.
+Type=simple
+WorkingDirectory=/opt/qchain-faucet
+ExecStartPre=-/usr/bin/docker rm -f qchain-faucet
+ExecStart=/usr/bin/docker run --rm --name qchain-faucet \
+  -v /opt/qchain-faucet:/qchain -w /qchain -p 9090:9090 \
+  qchain:latest qchain-faucet \
+    --rpc http://127.0.0.1:8080 \
+    --keypair /qchain/faucet-keypair.json \
+    --listen 0.0.0.0:9090 \
+    --amount 10000000 \
+    --cooldown-secs 60
+ExecStop=/usr/bin/docker stop qchain-faucet
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

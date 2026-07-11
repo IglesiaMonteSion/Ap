@@ -144,6 +144,23 @@ pub struct EngineState {
     /// permanent gap.
     pub pending_cert_requests: HashMap<Digest, ValidatorId>,
     pub pending_batch_requests: HashMap<(WorkerId, Digest), ValidatorId>,
+    /// Outstanding `Vote` replies this validator owes to a vertex's author,
+    /// keyed by the vertex digest being voted for, valued by (who to send
+    /// it to, the signature itself) - see `retry_pending_resync_requests`'s
+    /// doc comment for the real, confirmed-live bug this closes: unlike
+    /// `VertexProposal`/`CertificateRequest`/`WorkerBatchRequest`, a `Vote`
+    /// was a single-attempt send with no retry at all.
+    pub pending_votes_to_send: HashMap<Digest, (ValidatorId, MultiSignature)>,
+    /// The most recent certificate this validator itself authored -
+    /// unconditionally re-broadcast every tick (see
+    /// `retry_pending_resync_requests`'s doc comment for the real,
+    /// confirmed-live bootstrap deadlock this closes: `CertificateBroadcast`
+    /// is a one-shot send with no retry of its own, and the reactive
+    /// resync (`request_missing_parents`) can only be triggered by a
+    /// *later* message that references the missing certificate as a
+    /// parent - which never happens for the very first round, since
+    /// nothing has proposed a next round yet).
+    pub own_last_certificate: Option<Certificate>,
 }
 
 pub struct Engine {
@@ -398,6 +415,16 @@ impl Engine {
                         return;
                     }
                 };
+                // Registered as outstanding *before* the first send attempt,
+                // regardless of whether that attempt succeeds - see
+                // `retry_pending_resync_requests`'s doc comment for the real
+                // bug this closes: a `Vote` used to be a single-attempt send
+                // with no way to recover if it raced a peer's listener
+                // socket that wasn't bound yet.
+                {
+                    let mut state = self.state.lock().await;
+                    state.pending_votes_to_send.insert(digest, (from, sig.clone()));
+                }
                 if let Some(addr) = self.network.addr_of(&from) {
                     if let Err(e) = self.network.send_to(addr, &NetMessage::Vote { vertex_digest: digest, signature: sig }).await {
                         tracing::warn!("failed to send vote to {from}: {e}");
@@ -528,7 +555,72 @@ impl Engine {
     }
 
     /// Re-sends any still-outstanding `CertificateRequest`/
-    /// `WorkerBatchRequest`s, called on the same tick as `propose_round`.
+    /// `WorkerBatchRequest`s/`Vote`s, called on the same tick as
+    /// `propose_round`.
+    ///
+    /// **Second real bug closed here, found live running an actual n=20
+    /// validator testnet (not simulated) - a genuine `Vote` reply, unlike
+    /// every other resync message in this function, was a single-attempt
+    /// send with no retry at all.** With 20 real processes started nearly
+    /// simultaneously via a shell loop, each one's P2P listener binds at a
+    /// slightly different moment; a `VertexProposal` that reaches a peer
+    /// before *that peer's own* listener is up can still be received fine
+    /// (it's inbound), but the `Vote` reply the peer sends *back* to the
+    /// proposer races the proposer's own listener the same way, and if it
+    /// loses that race it's dropped with only a one-line warning and never
+    /// retried - unlike `VertexProposal` (retried via `own_pending_vertex`)
+    /// and `CertificateRequest`/`WorkerBatchRequest` (retried just below).
+    /// Confirmed live: a real 20-validator testnet on this sandbox got
+    /// permanently stuck at `next_round: 1`, `dag_certificates: 1` on
+    /// *every single node* - i.e. only one validator's round-0 vertex ever
+    /// reached quorum, because most of the other 19 validators' peers lost
+    /// exactly this race for at least one vote each. Since round N+1
+    /// requires 2f+1 stake worth of round-N certificates (see
+    /// `propose_round`), one validator short of quorum for its own vertex
+    /// freezes not just that validator but the *entire* network forever -
+    /// confirmed by watching all 20 nodes' `next_round`/`dag_certificates`
+    /// sit frozen simultaneously with CPU idle (not contended, not
+    /// deadlocked - just legitimately blocked on `propose_round`'s
+    /// prior-round quorum check returning early, tick after tick). This is
+    /// distinct from the pure CPU-contention slowdown already documented at
+    /// n=50 (throughput degrading under load) and from the ephemeral-port
+    /// exhaustion found at n=27 (TCP port range exhausted by message
+    /// volume) - this one is a genuine startup-ordering race that a *fixed*
+    /// small validator count (e.g. n=3) is unlikely to ever hit (fewer
+    /// simultaneous connection attempts, smaller window), but a real
+    /// deployment bringing up dozens of validators at once - or restarting
+    /// several together - could hit in production.
+    ///
+    /// **Third real bug closed here, found live immediately after fixing
+    /// the `Vote` retry above - fixing that one exposed this one, it did
+    /// not cause it.** Even with every `Vote` reliably delivered, a real
+    /// n=6 testnet plateaued forever at a handful of certificates instead
+    /// of reaching the 5-of-6 quorum needed to unlock round 1.
+    /// Instrumented live (temporary `tracing::info!` calls, removed once
+    /// diagnosed - same technique used for the round-checkpoint recovery
+    /// timing question, see `project-lessons-learned`): every validator's
+    /// own round-0 vertex *did* reach quorum stake locally (confirmed by
+    /// the vote tally reaching the threshold), but `record_vote`'s
+    /// resulting `CertificateBroadcast` - like `Vote` before this fix - is
+    /// a one-shot send with no retry, and unlike a missing *parent*
+    /// reference (handled by `request_missing_parents`'s reactive
+    /// resync), nothing ever asks for a missing round-0 certificate by
+    /// digest: that reactive path only triggers when a *later* vertex
+    /// lists the missing certificate as a parent, which cannot happen
+    /// before *someone* has reached round-0 quorum and proposed round 1 -
+    /// a genuine bootstrap chicken-and-egg gap specific to the very first
+    /// round every validator ever proposes. Fixed by having every
+    /// validator unconditionally re-broadcast its own most recently
+    /// self-certified certificate (`EngineState.own_last_certificate`)
+    /// every tick, forever - cheap (one certificate, one tick, one
+    /// validator), and sufficient: as long as at least one honest
+    /// validator keeps ticking, every peer eventually receives every
+    /// author's certificate through repeated direct pushes, the same
+    /// reasoning `own_pending_vertex`'s existing retry already relies on
+    /// one step earlier in the same pipeline. Once *any* validator moves
+    /// past round 0, `request_missing_parents`'s existing by-digest resync
+    /// takes over for all later rounds, so this only needed to cover the
+    /// bootstrap case.
     ///
     /// **Real bug closed here, found live via a deeper adversarial audit
     /// (rapid crash-loop of one validator, four kills/restarts within a
@@ -565,7 +657,7 @@ impl Engine {
     /// entry the moment the real content actually arrives, whichever way
     /// it arrives.
     pub async fn retry_pending_resync_requests(&self) {
-        let (cert_retries, batch_retries) = {
+        let (cert_retries, batch_retries, vote_retries, own_cert_retry) = {
             let mut state = self.state.lock().await;
             let resolved_certs: Vec<Digest> = state.pending_cert_requests.keys().copied().filter(|d| state.dag.contains(d)).collect();
             for digest in &resolved_certs {
@@ -576,10 +668,22 @@ impl Engine {
             for key in &resolved_batches {
                 state.pending_batch_requests.remove(key);
             }
+            // A vote is no longer owed once its vertex is already certified
+            // - whether that quorum was reached through this validator's
+            // own vote or through others', including via a certificate that
+            // arrived by some other path entirely (broadcast, or cert/batch
+            // re-sync).
+            let resolved_votes: Vec<Digest> = state.pending_votes_to_send.keys().copied().filter(|d| state.dag.contains(d)).collect();
+            for digest in &resolved_votes {
+                state.pending_votes_to_send.remove(digest);
+            }
             let cert_retries: Vec<(Digest, ValidatorId)> = state.pending_cert_requests.iter().map(|(&d, &from)| (d, from)).collect();
             let batch_retries: Vec<(WorkerId, Digest, ValidatorId)> =
                 state.pending_batch_requests.iter().map(|(&(worker_id, d), &from)| (worker_id, d, from)).collect();
-            (cert_retries, batch_retries)
+            let vote_retries: Vec<(Digest, ValidatorId, MultiSignature)> =
+                state.pending_votes_to_send.iter().map(|(&d, (from, sig))| (d, *from, sig.clone())).collect();
+            let own_cert_retry = state.own_last_certificate.clone();
+            (cert_retries, batch_retries, vote_retries, own_cert_retry)
         };
 
         for (digest, from) in cert_retries {
@@ -593,6 +697,18 @@ impl Engine {
             if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
                 tracing::warn!("retry: failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
             }
+        }
+        for (vertex_digest, from, signature) in vote_retries {
+            let Some(addr) = self.network.addr_of(&from) else { continue };
+            if let Err(e) = self.network.send_to(addr, &NetMessage::Vote { vertex_digest, signature }).await {
+                tracing::warn!("retry: failed to send vote to {from}: {e}");
+            }
+        }
+        // Unconditional, every tick, forever - see this function's doc
+        // comment for the real bootstrap deadlock this closes. Cheap: at
+        // most one certificate, once per tick, per validator.
+        if let Some(cert) = own_cert_retry {
+            self.network.broadcast(&NetMessage::CertificateBroadcast(cert)).await;
         }
     }
 
@@ -619,6 +735,7 @@ impl Engine {
         let signatures = state.pending_votes.remove(&vertex_digest).unwrap().into_iter().collect();
         let cert = Certificate { vertex, signatures };
         state.dag.insert(cert.clone());
+        state.own_last_certificate = Some(cert.clone());
         Some(cert)
     }
 
@@ -799,6 +916,8 @@ mod tests {
             voted_for: HashMap::new(),
             pending_cert_requests: HashMap::new(),
             pending_batch_requests: HashMap::new(),
+            pending_votes_to_send: HashMap::new(),
+            own_last_certificate: None,
         }
     }
 

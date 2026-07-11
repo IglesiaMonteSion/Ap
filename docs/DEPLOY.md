@@ -9,6 +9,24 @@ con valor económico real. No hay auditoría externa todavía (ver
 `ARCHITECTURE.md`/`CLAUDE.md`). No pongas nada de valor real detrás de
 esto, y dejalo claro a cualquiera que invites a participar.
 
+## Checklist rápido multi-región (una vez que haya VPS reales)
+
+Para cada validador, en su propia región:
+
+1. VPS Debian/Ubuntu fresca → `sudo ./deploy/provision-validator.sh qchain:latest`
+2. Ese participante corre `qchain keygen`/`qchain bundle` **en su propia
+   máquina** (nunca comparte `keypair.json`) → manda el bundle al coordinador
+3. Coordinador junta todos los bundles → `qchain-genesis-build` → un
+   `nodeN.json` por validador, sin haber visto ninguna clave privada
+4. Cada participante recibe *solo* su propio `nodeN.json` → lo renombra
+   `config.json`, lo pone en `/opt/qchain` junto a su `keypair.json`
+5. `sudo systemctl enable --now qchain-validator` en cada máquina
+6. Confirmar convergencia: `qchain balance`/`qchain registry` contra el
+   puerto RPC de *varias* regiones debe dar el mismo resultado
+
+El resto de este documento cubre cada paso en detalle, más el faucet y
+la página de estado.
+
 ## Qué hay en este repo para esto
 
 - `Dockerfile` — imagen única con los cuatro binarios: `qchain-node`
@@ -18,6 +36,17 @@ esto, y dejalo claro a cualquiera que invites a participar.
   validadores + faucet en un solo host, IPs estáticas). **No es la
   topología real multi-región** — sirve para probar que la imagen
   funciona antes de gastar en servidores reales.
+- `deploy/provision-validator.sh` — deja una VPS Debian/Ubuntu fresca
+  lista para correr un validador real: instala Docker si falta, abre los
+  puertos de `listen_addr`/`rpc_addr` en `ufw` (si está disponible),
+  activa NTP, e instala el servicio `systemd` de abajo. Pensado para
+  correrse una vez por máquina, en cualquier región — no asume nada del
+  resto de la red.
+- `deploy/systemd/qchain-validator.service` y
+  `deploy/systemd/qchain-faucet.service` — unidades `systemd` reales
+  (`Restart=on-failure`) para que el validador/faucet sobrevivan un
+  crash o un reinicio de la máquina sin intervención manual, en vez de
+  depender de `docker run -d` corriendo a mano en una sesión de shell.
 - Página de estado en `GET /` de cualquier validador (ver más abajo).
 
 ## Paso 0 — smoke test local (recomendado antes de gastar en servidores)
@@ -102,6 +131,29 @@ directo a la IP pública de la máquina, la misma que ya declaró en su
 manifest — sin mapeo de puertos ni NAT de por medio. Abrir los puertos
 `listen_addr` y `rpc_addr` en el firewall de esa máquina (típicamente
 9000 y 8080).
+
+### Alternativa recomendada para producción real: `systemd`
+
+`docker run -d` funciona, pero no sobrevive un reinicio de la máquina ni
+se reinicia solo si el proceso muere - hay que reingresar a mano. Para
+un validador real, sobre todo en una región distinta a la que estás
+mirando en el momento, usar en cambio:
+
+```
+sudo ./deploy/provision-validator.sh qchain:latest   # una vez, en la VPS nueva
+# copiar config.json + keypair.json a /opt/qchain en esa VPS
+sudo systemctl enable --now qchain-validator
+journalctl -u qchain-validator -f                    # confirmar que arrancó bien
+```
+
+`provision-validator.sh` instala Docker si falta, abre `listen_addr`/
+`rpc_addr` en `ufw` (si está disponible - si el proveedor usa un
+security group en su lugar, configurarlo ahí en cambio), activa NTP
+(los timestamps de log de validadores en regiones distintas solo se
+pueden correlacionar si los relojes están sincronizados), e instala
+`deploy/systemd/qchain-validator.service` (`Restart=on-failure`, arranca
+solo en el boot de la máquina). El mismo patrón aplica al faucet vía
+`deploy/systemd/qchain-faucet.service`.
 
 ## Faucet
 
