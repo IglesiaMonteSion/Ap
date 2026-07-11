@@ -86,6 +86,23 @@ pub struct StakeAccountData {
     /// reward correct without needing to remember every historical
     /// accrual: `pending = amount * current_acc / PRECISION - reward_debt`.
     pub reward_debt: u128,
+    /// A real, live-confirmed governance attack this closes (see
+    /// `project-lessons-learned`): before this field existed, `Vote`
+    /// snapshotted this position's `amount` into the proposal's permanent
+    /// tally, but nothing stopped `Undelegate` from reclaiming that same
+    /// stake an instant later - a voter's recorded weight stayed locked
+    /// into the outcome forever, with zero real economic exposure for
+    /// more than one transaction. Confirmed live: delegate, vote yes,
+    /// undelegate immediately, and a `Low`-tier proposal (no time-lock)
+    /// still passed and executed with the "attacker" holding zero stake
+    /// by the time it was decided - the same decoupling-of-voting-power-
+    /// from-commitment pattern behind the real Beanstalk ($182M, 2022)
+    /// and BonkDAO ($20M, 2026) governance drains. `Vote` sets this to
+    /// `max(current value, the proposal's voting_ends_round)`;
+    /// `Undelegate` refuses while `current_round < locked_until_round`.
+    /// 0 for a position that has never voted - never blocks an ordinary
+    /// delegator who stays out of governance.
+    pub locked_until_round: u64,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -178,7 +195,7 @@ pub fn accrue_reward_pool(accounts: &mut HashMap<Pubkey, Account>, pool_pk: Pubk
 pub struct StakingProgram;
 
 impl NativeProgram for StakingProgram {
-    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, _current_round: Round) -> Result<(), ExecError> {
+    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, current_round: Round) -> Result<(), ExecError> {
         let instr = StakingInstruction::try_from_slice(&instruction.data)
             .map_err(|e| ExecError::ProgramError(format!("bad instruction data: {e}")))?;
         match instr {
@@ -207,7 +224,7 @@ impl NativeProgram for StakingProgram {
                 };
                 let mut stake_account = Account::new_wallet(STAKING_PROGRAM_ID);
                 stake_account.balance = amount;
-                stake_account.data = borsh::to_vec(&StakeAccountData { owner: staker, validator, amount, reward_debt: settled_reward_debt(amount, pool_acc) })
+                stake_account.data = borsh::to_vec(&StakeAccountData { owner: staker, validator, amount, reward_debt: settled_reward_debt(amount, pool_acc), locked_until_round: 0 })
                     .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 accounts.insert(stake_pk, stake_account);
 
@@ -227,6 +244,17 @@ impl NativeProgram for StakingProgram {
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if data.owner != *payer {
                     return Err(ExecError::Unauthorized("Undelegate must be signed by the stake account's owner".into()));
+                }
+                // Real, live-confirmed governance attack this closes - see
+                // `StakeAccountData::locked_until_round`'s doc comment for
+                // the full reproduction (vote, undelegate immediately, a
+                // no-time-lock proposal still passes with the voter
+                // holding zero stake by decision time).
+                if current_round < data.locked_until_round {
+                    return Err(ExecError::ProgramError(format!(
+                        "this position voted on a proposal still deciding until round {} - cannot undelegate until then",
+                        data.locked_until_round
+                    )));
                 }
                 let amount = data.amount;
 
@@ -368,7 +396,7 @@ mod tests {
         assert_eq!(accounts[&staker].balance, 6_000);
         assert_eq!(accounts[&stake_pk].balance, 4_000);
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
-        assert_eq!(data, StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0 });
+        assert_eq!(data, StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0 });
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 4_000);
     }
 
@@ -411,6 +439,47 @@ mod tests {
         assert_eq!(accounts[&staker].balance, 10_000, "funds must return in full, no unbonding delay in this increment");
         assert_eq!(accounts[&stake_pk].balance, 0);
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 0);
+    }
+
+    /// The real, live-confirmed governance attack this closes (see
+    /// `StakeAccountData::locked_until_round`'s doc comment): a position
+    /// that voted must not be undelegated before the proposal it voted on
+    /// is decided. `locked_until_round` here stands in for what
+    /// `governance.rs`'s `Vote` handler would have set - this test targets
+    /// `Undelegate`'s enforcement in isolation.
+    #[test]
+    fn undelegate_is_rejected_while_a_vote_still_has_it_locked() {
+        let staker = Pubkey::new([22u8; 32]);
+        let stake_pk = Pubkey::new([20u8; 32]);
+        let validator = Pubkey::new([21u8; 32]);
+        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let delegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+
+        // Simulate what a real `Vote` would do: lock this position until
+        // round 266.
+        let mut data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
+        data.locked_until_round = 266;
+        accounts.get_mut(&stake_pk).unwrap().data = borsh::to_vec(&data).unwrap();
+
+        let undelegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+        };
+        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 200);
+        assert!(result.is_err(), "undelegating before the locking proposal is decided must be rejected");
+        assert_eq!(accounts[&stake_pk].balance, 4_000, "the position must remain intact, not partially unwound");
+
+        // Once the voting period has actually ended, the same position
+        // can undelegate normally.
+        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 266).unwrap();
+        assert_eq!(accounts[&stake_pk].balance, 0);
+        assert_eq!(accounts[&staker].balance, 10_000, "funds return in full once the lock has genuinely expired");
     }
 
     #[test]
@@ -589,7 +658,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -621,7 +690,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -644,7 +713,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -668,7 +737,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -693,7 +762,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },

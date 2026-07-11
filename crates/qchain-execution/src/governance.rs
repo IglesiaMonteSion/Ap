@@ -84,7 +84,7 @@ impl NativeProgram for GovernanceProgram {
                 let stake_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Vote requires accounts[1]".into()))?;
 
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
-                let stake_data = StakeAccountData::try_from_slice(&stake_account.data).map_err(borsh_err)?;
+                let mut stake_data = StakeAccountData::try_from_slice(&stake_account.data).map_err(borsh_err)?;
                 if stake_data.owner != *payer {
                     return Err(ExecError::Unauthorized("Vote's stake account must be owned by the transaction payer".into()));
                 }
@@ -103,6 +103,15 @@ impl NativeProgram for GovernanceProgram {
                     return Err(ExecError::ProgramError("this stake account already voted on this proposal".into()));
                 }
                 write_proposal(accounts, &proposal_pk, &proposal)?;
+
+                // Real, live-confirmed governance attack this closes (see
+                // `StakeAccountData::locked_until_round`'s doc comment):
+                // the vote weight just recorded above is permanent, so the
+                // stake behind it must stay locked at least until this
+                // proposal is decided - `max` because one position can
+                // vote on several proposals with overlapping periods.
+                stake_data.locked_until_round = stake_data.locked_until_round.max(proposal.voting_ends_round);
+                accounts.get_mut(&stake_pk).unwrap().data = borsh::to_vec(&stake_data).map_err(borsh_err)?;
             }
 
             GovernanceInstruction::Finalize => {
@@ -264,7 +273,7 @@ mod tests {
     }
 
     fn stake_account(owner: Pubkey, amount: u64) -> Account {
-        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0 };
+        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0, locked_until_round: 0 };
         Account { balance: amount, data: borsh::to_vec(&data).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
     }
 
@@ -514,6 +523,46 @@ mod tests {
 
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.yes_stake, 5_000, "voting power must come from the real delegated amount");
+    }
+
+    /// The exact real, live-confirmed attack this closes (see
+    /// `StakeAccountData::locked_until_round`'s doc comment): delegate,
+    /// vote, then try to reclaim the same stake before the vote is
+    /// decided - the Beanstalk/BonkDAO pattern of voting power decoupled
+    /// from sustained economic commitment. Composes both real programs
+    /// exactly as a live node would, not a synthetic single-program shape.
+    #[test]
+    fn undelegating_immediately_after_voting_is_rejected_until_the_proposal_is_decided() {
+        let staker = Pubkey::new([1u8; 32]);
+        let mut accounts = HashMap::from([
+            (staker, wallet(10_000)),
+            (STAKING_STATS_ID, stats_account(0)),
+            (REGISTRY_ACCOUNT_ID, registry_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
+
+        let delegate_ix = Instruction {
+            program_id: crate::ids::STAKING_PROGRAM_ID,
+            accounts: vec![staker, STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate { validator: Pubkey::new([50u8; 32]), amount: 5_000 }).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+
+        create_proposal(&mut accounts, staker, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        vote(&mut accounts, staker, STAKE_PK, VoteChoice::Yes, 1).unwrap();
+
+        let rule = quorum_rule(qchain_governance::RiskTier::Registry);
+        let undelegate_ix = Instruction {
+            program_id: crate::ids::STAKING_PROGRAM_ID,
+            accounts: vec![STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&crate::staking::StakingInstruction::Undelegate).unwrap(),
+        };
+        let too_early = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds - 1);
+        assert!(too_early.is_err(), "reclaiming the stake before the vote it cast is decided must be rejected");
+        assert_eq!(accounts[&STAKE_PK].balance, 5_000, "the position must remain fully intact while locked");
+
+        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds).unwrap();
+        assert_eq!(accounts[&STAKE_PK].balance, 0, "once the proposal's voting period has genuinely ended, the same position can undelegate normally");
     }
 
     /// The `Low` tier's whole point is to be cheap to move: no
