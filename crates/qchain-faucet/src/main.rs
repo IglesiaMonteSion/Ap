@@ -60,6 +60,25 @@ struct FaucetState {
     fee_limit: u64,
     cooldown: Duration,
     last_claim: HashMap<Pubkey, Instant>,
+    /// The faucet wallet's own nonce, tracked locally instead of re-fetched
+    /// from the network on every request - a real, live-confirmed bug this
+    /// closes (see `project-lessons-learned`): re-fetching raced the
+    /// network's own settlement latency (`round_interval_ms` plus gossip/
+    /// consensus), so a second request arriving before the first request's
+    /// transaction had actually executed read the same stale nonce and
+    /// collided with it - confirmed live via real `nonce mismatch`
+    /// execution failures under nothing more adversarial than plain
+    /// sequential requests. Safe to track locally because `Ledger::
+    /// apply_transaction` commits a transaction's nonce increment
+    /// unconditionally once it reaches execution (this project's existing
+    /// "you pay for attempted execution" behavior), regardless of whether
+    /// the `Transfer` instruction itself later succeeds - and the mutex
+    /// already held across this whole handler (see `faucet`'s own comment)
+    /// is exactly what makes a single local counter authoritative, the
+    /// same "single signer, serialize everything" reasoning the module
+    /// docs already state for concurrent requests. `None` until the first
+    /// request, which still fetches the real starting value once.
+    next_nonce: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +94,28 @@ async fn fetch_nonce(client: &reqwest::Client, rpc: &str, pk: &Pubkey) -> anyhow
     let account: qchain_core::Account = resp.error_for_status()?.json().await?;
     Ok(account.nonce)
 }
+
+async fn fetch_balance(client: &reqwest::Client, rpc: &str, pk: &Pubkey) -> anyhow::Result<u64> {
+    let resp = client.get(format!("{rpc}/account/{pk}")).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(0);
+    }
+    let account: qchain_core::Account = resp.error_for_status()?.json().await?;
+    Ok(account.balance)
+}
+
+/// How long to wait for a submitted payout to actually land before giving
+/// up and reporting an honest failure - a real, live-confirmed bug this
+/// closes (see `project-lessons-learned`): the old code returned success
+/// the moment `POST /tx` was merely *admitted* to the mempool, which is not
+/// the same claim as "the recipient was funded" - a transaction can still
+/// fail at real execution (the exact nonce-race above, or the faucet
+/// wallet genuinely running dry) with the client none the wiser, believing
+/// funds arrived when they never did. Bounded, not indefinite - a real
+/// operator needs a faucet request to eventually fail loudly rather than
+/// hang forever if the network stalls.
+const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Real, live-confirmed cross-network replay gap this closes (see
 /// `qchain_core::Message::chain_id`'s doc comment) - fetched fresh per
@@ -104,8 +145,12 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
 
     let client = reqwest::Client::new();
     let from = state.keypair.pubkey();
-    let nonce = fetch_nonce(&client, &state.rpc, &from).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let nonce = match state.next_nonce {
+        Some(n) => n,
+        None => fetch_nonce(&client, &state.rpc, &from).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+    };
     let chain_id = fetch_chain_id(&client, &state.rpc).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let balance_before = fetch_balance(&client, &state.rpc, &to).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
     let ix = Instruction {
         program_id: Pubkey::system_program_id(),
@@ -121,6 +166,30 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
         return Err((StatusCode::BAD_GATEWAY, format!("node rejected the faucet transaction: {body}")));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    // Safe to advance the tracked nonce now, without waiting for the
+    // confirmation poll below - see `FaucetState::next_nonce`'s doc
+    // comment for why admission alone already guarantees this nonce is
+    // consumed once execution runs, regardless of whether the transfer
+    // itself later succeeds.
+    state.next_nonce = Some(nonce + 1);
+
+    // Don't report success until the payout is actually confirmed on
+    // chain - see `CONFIRMATION_TIMEOUT`'s doc comment for the real bug
+    // this closes.
+    let deadline = std::time::Instant::now() + CONFIRMATION_TIMEOUT;
+    loop {
+        let balance_now = fetch_balance(&client, &state.rpc, &to).await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        if balance_now >= balance_before + state.amount {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("submitted but never confirmed executing within {CONFIRMATION_TIMEOUT:?} - the faucet wallet may be out of funds, or the network may be stalled"),
+            ));
+        }
+        tokio::time::sleep(CONFIRMATION_POLL_INTERVAL).await;
+    }
 
     state.last_claim.insert(to, Instant::now());
     Ok(Json(json!({ "funded": req.address, "amount": state.amount, "tx": body })))
@@ -144,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         fee_limit: cli.fee_limit,
         cooldown: Duration::from_secs(cli.cooldown_secs),
         last_claim: HashMap::new(),
+        next_nonce: None,
     }));
 
     let app = Router::new().route("/health", get(health)).route("/faucet", post(faucet)).with_state(state);
