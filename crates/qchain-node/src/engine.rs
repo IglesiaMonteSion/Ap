@@ -61,6 +61,7 @@ use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// How many worker lanes each validator partitions its ready transactions
@@ -194,7 +195,7 @@ pub struct Engine {
     pub self_id: ValidatorId,
     pub keypair: Keypair,
     pub validators: ValidatorSet,
-    pub network: Network,
+    pub network: Arc<Network>,
     pub state: Mutex<EngineState>,
     /// This network's own genesis-derived identity - see
     /// `qchain_node::config::NodeConfig::chain_id`'s doc comment. Checked
@@ -696,6 +697,9 @@ impl Engine {
             return;
         }
         let Some(addr) = self.network.addr_of(&from) else { return };
+        // Awaited sequentially - see `Network::send_to`'s doc comment for
+        // why a bounded write timeout there, not spawning here, is the
+        // real fix for a stuck peer write.
         for digest in missing {
             if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
                 tracing::warn!("failed to request missing certificate {digest:?} from {from}: {e}");
@@ -723,6 +727,8 @@ impl Engine {
             return;
         }
         let Some(addr) = self.network.addr_of(&from) else { return };
+        // Awaited sequentially - see `request_missing_parents`'s matching
+        // comment just above.
         for (worker_id, digest) in missing {
             if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
                 tracing::warn!("failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
@@ -862,6 +868,17 @@ impl Engine {
             (cert_retries, batch_retries, vote_retries, own_cert_retry)
         };
 
+        // Awaited sequentially, deliberately not spawned per item - see
+        // `Network::send_to`'s doc comment for the full story, including a
+        // first fix attempt (spawning each retry independently) that closed
+        // a real hang here but reintroduced unbounded concurrent task
+        // growth severe enough to OOM-kill a peer under a real resync
+        // backlog. `send_to` now has its own bounded write timeout, so a
+        // single stuck peer here costs at most `SEND_TIMEOUT` once per
+        // pending item per tick, never blocks forever - sequential
+        // awaiting is what keeps this function's own concurrency bounded
+        // (at most one in-flight send at a time), the same property that
+        // made this class of bug possible to reintroduce by spawning.
         for (digest, from) in cert_retries {
             let Some(addr) = self.network.addr_of(&from) else { continue };
             if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {

@@ -28,9 +28,20 @@ use qchain_core::ValidatorId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
+
+/// Bounds how long a single `send_to` write attempt may block on a
+/// half-stuck peer connection before being treated as a failure - see
+/// `send_to`'s doc comment for the real deadlock this closes. Generous
+/// relative to this project's own real round intervals (as low as 300ms in
+/// live testnets this session) and real message sizes (a handful of
+/// megabytes at most), so a healthy peer's connection is never spuriously
+/// timed out under real load - only a connection that has genuinely
+/// stopped draining.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
@@ -169,25 +180,64 @@ impl Network {
     /// misses this message (logged, not propagated as an error) - Narwhal's
     /// reliability comes from certificate-and-vote quorums tolerating
     /// missed messages, not from guaranteed delivery of any one of them.
-    pub async fn broadcast(&self, message: &NetMessage) {
-        for peer in &self.peers {
-            if let Err(e) = self.send_to(peer.addr, message).await {
-                tracing::warn!("broadcast to {} ({}) failed: {e}", peer.id, peer.addr);
-            }
+    ///
+    /// **Real bug closed here, found live pairing this with
+    /// `qchain-node::main`'s `MAX_CONCURRENT_MESSAGE_HANDLERS` fix**: this
+    /// used to `send_to` each peer in a sequential loop, awaiting one
+    /// before starting the next. `send_to`'s underlying `write_all` only
+    /// completes once the OS accepts the bytes into its socket send
+    /// buffer - fine normally, but the whole point of the concurrency-cap
+    /// fix is that an overloaded peer's receive side now deliberately
+    /// stops draining fast (real backpressure, not a bug) exactly while
+    /// it's resyncing a large gap. A sequential broadcast to `[healthy,
+    /// overloaded, healthy]` would block on the *second* peer for as long
+    /// as its backlog takes to drain, and every caller of `broadcast` -
+    /// including `submit_transaction`, which a real wallet RPC call is
+    /// waiting on synchronously - blocked right along with it. Confirmed
+    /// live: submitting a transaction while one peer of three was
+    /// mid-resync hung the RPC call itself past a 10-second client
+    /// timeout, on a broadcast to a *different, perfectly healthy* peer
+    /// that just happened to be queued behind the slow one. Fixed by
+    /// spawning each peer's send as its own task instead of awaiting them
+    /// in turn - "best effort, don't wait on any one of them" is what the
+    /// doc comment above already promised; this makes the implementation
+    /// actually keep that promise instead of only keeping it when every
+    /// peer happens to be fast.
+    pub async fn broadcast(self: &Arc<Self>, message: &NetMessage) {
+        for peer in self.peers.clone() {
+            let net = self.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(e) = net.send_to(peer.addr, &message).await {
+                    tracing::warn!("broadcast to {} ({}) failed: {e}", peer.id, peer.addr);
+                }
+            });
         }
     }
 
     /// Returns this peer's cached persistent connection, opening a fresh
-    /// one if none exists yet. The outer `connections` lock is only held
-    /// for the HashMap lookup/insert (a fast, short critical section) -
-    /// the actual I/O happens under the per-connection lock returned here,
-    /// so a slow or stalled peer never blocks sends to any other peer.
+    /// one if none exists yet. The shared `connections` lock is only ever
+    /// held for a HashMap lookup/insert, never across the connect itself -
+    /// see `SEND_TIMEOUT`'s sibling fix on `send_to` for the real class of
+    /// bug this closes for the *write* side; the same reasoning applies
+    /// here to the *connect* side, since a version of this function that
+    /// held the map lock across `TcpStream::connect(addr).await` (a real
+    /// prior version of this function did) would let one slow-to-connect
+    /// peer block every other peer's sends too, not just its own - the map
+    /// lock is process-wide, not per-peer. Connecting to the same new peer
+    /// from two concurrent callers is handled by re-checking the cache
+    /// after connecting and discarding the loser's redundant stream.
     async fn connection_for(&self, addr: SocketAddr) -> anyhow::Result<Arc<Mutex<TcpStream>>> {
+        if let Some(conn) = self.connections.lock().await.get(&addr) {
+            return Ok(conn.clone());
+        }
+        let stream = tokio::time::timeout(SEND_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out connecting to {addr} after {SEND_TIMEOUT:?}"))??;
         let mut conns = self.connections.lock().await;
         if let Some(conn) = conns.get(&addr) {
             return Ok(conn.clone());
         }
-        let stream = TcpStream::connect(addr).await?;
         let conn = Arc::new(Mutex::new(stream));
         conns.insert(addr, conn.clone());
         Ok(conn)
@@ -199,19 +249,54 @@ impl Network {
     /// one-retry-then-report-failure contract the phase-1 one-shot-
     /// connection version had, just without paying a fresh TCP handshake
     /// on every single message in the common (peer alive) case.
+    ///
+    /// **Real deadlock closed here, found live re-verifying the message-
+    /// handler concurrency cap (`qchain-node::main`'s
+    /// `MAX_CONCURRENT_MESSAGE_HANDLERS`) against a real resync scenario.**
+    /// A write to a cached connection whose peer has stopped reading (not
+    /// closed, just backed up - exactly what a validator deep in a real
+    /// certificate-resync backlog looks like) doesn't fail, it blocks
+    /// `write_all` indefinitely once the OS socket buffer fills. Every
+    /// caller in this codebase that retries on a fixed tick
+    /// (`qchain-node::engine`'s `retry_pending_resync_requests`, and the
+    /// same `tokio::spawn`'d loop that also drives `propose_round`) awaited
+    /// this call directly and sequentially - one permanently blocked peer
+    /// therefore froze not just that one send, but every future tick of
+    /// that entire loop, forever, confirmed live: a real 3-validator
+    /// resync stopped advancing mid-catch-up with zero further log output
+    /// at all (not even a slow trickle), which only a genuine hang
+    /// explains. A first fix attempt (spawning each retry as its own
+    /// `tokio::spawn`'d task instead of awaiting it inline) closed the hang
+    /// but reintroduced the *other* failure mode this session already
+    /// fixed once before: with hundreds of items retried unconditionally
+    /// on every tick and no bound on how many spawned sends could be
+    /// in-flight at once, a validator with a large real backlog flooded its
+    /// peers with duplicate requests fast enough to OOM-kill one of them
+    /// (confirmed live: kernel OOM killer terminated a validator at 15.5GB
+    /// RSS) - trading a permanent hang for the exact unbounded-task-growth
+    /// class of bug `MAX_CONCURRENT_MESSAGE_HANDLERS` was built to close.
+    /// The actual fix is here instead, at the root: `write_envelope` is now
+    /// wrapped in `SEND_TIMEOUT`, so a stuck write fails fast and this
+    /// function returns a real `Err` rather than hanging - every caller's
+    /// existing "log a warning and let the next tick retry" behavior
+    /// (already correct, already bounded to one attempt per pending item
+    /// per tick) then works exactly as designed, with no need for any
+    /// caller to spawn anything.
     pub async fn send_to(&self, addr: SocketAddr, message: &NetMessage) -> anyhow::Result<()> {
         let envelope = Envelope { from: self.self_id, message: message.clone() };
         let conn = self.connection_for(addr).await?;
         {
             let mut stream = conn.lock().await;
-            if write_envelope(&mut stream, &envelope).await.is_ok() {
+            if tokio::time::timeout(SEND_TIMEOUT, write_envelope(&mut stream, &envelope)).await.is_ok_and(|r| r.is_ok()) {
                 return Ok(());
             }
         }
         self.connections.lock().await.remove(&addr);
         let conn = self.connection_for(addr).await?;
         let mut stream = conn.lock().await;
-        write_envelope(&mut stream, &envelope).await
+        tokio::time::timeout(SEND_TIMEOUT, write_envelope(&mut stream, &envelope))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out writing to {addr} after {SEND_TIMEOUT:?}"))?
     }
 
     pub fn addr_of(&self, id: &ValidatorId) -> Option<SocketAddr> {
@@ -233,6 +318,7 @@ mod tests {
 
         let (net_a, mut rx_a) = Network::start(id_a, addr_a, vec![PeerInfo { id: id_b, addr: addr_b }]).await.unwrap();
         let (_net_b, mut rx_b) = Network::start(id_b, addr_b, vec![PeerInfo { id: id_a, addr: addr_a }]).await.unwrap();
+        let net_a = std::sync::Arc::new(net_a);
 
         net_a.broadcast(&NetMessage::WorkerBatchGossip { worker_id: 0, batch: Batch { transactions: vec![] } }).await;
 

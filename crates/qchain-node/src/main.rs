@@ -26,6 +26,15 @@ struct Cli {
     config: PathBuf,
 }
 
+/// Caps how many `handle_message` tasks may run concurrently - see the
+/// real, live-confirmed unbounded-memory bug this closes where it's used,
+/// below. Generous enough that legitimate concurrent traffic (this
+/// session measured real throughput up to ~110 tx/s across 10 validators)
+/// is never the limiting factor, while still bounding worst-case memory
+/// under a real retry storm to a fixed, small multiple of one message's
+/// size instead of "however large the pending backlog happens to grow."
+const MAX_CONCURRENT_MESSAGE_HANDLERS: usize = 256;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -50,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let validators = ValidatorSet::new(validator_infos);
 
     let (network, mut rx) = Network::start(self_id, config.listen_addr, peers).await?;
+    let network = Arc::new(network);
 
     // A `SledStore` reopened at a path from a previous run already holds
     // real state (balances, registry, params, staking stats) - re-running
@@ -186,10 +196,42 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let engine = engine.clone();
+        // Real, live-confirmed unbounded-memory bug closed here: every
+        // incoming message used to get its own `tokio::spawn`'d
+        // `handle_message` task with no cap at all on how many could be
+        // in flight concurrently. That's harmless at the tiny message
+        // rates every earlier live test in this session exercised, but a
+        // validator resyncing after a real gap of even a couple hundred
+        // rounds (found investigating a *different* validator - one that
+        // never restarted at all - spiking to multiple GB of RAM) drives
+        // `retry_pending_resync_requests` to resend every still-pending
+        // certificate/batch request on every single tick, unconditionally,
+        // for as long as the backlog takes to resolve - and a backlog that
+        // large takes many ticks. Each retry round adds another wave of
+        // spawned tasks before the previous wave has finished (each one
+        // contends on the same `state` mutex and does real ML-DSA-65
+        // signature verification), so the number of simultaneously
+        // in-flight tasks - each holding its own message payload - grows
+        // without bound. Confirmed live with a counter: 300,000+ in-flight
+        // tasks and climbing within seconds, matching the multi-GB RSS
+        // observed independently. `MAX_CONCURRENT_MESSAGE_HANDLERS` caps
+        // this directly; requests beyond the cap simply wait for a permit
+        // instead of piling up as unbounded spawned tasks. This also
+        // reduces read pressure on the bounded (4096) channel from
+        // `Network::start`, which back-pressures the TCP read loop, which
+        // back-pressures the sender's writes (`write_all().await` blocks
+        // once the OS socket buffer fills) - the retry storm's own send
+        // rate slows down for free once its peer stops draining fast
+        // enough, no change needed to the retry logic itself.
+        let message_handler_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MESSAGE_HANDLERS));
         tokio::spawn(async move {
             while let Some((from, msg)) = rx.recv().await {
                 let engine = engine.clone();
-                tokio::spawn(async move { engine.handle_message(from, msg).await });
+                let permit = message_handler_slots.clone().acquire_owned().await.expect("semaphore is never closed");
+                tokio::spawn(async move {
+                    engine.handle_message(from, msg).await;
+                    drop(permit);
+                });
             }
         });
     }

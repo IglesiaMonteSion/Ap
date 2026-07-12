@@ -41,7 +41,7 @@ use crate::dag_store::DagStore;
 use crate::quorum::ValidatorSet;
 use qchain_core::{Certificate, Digest, Round, ValidatorId};
 use sha3::{Digest as _, Sha3_256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Bullshark<'a> {
     dag: &'a DagStore,
@@ -145,18 +145,54 @@ impl<'a> Bullshark<'a> {
     /// only the specific digest whose own dependency chain isn't fully
     /// resolved yet stays pending, to retry on a future call once its
     /// dependencies (which are never blacklisted either) show up.
-    fn walk_causal_history(&self, digest: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>) -> bool {
+    /// **Real exponential-blowup bug closed here, found live (not by
+    /// inspection) building the restart-liveness fixes elsewhere in this
+    /// session (see `qchain-node::engine::propose_round`'s and
+    /// `ConsensusState::resuming_from`'s doc comments for the sibling
+    /// fixes this one was found alongside).** `seen` only ever records a
+    /// digest once its *entire* causal history is confirmed fully
+    /// present - by design, so a node blocked on a still-missing ancestor
+    /// can be retried on a later call once resync fills the gap. But a
+    /// real Narwhal DAG is wide, not a chain: every certificate lists
+    /// *multiple* parents (one per validator that certified the previous
+    /// round), so many certificates across many rounds share the same
+    /// ancestors. Without any *per-call* memo, every one of those shared
+    /// ancestors that isn't yet in `seen` (anything still resyncing) gets
+    /// re-explored, *from scratch, recursively*, on every single path
+    /// that reaches it - and with a branching factor of `n` validators and
+    /// `d` still-unresolved rounds of depth, that's `O(n^d)` redundant
+    /// re-visits of the exact same nodes within one `extend_order` call.
+    /// Confirmed live: a real 3-validator testnet, one validator resyncing
+    /// after a real (not even large - tens of rounds) gap - a peer that
+    /// never restarted spiked past 10GB RSS and 100%+ CPU within a couple
+    /// of minutes, because *its own* `walk_causal_history` calls kept
+    /// re-walking the same not-yet-fully-synced-on-the-other-side ancestor
+    /// region exponentially many times. Fixed with `memo`, scoped to one
+    /// `extend_order` call only (never persisted across calls, unlike
+    /// `seen`): every digest visited during this call - whether it
+    /// resolves or not - is cached, so a shared ancestor reached via a
+    /// second or third path is an `O(1)` lookup instead of a repeat
+    /// recursive walk. A genuinely still-missing ancestor is retried fresh
+    /// on the *next* `extend_order` call (new `memo`), exactly preserving
+    /// the existing liveness guarantee that new data always gets a fair
+    /// re-check - only the redundant *within-one-call* re-exploration is
+    /// eliminated.
+    fn walk_causal_history(&self, digest: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>, memo: &mut HashMap<Digest, bool>) -> bool {
         if seen.contains(&digest) {
             return true;
         }
+        if let Some(&resolved) = memo.get(&digest) {
+            return resolved;
+        }
         let Some(cert) = self.dag.get(&digest) else {
+            memo.insert(digest, false);
             return false;
         };
         let mut parents = cert.vertex.parents.clone();
         parents.sort();
         let mut all_parents_resolved = true;
         for parent in parents {
-            if !self.walk_causal_history(parent, seen, ordered) {
+            if !self.walk_causal_history(parent, seen, ordered, memo) {
                 all_parents_resolved = false;
                 // Keep going, don't short-circuit - a sibling reachable via
                 // a different parent may still be fully resolved and
@@ -164,10 +200,12 @@ impl<'a> Bullshark<'a> {
             }
         }
         if !all_parents_resolved {
+            memo.insert(digest, false);
             return false;
         }
         seen.insert(digest);
         ordered.push(digest);
+        memo.insert(digest, true);
         true
     }
 
@@ -193,11 +231,18 @@ impl<'a> Bullshark<'a> {
     /// docs' two-bug history).
     pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>) -> Vec<Digest> {
         let mut ordered = Vec::new();
+        // Scoped to this one call only - see `walk_causal_history`'s doc
+        // comment for the real exponential-blowup bug this closes. Many
+        // rounds' leader digests share ancestors in a real (wide, multi-
+        // parent) DAG; without this, each shared-but-still-unresolved
+        // ancestor gets fully re-walked from scratch on every path that
+        // reaches it, within this single call.
+        let mut memo = HashMap::new();
         let mut round = from_round;
         while round <= up_to_round {
             match self.resolve(round, up_to_round) {
                 RoundOutcome::Committed(digest) => {
-                    if !self.walk_causal_history(digest, seen, &mut ordered) {
+                    if !self.walk_causal_history(digest, seen, &mut ordered, &mut memo) {
                         break;
                     }
                     round += 1;
