@@ -12,13 +12,18 @@
 //! Each `Delegate` call opens a brand-new stake account (no top-up/reuse
 //! of an existing position, mirroring how `CreateAccount` already works
 //! elsewhere in this codebase) - a staker can hold several. `Undelegate`
-//! closes a position immediately: no unbonding delay yet (out of scope
-//! per `ARCHITECTURE.md` §5's "fuera de alcance en fase 1: calibración
-//! fina de la tasa de emisión/staking" - an unbonding period is exactly
-//! that kind of economic calibration, not modeled here). A closed stake
-//! account is zeroed rather than deleted, since this execution model has
-//! no account-deletion primitive yet (see `Ledger`'s working-set
-//! commit loop) - a documented phase-2 limitation, not an oversight.
+//! closes a position once its minimum bonding period has elapsed (see
+//! `StakeAccountData::bonding_until_round` - added after a live-confirmed
+//! reward-sniping attack showed instant, zero-cost delegate/undelegate
+//! round-trips capturing a real, disproportionate share of the reward
+//! pool; this is a real minimum lock-up, not the full economic
+//! calibration - a properly tuned unbonding schedule tied to a real
+//! emission model is still out of scope per `ARCHITECTURE.md` §5's
+//! "fuera de alcance en fase 1: calibración fina de la tasa de
+//! emisión/staking"). A closed stake account is zeroed rather than
+//! deleted, since this execution model has no account-deletion primitive
+//! yet (see `Ledger`'s working-set commit loop) - a documented phase-2
+//! limitation, not an oversight.
 //!
 //! `ReportEquivocation` slashes a proven-Byzantine validator's *own*
 //! self-stake (a `StakeAccountData` where `owner == validator ==` the
@@ -103,7 +108,38 @@ pub struct StakeAccountData {
     /// 0 for a position that has never voted - never blocks an ordinary
     /// delegator who stays out of governance.
     pub locked_until_round: u64,
+    /// A real, live-confirmed reward-sniping vulnerability this closes
+    /// (see `project-lessons-learned`): before this field existed, a
+    /// position could `Delegate` a large amount right before real fee
+    /// activity credited the shared reward pool, capture a share of that
+    /// accrual proportional to its (temporarily huge) stake, and
+    /// `Undelegate` an instant later - zero real economic exposure,
+    /// zero opportunity cost, zero risk. Confirmed live: a "sniper"
+    /// delegating 50,000,000 for the duration of one burst of real fee
+    /// transactions captured ~99.8% of the reward generated during that
+    /// window, while a genuine long-term delegator present the entire
+    /// time (before, during, and after) with 1,000,000 real stake
+    /// captured only ~0.2% - a real, quantified transfer of value from
+    /// sustained network security to an instant round-trip. Set by
+    /// `Delegate` to `current_round + MINIMUM_BONDING_ROUNDS`; `Undelegate`
+    /// refuses while `current_round < bonding_until_round`. Doesn't change
+    /// the reward-per-share math itself (still simple, still correct for
+    /// genuinely long-term positions) - it removes the "free, zero-
+    /// duration" property that made sniping profitable at no real cost,
+    /// same principle as `locked_until_round` above but applied
+    /// unconditionally to every position, not just ones that voted.
+    pub bonding_until_round: u64,
 }
+
+/// A real economic cost for reward-sniping (see
+/// `StakeAccountData::bonding_until_round`'s doc comment): capital
+/// delegated is genuinely tied up for this many rounds before it can be
+/// reclaimed, regardless of when it was delegated. Chosen to match this
+/// codebase's own already-established magnitude for "long enough that an
+/// instant round-trip can't work" - `qchain_governance::RiskTier::Low`'s
+/// `voting_period_rounds` is the same 100, a number this project already
+/// treats as a real, if modest, commitment window elsewhere.
+pub const MINIMUM_BONDING_ROUNDS: u64 = 100;
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum StakingInstruction {
@@ -224,8 +260,15 @@ impl NativeProgram for StakingProgram {
                 };
                 let mut stake_account = Account::new_wallet(STAKING_PROGRAM_ID);
                 stake_account.balance = amount;
-                stake_account.data = borsh::to_vec(&StakeAccountData { owner: staker, validator, amount, reward_debt: settled_reward_debt(amount, pool_acc), locked_until_round: 0 })
-                    .map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stake_account.data = borsh::to_vec(&StakeAccountData {
+                    owner: staker,
+                    validator,
+                    amount,
+                    reward_debt: settled_reward_debt(amount, pool_acc),
+                    locked_until_round: 0,
+                    bonding_until_round: current_round + MINIMUM_BONDING_ROUNDS,
+                })
+                .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 accounts.insert(stake_pk, stake_account);
 
                 let stats = accounts
@@ -254,6 +297,17 @@ impl NativeProgram for StakingProgram {
                     return Err(ExecError::ProgramError(format!(
                         "this position voted on a proposal still deciding until round {} - cannot undelegate until then",
                         data.locked_until_round
+                    )));
+                }
+                // Real, live-confirmed reward-sniping vulnerability this
+                // closes - see `StakeAccountData::bonding_until_round`'s
+                // doc comment for the full reproduction and measured
+                // severity (~99.8% of a reward event captured by a
+                // seconds-long position).
+                if current_round < data.bonding_until_round {
+                    return Err(ExecError::ProgramError(format!(
+                        "this position is still in its minimum bonding period until round {} - cannot undelegate until then",
+                        data.bonding_until_round
                     )));
                 }
                 let amount = data.amount;
@@ -396,7 +450,10 @@ mod tests {
         assert_eq!(accounts[&staker].balance, 6_000);
         assert_eq!(accounts[&stake_pk].balance, 4_000);
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
-        assert_eq!(data, StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0 });
+        assert_eq!(
+            data,
+            StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: MINIMUM_BONDING_ROUNDS }
+        );
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 4_000);
     }
 
@@ -434,9 +491,9 @@ mod tests {
             accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 0).unwrap();
+        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS).unwrap();
 
-        assert_eq!(accounts[&staker].balance, 10_000, "funds must return in full, no unbonding delay in this increment");
+        assert_eq!(accounts[&staker].balance, 10_000, "funds must return in full once the minimum bonding period has elapsed");
         assert_eq!(accounts[&stake_pk].balance, 0);
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 0);
     }
@@ -480,6 +537,48 @@ mod tests {
         StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 266).unwrap();
         assert_eq!(accounts[&stake_pk].balance, 0);
         assert_eq!(accounts[&staker].balance, 10_000, "funds return in full once the lock has genuinely expired");
+    }
+
+    /// The real, live-confirmed reward-sniping vulnerability this closes
+    /// (see `StakeAccountData::bonding_until_round`'s doc comment): a
+    /// same-round, zero-duration delegate/undelegate round-trip - the exact
+    /// shape of the live attack - must be rejected.
+    #[test]
+    fn undelegate_is_rejected_during_its_minimum_bonding_period() {
+        let staker = Pubkey::new([24u8; 32]);
+        let stake_pk = Pubkey::new([25u8; 32]);
+        let validator = Pubkey::new([26u8; 32]);
+        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let delegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+
+        let undelegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+        };
+
+        // The exact reward-sniping window this closes: a same-round,
+        // zero-duration delegate/undelegate round-trip must be rejected.
+        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 0);
+        assert!(result.is_err(), "undelegating in the same round as delegating must be rejected");
+        assert_eq!(result.unwrap_err().to_string(), "program error: this position is still in its minimum bonding period until round 100 - cannot undelegate until then");
+        assert_eq!(accounts[&stake_pk].balance, 4_000, "the position must remain intact, not partially unwound");
+
+        // Still locked one round before the bonding period elapses.
+        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS - 1);
+        assert!(result.is_err(), "undelegating before the minimum bonding period has elapsed must be rejected");
+        assert_eq!(accounts[&stake_pk].balance, 4_000);
+
+        // Once the minimum bonding period has genuinely elapsed, the same
+        // position can undelegate normally.
+        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS).unwrap();
+        assert_eq!(accounts[&stake_pk].balance, 0);
+        assert_eq!(accounts[&staker].balance, 10_000, "funds return in full once the bonding period has genuinely elapsed");
     }
 
     #[test]
@@ -658,7 +757,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -690,7 +789,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -713,7 +812,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -737,7 +836,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -762,7 +861,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },

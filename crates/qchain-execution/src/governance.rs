@@ -273,7 +273,7 @@ mod tests {
     }
 
     fn stake_account(owner: Pubkey, amount: u64) -> Account {
-        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0, locked_until_round: 0 };
+        let data = StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 };
         Account { balance: amount, data: borsh::to_vec(&data).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
     }
 

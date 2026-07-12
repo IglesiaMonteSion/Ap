@@ -88,8 +88,9 @@ enum Command {
         fee_limit: u64,
     },
     /// Close a stake account, returning its funds plus any pending reward
-    /// (auto-paid, see `qchain-execution`'s `staking` module docs). No
-    /// unbonding delay in this increment.
+    /// (auto-paid, see `qchain-execution`'s `staking` module docs). Rejected
+    /// until the position's minimum bonding period has elapsed (see
+    /// `StakeAccountData::bonding_until_round`).
     StakeUndelegate {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
