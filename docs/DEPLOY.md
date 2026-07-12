@@ -9,6 +9,34 @@ con valor económico real. No hay auditoría externa todavía (ver
 `ARCHITECTURE.md`/`CLAUDE.md`). No pongas nada de valor real detrás de
 esto, y dejalo claro a cualquiera que invites a participar.
 
+## El camino fácil: `deploy/install-node.sh`
+
+Si no tenés experiencia técnica (o simplemente querés algo rápido), no
+hace falta seguir el checklist manual de abajo. En una VPS Debian/Ubuntu
+fresca (o cualquier máquina Linux donde tengas `sudo`):
+
+```
+sudo ./deploy/install-node.sh
+```
+
+El script pregunta una sola cosa — si querés **crear tu propia red de
+prueba** (un solo nodo, vos sos el único validador, con una wallet de
+prueba ya cargada de fondos para probar transferencias al toque) o
+**unirte a una red que ya existe** (te va a pedir tu bundle público para
+mandárselo a quien coordina esa red, y esperar el `config.json` que te
+devuelvan) — y hace todo lo demás solo: instala Docker si falta, genera
+tu clave, arma la configuración, abre los puertos, e instala el nodo
+como servicio (`systemctl`, se reinicia solo si se cae). Al final te
+imprime la URL de la página de estado y cómo ver los logs.
+
+Requiere tener la imagen Docker (`qchain:latest`) ya cargada en la
+máquina (`docker load -i qchain-image.tar` o `docker pull`, ver más
+abajo) — el script te avisa si falta.
+
+El resto de esta guía documenta el camino manual, paso a paso, para
+quien quiera más control (multi-validador coordinado, ajustar
+`round_interval_ms`, etc.) o entender qué hace el instalador por dentro.
+
 ## Checklist rápido multi-región (una vez que haya VPS reales)
 
 Para cada validador, en su propia región:
