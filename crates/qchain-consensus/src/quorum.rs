@@ -21,9 +21,25 @@ pub struct ValidatorSet {
 }
 
 impl ValidatorSet {
+    /// A real, live-confirmed permanent-freeze bug this closes (see
+    /// `project-lessons-learned`): if `validators` lists the same
+    /// `ValidatorId` more than once (a duplicate manifest merged by
+    /// `qchain-genesis-build`, or a hand-edited config mistake), every
+    /// quorum computation elsewhere in this codebase (`bullshark.rs`,
+    /// `qchain-node::engine`) sums `stake_of(id)` over a *set* of unique
+    /// voting/certifying validator ids - it can never count the same
+    /// validator's stake twice, since it looks up the deduplicated map
+    /// below. `total_stake` must be computed from that same deduplicated
+    /// map, not the raw input list - summing the raw list first (the old
+    /// code) could inflate `total_stake`, and therefore
+    /// `quorum_threshold()`, past what the *real*, deduplicated total
+    /// stake could ever reach - a live-confirmed real 3-node testnet with
+    /// one validator's entry duplicated froze permanently at round 1,
+    /// zero certificates ever formed, because the honest threshold was
+    /// mathematically unreachable even with every validator voting.
     pub fn new(validators: Vec<ValidatorInfo>) -> Self {
-        let total_stake = validators.iter().map(|v| v.stake).sum();
-        let validators = validators.into_iter().map(|v| (v.id, v)).collect();
+        let validators: HashMap<ValidatorId, ValidatorInfo> = validators.into_iter().map(|v| (v.id, v)).collect();
+        let total_stake = validators.values().map(|v| v.stake).sum();
         ValidatorSet { validators, total_stake }
     }
 
@@ -96,5 +112,24 @@ mod tests {
         let set1 = ValidatorSet::new(vec![a.clone(), b.clone()]);
         let set2 = ValidatorSet::new(vec![b, a]);
         assert_eq!(set1.ids_sorted(), set2.ids_sorted());
+    }
+
+    /// The exact real, live-confirmed permanent-freeze bug this closes
+    /// (see `ValidatorSet::new`'s doc comment and `project-lessons-
+    /// learned`): the same validator identity listed twice must not let
+    /// its stake count twice toward `total_stake`/`quorum_threshold`,
+    /// since no real quorum computation can ever count that validator's
+    /// stake more than once either.
+    #[test]
+    fn a_duplicated_validator_entry_does_not_inflate_total_stake_or_the_quorum_threshold() {
+        let dup = info(5);
+        let b = info(1);
+        let c = info(1);
+        let honest_set = ValidatorSet::new(vec![dup.clone(), b.clone(), c.clone()]);
+        let duplicated_set = ValidatorSet::new(vec![dup.clone(), dup, b, c]);
+
+        assert_eq!(duplicated_set.total_stake(), honest_set.total_stake(), "listing one validator twice must not change the real total stake");
+        assert_eq!(duplicated_set.quorum_threshold(), honest_set.quorum_threshold(), "the duplicated entry must not change the quorum threshold either");
+        assert_eq!(duplicated_set.ids_sorted().len(), 3, "the duplicate must not appear as a fourth distinct validator");
     }
 }

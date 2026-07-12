@@ -82,6 +82,29 @@ fn main() -> anyhow::Result<()> {
         .map(|p| -> anyhow::Result<ValidatorManifest> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) })
         .collect::<anyhow::Result<_>>()?;
 
+    // A real, live-confirmed permanent-freeze bug this closes (see
+    // `qchain_consensus::quorum::ValidatorSet::new`'s doc comment and
+    // `project-lessons-learned`): two manifests naming the same validator
+    // identity - an honest copy-paste mistake between contributors, or a
+    // malicious contributor duplicating someone else's already-public
+    // bundle - inflates the quorum threshold past what real, unique-
+    // validator votes could ever reach, freezing the whole network from
+    // genesis. `ValidatorSet::new` itself no longer double-counts a
+    // duplicate's stake, but catching it here, before any node ever
+    // starts, gives a human-actionable error pointing at the exact
+    // colliding manifest files instead of a silent, confusing freeze.
+    let mut seen_addresses: std::collections::HashMap<qchain_crypto::Pubkey, &std::path::Path> = std::collections::HashMap::new();
+    for (manifest, path) in manifests.iter().zip(manifest_paths.iter()) {
+        let address = manifest.pubkey_bundle.to_address();
+        if let Some(first_path) = seen_addresses.insert(address, path) {
+            anyhow::bail!(
+                "duplicate validator identity {address} in both {} and {} - each manifest must be a distinct validator, or this genesis would freeze the network at launch (see qchain_consensus::quorum::ValidatorSet)",
+                first_path.display(),
+                path.display()
+            );
+        }
+    }
+
     let validators: Vec<ValidatorConfig> =
         manifests.iter().map(|m| ValidatorConfig { pubkey_bundle: m.pubkey_bundle.clone(), addr: m.listen_addr, stake: m.stake }).collect();
 
