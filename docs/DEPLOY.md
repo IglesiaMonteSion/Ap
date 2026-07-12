@@ -24,14 +24,34 @@ prueba** (un solo nodo, vos sos el único validador, con una wallet de
 prueba ya cargada de fondos para probar transferencias al toque) o
 **unirte a una red que ya existe** (te va a pedir tu bundle público para
 mandárselo a quien coordina esa red, y esperar el `config.json` que te
-devuelvan) — y hace todo lo demás solo: instala Docker si falta, genera
-tu clave, arma la configuración, abre los puertos, e instala el nodo
-como servicio (`systemctl`, se reinicia solo si se cae). Al final te
-imprime la URL de la página de estado y cómo ver los logs.
+devuelvan) — y hace todo lo demás solo: instala Docker si falta (y
+verifica que su servicio esté corriendo), genera tu clave, arma la
+configuración (validando que el `config.json` resultante sea JSON
+correcto antes de seguir), abre los puertos, restringe los permisos de
+tu clave privada (`chmod 600`), e instala el nodo como servicio
+(`systemctl`, se reinicia solo si se cae, y el script confirma que quedó
+activo). Al final te imprime la URL de la página de estado, cómo ver los
+logs, y un recordatorio de que el RPC no tiene autenticación.
 
 Requiere tener la imagen Docker (`qchain:latest`) ya cargada en la
 máquina (`docker load -i qchain-image.tar` o `docker pull`, ver más
-abajo) — el script te avisa si falta.
+abajo) — el script verifica que la imagen realmente tenga los binarios
+de qchain antes de avanzar, y te avisa si falta o está rota.
+
+Es seguro volver a correrlo: si ya generó tu clave o tu `config.json`,
+nunca los pisa (ni siquiera si un paso anterior falló a mitad de camino)
+— solo te pregunta si querés reinstalar el servicio. Para bajar el nodo
+sin perder nada: `sudo ./deploy/install-node.sh --uninstall`.
+
+También se puede correr sin preguntas, para instalación automatizada:
+
+```
+sudo ./deploy/install-node.sh --modo solo --yes
+sudo ./deploy/install-node.sh --modo unirse --config /ruta/a/config.json --yes
+```
+
+Ver todas las opciones (puertos custom, imagen custom, carpeta de
+instalación custom) con `sudo ./deploy/install-node.sh --help`.
 
 El resto de esta guía documenta el camino manual, paso a paso, para
 quien quiera más control (multi-validador coordinado, ajustar
