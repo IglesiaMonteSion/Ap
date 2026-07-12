@@ -129,7 +129,42 @@ pub struct StakeAccountData {
     /// same principle as `locked_until_round` above but applied
     /// unconditionally to every position, not just ones that voted.
     pub bonding_until_round: u64,
+    /// A real, live-confirmed slash-evasion vulnerability this closes (see
+    /// `project-lessons-learned`): before this field existed, `Undelegate`
+    /// paid out a self-stake position's full principal in one instant
+    /// transaction, with no delay at all - a validator who equivocated
+    /// could simply submit their own `Undelegate` in the same breath as
+    /// the conflicting vertices, and if that transaction executed before
+    /// anyone else's `ReportEquivocation` (a real race - detecting,
+    /// signing, and submitting a report transaction takes at least one
+    /// real round of latency, while the equivocator's own `Undelegate` can
+    /// be prepared in advance and fired the instant they misbehave), the
+    /// stake account was already zeroed by the time the slash tried to
+    /// burn it - `ReportEquivocation` rejects with "nothing to slash",
+    /// and the validator walks away with their full principal despite
+    /// being cryptographically proven Byzantine. Confirmed live: an
+    /// equivocating validator's `Undelegate` and a third party's
+    /// `ReportEquivocation` submitted immediately afterward - the
+    /// `Undelegate` won the race, the report failed with exactly that
+    /// error, and the validator's wallet balance came back to its
+    /// pre-delegation level. `None` until a self-stake position's first
+    /// `Undelegate` call, which starts the clock instead of paying out
+    /// immediately (see `SELF_STAKE_UNBONDING_ROUNDS`) - a second
+    /// `Undelegate` call after that many rounds have passed completes the
+    /// withdrawal. Only ever set on self-stake positions (`owner ==
+    /// validator`); an ordinary delegator's `Undelegate` is completely
+    /// unaffected and stays instant, since slashing never touches
+    /// delegator stake in the first place.
+    pub unbonding_requested_at_round: Option<u64>,
 }
+
+/// How long a self-stake position's principal stays slashable after
+/// `Undelegate` is first requested, before a second `Undelegate` call can
+/// actually withdraw it - see `StakeAccountData::unbonding_requested_at_
+/// round`'s doc comment for the real slash-evasion race this closes. Same
+/// magnitude already established elsewhere in this module for "long
+/// enough that a same-instant round-trip can't work."
+pub const SELF_STAKE_UNBONDING_ROUNDS: u64 = 100;
 
 /// A real economic cost for reward-sniping (see
 /// `StakeAccountData::bonding_until_round`'s doc comment): capital
@@ -267,6 +302,7 @@ impl NativeProgram for StakingProgram {
                     reward_debt: settled_reward_debt(amount, pool_acc),
                     locked_until_round: 0,
                     bonding_until_round: current_round + MINIMUM_BONDING_ROUNDS,
+                    unbonding_requested_at_round: None,
                 })
                 .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 accounts.insert(stake_pk, stake_account);
@@ -309,6 +345,30 @@ impl NativeProgram for StakingProgram {
                         "this position is still in its minimum bonding period until round {} - cannot undelegate until then",
                         data.bonding_until_round
                     )));
+                }
+                // A real, live-confirmed slash-evasion race this closes -
+                // see `StakeAccountData::unbonding_requested_at_round`'s
+                // doc comment for the full reproduction. Only a genuine
+                // self-stake position (the only kind `ReportEquivocation`
+                // ever touches) goes through this two-step exit; an
+                // ordinary delegator's `Undelegate` stays instant, exactly
+                // as before.
+                if data.owner == data.validator {
+                    match data.unbonding_requested_at_round {
+                        None => {
+                            data.unbonding_requested_at_round = Some(current_round);
+                            let stake_account = accounts.get_mut(&stake_pk).unwrap();
+                            stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                            return Ok(());
+                        }
+                        Some(requested_round) if current_round < requested_round + SELF_STAKE_UNBONDING_ROUNDS => {
+                            return Err(ExecError::ProgramError(format!(
+                                "this self-stake position is still unbonding until round {} - cannot withdraw until then",
+                                requested_round + SELF_STAKE_UNBONDING_ROUNDS
+                            )));
+                        }
+                        Some(_) => {}
+                    }
                 }
                 let amount = data.amount;
 
@@ -452,7 +512,7 @@ mod tests {
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
         assert_eq!(
             data,
-            StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: MINIMUM_BONDING_ROUNDS }
+            StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: MINIMUM_BONDING_ROUNDS, unbonding_requested_at_round: None }
         );
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 4_000);
     }
@@ -757,7 +817,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -776,6 +836,107 @@ mod tests {
         assert_eq!(data.reward_debt, 0);
     }
 
+    /// The exact real, live-confirmed slash-evasion race this closes (see
+    /// `StakeAccountData::unbonding_requested_at_round`'s doc comment): an
+    /// equivocating validator's own `Undelegate`, submitted the instant
+    /// they misbehave, must not be able to empty their self-stake before
+    /// `ReportEquivocation` can burn it - live-confirmed to actually
+    /// succeed and evade the slash entirely before this fix. The first
+    /// `Undelegate` call only starts the clock (funds stay in place,
+    /// still slashable); a second call before the unbonding window
+    /// elapses is rejected; `ReportEquivocation` still finds and burns
+    /// the position while it's merely "unbonding," not yet withdrawn.
+    #[test]
+    fn a_self_stake_undelegate_starts_an_unbonding_window_instead_of_paying_out_immediately_and_stays_slashable_during_it() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([40u8; 32]);
+        let mut accounts = HashMap::from([
+            (
+                stake_pk,
+                Account {
+                    data: borsh::to_vec(&StakeAccountData {
+                        owner: validator,
+                        validator,
+                        amount: 5_000_000,
+                        reward_debt: 0,
+                        locked_until_round: 0,
+                        bonding_until_round: 0,
+                        unbonding_requested_at_round: None,
+                    })
+                    .unwrap(),
+                    balance: 5_000_000,
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
+        let undelegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+        };
+
+        // First call: starts unbonding, funds stay exactly where they are.
+        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, 0).unwrap();
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the self-stake must not be paid out on the first Undelegate call");
+        let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
+        assert_eq!(data.amount, 5_000_000, "the position's recorded amount must be untouched while merely unbonding");
+        assert_eq!(data.unbonding_requested_at_round, Some(0));
+
+        // Exactly the real attack: ReportEquivocation must still find and
+        // burn the position while it's mid-unbonding, not yet withdrawn.
+        let reporter = Pubkey::new([41u8; 32]);
+        let evidence = conflicting_evidence(&validator_kp, 7);
+        let report_ix =
+            Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        StakingProgram.process(&mut accounts, &report_ix, &reporter, 1).unwrap();
+        assert_eq!(accounts[&stake_pk].balance, 0, "the slash must still burn the position even though it was mid-unbonding, not yet withdrawn");
+    }
+
+    #[test]
+    fn a_second_undelegate_before_the_unbonding_window_elapses_is_rejected_but_succeeds_after() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([42u8; 32]);
+        let mut accounts = HashMap::from([
+            (
+                stake_pk,
+                Account {
+                    data: borsh::to_vec(&StakeAccountData {
+                        owner: validator,
+                        validator,
+                        amount: 5_000_000,
+                        reward_debt: 0,
+                        locked_until_round: 0,
+                        bonding_until_round: 0,
+                        unbonding_requested_at_round: None,
+                    })
+                    .unwrap(),
+                    balance: 5_000_000,
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
+        let undelegate_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, 0).unwrap();
+
+        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &validator, SELF_STAKE_UNBONDING_ROUNDS - 1);
+        assert!(result.is_err(), "withdrawing before the unbonding window elapses must be rejected");
+        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the position must remain intact, not partially unwound");
+
+        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, SELF_STAKE_UNBONDING_ROUNDS).unwrap();
+        assert_eq!(accounts[&stake_pk].balance, 0);
+        assert_eq!(accounts[&validator].balance, 5_000_000, "principal returns in full once the unbonding window has genuinely elapsed");
+    }
+
     #[test]
     fn report_equivocation_rejects_a_delegators_position_not_the_validators_own_self_stake() {
         let validator_kp = qchain_crypto::Keypair::generate().unwrap();
@@ -789,7 +950,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -812,7 +973,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -836,7 +997,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -861,7 +1022,7 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0 }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },

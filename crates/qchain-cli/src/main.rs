@@ -90,7 +90,13 @@ enum Command {
     /// Close a stake account, returning its funds plus any pending reward
     /// (auto-paid, see `qchain-execution`'s `staking` module docs). Rejected
     /// until the position's minimum bonding period has elapsed (see
-    /// `StakeAccountData::bonding_until_round`).
+    /// `StakeAccountData::bonding_until_round`). For a validator's own
+    /// self-stake specifically, this is a two-step exit: the first call
+    /// only starts an unbonding window (see
+    /// `StakeAccountData::unbonding_requested_at_round`) - real funds move
+    /// only once a second call is submitted after that window elapses.
+    /// An ordinary delegator's position is unaffected and closes instantly
+    /// as before.
     StakeUndelegate {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
