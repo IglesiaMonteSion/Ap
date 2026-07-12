@@ -1,86 +1,274 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>qchain validator status</title>
+<title>qchain — panel del validador</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --border: #e2e4e9;
+    --text: #16181d;
+    --text-dim: #6b7280;
+    --accent: #4f46e5;
+    --accent-bg: #eef0fe;
+    --good: #16a34a;
+    --good-bg: #e9f9ee;
+    --bad: #dc2626;
+    --bad-bg: #fdecec;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0f13;
+      --panel: #16181f;
+      --border: #262933;
+      --text: #e8e9ec;
+      --text-dim: #8b8f9a;
+      --accent: #818cf8;
+      --accent-bg: #1c1d3a;
+      --good: #4ade80;
+      --good-bg: #123822;
+      --bad: #f87171;
+      --bad-bg: #3a1515;
+    }
+  }
+  * { box-sizing: border-box; }
   body {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    max-width: 860px;
-    margin: 2rem auto;
-    padding: 0 1rem;
-    line-height: 1.5;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 0 0 3rem;
+    line-height: 1.45;
   }
-  h1 { font-size: 1.1rem; margin-bottom: 0.25rem; }
-  .sub { opacity: 0.6; font-size: 0.85rem; margin-bottom: 1.5rem; }
-  section {
-    border: 1px solid currentColor;
-    border-radius: 8px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-    opacity: 0.95;
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 5;
   }
-  section h2 { margin: 0 0 0.75rem; font-size: 0.95rem; }
-  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
-  dt { opacity: 0.6; }
-  dd { margin: 0; word-break: break-all; }
-  input, button {
+  .brand { display: flex; align-items: center; gap: 0.6rem; }
+  .logo {
+    width: 2rem; height: 2rem; border-radius: 8px;
+    background: var(--accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 1rem; flex-shrink: 0;
+  }
+  .brand h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+  .brand h1 .dim { color: var(--text-dim); font-weight: 400; }
+  .topmeta { display: flex; align-items: center; gap: 1rem; font-size: 0.8rem; color: var(--text-dim); flex-wrap: wrap; }
+  .live-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--good); display: inline-block; margin-right: 0.35rem; box-shadow: 0 0 0 0 var(--good); animation: pulse 2s infinite; }
+  .live-dot.down { background: var(--bad); animation: none; box-shadow: none; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 55%, transparent); }
+    70% { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+
+  main { max-width: 1080px; margin: 0 auto; padding: 1.5rem; }
+
+  .banner {
+    padding: 0.85rem 1rem;
+    border-radius: 10px;
+    margin-bottom: 1.25rem;
+    font-size: 0.9rem;
+    border: 1px solid transparent;
+  }
+  .banner-danger { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .banner a { color: inherit; font-weight: 600; text-decoration: underline; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.9rem 1rem;
+  }
+  .stat-card.wide { grid-column: span 2; }
+  .stat-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin-bottom: 0.3rem; }
+  .stat-value { font-size: 1.25rem; font-weight: 600; }
+  .stat-value.mono { font-size: 0.85rem; word-break: break-all; cursor: pointer; }
+  .stat-value.mono:hover { color: var(--accent); }
+  .stat-sub { font-size: 0.75rem; color: var(--text-dim); margin-top: 0.15rem; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.1rem 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.85rem; flex-wrap: wrap; gap: 0.5rem; }
+  .panel h2 { font-size: 0.95rem; margin: 0; font-weight: 600; }
+  .panel-sub { font-size: 0.8rem; color: var(--text-dim); margin: -0.5rem 0 0.9rem; }
+
+  .btn, .btn-ghost {
     font: inherit;
-    padding: 0.4rem 0.6rem;
-    border-radius: 6px;
-    border: 1px solid currentColor;
+    font-size: 0.82rem;
+    padding: 0.4rem 0.75rem;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .btn { background: var(--accent); color: white; border: 1px solid var(--accent); }
+  .btn:hover { opacity: 0.9; }
+  .btn-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
+  .btn-ghost:hover { color: var(--text); border-color: var(--text-dim); }
+  .btn-block { width: 100%; margin-top: 0.75rem; }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; white-space: nowrap; }
+  th { color: var(--text-dim); font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--border); }
+  tbody tr { border-bottom: 1px solid var(--border); cursor: pointer; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--accent-bg); }
+  .amount { font-weight: 600; }
+  .empty { font-size: 0.85rem; color: var(--text-dim); text-align: center; padding: 1.25rem 0; }
+
+  .lookup-row { display: flex; gap: 0.5rem; }
+  input {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
     background: transparent;
     color: inherit;
+    flex: 1;
+    min-width: 0;
   }
-  input { width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
-  button { cursor: pointer; }
-  .err { color: #c0392b; }
-  pre { white-space: pre-wrap; word-break: break-all; margin: 0.5rem 0 0; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid currentColor; border-bottom-color: color-mix(in srgb, currentColor 20%, transparent); }
-  th { opacity: 0.6; font-weight: normal; }
-  tbody tr { cursor: pointer; }
-  tbody tr:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
-  .mono-cell { font-variant-numeric: tabular-nums; }
-  .empty-note { opacity: 0.6; font-size: 0.85rem; }
-  .table-wrap { overflow-x: auto; }
+
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; font-size: 0.85rem; margin: 0.5rem 0; }
+  .kv dt { color: var(--text-dim); }
+  .kv dd { margin: 0; word-break: break-all; }
+
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 0.75rem 0; }
+  @media (max-width: 620px) { .compare { grid-template-columns: 1fr; } .stat-card.wide { grid-column: span 1; } }
+  .compare-card { border: 1px solid var(--border); border-radius: 10px; padding: 0.75rem; }
+  .compare-card h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-dim); margin: 0 0 0.5rem; }
+  .arrow { color: var(--text-dim); }
+
+  details { margin-top: 0.75rem; }
+  summary { cursor: pointer; font-size: 0.8rem; color: var(--text-dim); }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0 0; }
+
+  .toast {
+    position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%) translateY(120%);
+    background: var(--text); color: var(--bg); padding: 0.5rem 1rem; border-radius: 8px;
+    font-size: 0.8rem; transition: transform 0.2s ease, opacity 0.2s ease; z-index: 10;
+    opacity: 0; pointer-events: none;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+
+  footer { max-width: 1080px; margin: 0 auto; padding: 0 1.5rem; font-size: 0.78rem; color: var(--text-dim); }
 </style>
 </head>
 <body>
-  <h1>qchain validator status</h1>
-  <div class="sub">Live status and recent real activity for this one validator - not a network-wide indexer (each validator only knows the transfers it itself executed). See <code>qchain-cli</code> for submitting transfers, staking, and governance.</div>
-
-  <section>
-    <h2>node</h2>
-    <dl id="status-fields"><dt>loading</dt><dd>...</dd></dl>
-  </section>
-
-  <section>
-    <h2>state root</h2>
-    <dl id="root-fields"><dt>loading</dt><dd>...</dd></dl>
-  </section>
-
-  <section>
-    <h2>recent transfers</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>hash</th><th>from</th><th>to</th><th>amount</th><th>fee</th></tr></thead>
-        <tbody id="transfers-body"></tbody>
-      </table>
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">Q</div>
+      <h1>qchain <span class="dim">· panel del validador</span></h1>
     </div>
-    <p id="transfers-empty" class="empty-note" style="display:none">no transfers captured yet on this validator</p>
-    <button id="load-more" style="margin-top:0.5rem">load more</button>
-    <pre id="transfer-detail"></pre>
-  </section>
+    <div class="topmeta">
+      <span><span class="live-dot" id="live-dot"></span><span id="live-text">conectando…</span></span>
+      <span id="chain-id-badge" class="mono" title="identidad de esta red - las transacciones firmadas para otra red se rechazan"></span>
+      <span id="last-updated"></span>
+    </div>
+  </div>
 
-  <section>
-    <h2>account lookup</h2>
-    <input id="addr" placeholder="paste an address (base58)">
-    <button id="lookup">look up</button>
-    <pre id="account-result"></pre>
-  </section>
+  <main>
+    <section id="security-banner" class="banner banner-danger" hidden>
+      ⚠️ <span id="security-banner-text"></span> —
+      <a href="/equivocation_evidence" target="_blank" rel="noopener">ver evidencia cruda</a>
+    </section>
+
+    <section class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">ronda actual</div>
+        <div class="stat-value" id="stat-round">–</div>
+        <div class="stat-sub" id="stat-round-rate">&nbsp;</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">certificados (DAG)</div>
+        <div class="stat-value" id="stat-certs">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">tx ejecutadas</div>
+        <div class="stat-value" id="stat-executed">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">recibos capturados</div>
+        <div class="stat-value" id="stat-receipts">–</div>
+      </div>
+      <div class="stat-card wide" id="stat-validator-card">
+        <div class="stat-label">dirección de este validador</div>
+        <div class="stat-value mono" id="stat-validator" title="copiar">–</div>
+      </div>
+      <div class="stat-card wide" id="stat-root-card">
+        <div class="stat-label">raíz de Merkle (estado actual)</div>
+        <div class="stat-value mono" id="stat-root" title="copiar">–</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>actividad reciente</h2>
+        <button id="refresh-transfers" class="btn-ghost">↻ actualizar</button>
+      </div>
+      <div class="panel-sub">Transferencias que este validador ejecutó y confirmó — no un índice de toda la red, cada validador solo ve lo que él mismo procesó.</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>hash</th><th>desde</th><th>hacia</th><th>monto</th><th>fee</th></tr></thead>
+          <tbody id="transfers-body"></tbody>
+        </table>
+      </div>
+      <p id="transfers-empty" class="empty" hidden>todavía no se ejecutó ninguna transferencia en este validador</p>
+      <button id="load-more" class="btn btn-block" hidden>cargar más</button>
+    </section>
+
+    <section class="panel" id="detail-panel" hidden>
+      <div class="panel-header">
+        <h2>detalle de transferencia</h2>
+        <button id="close-detail" class="btn-ghost">cerrar ✕</button>
+      </div>
+      <div id="detail-body"></div>
+    </section>
+
+    <section class="panel">
+      <h2>consultar un balance</h2>
+      <div class="panel-sub">Pegá cualquier dirección (base58) para ver su cuenta en este validador.</div>
+      <div class="lookup-row">
+        <input id="addr" placeholder="ej: 6T4ZQpETx5NdtPFJTqGqdVCgq8D3GFb5LXtMDvEESF1i">
+        <button id="lookup" class="btn">consultar</button>
+      </div>
+      <div id="account-result"></div>
+    </section>
+  </main>
+
+  <footer>
+    Esto es la vista de <strong>un solo validador</strong>, no un explorador de toda la red. Para transferir, delegar stake, votar propuestas de gobernanza, o verificar una prueba STARK de forma independiente, usá <code>qchain-cli</code>.
+  </footer>
+
+  <div class="toast" id="toast">copiado</div>
 
 <script>
 async function getJson(path) {
@@ -89,86 +277,227 @@ async function getJson(path) {
   return res.json();
 }
 
-function renderDl(el, obj) {
-  el.innerHTML = Object.entries(obj).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+function short(s, head = 8, tail = 6) {
+  return (s && s.length > head + tail + 1) ? s.slice(0, head) + "…" + s.slice(-tail) : s;
 }
 
-function short(s) {
-  return s && s.length > 14 ? s.slice(0, 6) + "…" + s.slice(-4) : s;
+// `TransferReceipt`'s tx_hash/root_before/root_after are raw [u8;32] on the
+// wire (no hex serde impl on that struct, unlike the hand-rolled
+// TransferSummary the list endpoint returns) - normalize both shapes here
+// instead of assuming every hash-looking field is already a hex string.
+function toHex(v) {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map(b => b.toString(16).padStart(2, "0")).join("");
+  return String(v);
 }
+
+function fmtNum(n) {
+  return typeof n === "number" ? n.toLocaleString("es") : n;
+}
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 1200);
+}
+
+function makeCopyable(el, getValue) {
+  el.addEventListener("click", async () => {
+    const v = getValue();
+    if (!v || v === "–") return;
+    try {
+      await navigator.clipboard.writeText(v);
+      toast("copiado");
+    } catch (e) {
+      toast("no se pudo copiar");
+    }
+  });
+}
+
+let lastRoundSample = null; // { round, t }
+let liveOk = true;
+
+function setLive(ok) {
+  liveOk = ok;
+  document.getElementById("live-dot").classList.toggle("down", !ok);
+  document.getElementById("live-text").textContent = ok ? "en vivo" : "sin conexión";
+}
+
+function setUpdatedNow() {
+  document.getElementById("last-updated").textContent = "actualizado " + new Date().toLocaleTimeString("es");
+}
+
+let validatorAddr = "–";
+let rootHex = "–";
 
 async function refreshStatus() {
   try {
     const status = await getJson("/status");
-    renderDl(document.getElementById("status-fields"), status);
+    setLive(true);
+    document.getElementById("stat-certs").textContent = fmtNum(status.dag_certificates);
+    document.getElementById("stat-executed").textContent = fmtNum(status.executed_transactions);
+    document.getElementById("stat-round").textContent = fmtNum(status.next_round);
+    validatorAddr = status.validator;
+    document.getElementById("stat-validator").textContent = short(validatorAddr, 10, 8);
+
+    const now = Date.now();
+    if (lastRoundSample && now > lastRoundSample.t) {
+      const dRounds = status.next_round - lastRoundSample.round;
+      const dSecs = (now - lastRoundSample.t) / 1000;
+      if (dSecs >= 1.5) {
+        const rate = dRounds / dSecs;
+        document.getElementById("stat-round-rate").textContent =
+          rate > 0 ? `+${rate.toFixed(1)} rondas/s` : "sin avance reciente";
+        lastRoundSample = { round: status.next_round, t: now };
+      }
+    } else if (!lastRoundSample) {
+      lastRoundSample = { round: status.next_round, t: now };
+    }
   } catch (e) {
-    document.getElementById("status-fields").innerHTML = `<dt class="err">error</dt><dd class="err">${e.message}</dd>`;
+    setLive(false);
   }
+
   try {
     const root = await getJson("/root");
-    renderDl(document.getElementById("root-fields"), root);
-  } catch (e) {
-    document.getElementById("root-fields").innerHTML = `<dt class="err">error</dt><dd class="err">${e.message}</dd>`;
-  }
+    rootHex = root.root;
+    document.getElementById("stat-root").textContent = short(rootHex, 10, 8);
+    document.getElementById("stat-receipts").textContent = fmtNum(root.receipt_count);
+  } catch (e) { /* keep last known value */ }
+
+  setUpdatedNow();
+}
+
+async function refreshChainId() {
+  try {
+    const r = await getJson("/chain_id");
+    document.getElementById("chain-id-badge").textContent = "red " + short(r.chain_id, 6, 4);
+    document.getElementById("chain-id-badge").title = "chain_id completo: " + r.chain_id;
+  } catch (e) { /* optional */ }
+}
+
+async function refreshEquivocations() {
+  try {
+    const list = await getJson("/equivocation_evidence");
+    const banner = document.getElementById("security-banner");
+    if (list.length > 0) {
+      document.getElementById("security-banner-text").textContent =
+        `este validador detectó ${list.length} equivocación(es) real(es) de otro(s) validador(es)`;
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
+    }
+  } catch (e) { /* optional */ }
 }
 
 let transfersOffset = 0;
 const TRANSFERS_PAGE = 20;
 
-async function loadTransfers() {
+async function loadTransfers(reset = false) {
+  if (reset) {
+    transfersOffset = 0;
+    document.getElementById("transfers-body").innerHTML = "";
+  }
   const body = document.getElementById("transfers-body");
   const emptyNote = document.getElementById("transfers-empty");
+  const loadMore = document.getElementById("load-more");
   try {
     const rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=${transfersOffset}`);
     if (transfersOffset === 0 && rows.length === 0) {
-      emptyNote.style.display = "block";
-      document.getElementById("load-more").style.display = "none";
+      emptyNote.hidden = false;
+      loadMore.hidden = true;
       return;
     }
-    emptyNote.style.display = "none";
+    emptyNote.hidden = true;
     for (const r of rows) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td class="mono-cell">${short(r.tx_hash)}</td><td class="mono-cell">${short(r.from)}</td><td class="mono-cell">${short(r.to)}</td><td class="mono-cell">${r.amount}</td><td class="mono-cell">${r.fee}</td>`;
+      tr.innerHTML = `<td class="mono">${short(r.tx_hash)}</td><td class="mono">${short(r.from)}</td><td class="mono">${short(r.to)}</td><td class="amount">${fmtNum(r.amount)}</td><td>${fmtNum(r.fee)}</td>`;
       tr.addEventListener("click", () => showTransfer(r.tx_hash));
       body.appendChild(tr);
     }
     transfersOffset += rows.length;
-    if (rows.length < TRANSFERS_PAGE) {
-      document.getElementById("load-more").style.display = "none";
-    }
+    loadMore.hidden = rows.length < TRANSFERS_PAGE;
   } catch (e) {
-    emptyNote.textContent = `error loading transfers: ${e.message}`;
-    emptyNote.style.display = "block";
+    emptyNote.textContent = `error cargando transferencias: ${e.message}`;
+    emptyNote.hidden = false;
   }
 }
 
+function accountCard(title, address, before, after) {
+  return `<div class="compare-card">
+    <h3>${title}</h3>
+    <div class="kv">
+      <dt>dirección</dt><dd class="mono">${short(address, 10, 8)}</dd>
+      <dt>balance antes</dt><dd>${fmtNum(before.balance)}</dd>
+      <dt>balance después</dt><dd>${fmtNum(after.balance)}</dd>
+      <dt>nonce después</dt><dd>${fmtNum(after.nonce)}</dd>
+    </div>
+  </div>`;
+}
+
 async function showTransfer(hash) {
-  const out = document.getElementById("transfer-detail");
-  out.textContent = "loading...";
+  const panel = document.getElementById("detail-panel");
+  const out = document.getElementById("detail-body");
+  panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  out.innerHTML = "cargando…";
   try {
-    out.textContent = JSON.stringify(await getJson(`/transfers/${hash}`), null, 2);
+    const r = await getJson(`/transfers/${hash}`);
+    out.innerHTML = `
+      <div class="kv">
+        <dt>hash</dt><dd class="mono">${toHex(r.tx_hash)}</dd>
+        <dt>monto</dt><dd>${fmtNum(r.amount)}</dd>
+        <dt>fee cobrado</dt><dd>${fmtNum(r.fee)}</dd>
+        <dt>raíz antes</dt><dd class="mono">${short(toHex(r.root_before), 10, 8)}</dd>
+        <dt>raíz después</dt><dd class="mono">${short(toHex(r.root_after), 10, 8)}</dd>
+      </div>
+      <div class="compare">
+        ${accountCard("cuenta origen", r.from, r.from_before, r.from_after)}
+        ${accountCard("cuenta destino", r.to, r.to_before, r.to_after)}
+      </div>
+      <details>
+        <summary>ver JSON crudo (incluye pruebas Merkle completas)</summary>
+        <pre>${JSON.stringify(r, null, 2)}</pre>
+      </details>`;
   } catch (e) {
     out.textContent = `error: ${e.message}`;
   }
 }
 
-document.getElementById("load-more").addEventListener("click", loadTransfers);
+document.getElementById("close-detail").addEventListener("click", () => {
+  document.getElementById("detail-panel").hidden = true;
+});
+document.getElementById("load-more").addEventListener("click", () => loadTransfers(false));
+document.getElementById("refresh-transfers").addEventListener("click", () => loadTransfers(true));
 
 document.getElementById("lookup").addEventListener("click", async () => {
   const addr = document.getElementById("addr").value.trim();
   const out = document.getElementById("account-result");
-  out.textContent = "looking up...";
-  if (!addr) { out.textContent = ""; return; }
+  if (!addr) { out.innerHTML = ""; return; }
+  out.innerHTML = "consultando…";
   try {
-    out.textContent = JSON.stringify(await getJson(`/account/${addr}`), null, 2);
+    const acc = await getJson(`/account/${addr}`);
+    out.innerHTML = `<div class="kv">
+      <dt>balance</dt><dd>${fmtNum(acc.balance)}</dd>
+      <dt>nonce</dt><dd>${fmtNum(acc.nonce)}</dd>
+    </div>`;
   } catch (e) {
-    out.textContent = "not found (or invalid address)";
+    out.innerHTML = `<span style="color:var(--bad)">no encontrada (o dirección inválida)</span>`;
   }
 });
+document.getElementById("addr").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("lookup").click();
+});
+
+makeCopyable(document.getElementById("stat-validator"), () => validatorAddr);
+makeCopyable(document.getElementById("stat-root"), () => rootHex);
 
 refreshStatus();
-loadTransfers();
-setInterval(refreshStatus, 3000);
+refreshChainId();
+refreshEquivocations();
+loadTransfers(true);
+setInterval(refreshStatus, 2000);
+setInterval(refreshEquivocations, 15000);
 </script>
 </body>
 </html>
