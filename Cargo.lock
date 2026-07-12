@@ -1898,6 +1898,7 @@ dependencies = [
  "qchain-core",
  "qchain-crypto",
  "qchain-governance",
+ "qchain-stark",
  "qchain-storage",
  "serde",
  "sha3",

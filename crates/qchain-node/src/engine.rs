@@ -71,6 +71,22 @@ use tokio::sync::Mutex;
 /// dissemination load is spread). See the module docs above.
 const WORKER_COUNT: u8 = 4;
 
+/// Hard cap on how many receipts a single `GET /stark_proof` call will
+/// ever prove, regardless of what the caller requests or omits - see
+/// `Engine::stark_proof`'s doc comment for the real, live-measured CPU-
+/// exhaustion DoS this closes. 500 is comfortably fast on this project's
+/// own measured numbers (n=100 proved in ~16.5ms), while still covering a
+/// generous "recent activity" window for a real light-client caller.
+const MAX_STARK_PROOF_RECEIPTS: usize = 500;
+
+/// How many of `available` receipts a single `/stark_proof` call actually
+/// proves, given what the caller requested (`None` meaning "all of them").
+/// Always `<= MAX_STARK_PROOF_RECEIPTS` and `<= available` - see
+/// `Engine::stark_proof`'s doc comment for the DoS this bound closes.
+fn effective_stark_proof_limit(requested: Option<usize>, available: usize) -> usize {
+    requested.map_or(available, |n| n.min(available)).min(MAX_STARK_PROOF_RECEIPTS)
+}
+
 /// Splits ready transactions into up to `WORKER_COUNT` batches, one per
 /// non-empty lane. Lane assignment is by the payer's address so a given
 /// account's transactions always land in the same lane and keep their
@@ -376,11 +392,12 @@ impl Engine {
     }
 
     /// Builds a real `qchain-stark` proof over the most recent `limit`
-    /// captured transfer receipts (all of them if `limit` is `None`),
-    /// binds it to the real Merkle root transitions those receipts
-    /// recorded, and self-verifies via `verify_batch_bound_to_state`
-    /// before ever handing it to a caller - a validator should never
-    /// serve a proof it hasn't itself confirmed verifies.
+    /// captured transfer receipts (all of them if `limit` is `None`, up to
+    /// `MAX_STARK_PROOF_RECEIPTS`), binds it to the real Merkle root
+    /// transitions those receipts recorded, and self-verifies via
+    /// `verify_batch_bound_to_state` before ever handing it to a caller -
+    /// a validator should never serve a proof it hasn't itself confirmed
+    /// verifies.
     ///
     /// Real limitation, not silently glossed over: `verify_batch_bound_to_state`
     /// requires the bound rows to be one *contiguous* run of state
@@ -396,10 +413,23 @@ impl Engine {
         let receipts: Vec<qchain_execution::TransferReceipt> = {
             let state = self.state.lock().await;
             let all = state.ledger.transfer_receipts();
-            match limit {
-                Some(n) if n < all.len() => all[all.len() - n..].to_vec(),
-                _ => all.to_vec(),
-            }
+            // A real, live-measured DoS this closes: `qchain_stark::prove_batch`
+            // scales far worse than linearly with receipt count (measured on
+            // this same machine: n=100 -> 16.5ms, n=1,000 -> 948ms, n=5,000 ->
+            // 71.8s, n=20,000 -> still running after 5+ minutes of CPU before
+            // being killed). `transfer_receipts` is an unbounded in-memory log
+            // (already-documented simplification, see `qchain_execution::
+            // receipt`'s module docs) that only grows over a validator's real
+            // lifetime, and this endpoint is a plain, unauthenticated GET with
+            // no per-call cost to the caller - proving "all of them" (the
+            // default when `limit` is omitted) turns chain age directly into
+            // free, repeatable CPU-exhaustion leverage for anyone. Clamped
+            // here, unconditionally, regardless of what the caller requests
+            // or omits - the same "bound the worst case of a single call"
+            // principle already used for message size limits and bytecode
+            // size caps elsewhere in this codebase.
+            let effective_limit = effective_stark_proof_limit(limit, all.len());
+            all[all.len() - effective_limit..].to_vec()
         };
         if receipts.is_empty() {
             return Err(StarkProofError::NoReceipts);
@@ -1269,5 +1299,20 @@ mod tests {
             payer_can_afford_admission(&state, &tx(&alice, 0)),
             "an account with real balance covering its byte fee must be admitted"
         );
+    }
+
+    /// The real, live-measured DoS this closes (see `stark_proof`'s doc
+    /// comment): proving cost scales far worse than linearly with receipt
+    /// count, so a validator with a long real history must never let a
+    /// caller (including one that omits `limit` entirely, asking for
+    /// "everything") force proving more than `MAX_STARK_PROOF_RECEIPTS`
+    /// receipts in one call.
+    #[test]
+    fn stark_proof_limit_is_always_capped_regardless_of_what_is_requested() {
+        assert_eq!(effective_stark_proof_limit(None, 50), 50, "fewer receipts than the cap exist - prove all of them");
+        assert_eq!(effective_stark_proof_limit(None, 10_000), MAX_STARK_PROOF_RECEIPTS, "omitting limit must not mean 'prove everything'");
+        assert_eq!(effective_stark_proof_limit(Some(10_000), 10_000), MAX_STARK_PROOF_RECEIPTS, "an explicit huge limit must still be capped");
+        assert_eq!(effective_stark_proof_limit(Some(10), 10_000), 10, "a real request smaller than the cap must be honored exactly");
+        assert_eq!(effective_stark_proof_limit(Some(10_000), 3), 3, "requesting more than exists must still only prove what exists");
     }
 }

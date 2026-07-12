@@ -369,13 +369,38 @@ impl Ledger {
             }
         }
 
-        // Capture the "after" half now - deliberately *before* the dust
-        // sweep below, since the STARK's conservation equations model
-        // the transfer's own raw arithmetic, not the dust-sweep
-        // adjustment that may still zero a resulting balance
-        // afterward - same class of documented simplification as
-        // `qchain-stark`'s own "doesn't re-derive full Ledger fee/nonce
-        // semantics" scope note.
+        // A real, live-confirmed bug this closes (see `project-lessons-
+        // learned`): the dust sweep (below) can still zero a resulting
+        // balance *after* this point, but `qchain-stark`'s AIR only ever
+        // models plain conservation (`to_after == to_before + amount`) -
+        // it has no notion of a dust sweep at all, the same kind of
+        // single-instruction-shape restriction that already rules out
+        // multi-instruction transactions capturing a receipt (see
+        // `receipt.rs` module docs). The old code captured the pre-sweep
+        // `working` values into the receipt regardless, which either
+        // disagreed with what actually got committed (breaking the *next*
+        // receipt's chaining, `RootSequenceMismatch`) or, if corrected to
+        // report the real post-sweep value instead, disagreed with the
+        // circuit's own internal arithmetic for *this* row instead
+        // (`BalanceMismatch` - tried and confirmed by this fix's own
+        // test). Since the circuit cannot represent a swept balance
+        // either way, the honest fix is the same one already used for
+        // multi-instruction transactions: don't capture a receipt for a
+        // transfer that would be dust-swept, rather than capturing one
+        // guaranteed to fail self-verification either at proving or at
+        // chaining. `total_gas_fee` is guaranteed `0` for every receipt-
+        // eligible transaction (single-instruction, native
+        // `SystemInstruction::Transfer` - `Program::Wasm`/gas fees never
+        // apply to this branch), so predicting only the dust sweep here
+        // exactly matches what the commit loop below will actually write.
+        let would_be_dust_swept = |account: &Account| -> bool {
+            account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold
+        };
+        let pre_capture = pre_capture.filter(|(from, to, ..)| {
+            let from_swept = working.get(from).is_some_and(&would_be_dust_swept);
+            let to_swept = working.get(to).is_some_and(&would_be_dust_swept);
+            !from_swept && !to_swept
+        });
         if let Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before)) = pre_capture {
             // Same real semantics the old `OverlayStore { base: self.store,
             // overlay: &working }` gave: "the committed store as of right
@@ -1006,6 +1031,82 @@ mod tests {
         // And the roots themselves must be the real, independently
         // computable roots before/after this exact transaction.
         assert_eq!(r.root_after, ledger.merkle_root());
+    }
+
+    /// The real, live-confirmed bug this closes (see `project-lessons-
+    /// learned`): a transfer landing a resulting balance below
+    /// `DUST_THRESHOLD_UNITS` (routine - a brand-new recipient starts
+    /// there) used to capture `root_after`/`to_after` from *before* the
+    /// dust sweep, so the receipt disagreed with what actually got
+    /// committed - breaking the *next* receipt's `root_before` from
+    /// chaining into it (`GET /stark_proof`'s `ChainBroken`). Reporting
+    /// the real post-sweep value instead doesn't work either - tried and
+    /// confirmed by an earlier version of this exact test - because
+    /// `qchain-stark`'s AIR only ever models plain conservation
+    /// (`to_after == to_before + amount`), with no notion of a dust
+    /// sweep at all, so a "corrected" swept receipt fails the circuit's
+    /// own internal arithmetic instead (`BalanceMismatch`). The only
+    /// honest fix is not capturing a receipt at all for a transfer that
+    /// would be dust-swept - this test confirms that: the sub-threshold
+    /// transfer produces no receipt, but a normal, comfortably-above-
+    /// threshold transfer right after it still gets a receipt whose
+    /// `root_before` is the real current tree root (not chained from a
+    /// receipt that was never captured), and that one receipt still
+    /// genuinely proves and verifies end to end.
+    #[test]
+    fn a_transfer_landing_below_the_dust_threshold_captures_no_receipt_instead_of_an_unprovable_one() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let carol = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 50_000_000);
+
+        // Sub-threshold: bob's resulting balance would be swept to 0 -
+        // must not produce a receipt at all.
+        let ix1 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: DUST_THRESHOLD_UNITS / 2 }).unwrap(),
+        };
+        let tx1 = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix1]).unwrap();
+        ledger.apply_transaction(&tx1, &validator, 0).unwrap();
+        assert_eq!(ledger.get_balance(&bob), 0, "the transfer itself must still execute and sweep the dust normally");
+        assert!(ledger.transfer_receipts().is_empty(), "a transfer the circuit can't represent (dust-swept) must not capture a receipt at all");
+
+        // A second, unrelated, comfortably-above-threshold transfer.
+        let ix2 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), carol],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+        };
+        let tx2 = Transaction::new_signed(&alice, 1, [0u8; 32], 50_000_000, vec![ix2]).unwrap();
+        ledger.apply_transaction(&tx2, &validator, 0).unwrap();
+
+        let receipts = ledger.transfer_receipts();
+        assert_eq!(receipts.len(), 1, "only the provable transfer gets a receipt");
+        let r = &receipts[0];
+        assert_eq!(r.root_after, ledger.merkle_root(), "the captured root_after must match what was actually committed");
+
+        // The real qchain-stark self-verification path itself - the
+        // failure mode this closes surfaced exactly here, either as
+        // `RootSequenceMismatch` (naive fix) or `BalanceMismatch`
+        // (reporting the real swept value instead).
+        let steps = vec![qchain_stark::TransferStep::conserving(r.from.to_bytes(), r.to.to_bytes(), r.from_before.balance, r.to_before.balance, r.amount, r.fee)];
+        let bindings = vec![qchain_stark::RowStateBinding {
+            root_before: r.root_before,
+            root_after: r.root_after,
+            from_before: r.from_before.clone(),
+            from_after: r.from_after.clone(),
+            to_before: r.to_before.clone(),
+            to_after: r.to_after.clone(),
+            from_proof_before: r.from_proof_before.clone(),
+            from_proof_after: r.from_proof_after.clone(),
+            to_proof_before: r.to_proof_before.clone(),
+            to_proof_after: r.to_proof_after.clone(),
+        }];
+        let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).unwrap();
+        qchain_stark::verify_batch_bound_to_state(proof, pub_inputs, &bindings).expect("the one real captured receipt must still genuinely self-verify");
     }
 
     #[test]
