@@ -16,7 +16,20 @@
 use borsh::BorshDeserialize;
 use qchain_core::Account;
 use qchain_crypto::{AlgorithmStatus, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA};
-use wasmtime::{Caller, Config, Engine, Linker, Module, Store, Val};
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
+
+/// A real, live-confirmed memory-bomb DoS this closes: fuel meters
+/// instructions, not the data volume they touch (confirmed in
+/// wasmtime-cranelift's `fuel_before_op` - every instruction costs exactly 1
+/// fuel regardless of operand size), so `memory.grow`/`memory.fill` can
+/// commit gigabytes of real RAM for a handful of fuel. Measured live: a
+/// 72-byte contract calling `memory.grow` then a single `memory.fill` drove
+/// a validator's RSS from ~9MB to ~1.96GB and blocked it for several real
+/// seconds, for a fuel cost of 7 out of a 5,000,000 budget. 16MiB is
+/// generous for this project's actual reference contracts (a few KB at
+/// most) while making a bomb attempt fail cheaply instead of committing
+/// real memory.
+const MAX_CONTRACT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct WasmCallResult {
     pub accounts: Vec<Account>,
@@ -44,6 +57,9 @@ struct HostState {
     /// vulnerability this closed.
     is_signer: Vec<bool>,
     log: Vec<String>,
+    /// Enforces `MAX_CONTRACT_MEMORY_BYTES` - see that constant's doc
+    /// comment for the real memory-bomb DoS this closes.
+    limits: StoreLimits,
 }
 
 fn read_memory(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
@@ -210,9 +226,11 @@ impl WasmExecutor {
         let module = Module::new(&self.engine, wasm_bytes)?;
         let linker = self.build_linker()?;
 
-        let host_state = HostState { accounts, is_signer, log: Vec::new() };
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let host_state = HostState { accounts, is_signer, log: Vec::new(), limits };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
+        store.limiter(|state| &mut state.limits);
 
         let instance = linker.instantiate(&mut store, &module)?;
         let func = instance
@@ -347,6 +365,32 @@ mod tests {
         assert!(result.fuel_consumed > 0, "fuel spent looping before the trap must not be reported as zero");
     }
 
+    /// The exact real, live-confirmed memory-bomb DoS `MAX_CONTRACT_MEMORY_
+    /// BYTES`/`StoreLimits` closes - see that constant's doc comment for the
+    /// measured real numbers (a 72-byte contract driving RSS from ~9MB to
+    /// ~1.96GB for 7 fuel, live against a real single-validator testnet).
+    /// This reproduces the identical shape (grow then fill far past the
+    /// limit) and confirms it now traps cheaply instead of committing real
+    /// memory.
+    #[test]
+    fn a_contract_growing_memory_past_the_configured_limit_traps_instead_of_committing_real_memory() {
+        const MEMORY_BOMB_WAT: &str = r#"
+            (module
+                (memory (export "memory") 1 65536)
+                (func (export "bomb")
+                    (drop (memory.grow (i32.const 30520)))
+                    (memory.fill (i32.const 0) (i32.const 65) (i32.const 2000000000))
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(MEMORY_BOMB_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+
+        let result = executor.call(&wasm_bytes, "bomb", &[], vec![], vec![], 5_000_000).unwrap();
+        assert!(result.trap.is_some(), "growing memory past MAX_CONTRACT_MEMORY_BYTES must trap, not succeed");
+        assert!(result.fuel_consumed < 100, "the trap must fire on the grow itself, not after real work - got {} fuel", result.fuel_consumed);
+    }
+
     const IS_SIGNER_WAT: &str = r#"
         (module
             (import "env" "host_is_signer" (func $is_signer (param i32) (result i32)))
@@ -363,7 +407,8 @@ mod tests {
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
         let accounts = vec![wallet(0), wallet(0)];
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![true, false], log: vec![] });
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![true, false], log: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let func = instance.get_func(&mut store, "check").unwrap();
@@ -414,7 +459,8 @@ mod tests {
         let wasm_bytes = wat::parse_str(VERIFY_WAT).unwrap();
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![], log: vec![] });
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![], log: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
