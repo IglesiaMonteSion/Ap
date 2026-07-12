@@ -200,8 +200,11 @@ security group en su lugar, configurarlo ahí en cambio), activa NTP
 (los timestamps de log de validadores en regiones distintas solo se
 pueden correlacionar si los relojes están sincronizados), e instala
 `deploy/systemd/qchain-validator.service` (`Restart=on-failure`, arranca
-solo en el boot de la máquina). El mismo patrón aplica al faucet vía
-`deploy/systemd/qchain-faucet.service`.
+solo en el boot de la máquina). El script en sí solo cubre el validador
+— si el faucet va a correr en la misma VPS (el caso más común), la
+unidad `deploy/systemd/qchain-faucet.service` usa el mismo patrón
+(`--network host`, `Restart=on-failure`), pero hay que instalarla y
+abrir su puerto a mano, ver más abajo.
 
 ## Faucet
 
@@ -217,6 +220,18 @@ docker run -d --name qchain-faucet \
     --listen 0.0.0.0:9090 \
     --amount 10000000 \
     --cooldown-secs 60
+```
+
+Para correrlo como servicio real (`Restart=on-failure`) en la misma VPS
+que un validador, copiar `faucet-keypair.json` a `/opt/qchain-faucet/`,
+instalar la unidad, y abrir su puerto (`provision-validator.sh` no lo
+hace por vos, ya que no siempre corre en el mismo host que el validador):
+
+```
+sudo cp deploy/systemd/qchain-faucet.service /etc/systemd/system/
+sudo ufw allow 9090/tcp comment 'qchain faucet'   # si usás ufw
+sudo systemctl daemon-reload
+sudo systemctl enable --now qchain-faucet
 ```
 
 El wallet del faucet necesita balance real — se lo asigna vía el

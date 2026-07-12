@@ -7,11 +7,20 @@ Requires=docker.service
 [Service]
 # Expects /opt/qchain-faucet to contain faucet-keypair.json - see
 # docs/DEPLOY.md for --amount/--cooldown-secs tuning and the RPC target.
+# Uses --network host, same as qchain-validator.service and for the same
+# reason: without it, this container's own 127.0.0.1 is its own loopback,
+# not the host's - a faucet co-located with a validator on the same box
+# (the natural first thing to try, since this unit ships a working
+# default instead of a placeholder) would never actually reach
+# --rpc http://127.0.0.1:8080. With host networking the port mapping
+# below is unnecessary (the container binds directly to the host's
+# 9090), same as the validator unit needs no port mapping either.
 Type=simple
 WorkingDirectory=/opt/qchain-faucet
 ExecStartPre=-/usr/bin/docker rm -f qchain-faucet
 ExecStart=/usr/bin/docker run --rm --name qchain-faucet \
-  -v /opt/qchain-faucet:/qchain -w /qchain -p 9090:9090 \
+  --network host \
+  -v /opt/qchain-faucet:/qchain -w /qchain \
   qchain:latest qchain-faucet \
     --rpc http://127.0.0.1:8080 \
     --keypair /qchain/faucet-keypair.json \
