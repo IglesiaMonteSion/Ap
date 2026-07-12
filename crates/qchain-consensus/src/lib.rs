@@ -51,14 +51,73 @@ pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool
 /// certificates have already been emitted so repeated calls to `advance`
 /// only ever return newly-finalized digests, in commit order - the piece a
 /// node's block-application loop actually consumes.
-#[derive(Default)]
 pub struct ConsensusState {
     seen: HashSet<Digest>,
+    /// The round `advance` starts walking from - always `0` for a fresh
+    /// validator (`new`), but see `resuming_from` for why a restarted one
+    /// needs a different value.
+    from_round: Round,
+}
+
+impl Default for ConsensusState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConsensusState {
     pub fn new() -> Self {
-        Self::default()
+        ConsensusState { seen: HashSet::new(), from_round: 0 }
+    }
+
+    /// For a validator resuming from a persisted round checkpoint whose DAG
+    /// content isn't persisted (see `qchain-node::engine::propose_round`'s
+    /// doc comment for the sibling proposal-side bug/fix this pairs with -
+    /// same real restart scenario, found in the same live reproduction,
+    /// different code path). Starting `advance` from `0` every time (what
+    /// `new` does) is correct for a validator whose local DAG genuinely
+    /// spans everything from round 0 - but for one resuming with an empty
+    /// DAG and a `next_round` already far past 0, round 0 can never
+    /// resolve (no certificate for it, and no peer left to ever supply
+    /// one in a single-validator network), so `extend_order`'s "stop at
+    /// the first undecided round" safety rule - correct in general -
+    /// would block forever on a round that's actually just permanently
+    /// unrecoverable, not transiently missing. Starting from
+    /// `starting_round` instead skips re-deriving commit order for
+    /// history this validator can no longer see; nothing unsafe about
+    /// that (this validator's own account-state effects of those earlier
+    /// rounds already persisted via `SledStore` independent of Bullshark
+    /// ordering).
+    ///
+    /// **Caller obligation, found the hard way (live, not by inspection):
+    /// only call this when this validator's own stake alone already meets
+    /// `ValidatorSet::quorum_threshold` - the exact same condition
+    /// `qchain-node::engine::propose_round` guards its own fast path on.**
+    /// It is *not* enough that a peer's intact DAG already finalized the
+    /// skipped history "elsewhere" - `walk_causal_history` follows
+    /// `Certificate::parents` wherever they actually point, regardless of
+    /// where `extend_order`'s round loop starts, and a peer who never
+    /// restarted has REAL parent links reaching back past
+    /// `starting_round`. For a validator that isn't alone/dominant, using
+    /// `resuming_from` doesn't skip that walk - it just empties `seen`
+    /// right before the walk needs to redo it, and unlike the round-by-
+    /// round outer loop (whose `seen` cache fills in incrementally, one
+    /// resolved round at a time - the reason `new()` stays cheap), a
+    /// `walk_causal_history` call that fails partway through (an ancestor
+    /// still being resynced) caches *nothing at all*, so the whole
+    /// multi-round walk gets repeated from scratch on every single
+    /// incoming message while resync is in progress. Confirmed live: a
+    /// real 3-validator testnet with evenly-spread stake (no validator
+    /// dominant), one validator restarted after a real gap - CPU pinned
+    /// past 200%, RSS climbing into the hundreds of MB within seconds,
+    /// RPC completely unresponsive; the identical scenario using `new()`
+    /// recovered in under a second. For a validator that isn't dominant,
+    /// nothing else could have progressed without it while it was down
+    /// anyway (quorum requires it), so there's no history to skip in the
+    /// first place - `new()` is not just safe there, it's the only
+    /// correct choice.
+    pub fn resuming_from(starting_round: Round) -> Self {
+        ConsensusState { seen: HashSet::new(), from_round: starting_round }
     }
 
     /// Re-evaluates leader commitment across the whole DAG (cheap at
@@ -67,7 +126,7 @@ impl ConsensusState {
     /// the total order since the last call.
     pub fn advance(&mut self, dag: &DagStore, validators: &ValidatorSet) -> Vec<Digest> {
         let bullshark = Bullshark::new(dag, validators);
-        bullshark.extend_order(0, dag.highest_round(), &mut self.seen)
+        bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen)
     }
 
     pub fn ordered_count(&self) -> usize {

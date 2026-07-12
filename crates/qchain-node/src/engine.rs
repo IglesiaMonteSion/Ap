@@ -1016,10 +1016,41 @@ impl Engine {
             let round = state.next_round;
             if round > 0 {
                 let prev_round = round - 1;
-                let stake: u64 =
-                    state.dag.certificates_in_round(prev_round).map(|c| self.validators.stake_of(&c.vertex.author)).sum();
-                if stake < self.validators.quorum_threshold() {
-                    return;
+                let quorum = self.validators.quorum_threshold();
+                // Real permanent-freeze regression found live while
+                // building the dashboard (restarting a persisted
+                // single-validator node for a screenshot): this gate's
+                // only source of "round `prev_round` really had quorum"
+                // evidence is the in-memory DAG, which `round_checkpoint`
+                // deliberately does not persist. In a multi-validator
+                // network that's fine - a restarted validator's peers keep
+                // proposing new rounds, and receiving those organically
+                // re-syncs the missing certificate via the existing
+                // missing-parent request path. A validator whose own stake
+                // *alone* already meets quorum (always true for n=1, and
+                // for any real "dominant validator" topology) has no such
+                // peer to rely on and would otherwise stall here forever
+                // after every restart - confirmed live: single validator,
+                // `data_dir` set, killed and restarted, `next_round`/
+                // `dag_certificates` frozen for 10+ real seconds.
+                // Sound, not a weakened check: `state.next_round` only
+                // ever advances past a round *after* this exact gate
+                // passed for it (a few lines below, `state.next_round =
+                // round + 1`), so `next_round > 0` alone already proves a
+                // prior process lifetime satisfied quorum for every round
+                // up to `prev_round` - re-deriving that from DAG content
+                // that was never guaranteed to survive a restart is
+                // unnecessary when this validator's own stake was always
+                // sufficient on its own. Does not change behavior for a
+                // real spread-stake network (there, no single validator's
+                // stake reaches quorum alone, so the check below still
+                // runs exactly as before).
+                if self.validators.stake_of(&self.self_id) < quorum {
+                    let stake: u64 =
+                        state.dag.certificates_in_round(prev_round).map(|c| self.validators.stake_of(&c.vertex.author)).sum();
+                    if stake < quorum {
+                        return;
+                    }
                 }
             }
 

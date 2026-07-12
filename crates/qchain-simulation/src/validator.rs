@@ -115,9 +115,20 @@ impl SimValidator {
         let round = self.next_round;
         if round > 0 {
             let prev = round - 1;
-            let stake: u64 = self.dag.certificates_in_round(prev).map(|c| validators.stake_of(&c.vertex.author)).sum();
-            if stake < validators.quorum_threshold() {
-                return vec![];
+            let quorum = validators.quorum_threshold();
+            // Mirrors the real fix in `qchain-node::engine::propose_round`
+            // (see its doc comment for the full real-world reproduction):
+            // a validator whose own stake alone already meets quorum can
+            // never be stuck waiting on DAG content the harness (like
+            // `round_checkpoint` for the real node) doesn't persist -
+            // `next_round > 0` alone already proves a prior tick satisfied
+            // this same gate. Does not change behavior when no single
+            // validator's stake reaches quorum alone.
+            if validators.stake_of(&self.id) < quorum {
+                let stake: u64 = self.dag.certificates_in_round(prev).map(|c| validators.stake_of(&c.vertex.author)).sum();
+                if stake < quorum {
+                    return vec![];
+                }
             }
         }
         let parents: Vec<Digest> = if round == 0 {
@@ -300,5 +311,95 @@ impl SimValidator {
     pub fn try_commit(&mut self, validators: &ValidatorSet) {
         let newly = self.consensus.advance(&self.dag, validators);
         self.committed_order.extend(newly);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qchain_consensus::ValidatorInfo;
+
+    /// The exact real bug this closes (see `maybe_propose`'s doc comment
+    /// and `qchain-node::engine::propose_round`'s, and
+    /// `project-lessons-learned`): reproduces a real validator's process
+    /// restart by advancing `next_round` normally, then wiping `dag` while
+    /// leaving `next_round` untouched - exactly what `round_checkpoint`
+    /// persistence does for a real node (it persists the round number but
+    /// deliberately not the DAG's certificate content). A single validator
+    /// has no peer to ever resupply the wiped round's certificate, so
+    /// without the fix this would never propose again.
+    #[test]
+    fn a_solo_validator_resuming_with_an_empty_dag_but_an_already_advanced_next_round_keeps_proposing() {
+        let kp = Keypair::generate().unwrap();
+        let info = ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake: 1 };
+        let validators = ValidatorSet::new(vec![info]);
+        let mut v = SimValidator::new(kp.pubkey(), kp, ByzantineBehavior::Honest);
+
+        // Advance a few real rounds with no peers - a lone validator
+        // self-certifies every round immediately (its own stake alone
+        // already meets quorum), same as a real single-validator network.
+        // `maybe_propose`'s return value is only the *peer-directed*
+        // messages to send (empty with zero peers, regardless of whether
+        // this validator itself actually advanced) - `next_round` ticking
+        // up is the real, peer-independent signal that it proposed and
+        // self-certified.
+        for i in 0..3 {
+            v.maybe_propose(&validators, &[]);
+            assert_eq!(v.next_round, i + 1, "next_round must advance by one on every real proposal");
+        }
+
+        // Simulate the restart: next_round survives (this is exactly what
+        // `round_checkpoint` persists for the real node), the DAG's
+        // certificate content does not.
+        v.dag = DagStore::new();
+        v.own_pending_vertex = None;
+
+        v.maybe_propose(&validators, &[]);
+        assert_eq!(v.next_round, 4, "a solo validator must keep proposing (next_round must actually advance) after resuming from a persisted round with no local certificate history - this is the real bug that was found live");
+    }
+
+    /// A second, deeper real bug found live in the same restart
+    /// reproduction as the one above: fixing `maybe_propose`/
+    /// `propose_round` restores round *proposal* liveness (certificates
+    /// keep forming, `next_round` keeps climbing), but `ConsensusState::
+    /// advance` unconditionally started walking Bullshark's total order
+    /// from round `0` - permanently `Undecided` once the DAG's content
+    /// before the restart is gone, since round 0 can never resolve
+    /// (`qchain-node`'s `/status` looked alive - `next_round`/
+    /// `dag_certificates` climbing - while `executed_transactions` stayed
+    /// frozen forever and no new transaction ever actually committed).
+    /// Confirms `ConsensusState::resuming_from` closes it: committed order
+    /// keeps growing after a restart with an empty DAG, not just proposals.
+    #[test]
+    fn a_solo_validator_resuming_also_keeps_committing_new_rounds_not_just_proposing_them() {
+        let kp = Keypair::generate().unwrap();
+        let info = ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake: 1 };
+        let validators = ValidatorSet::new(vec![info]);
+        let mut v = SimValidator::new(kp.pubkey(), kp, ByzantineBehavior::Honest);
+
+        for _ in 0..3 {
+            v.maybe_propose(&validators, &[]);
+            v.try_commit(&validators);
+        }
+        let committed_before_restart = v.committed_order.len();
+        assert!(committed_before_restart > 0, "at least one round must have genuinely committed before the simulated restart");
+
+        // Simulate the restart exactly like the sibling test above, but
+        // this time also reset `consensus` the way `qchain-node::main.rs`
+        // now does: resuming from the persisted `next_round`, not a fresh
+        // `ConsensusState::new()` (which would silently reintroduce this
+        // exact bug by trying to resolve from round 0 again).
+        v.dag = DagStore::new();
+        v.own_pending_vertex = None;
+        v.consensus = ConsensusState::resuming_from(v.next_round);
+
+        for _ in 0..3 {
+            v.maybe_propose(&validators, &[]);
+            v.try_commit(&validators);
+        }
+        assert!(
+            v.committed_order.len() > committed_before_restart,
+            "committed_order must keep growing after resuming - a validator whose status page shows rounds advancing but never gains new committed/executed transactions is the real, more dangerous shape of this bug"
+        );
     }
 }

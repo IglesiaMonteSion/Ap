@@ -126,6 +126,37 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");
     }
 
+    // Real bug found live building this exact fix, one layer deeper than
+    // the `propose_round` gate it pairs with: `ConsensusState::
+    // resuming_from` is only safe to use when this validator's own stake
+    // alone already meets quorum (the same condition `propose_round`
+    // guards its fast path on) - in that case, and only that case, nobody
+    // else could have certified anything while it was down, so whatever
+    // it proposes after resuming genuinely has no real ancestor history
+    // to walk. For a validator that is *not* dominant, its peers kept
+    // producing real certificates the whole time, each carrying REAL
+    // parent links reaching all the way back past this validator's
+    // checkpoint round - `walk_causal_history` follows those parent links
+    // regardless of where `extend_order`'s outer loop starts, so
+    // `resuming_from(next_round)` doesn't skip that walk, it just makes
+    // `seen` start empty right before the walk needs to redo it - and
+    // unlike the round-by-round outer loop (which caches each round's
+    // walk in `seen` incrementally, safe against `ConsensusState::new()`),
+    // a `walk_causal_history` call that fails partway (an ancestor still
+    // being resynced) caches *nothing*, so the whole multi-round walk
+    // gets redone from scratch on every single incoming message during
+    // resync - confirmed live: a real 3-validator testnet, stakes spread
+    // evenly (no validator dominant), one validator restarted after a
+    // real gap - CPU pinned at 200%+ and RSS climbing into the hundreds
+    // of MB within seconds, RPC completely unresponsive, while the exact
+    // same scenario with `ConsensusState::new()` recovered in under a
+    // second. Falling back to `ConsensusState::new()` for the non-dominant
+    // case costs nothing here - it's exactly what already worked before
+    // this fix existed, and that path never even reaches `resuming_from`'s
+    // added behavior in the first place.
+    let consensus =
+        if validators.stake_of(&self_id) >= validators.quorum_threshold() { ConsensusState::resuming_from(next_round) } else { ConsensusState::new() };
+
     let engine = Arc::new(Engine {
         self_id,
         keypair,
@@ -135,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
             dag: DagStore::new(),
-            consensus: ConsensusState::new(),
+            consensus,
             mempool: HashMap::new(),
             batches: HashMap::new(),
             pending_votes: HashMap::new(),
