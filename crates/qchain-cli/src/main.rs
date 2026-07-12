@@ -405,6 +405,19 @@ enum Command {
     /// trusts nothing the node says beyond the raw proof bytes and public
     /// inputs, unlike `balance`/`params`/etc., which just print whatever
     /// the node reports.
+    ///
+    /// Honest limit of local verification alone, not fixed by any check
+    /// this command can run: `verify_batch_bound_to_state` proves the
+    /// batch is *internally* consistent (real conservation of value, real
+    /// Merkle inclusion proofs, roots chaining row to row) - it cannot
+    /// prove the very first row's claimed starting root is genuinely this
+    /// network's real history, since a single fully malicious node
+    /// controls both `/stark_proof` and everything it binds to. Every
+    /// light client design has this same "weak subjectivity" gap (Bitcoin
+    /// SPV, Ethereum light clients included) - the real mitigation is
+    /// asking multiple independently-operated nodes and comparing, the
+    /// same trust-reduction `load-test --monitor` already uses for a
+    /// different purpose. `--cross-check-rpc` does exactly that here.
     LightClientVerify {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
@@ -412,6 +425,15 @@ enum Command {
         /// instead of every one the node has ever recorded.
         #[arg(long)]
         limit: Option<usize>,
+        /// Additional, independently-operated nodes to cross-check
+        /// against - each fetches and verifies its *own* proof
+        /// independently (never trusting `rpc`'s bytes), then this
+        /// command compares the resulting final root across all of them.
+        /// Pass multiple times for more nodes. See this command's own doc
+        /// comment for why this matters: local verification alone can't
+        /// tell a single lying node from the real network.
+        #[arg(long = "cross-check-rpc")]
+        cross_check_rpc: Vec<String>,
     },
 }
 
@@ -452,6 +474,34 @@ struct StarkProofWire {
     pub_inputs: qchain_stark::PublicInputs,
     bindings: Vec<qchain_stark::RowStateBinding>,
     row_count: usize,
+}
+
+/// Fetches `/stark_proof` from `rpc`, verifies it entirely locally (never
+/// trusting anything the node says beyond the raw proof bytes), and
+/// returns the batch's final bound root - the state this node's local
+/// verification actually vouches for. See `LightClientVerify`'s own doc
+/// comment for why a single call to this function can't, by itself, prove
+/// that final root is genuinely this network's real history rather than a
+/// self-consistent fake one - callers wanting that assurance should call
+/// this against multiple independently-operated nodes and compare results.
+fn fetch_and_verify_stark_proof(rpc: &str, limit: Option<usize>) -> anyhow::Result<[u8; 32]> {
+    let mut url = format!("{rpc}/stark_proof");
+    if let Some(limit) = limit {
+        url = format!("{url}?limit={limit}");
+    }
+    let resp = reqwest::blocking::get(&url)?;
+    if !resp.status().is_success() {
+        anyhow::bail!("node refused to serve a proof: {}", resp.text()?);
+    }
+    let wire: StarkProofWire = resp.json()?;
+
+    let proof_bytes = hex::decode(&wire.proof)?;
+    let proof = qchain_stark::Proof::from_bytes(&proof_bytes).map_err(|e| anyhow::anyhow!("malformed proof bytes: {e}"))?;
+    let final_root = wire.bindings.last().ok_or_else(|| anyhow::anyhow!("proof carries no row bindings"))?.root_after;
+
+    println!("{rpc}: fetched a proof over {} row(s) ({} proof bytes)", wire.row_count, proof_bytes.len());
+    qchain_stark::verify_batch_bound_to_state(proof, wire.pub_inputs, &wire.bindings)?;
+    Ok(final_root)
 }
 
 fn fetch_executed_count(rpc: &str) -> anyhow::Result<u64> {
@@ -881,26 +931,37 @@ fn main() -> anyhow::Result<()> {
             let body = submit_instruction(&rpc, &payer, program_pk, account_pks, data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
-        Command::LightClientVerify { rpc, limit } => {
-            let mut url = format!("{rpc}/stark_proof");
-            if let Some(limit) = limit {
-                url = format!("{url}?limit={limit}");
-            }
-            let resp = reqwest::blocking::get(&url)?;
-            if !resp.status().is_success() {
-                anyhow::bail!("node refused to serve a proof: {}", resp.text()?);
-            }
-            let wire: StarkProofWire = resp.json()?;
+        Command::LightClientVerify { rpc, limit, cross_check_rpc } => {
+            let final_root = fetch_and_verify_stark_proof(&rpc, limit)?;
+            println!("{rpc}: verified locally: every row's conservation equation, u64 range check, and real Merkle root transition checks out");
 
-            // Everything past this point is checked locally, not just
-            // printed - a light client that only parsed and echoed the
-            // response back wouldn't be verifying anything at all.
-            let proof_bytes = hex::decode(&wire.proof)?;
-            let proof = qchain_stark::Proof::from_bytes(&proof_bytes).map_err(|e| anyhow::anyhow!("malformed proof bytes: {e}"))?;
-
-            println!("fetched a proof over {} row(s) ({} proof bytes) from {rpc}", wire.row_count, proof_bytes.len());
-            qchain_stark::verify_batch_bound_to_state(proof, wire.pub_inputs, &wire.bindings)?;
-            println!("verified locally: every row's conservation equation, u64 range check, and real Merkle root transition checks out");
+            if !cross_check_rpc.is_empty() {
+                // Each of these independently fetches and verifies its
+                // *own* proof - never the primary's bytes - so a match
+                // here means N separately-operated nodes each produced
+                // real, locally-verified evidence of the same final
+                // state, not just that they returned identical bytes.
+                let mut disagreement = false;
+                for peer in &cross_check_rpc {
+                    match fetch_and_verify_stark_proof(peer, limit) {
+                        Ok(peer_root) if peer_root == final_root => {
+                            println!("{peer}: verified locally, final root matches {rpc}");
+                        }
+                        Ok(peer_root) => {
+                            disagreement = true;
+                            println!("{peer}: verified locally, but its final root ({}) does NOT match {rpc}'s ({}) - possible fork or a lying node", hex::encode(peer_root), hex::encode(final_root));
+                        }
+                        Err(e) => {
+                            disagreement = true;
+                            println!("{peer}: failed to independently verify: {e}");
+                        }
+                    }
+                }
+                if disagreement {
+                    anyhow::bail!("cross-check disagreement - do not trust {rpc} alone, see warnings above");
+                }
+                println!("all {} node(s) (primary + cross-checked) independently agree on the final state", 1 + cross_check_rpc.len());
+            }
         }
     }
     Ok(())
