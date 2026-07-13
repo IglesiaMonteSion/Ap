@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
-  "released": "genesis",
-  "notes": "Primera versión pública de qchain. La versión que corre cada nodo se toma del Cargo.toml del workspace (env!(CARGO_PKG_VERSION)) y se anuncia a los pares; este archivo es la referencia humana/tooling de la última versión. Para cortar una nueva versión: subí `version` en Cargo.toml (raíz), actualizá este archivo, commiteá, y recompilá/actualizá los nodos con deploy/update-node.sh."
+  "version": "1.1.0",
+  "released": "2026-07-13",
+  "notes": "Segunda versión. Cambios desde 1.0.0: wallet web (qchain-wallet) para crear wallets, ver balances y transferir desde el navegador, con protección por contraseña para exponerla a internet de forma segura; instalador que construye la imagen desde el código automáticamente y usa el script oficial de Docker (arregla Ubuntu/no-Debian); persistencia real del DAG en disco con poda por ventana de ronda; state/snapshot sync verificado para validadores muy atrasados; delimitadores de longitud en los digests; validación de corrupción al arrancar el store; paginación real de snapshots; y caminatas causales iterativas (sin desbordar el stack). La versión que corre cada nodo se toma del Cargo.toml del workspace (env!(CARGO_PKG_VERSION)) y se anuncia a los pares; este archivo es la referencia humana/tooling de la última versión. Para cortar una nueva versión: subí `version` en Cargo.toml (raíz), actualizá este archivo, commiteá, y recompilá/actualizá los nodos con deploy/update-node.sh."
 }
