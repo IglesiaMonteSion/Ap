@@ -421,6 +421,13 @@ impl NativeProgram for StakingProgram {
             StakingInstruction::ReportEquivocation { evidence } => {
                 let stake_pk =
                     *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[0]".into()))?;
+                // Optional accounts[1] = the staking-stats singleton. The CLI
+                // always passes it (see `report-equivocation`), so in practice
+                // it is always present and the global `total_staked` counter
+                // is kept correct; it's tolerated-absent only so a caller that
+                // omits it degrades to a no-op on the counter rather than a
+                // hard rejection (the slash itself still applies either way).
+                let stats_pk = instruction.accounts.get(1).copied();
 
                 if evidence.vertex_a.round != evidence.vertex_b.round || evidence.vertex_a.author != evidence.vertex_b.author {
                     return Err(ExecError::ProgramError("evidence must reference the same (round, author)".into()));
@@ -465,11 +472,27 @@ impl NativeProgram for StakingProgram {
                 // validators): it simply leaves circulating supply, same
                 // as the existing burn-half-of-fees pattern elsewhere in
                 // this codebase.
+                let slashed = data.amount;
                 data.amount = 0;
                 data.reward_debt = 0;
                 let stake_account = accounts.get_mut(&stake_pk).unwrap();
                 stake_account.balance = 0;
                 stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+
+                // Decrement the global `total_staked` counter by the slashed
+                // amount - the same bookkeeping `Undelegate` does when a
+                // position leaves. Without this the counter stays inflated
+                // forever after any slash, permanently under-crediting honest
+                // delegators' reward-per-share (which divides by
+                // `total_staked`) and understating governance participation
+                // (which measures turnout against it). `saturating_sub`
+                // guards against any pre-existing desync rather than
+                // underflowing.
+                if let Some(stats_pk) = stats_pk {
+                    let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
+                    let total = read_stats(stats)?.saturating_sub(slashed);
+                    stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                }
             }
         }
         Ok(())
@@ -834,6 +857,45 @@ mod tests {
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
         assert_eq!(data.amount, 0);
         assert_eq!(data.reward_debt, 0);
+    }
+
+    /// A slash must also decrement the global `total_staked` counter by the
+    /// burned amount, exactly like a normal `Undelegate` does - otherwise the
+    /// counter stays permanently inflated, under-crediting honest delegators'
+    /// reward-per-share and understating governance turnout forever after any
+    /// slash. Verifies the counter drops by exactly the slashed amount when
+    /// the stats account is passed as accounts[1].
+    #[test]
+    fn report_equivocation_also_decrements_the_global_total_staked_counter() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([32u8; 32]);
+        let reporter = Pubkey::new([33u8; 32]);
+        // Stats starts at 8,000,000 (the accused's 5,000,000 self-stake plus
+        // an unrelated 3,000,000 that must survive the slash untouched).
+        let mut accounts = HashMap::from([
+            (
+                stake_pk,
+                Account {
+                    data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                    balance: 5_000_000,
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
+            (STAKING_STATS_ID, Account { data: borsh::to_vec(&8_000_000u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }),
+        ]);
+
+        let evidence = conflicting_evidence(&validator_kp, 9);
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &ix, &reporter, 0).unwrap();
+
+        assert_eq!(accounts[&stake_pk].balance, 0, "the self-stake is burned");
+        let total: u64 = borsh::BorshDeserialize::try_from_slice(&accounts[&STAKING_STATS_ID].data).unwrap();
+        assert_eq!(total, 3_000_000, "total_staked must drop by exactly the slashed 5,000,000, leaving the unrelated 3,000,000");
     }
 
     /// The exact real, live-confirmed slash-evasion race this closes (see

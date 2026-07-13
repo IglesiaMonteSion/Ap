@@ -480,6 +480,8 @@ pub enum VerifyError {
     Stark(#[from] winterfell::VerifierError),
     #[error("public value at column {column}, step {step} exceeds u64::MAX - not a real non-negative u64")]
     ValueOutOfU64Range { column: usize, step: usize },
+    #[error("malformed proof rejected before verification (e.g. wrong trace width)")]
+    Malformed,
 }
 
 fn is_valid_u64(value: BaseElement) -> bool {
@@ -494,11 +496,25 @@ fn is_valid_u64(value: BaseElement) -> bool {
 /// module docs without an in-circuit bit-decomposition gadget.
 pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), VerifyError> {
     let min_opts = winterfell::AcceptableOptions::MinConjecturedSecurity(95);
-    winterfell::verify::<TransferAir, Blake3_256<BaseElement>, DefaultRandomCoin<Blake3_256<BaseElement>>, MerkleTree<Blake3_256<BaseElement>>>(
-        proof,
-        pub_inputs.clone(),
-        &min_opts,
-    )?;
+    // `catch_unwind`: `winterfell::verify` reconstructs the AIR from the
+    // *proof's own* trace metadata, and `TransferAir::new` asserts a fixed
+    // 14-column trace width (`assert_eq!`). A proof is untrusted input here -
+    // it arrives over RPC from a possibly-malicious node (the light client's
+    // `light-client-verify`, including its multi-node `--cross-check-rpc`
+    // path, and the node's own pre-serve self-verify). A proof declaring a
+    // different width would otherwise panic and crash the verifier instead of
+    // being cleanly rejected - a DoS, though not a soundness break (a genuine
+    // forge still can't verify). Same tool this crate already uses for
+    // Winterfell's debug-only internal panics.
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        winterfell::verify::<TransferAir, Blake3_256<BaseElement>, DefaultRandomCoin<Blake3_256<BaseElement>>, MerkleTree<Blake3_256<BaseElement>>>(
+            proof,
+            pub_inputs.clone(),
+            &min_opts,
+        )
+    }))
+    .map_err(|_| VerifyError::Malformed)?;
+    verified?;
     for (column, values) in pub_inputs.columns.iter().enumerate() {
         for (step, &value) in values.iter().enumerate() {
             if !is_valid_u64(value) {

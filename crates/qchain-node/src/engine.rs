@@ -80,6 +80,42 @@ const WORKER_COUNT: u8 = 4;
 /// generous "recent activity" window for a real light-client caller.
 const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 
+/// Hard cap on how many not-yet-ready transactions a single payer may have
+/// queued in this validator's mempool at once. Bounds the real,
+/// unbounded-growth mempool OOM this closes: `payer_can_afford_admission`
+/// checks only that the payer can afford *one* transaction's byte fee, and
+/// `drain_ready_transactions` only ever removes transactions at or
+/// consecutively above the account's current nonce - so a payer that submits
+/// at nonces `1, 2, 3, …` (deliberately never nonce 0, or leaving any gap)
+/// has *nothing* drain, and every one still passes admission (the balance is
+/// never decremented at admission time) and is gossiped network-wide. Left
+/// generous - far above the ~300 `qchain-cli load-test` legitimately queues -
+/// so real burst submission is never the limiting factor, while still
+/// bounding worst-case memory per account to a fixed multiple of one
+/// transaction's size instead of "however many the attacker cares to send."
+const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
+
+/// Hard cap on cached worker batches. `batches` is fed by unauthenticated
+/// `WorkerBatchGossip`/`WorkerBatchResponse` whose keys are content-derived
+/// digests an attacker fully controls, so without a bound a peer can stream
+/// unlimited distinct junk batches into it - the same unbounded-growth OOM
+/// class. Consumed batches are dropped as their certificates commit (see
+/// `try_commit`); this cap is the backstop for batches that are gossiped but
+/// never end up committed. Generous relative to `WORKER_COUNT` lanes across a
+/// realistic in-flight round window.
+const MAX_CACHED_BATCHES: usize = 65_536;
+
+/// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
+/// `first_seen_vertex`) to retain behind the current round before pruning.
+/// These maps gain ~one entry per validator per round *forever* otherwise -
+/// a slow but certain OOM on a long-running validator with no attacker at
+/// all. A round this far behind the current one can no longer be voted on or
+/// have a first-seen vertex that still matters (any equivocation already
+/// observed for it is preserved separately in `equivocation_evidence`, which
+/// only grows on genuine, slashable misbehavior). Comfortably larger than any
+/// resync gap a live validator recovers across in practice.
+const ROUND_STATE_RETENTION: Round = 512;
+
 /// How many of `available` receipts a single `/stark_proof` call actually
 /// proves, given what the caller requested (`None` meaning "all of them").
 /// Always `<= MAX_STARK_PROOF_RECEIPTS` and `<= available` - see
@@ -268,8 +304,48 @@ pub enum StarkProofError {
 /// validator's mempool, which is what the demonstrated attack needed.
 fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
     let balance = state.ledger.store().get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
-    let byte_fee = state.ledger.current_params().base_fee_per_byte * tx.byte_size() as u64;
+    // `saturating_mul`, not `*`: `base_fee_per_byte` is governance-settable
+    // (Low tier, no hard upper bound), so a near-`u64::MAX` value times a
+    // multi-KB `byte_size` overflows. A plain `*` would wrap to a small
+    // number in release and wrongly admit; saturating pins it at `u64::MAX`
+    // so an over-large fee simply makes nothing affordable, matching intent.
+    let byte_fee = state.ledger.current_params().base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
     balance >= byte_fee
+}
+
+/// Inserts `tx` into the per-account, nonce-ordered mempool, enforcing the
+/// per-payer queue cap (`MAX_MEMPOOL_TXS_PER_PAYER`). Returns `false`
+/// (without inserting) if this payer is already at the cap and `tx` is a new
+/// nonce for it - the bound that closes the unbounded-mempool OOM (see
+/// `MAX_MEMPOOL_TXS_PER_PAYER`'s doc comment). A resubmission of a
+/// (payer, nonce) pair already queued is accepted as a no-op (returns
+/// `true`, keeps the first-seen transaction) and never counts against the
+/// cap, so an honest client retrying is never turned away. Shared by both
+/// admission entry points (RPC `submit_transaction` and the gossip handler)
+/// so the bound can't be enforced in one and forgotten in the other.
+fn admit_to_mempool(state: &mut EngineState, tx: Transaction) -> bool {
+    let queue = state.mempool.entry(tx.message.payer).or_default();
+    if !queue.contains_key(&tx.message.nonce) && queue.len() >= MAX_MEMPOOL_TXS_PER_PAYER {
+        return false;
+    }
+    queue.entry(tx.message.nonce).or_insert(tx);
+    true
+}
+
+/// Caches a gossiped/served worker batch by its content digest, enforcing
+/// the `MAX_CACHED_BATCHES` bound (see its doc comment for the unauthenticated
+/// flood this closes). A batch whose digest is already cached is a no-op; a
+/// genuinely new one is dropped, not inserted, once the cap is reached -
+/// consumed batches are already evicted as their certificates commit
+/// (`try_commit`), so hitting the cap means an abnormal volume of batches
+/// that were gossiped but never committed, i.e. exactly the flood this guards
+/// against. Dropping here is safe: a validator that later genuinely needs a
+/// dropped batch re-requests it by digest (`request_missing_batches`).
+fn cache_batch(state: &mut EngineState, batch: Batch) {
+    let digest = batch.digest();
+    if state.batches.contains_key(&digest) || state.batches.len() < MAX_CACHED_BATCHES {
+        state.batches.entry(digest).or_insert(batch);
+    }
 }
 
 /// Pulls every transaction that's actually ready to execute out of the
@@ -337,7 +413,9 @@ impl Engine {
             if !payer_can_afford_admission(&state, &tx) {
                 anyhow::bail!("payer cannot afford this transaction's byte fee");
             }
-            state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx.clone());
+            if !admit_to_mempool(&mut state, tx.clone()) {
+                anyhow::bail!("payer already has the maximum number of queued transactions ({MAX_MEMPOOL_TXS_PER_PAYER})");
+            }
         }
         self.network.broadcast(&NetMessage::TransactionGossip(tx)).await;
         Ok(hash)
@@ -508,16 +586,17 @@ impl Engine {
                     tracing::warn!("dropping gossiped transaction from {from} whose payer cannot afford its byte fee");
                     return;
                 }
-                state.mempool.entry(tx.message.payer).or_default().entry(tx.message.nonce).or_insert(tx);
+                if !admit_to_mempool(&mut state, tx) {
+                    tracing::warn!("dropping gossiped transaction from {from}: payer already at the mempool queue cap");
+                }
                 // Not re-broadcast further - this project's validator sets
                 // are fully connected (see `NetMessage::TransactionGossip`'s
                 // doc comment), so the originating validator's own
                 // broadcast already reached every peer in one hop.
             }
             NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
-                let digest = batch.digest();
                 let mut state = self.state.lock().await;
-                state.batches.entry(digest).or_insert(batch);
+                cache_batch(&mut state, batch);
             }
             NetMessage::VertexProposal { vertex, author_signature } => {
                 if vertex.author != from {
@@ -609,6 +688,40 @@ impl Engine {
                 }
             }
             NetMessage::Vote { vertex_digest, signature } => {
+                // Verify the vote BEFORE it is ever recorded - closes two
+                // real problems at once, both live-confirmed as a class this
+                // project keeps hitting (unbounded/unauthenticated growth):
+                //
+                // (1) DoS/OOM: `record_vote` used to insert into
+                //     `pending_votes` unconditionally, before any check.
+                //     The P2P transport is unauthenticated (see
+                //     `qchain-network`'s `message.rs`), so anyone who can
+                //     reach the port could stream `Vote { random_digest,
+                //     garbage_sig }` with a spoofed sender - each distinct
+                //     random digest a new never-pruned map key holding a
+                //     full `MultiSignature` (~KB). No funding, no valid key,
+                //     no restart needed - the cheapest OOM in the codebase.
+                // (2) Soundness of quorum counting: `record_vote` sums
+                //     `stake_of(voter)` over the recorded voters to decide
+                //     when its own vertex reaches quorum. Counting an
+                //     unverified (or spoofed-sender) vote toward that sum let
+                //     a peer inflate the apparent tally and trigger a
+                //     `CertificateBroadcast` that every honest receiver then
+                //     rejects in `verify_certificate` - wasted work at best.
+                //
+                // Requiring the sender to be a known validator and the
+                // signature to verify over the exact voted digest (the same
+                // `qchain_crypto::verify` check the `VertexProposal` arm
+                // already applies to an author's signature) means only real,
+                // attributable votes are ever stored or counted.
+                let Some(voter_info) = self.validators.get(&from) else {
+                    tracing::warn!("dropping vote from unknown validator {from}");
+                    return;
+                };
+                if !qchain_crypto::verify(&voter_info.pubkey_bundle, &vertex_digest[..], &signature) {
+                    tracing::warn!("dropping vote from {from} whose signature does not verify over the voted digest");
+                    return;
+                }
                 if let Some(cert) = self.record_vote(vertex_digest, from, signature).await {
                     self.network.broadcast(&NetMessage::CertificateBroadcast(cert)).await;
                     self.try_commit().await;
@@ -667,9 +780,8 @@ impl Engine {
                 }
             }
             NetMessage::WorkerBatchResponse { worker_id: _, batch } => {
-                let digest = batch.digest();
                 let mut state = self.state.lock().await;
-                state.batches.entry(digest).or_insert(batch);
+                cache_batch(&mut state, batch);
             }
         }
     }
@@ -905,6 +1017,25 @@ impl Engine {
         }
     }
 
+    /// Drops `(round, author)`-keyed bookkeeping for rounds more than
+    /// `ROUND_STATE_RETENTION` behind the current round - the bound that
+    /// closes the slow, attacker-free `voted_for`/`first_seen_vertex` OOM
+    /// (see `ROUND_STATE_RETENTION`'s doc comment: without this these maps
+    /// gain ~one entry per validator per round forever). Called every tick.
+    /// `equivocation_evidence` is deliberately NOT pruned here - it only ever
+    /// grows on genuine, slashable misbehavior (rare, and each entry is
+    /// real evidence someone may still want to submit), unlike the two maps
+    /// pruned here which gain an entry every single round unconditionally.
+    pub async fn prune_stale_round_state(&self) {
+        let mut state = self.state.lock().await;
+        let horizon = state.next_round.saturating_sub(ROUND_STATE_RETENTION);
+        if horizon == 0 {
+            return;
+        }
+        state.voted_for.retain(|(round, _), _| *round >= horizon);
+        state.first_seen_vertex.retain(|(round, _), _| *round >= horizon);
+    }
+
     /// Records a vote toward whichever vertex this validator currently has
     /// pending certification. Returns the freshly-formed certificate the
     /// moment quorum stake is reached, `None` otherwise (including when the
@@ -912,12 +1043,24 @@ impl Engine {
     /// a vertex's author collects its votes).
     async fn record_vote(&self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature) -> Option<Certificate> {
         let mut state = self.state.lock().await;
-        state.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
 
-        let (vertex, _) = state.own_pending_vertex.as_ref()?;
-        if vertex.digest() != vertex_digest {
+        // Only a vertex's own author collects its votes, so only ever store
+        // votes for THIS validator's current pending proposal - checked
+        // before the insert, not after. Storing votes for any other digest
+        // (a vote for a peer's vertex, a late vote for an already-certified
+        // one, or - now that votes are verified at ingestion but a
+        // tolerated-Byzantine validator can still sign a vote over any
+        // 32-byte value it likes - a flood of validly-signed votes for
+        // fabricated digests) would leave permanent, never-pruned entries
+        // in `pending_votes`, the same unbounded-growth OOM class this
+        // project keeps closing. Bounded here to at most the vote set of a
+        // single proposal (~one entry per validator), cleared the moment
+        // that proposal certifies (below) or is replaced by the next one.
+        let own_digest = state.own_pending_vertex.as_ref().map(|(v, _)| v.digest());
+        if own_digest != Some(vertex_digest) {
             return None;
         }
+        state.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
 
         let stake: u64 = state.pending_votes[&vertex_digest].keys().map(|id| self.validators.stake_of(id)).sum();
         if stake < self.validators.quorum_threshold() {
@@ -943,19 +1086,21 @@ impl Engine {
         let newly_ordered = state.consensus.advance(&state.dag, &self.validators);
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
-            // Not removed on use: an empty (or otherwise coincidentally
-            // identical) batch can be referenced by more than one
-            // certificate (from different workers, or even different
-            // vertices), so the cache is keyed by content, not by a single
-            // certificate's claim on it. Phase-1 limitation: the cache is
-            // never pruned, so it grows with the number of distinct
-            // batches ever gossiped - fine at testnet scale, a real
-            // eviction policy is later work. Applied in the vertex's own
-            // `batch_digests` order (worker lane order at proposal time) -
-            // every validator sees the identical certified list, so this
-            // order is already agreed, not re-derived locally.
+            // Applied in the vertex's own `batch_digests` order (worker lane
+            // order at proposal time) - every validator sees the identical
+            // certified list, so this order is already agreed, not re-derived
+            // locally. Each consumed batch is then evicted from the cache: a
+            // batch is content-addressed and included by exactly one vertex,
+            // and once its transactions are committed they are applied for
+            // good (any later re-reference of the same digest would re-run
+            // no-ops rejected on the already-advanced nonce), so keeping it
+            // cached serves no purpose and would grow `batches` unboundedly.
+            // This is what keeps the cache scoped to in-flight (not-yet-
+            // committed) batches in steady state; `MAX_CACHED_BATCHES` is the
+            // backstop for gossiped-but-never-committed flood, not the
+            // primary bound.
             for (worker_id, batch_digest) in &cert.vertex.batch_digests {
-                let Some(batch) = state.batches.get(batch_digest).cloned() else {
+                let Some(batch) = state.batches.remove(batch_digest) else {
                     tracing::warn!("committed certificate references an unseen batch from worker {worker_id} - skipping its transactions");
                     continue;
                 };

@@ -19,6 +19,23 @@ members = [
 version = "0.1.0"
 edition = "2021"
 
+# Defense-in-depth for a ledger: catch integer overflow/underflow as a loud
+# panic instead of silently wrapping in release builds (Rust's release
+# default is to wrap). A wrapped `balance - amount` underflow would mint
+# money out of nothing; a wrapped stake/fee sum would corrupt quorum or fee
+# logic. Money paths in `qchain-execution` also use explicit `checked_*`
+# arithmetic that rejects the offending transaction gracefully (an
+# `ExecError`, not a panic) - this profile setting is the backstop for any
+# arithmetic site that ISN'T yet guarded, turning a silent-corruption latent
+# bug into an immediately-visible crash. `debug-assertions` is deliberately
+# left at the release default (off): turning it on would also enable
+# Winterfell's debug-only internal trace-consistency `panic!` in production
+# (documented in `qchain-stark`), which we do not want. Overhead is
+# negligible - the validator's dominant cost is liboqs PQC verification (C
+# code, unaffected), not Rust integer ops.
+[profile.release]
+overflow-checks = true
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

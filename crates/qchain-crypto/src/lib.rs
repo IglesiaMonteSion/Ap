@@ -33,7 +33,7 @@ pub mod registry;
 pub mod slh_dsa;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, VerifyingKey};
 use oqs::sig::{Algorithm as OqsAlgorithm, Sig};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -337,7 +337,17 @@ pub fn verify_ed25519_component(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -
     match VerifyingKey::from_bytes(pubkey) {
         Ok(vk) => {
             let dsig = DalekSignature::from_bytes(sig);
-            vk.verify(msg, &dsig).is_ok()
+            // `verify_strict`, not `verify`: the non-strict path accepts
+            // non-canonical `S`/`R` encodings, which makes ed25519 signatures
+            // malleable - an observer of a pending transaction could produce
+            // a variant signature that still verifies, changing the
+            // transaction's own hash (its Narwhal batch digest and RPC txid)
+            // without the payer's involvement. Nonce-based replay protection
+            // means this can't double-spend, but a stable txid is a real
+            // client-facing promise, and consensus vote/certificate digests
+            // should likewise not be third-party-malleable. `verify_strict`
+            // rejects the non-canonical encodings, closing it.
+            vk.verify_strict(msg, &dsig).is_ok()
         }
         Err(_) => false,
     }

@@ -636,7 +636,10 @@ fn main() -> anyhow::Result<()> {
             );
 
             let data = borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) })?;
-            let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk], data, nonce, fee_limit)?;
+            // accounts[1] = staking stats, so the slash also decrements the
+            // global `total_staked` counter (keeps reward-per-share and
+            // governance turnout accounting correct after a slash).
+            let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {

@@ -245,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 ticker.tick().await;
                 engine.propose_round().await;
                 engine.retry_pending_resync_requests().await;
+                engine.prune_stale_round_state().await;
             }
         });
     }

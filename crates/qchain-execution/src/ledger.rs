@@ -239,7 +239,15 @@ impl Ledger {
         self.check_registry_status(tx, is_first_transaction_from_this_payer)?;
 
         let params = self.current_params();
-        let byte_fee = params.base_fee_per_byte * tx.byte_size() as u64;
+        // `saturating_mul`, not `*`: `base_fee_per_byte` is governance-set
+        // (Low tier, unbounded above), so a near-`u64::MAX` value times a
+        // multi-KB `byte_size` overflows - a plain `*` wraps in release to a
+        // small/garbage fee (trivializing or bricking fee collection). This
+        // matches the sibling trap-billing path, which already uses
+        // `saturating_mul` (`bill_trapped_wasm_fuel`), and the admission-time
+        // check (`payer_can_afford_admission`). Saturation to `u64::MAX` here
+        // means the payer simply can't afford it and the tx is rejected.
+        let byte_fee = params.base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
         if payer_account.balance < byte_fee {
             return Err(ExecError::InsufficientFunds);
         }
@@ -458,7 +466,30 @@ impl Ledger {
             payer_after.balance -= total_gas_fee;
             self.total_burned += total_gas_fee / 2;
             let gas_validator_share = total_gas_fee - total_gas_fee / 2;
-            working.entry(*fee_collector).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id())).balance += gas_validator_share;
+            // Seed the fee collector's working-set entry from its REAL
+            // stored balance, exactly like the payer is seeded at the top of
+            // this function - never from a fresh zero-balance account. This
+            // is load-bearing, not cosmetic: `fee_collector` (the block
+            // proposer) is not the payer and is not listed in any
+            // instruction's `accounts` for a normal transaction, so it is
+            // absent from `working`. An `or_insert_with(Account::new_wallet)`
+            // here would fabricate a fresh zero-balance account holding only
+            // this one transaction's gas share, and the commit loop below
+            // (`write_account` is a full overwrite) would then clobber the
+            // validator's entire accumulated fee balance in the store with
+            // it - and, since that fresh account is system-owned and holds
+            // less than `dust_threshold`, the dust sweep would then zero even
+            // that. Net effect before this fix: every fuel-consuming WASM
+            // contract call wiped the proposer's balance to zero and silently
+            // broke supply conservation. Seeding from the store (`or_insert`
+            // only runs when absent; when `fee_collector` *is* already in
+            // `working` - e.g. it was also the payer - the existing entry is
+            // reused and this share is simply added on top) preserves the
+            // real balance in both cases.
+            working
+                .entry(*fee_collector)
+                .or_insert_with(|| self.store.get(fee_collector).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())))
+                .balance += gas_validator_share;
         }
 
         for (pk, mut account) in working {
@@ -573,7 +604,13 @@ impl Ledger {
             working.insert(*pk, account);
         }
 
-        Ok(result.fuel_consumed * gas_price_per_fuel)
+        // `saturating_mul`, matching `bill_trapped_wasm_fuel`'s trap path
+        // and the byte-fee computation: `gas_price_per_fuel` is
+        // governance-set with no hard upper bound, so a near-`u64::MAX`
+        // price times real fuel would wrap in release. Saturation makes an
+        // absurd price simply exceed any balance / `fee_limit` and reject,
+        // never wrap to a small charge.
+        Ok(result.fuel_consumed.saturating_mul(gas_price_per_fuel))
     }
 }
 
