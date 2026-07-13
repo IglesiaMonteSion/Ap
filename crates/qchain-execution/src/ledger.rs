@@ -96,6 +96,17 @@ impl Ledger {
         &self.transfer_receipts
     }
 
+    /// Restores previously-captured receipts (loaded from disk by
+    /// `qchain-node` on startup) as the initial history, oldest first, so
+    /// the transfer log survives a restart instead of being lost the way
+    /// an in-memory `Vec` alone would lose it. Called once, before the
+    /// node replays any committed transactions - replayed transactions are
+    /// rejected by the nonce check in `apply_transaction` and so never
+    /// re-append a duplicate receipt, keeping the restored history exact.
+    pub fn restore_receipts(&mut self, receipts: Vec<TransferReceipt>) {
+        self.transfer_receipts = receipts;
+    }
+
     /// Writes an account directly into the store - genesis-time seeding
     /// of program-owned singleton accounts (the staking-stats counter,
     /// the algorithm registry), not a user-facing operation like

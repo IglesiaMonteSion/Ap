@@ -57,7 +57,7 @@
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
-use qchain_execution::Ledger;
+use qchain_execution::{Ledger, TransferReceipt};
 use qchain_network::{NetMessage, Network};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -354,9 +354,43 @@ pub struct Engine {
     /// to one root (see `CachedSnapshot`/`snapshot_page`). Lazily captured on
     /// first request, refreshed past `SNAPSHOT_CACHE_TTL`.
     pub snapshot_cache: Mutex<Option<std::sync::Arc<CachedSnapshot>>>,
+    /// On-disk log of captured `TransferReceipt`s (a `sled` tree at
+    /// `data_dir/receipts`, `None` for an in-memory node), keyed by a
+    /// monotonic sequence so iteration yields them oldest-first. This is what
+    /// makes the transaction *history* (not just balances) survive a restart:
+    /// without it, the in-memory receipt `Vec` is empty on every boot and the
+    /// dashboard shows no past activity even though the ledger state is intact.
+    /// Best-effort persist, same contract as `cert_log`.
+    pub receipt_log: Option<sled::Db>,
 }
 
 impl Engine {
+    /// Appends a newly captured transfer receipt to the on-disk log, if this
+    /// node persists to disk. Keyed by a sled-generated monotonic id so the
+    /// on-disk order matches capture order (oldest first) on reload. Best-
+    /// effort: a disk error is logged, not fatal - a receipt that fails to
+    /// persist is just missing from history after a restart, never a
+    /// correctness problem (balances are the source of truth, via `SledStore`).
+    fn persist_receipt(&self, receipt: &TransferReceipt) {
+        if let Some(db) = &self.receipt_log {
+            let key = match db.generate_id() {
+                Ok(id) => id.to_be_bytes(),
+                Err(e) => {
+                    tracing::warn!("failed to allocate a receipt-log id: {e}");
+                    return;
+                }
+            };
+            match serde_json::to_vec(receipt) {
+                Ok(bytes) => {
+                    if let Err(e) = db.insert(key, bytes) {
+                        tracing::warn!("failed to persist a transfer receipt: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("failed to encode a transfer receipt for the log: {e}"),
+            }
+        }
+    }
+
     /// Inserts a verified certificate into the in-memory DAG and, if this
     /// node persists to disk, appends it to the on-disk cert log so a restart
     /// can reload it locally (see `Engine::cert_log`). Best-effort persist: a
@@ -1476,8 +1510,22 @@ impl Engine {
                     continue;
                 };
                 for tx in &batch.transactions {
+                    let receipts_before = state.ledger.transfer_receipts().len();
                     match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
-                        Ok(_) => state.executed += 1,
+                        Ok(_) => {
+                            state.executed += 1;
+                            // Persist any receipt this transaction captured, so the
+                            // transfer history survives a restart (see `receipt_log`).
+                            // A replay during restart re-derivation fails the nonce
+                            // check above and captures nothing, so this never
+                            // double-writes. Cloned out to end the immutable borrow
+                            // before the next mutable `apply_transaction`.
+                            let new: Vec<TransferReceipt> =
+                                state.ledger.transfer_receipts()[receipts_before..].to_vec();
+                            for r in &new {
+                                self.persist_receipt(r);
+                            }
+                        }
                         Err(e) => tracing::warn!("transaction execution failed: {e}"),
                     }
                 }

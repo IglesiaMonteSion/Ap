@@ -262,6 +262,33 @@ async fn main() -> anyhow::Result<()> {
         consensus.set_gc_floor(round);
     }
 
+    // Reload the transfer-history log (a `sled` tree at `data_dir/receipts`)
+    // so the dashboard's recent-activity list survives a restart/update -
+    // without this the receipts live only in memory and every boot shows an
+    // empty history even though balances (in `SledStore`) are intact. Loaded
+    // before the engine replays committed transactions: a replay hits the
+    // nonce check in `apply_transaction` and captures nothing, so the restored
+    // history stays exact (no duplicates). Corrupt entries are skipped, not
+    // fatal - history is a convenience view, not consensus state.
+    let receipt_log: Option<sled::Db> = match &config.data_dir {
+        Some(dir) => Some(sled::open(dir.join("receipts"))?),
+        None => None,
+    };
+    if let Some(db) = &receipt_log {
+        let mut loaded = Vec::new();
+        for entry in db.iter() {
+            let (_seq, bytes) = entry?;
+            match serde_json::from_slice::<qchain_execution::TransferReceipt>(&bytes) {
+                Ok(r) => loaded.push(r),
+                Err(e) => tracing::warn!("skipping a corrupt transfer receipt in the on-disk log: {e}"),
+            }
+        }
+        if !loaded.is_empty() {
+            tracing::info!("reloaded {} transfer receipts from the on-disk log", loaded.len());
+            ledger.restore_receipts(loaded);
+        }
+    }
+
     let engine = Arc::new(Engine {
         self_id,
         keypair,
@@ -269,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
         network,
         chain_id: config.chain_id(),
         cert_log,
+        receipt_log,
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
