@@ -101,10 +101,28 @@ async fn main() -> anyhow::Result<()> {
         password: password.clone(),
     });
 
-    let app = Router::new()
-        .route("/", get(index))
+    // Public routes: the non-custodial (WASM) wallet holds NO keys on the
+    // server - the private key is generated, encrypted and used entirely in the
+    // browser, protected by the user's own password there. So it needs no
+    // server login. Its endpoints are the static assets plus read-only proxies
+    // (chain_id, account) and a relay that just forwards an already-signed tx
+    // to the node's /tx (itself open) - no new attack surface. `/api/config`
+    // and `/api/node` are read-only and shared by both wallets.
+    let public = Router::new()
+        .route("/wasm", get(wasm_page))
+        .route("/wasm/qchain_wasm.js", get(wasm_js))
+        .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
+        .route("/api/chain_id", get(chain_id_ep))
+        .route("/api/account/:address", get(account_ep))
+        .route("/api/relay-tx", post(relay_tx))
         .route("/api/config", get(config))
-        .route("/api/node", get(node_status))
+        .route("/api/node", get(node_status));
+
+    // Protected routes: the custodial wallet (keys held on the server). These
+    // DO need the password gate - whoever reaches them could otherwise create,
+    // read, export or spend server-held wallets.
+    let protected = Router::new()
+        .route("/", get(index))
         .route("/api/wallets", get(list_wallets).post(new_wallet))
         .route("/api/balance/:address", get(balance))
         .route("/api/max/:name", get(max_amount))
@@ -114,17 +132,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/import", post(import_wallet))
         .route("/api/export/:name", get(export_wallet))
         .route("/api/export-encrypted", post(export_encrypted))
-        // Non-custodial (WASM) wallet: keys are generated, encrypted and used
-        // entirely in the browser. The server only serves the static assets
-        // and relays RPC (it never sees a private key).
-        .route("/wasm", get(wasm_page))
-        .route("/wasm/qchain_wasm.js", get(wasm_js))
-        .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
-        .route("/api/chain_id", get(chain_id_ep))
-        .route("/api/account/:address", get(account_ep))
-        .route("/api/relay-tx", post(relay_tx))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
-        .with_state(state);
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let app = public.merge(protected).with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
