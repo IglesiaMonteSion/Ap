@@ -219,6 +219,12 @@
       <div class="stat-card">
         <div class="stat-label">tx ejecutadas</div>
         <div class="stat-value" id="stat-executed">–</div>
+        <div class="stat-sub" id="stat-tps">&nbsp;</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">fee de transferencia</div>
+        <div class="stat-value" id="stat-fee">–</div>
+        <div class="stat-sub" id="stat-fee-sub">&nbsp;</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">recibos capturados</div>
@@ -242,7 +248,7 @@
       <div class="panel-sub">Transferencias que este validador ejecutó y confirmó — no un índice de toda la red, cada validador solo ve lo que él mismo procesó.</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>hash</th><th>desde</th><th>hacia</th><th>monto</th><th>fee</th></tr></thead>
+          <thead><tr><th>hash</th><th>desde</th><th>hacia</th><th>monto (QCH)</th><th>fee (QCH)</th></tr></thead>
           <tbody id="transfers-body"></tbody>
         </table>
       </div>
@@ -300,6 +306,19 @@ function fmtNum(n) {
   return typeof n === "number" ? n.toLocaleString("es") : n;
 }
 
+// Format a base-unit amount as human QCH (1 QCH = 1e9 unidades), thousands
+// with '.', decimals with ','. Uses BigInt so large balances don't lose
+// precision. Accepts a number or a string.
+function qch(units) {
+  let u;
+  try { u = BigInt(typeof units === "string" ? units : Math.trunc(units)); }
+  catch (e) { return String(units); }
+  const neg = u < 0n; if (neg) u = -u;
+  const intPart = (u / 1000000000n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  const frac = (u % 1000000000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return (neg ? "-" : "") + intPart + (frac ? "," + frac : "") + " QCH";
+}
+
 function toast(msg) {
   const el = document.getElementById("toast");
   el.textContent = msg;
@@ -321,6 +340,7 @@ function makeCopyable(el, getValue) {
 }
 
 let lastRoundSample = null; // { round, t }
+let lastTxSample = null; // { count, t } - for live TPS
 let liveOk = true;
 
 function setLive(ok) {
@@ -345,6 +365,30 @@ async function refreshStatus() {
     document.getElementById("stat-round").textContent = fmtNum(status.next_round);
     validatorAddr = status.validator;
     document.getElementById("stat-validator").textContent = short(validatorAddr, 10, 8);
+
+    // Live fee: base_fee_per_byte and the fee of a standard ~5.5 KB hybrid
+    // transfer (the exact size qchain-cli/the wallet build).
+    if (typeof status.base_fee_per_byte === "number") {
+      const transferFee = status.base_fee_per_byte * 5571;
+      document.getElementById("stat-fee").textContent = qch(transferFee);
+      document.getElementById("stat-fee-sub").textContent =
+        `${fmtNum(status.base_fee_per_byte)} u/byte`;
+    }
+
+    // Live TPS: executed-transaction delta over the sample window.
+    const nowTx = Date.now();
+    if (lastTxSample && nowTx > lastTxSample.t) {
+      const dTx = status.executed_transactions - lastTxSample.count;
+      const dS = (nowTx - lastTxSample.t) / 1000;
+      if (dS >= 1.5) {
+        const tps = dTx / dS;
+        document.getElementById("stat-tps").textContent =
+          tps > 0 ? `${tps.toFixed(1)} tx/s` : "sin tx recientes";
+        lastTxSample = { count: status.executed_transactions, t: nowTx };
+      }
+    } else if (!lastTxSample) {
+      lastTxSample = { count: status.executed_transactions, t: nowTx };
+    }
 
     const updateBanner = document.getElementById("update-banner");
     if (status.update_available) {
@@ -425,7 +469,7 @@ async function loadTransfers(reset = false) {
     emptyNote.hidden = true;
     for (const r of rows) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td class="mono">${short(r.tx_hash)}</td><td class="mono">${short(r.from)}</td><td class="mono">${short(r.to)}</td><td class="amount">${fmtNum(r.amount)}</td><td>${fmtNum(r.fee)}</td>`;
+      tr.innerHTML = `<td class="mono">${short(r.tx_hash)}</td><td class="mono">${short(r.from)}</td><td class="mono">${short(r.to)}</td><td class="amount">${qch(r.amount)}</td><td>${qch(r.fee)}</td>`;
       tr.addEventListener("click", () => showTransfer(r.tx_hash));
       body.appendChild(tr);
     }
@@ -442,8 +486,8 @@ function accountCard(title, address, before, after) {
     <h3>${title}</h3>
     <div class="kv">
       <dt>dirección</dt><dd class="mono">${short(address, 10, 8)}</dd>
-      <dt>balance antes</dt><dd>${fmtNum(before.balance)}</dd>
-      <dt>balance después</dt><dd>${fmtNum(after.balance)}</dd>
+      <dt>balance antes</dt><dd>${qch(before.balance)}</dd>
+      <dt>balance después</dt><dd>${qch(after.balance)}</dd>
       <dt>nonce después</dt><dd>${fmtNum(after.nonce)}</dd>
     </div>
   </div>`;
@@ -460,8 +504,8 @@ async function showTransfer(hash) {
     out.innerHTML = `
       <div class="kv">
         <dt>hash</dt><dd class="mono">${toHex(r.tx_hash)}</dd>
-        <dt>monto</dt><dd>${fmtNum(r.amount)}</dd>
-        <dt>fee cobrado</dt><dd>${fmtNum(r.fee)}</dd>
+        <dt>monto</dt><dd>${qch(r.amount)}</dd>
+        <dt>fee cobrado</dt><dd>${qch(r.fee)}</dd>
         <dt>raíz antes</dt><dd class="mono">${short(toHex(r.root_before), 10, 8)}</dd>
         <dt>raíz después</dt><dd class="mono">${short(toHex(r.root_after), 10, 8)}</dd>
       </div>
@@ -492,7 +536,7 @@ document.getElementById("lookup").addEventListener("click", async () => {
   try {
     const acc = await getJson(`/account/${addr}`);
     out.innerHTML = `<div class="kv">
-      <dt>balance</dt><dd>${fmtNum(acc.balance)}</dd>
+      <dt>balance</dt><dd>${qch(acc.balance)}</dd>
       <dt>nonce</dt><dd>${fmtNum(acc.nonce)}</dd>
     </div>`;
   } catch (e) {

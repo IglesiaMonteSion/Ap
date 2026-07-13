@@ -424,6 +424,11 @@ pub struct StatusResponse {
     /// "there is an update available." `None` when up to date. See
     /// `EngineState::update_available`.
     pub update_available: Option<String>,
+    /// Live on-chain `base_fee_per_byte` (governance-settable), so the
+    /// dashboard can show the current network fee in real time instead of a
+    /// hardcoded guess. The fee of a standard transfer is this times the
+    /// transaction's byte size (~5.5 KB for the default hybrid signature).
+    pub base_fee_per_byte: u64,
 }
 
 /// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
@@ -868,6 +873,7 @@ impl Engine {
             executed_transactions: state.executed,
             version: NODE_VERSION.to_string(),
             update_available: state.update_available.clone(),
+            base_fee_per_byte: state.ledger.current_params().base_fee_per_byte,
         }
     }
 

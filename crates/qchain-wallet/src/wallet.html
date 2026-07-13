@@ -46,6 +46,12 @@
   .hint{font-size:12px;color:var(--muted);margin-top:6px}
   .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
+  button{background:linear-gradient(180deg,var(--accent),color-mix(in srgb,var(--accent) 85%,#000));box-shadow:0 1px 2px rgba(0,0,0,.15)}
+  button.ghost{background:transparent;box-shadow:none}
+  h1{background:linear-gradient(90deg,var(--accent),#7aa2ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .total-card{background:linear-gradient(135deg,var(--accent),#1e50c8);border:0;color:#fff;text-align:center;padding:22px 16px}
+  .total-label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;opacity:.85}
+  .total-value{font-size:30px;font-weight:800;margin-top:4px;letter-spacing:-.01em}
 </style>
 </head>
 <body>
@@ -65,6 +71,12 @@
     </div>
     <div class="hint">La clave se guarda en este dispositivo. Guardá una copia del archivo: es tu wallet.</div>
     <div class="msg" id="new-msg"></div>
+  </div>
+
+  <!-- Total -->
+  <div class="card total-card">
+    <div class="total-label">Saldo total</div>
+    <div class="total-value" id="total-balance">– QCH</div>
   </div>
 
   <!-- Mis wallets -->
@@ -87,8 +99,11 @@
     <select id="t-to-pick" style="margin-top:6px"><option value="">— o elegí una de mis wallets —</option></select>
 
     <label for="t-amount">Monto (en QCH)</label>
-    <input id="t-amount" placeholder="ej: 1.5" inputmode="decimal" autocomplete="off">
-    <div class="hint">1 QCH = 1.000.000.000 unidades. El fee de red es ~0,001 QCH.</div>
+    <div class="row">
+      <input id="t-amount" placeholder="ej: 1.5" inputmode="decimal" autocomplete="off">
+      <button class="ghost" id="max-btn" style="flex:0 0 auto" title="enviar todo el saldo disponible menos el fee">máx</button>
+    </div>
+    <div class="hint" id="fee-hint">1 QCH = 1.000.000.000 unidades. El fee de red se calcula solo al enviar.</div>
 
     <div style="margin-top:14px"><button id="send-btn" style="width:100%">Enviar</button></div>
     <div class="msg" id="send-msg"></div>
@@ -135,10 +150,12 @@ async function api(path, opts){
 
 async function loadNode(){
   try{
-    const cfg = await api("/api/config");
-    const st = await (await fetch(cfg.rpc + "/status")).json();
+    // Vía el backend de la wallet (mismo origen) - el navegador no puede
+    // consultar el nodo directo (otro puerto = otro origen, sin CORS).
+    const st = await api("/api/node");
+    if(st.online === false) throw new Error("offline");
     $("dot").className="dot ok";
-    $("node-text").textContent = `nodo ${short(cfg.rpc.replace(/^https?:\/\//,""))} · v${st.version} · ronda ${st.next_round}`;
+    $("node-text").textContent = `en vivo · v${st.version} · ronda ${st.next_round}`;
   }catch(e){
     $("dot").className="dot bad";
     $("node-text").textContent="nodo no responde";
@@ -149,6 +166,9 @@ async function loadWallets(){
   try{
     WALLETS = await api("/api/wallets");
   }catch(e){ WALLETS=[]; }
+  // total de saldo (suma exacta con BigInt)
+  const total = WALLETS.reduce((a,w)=>a+BigInt(w.balance||"0"), 0n);
+  $("total-balance").textContent = qchDisp(total.toString());
   const box=$("wallets");
   if(WALLETS.length===0){ box.innerHTML='<div class="empty">todavía no tenés wallets — creá una arriba</div>'; }
   else{
@@ -203,6 +223,26 @@ $("send-btn").onclick = async ()=>{
     setTimeout(loadWallets, 1500);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
   $("send-btn").disabled=false;
+};
+
+// "máx": pregunta al server el saldo menos el fee real (calculado con la
+// firma real de esta wallet) y lo pone en el campo de monto, ya en QCH.
+$("max-btn").onclick = async ()=>{
+  const from=$("t-from").value;
+  const msg=$("send-msg"); msg.className="msg"; msg.textContent="";
+  if(!from){ msg.className="msg err"; msg.textContent="elegí desde qué wallet enviar"; return; }
+  $("max-btn").disabled=true;
+  try{
+    const r = await api("/api/max/"+encodeURIComponent(from));
+    if(BigInt(r.max) <= 0n){
+      msg.className="msg err"; msg.textContent="esta wallet no tiene saldo suficiente ni para el fee";
+      $("fee-hint").textContent="1 QCH = 1.000.000.000 unidades. El fee de red se calcula solo al enviar.";
+    }else{
+      $("t-amount").value = unitsToQch(r.max);
+      $("fee-hint").textContent = `máximo enviable: ${qchDisp(r.max)} · fee de red: ${qchDisp(r.fee)}`;
+    }
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("max-btn").disabled=false;
 };
 
 $("refresh").onclick = ()=>{ loadWallets(); loadNode(); };

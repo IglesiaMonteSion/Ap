@@ -102,8 +102,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/config", get(config))
+        .route("/api/node", get(node_status))
         .route("/api/wallets", get(list_wallets).post(new_wallet))
         .route("/api/balance/:address", get(balance))
+        .route("/api/max/:name", get(max_amount))
         .route("/api/transfer", post(transfer))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
@@ -163,6 +165,27 @@ async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "rpc": st.rpc }))
 }
 
+/// The node's `/status`, proxied through this server. The browser can't fetch
+/// the node directly (it's a different origin - a different port - and the
+/// node sends no CORS headers, so a cross-origin fetch is blocked), so the
+/// wallet's own backend, which already talks to the node, relays it. Returns
+/// `{ online: false }` if the node isn't reachable rather than erroring, so
+/// the UI can show a clean "node down" state.
+async fn node_status(State(st): State<Arc<AppState>>) -> Json<Value> {
+    match st.http.get(format!("{}/status", st.rpc)).send().await {
+        Ok(resp) => match resp.json::<Value>().await {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("online".to_string(), Value::Bool(true));
+                }
+                Json(v)
+            }
+            Err(_) => Json(json!({ "online": false })),
+        },
+        Err(_) => Json(json!({ "online": false })),
+    }
+}
+
 #[derive(Serialize)]
 struct WalletInfo {
     name: String,
@@ -216,6 +239,28 @@ async fn balance(State(st): State<Arc<AppState>>, Path(address): Path<String>) -
     Ok(Json(json!({ "address": pk.to_string(), "balance": bal.to_string() })))
 }
 
+/// The most a wallet can send in one transfer: its balance minus the exact
+/// network fee. Computed against reality, not a guess: builds a real signed
+/// transfer with this wallet's own key to measure the transaction's byte size
+/// (which depends on the signature scheme), and reads the live
+/// `base_fee_per_byte` from the node - fee = size × base_fee_per_byte, the
+/// same formula the ledger charges. The amount value doesn't affect the size
+/// (a `u64` is fixed-width), so a zero-amount sample measures it exactly.
+async fn max_amount(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    let name = sanitize_name(&name)?;
+    let path = wallet_path(&st, &name)?;
+    let payer = qchain_crypto::read_keypair_file(&path).map_err(|_| ApiError::bad(format!("no encontré la wallet '{name}'")))?;
+    let balance = fetch_account(&st, &payer.pubkey()).await.map_err(ApiError::internal)?.map(|a| a.balance).unwrap_or(0);
+    let base_fee = fetch_base_fee(&st).await.map_err(ApiError::internal)?;
+    let chain_id = fetch_chain_id(&st).await.map_err(ApiError::internal)?;
+    let data = borsh::to_vec(&SystemInstruction::Transfer { amount: 0 }).map_err(ApiError::internal)?;
+    let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![payer.pubkey(), payer.pubkey()], data };
+    let sample = Transaction::new_signed(&payer, 0, chain_id, st.fee_limit, vec![ix]).map_err(ApiError::internal)?;
+    let fee = base_fee.saturating_mul(sample.byte_size() as u64);
+    let max = balance.saturating_sub(fee);
+    Ok(Json(json!({ "max": max.to_string(), "fee": fee.to_string(), "balance": balance.to_string() })))
+}
+
 #[derive(Deserialize)]
 struct TransferReq {
     /// Name of the sending wallet (a file in `wallets_dir`).
@@ -259,6 +304,13 @@ async fn fetch_account(st: &AppState, address: &Pubkey) -> anyhow::Result<Option
         return Ok(None);
     }
     Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// Live `base_fee_per_byte` from the node's `/status` - the current network
+/// fee rate, so "send max" and any fee display track governance changes.
+async fn fetch_base_fee(st: &AppState) -> anyhow::Result<u64> {
+    let resp: Value = st.http.get(format!("{}/status", st.rpc)).send().await?.error_for_status()?.json().await?;
+    Ok(resp["base_fee_per_byte"].as_u64().unwrap_or(0))
 }
 
 async fn fetch_chain_id(st: &AppState) -> anyhow::Result<[u8; 32]> {
