@@ -3,17 +3,28 @@ name = "qchain-crypto"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Which ML-DSA-65 / SLH-DSA backend to compile. The validator node uses
+# `liboqs` (default); the browser/WASM wallet uses `pure` (RustCrypto ml-dsa,
+# no C, compiles to wasm32). Exactly one must be enabled.
+default = ["liboqs"]
+liboqs = ["dep:oqs", "dep:rand"]
+pure = ["dep:ml-dsa"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 borsh.workspace = true
 ed25519-dalek.workspace = true
-oqs.workspace = true
-rand.workspace = true
 bs58.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 sha3.workspace = true
+oqs = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
+# Native cross-check of the pure backend against liboqs (tests/wasm_feasibility.rs);
+# default features here (incl. getrandom) are fine on the native test target.
 ml-dsa = "0.1"

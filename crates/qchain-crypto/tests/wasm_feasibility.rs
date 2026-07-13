@@ -49,6 +49,50 @@ fn rustcrypto_signature_is_accepted_by_liboqs_node() {
     assert!(!rejected, "liboqs must reject the signature over a different message");
 }
 
+/// End-to-end: a keypair derived from a 32-byte master seed exactly the way
+/// the browser build's `Keypair::generate_from_seed` does it (domain-separated
+/// SHA3-256 sub-seeds -> Ed25519 from bytes + ML-DSA from seed) produces both
+/// component signatures that the NODE accepts. This is the real proof that a
+/// wallet whose keys are born in the browser (from `crypto.getRandomValues`)
+/// can transact against the live network.
+#[test]
+fn seed_derived_browser_keys_verify_under_the_node() {
+    use ed25519_dalek::{Signer as EdSigner, SigningKey as EdKey};
+    use sha3::{Digest, Sha3_256};
+
+    let master_seed = [7u8; 32];
+    // Same derivation as `Keypair::generate_from_seed`.
+    let ed_seed: [u8; 32] = Sha3_256::new()
+        .chain_update(b"qchain-ed25519-v1")
+        .chain_update(master_seed)
+        .finalize()
+        .into();
+    let mldsa_seed: [u8; 32] = Sha3_256::new()
+        .chain_update(b"qchain-ml-dsa-65-v1")
+        .chain_update(master_seed)
+        .finalize()
+        .into();
+
+    // Ed25519 half.
+    let ed = EdKey::from_bytes(&ed_seed);
+    let ed_sig = ed.sign(MSG).to_bytes();
+    let ed_pk = ed.verifying_key().to_bytes();
+    assert!(
+        qchain_crypto::verify_ed25519_component(&ed_pk, MSG, &ed_sig),
+        "node must accept the seed-derived Ed25519 signature"
+    );
+
+    // ML-DSA-65 half (pure-Rust, as WASM would do it).
+    let ms = ml_dsa::B32::try_from(&mldsa_seed[..]).unwrap();
+    let msk = SigningKey::<MlDsa65>::from_seed(&ms);
+    let mvk = msk.verifying_key().encode();
+    let msig = msk.sign(MSG).encode();
+    assert!(
+        qchain_crypto::verify_ml_dsa_65_component(mvk.as_slice(), MSG, msig.as_slice()),
+        "node must accept the seed-derived ML-DSA-65 signature"
+    );
+}
+
 /// Reverse direction: a signature made by liboqs (the node) is accepted by the
 /// pure-Rust `ml-dsa` crate (so a WASM light client could verify node output).
 #[test]

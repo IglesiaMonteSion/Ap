@@ -17,15 +17,14 @@
 //! path is an acceptable trade for hash-based security's more conservative
 //! assumption and for keeping the (already large) signature as small as
 //! this scheme allows.
-
-use oqs::sig::{Algorithm as OqsAlgorithm, Sig};
-
-use crate::ensure_oqs_init;
-
-fn slh_dsa_sig() -> anyhow::Result<Sig> {
-    ensure_oqs_init();
-    Sig::new(OqsAlgorithm::SphincsSha2256sSimple).map_err(|e| anyhow::anyhow!("liboqs SLH-DSA (SHA2-256s-simple) unavailable: {e}"))
-}
+//!
+//! Backend: liboqs (the `liboqs` feature). SLH-DSA is deliberately NOT ported
+//! to the pure-Rust/WASM backend - it is an opt-in factor the mandatory hybrid
+//! combo doesn't use, so the browser wallet doesn't need it. Under the `pure`
+//! (wasm) build this module is a stub whose type/method signatures still exist
+//! (so `Keypair` and the keypair-file code compile unchanged) but whose
+//! operations are unavailable (generate/sign return an error, verify returns
+//! false).
 
 /// A standalone SLH-DSA keypair - deliberately not merged into the hybrid
 /// `Keypair` type, since this scheme is opt-in, not part of the mandatory
@@ -36,12 +35,6 @@ pub struct SlhDsaKeypair {
 }
 
 impl SlhDsaKeypair {
-    pub fn generate() -> anyhow::Result<Self> {
-        let sig_alg = slh_dsa_sig()?;
-        let (pk, sk) = sig_alg.keypair().map_err(|e| anyhow::anyhow!("SLH-DSA keygen failed: {e}"))?;
-        Ok(SlhDsaKeypair { pk: pk.into_vec(), sk: sk.into_vec() })
-    }
-
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.pk
     }
@@ -56,35 +49,82 @@ impl SlhDsaKeypair {
     pub fn from_raw_parts(pk: Vec<u8>, sk: Vec<u8>) -> Self {
         SlhDsaKeypair { pk, sk }
     }
+}
 
-    pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let sig_alg = slh_dsa_sig()?;
-        let sk_ref = sig_alg
-            .secret_key_from_bytes(&self.sk)
-            .ok_or_else(|| anyhow::anyhow!("corrupt SLH-DSA secret key"))?;
-        let sig = sig_alg.sign(msg, sk_ref).map_err(|e| anyhow::anyhow!("SLH-DSA signing failed: {e}"))?;
-        Ok(sig.into_vec())
+// --------------------------------------------------------------------------
+// liboqs backend (native / node)
+// --------------------------------------------------------------------------
+#[cfg(feature = "liboqs")]
+mod imp {
+    use super::SlhDsaKeypair;
+    use crate::ensure_oqs_init;
+    use oqs::sig::{Algorithm as OqsAlgorithm, Sig};
+
+    fn slh_dsa_sig() -> anyhow::Result<Sig> {
+        ensure_oqs_init();
+        Sig::new(OqsAlgorithm::SphincsSha2256sSimple)
+            .map_err(|e| anyhow::anyhow!("liboqs SLH-DSA (SHA2-256s-simple) unavailable: {e}"))
+    }
+
+    impl SlhDsaKeypair {
+        pub fn generate() -> anyhow::Result<Self> {
+            let sig_alg = slh_dsa_sig()?;
+            let (pk, sk) = sig_alg.keypair().map_err(|e| anyhow::anyhow!("SLH-DSA keygen failed: {e}"))?;
+            Ok(SlhDsaKeypair { pk: pk.into_vec(), sk: sk.into_vec() })
+        }
+
+        pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let sig_alg = slh_dsa_sig()?;
+            let sk_ref = sig_alg
+                .secret_key_from_bytes(&self.sk)
+                .ok_or_else(|| anyhow::anyhow!("corrupt SLH-DSA secret key"))?;
+            let sig = sig_alg.sign(msg, sk_ref).map_err(|e| anyhow::anyhow!("SLH-DSA signing failed: {e}"))?;
+            Ok(sig.into_vec())
+        }
+    }
+
+    pub fn verify(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+        let Ok(sig_alg) = slh_dsa_sig() else { return false };
+        let Some(pk_ref) = sig_alg.public_key_from_bytes(pubkey) else {
+            return false;
+        };
+        let Some(sig_ref) = sig_alg.signature_from_bytes(sig) else {
+            return false;
+        };
+        sig_alg.verify(msg, sig_ref, pk_ref).is_ok()
+    }
+}
+
+// --------------------------------------------------------------------------
+// pure/wasm stub (SLH-DSA not available in the browser build)
+// --------------------------------------------------------------------------
+#[cfg(not(feature = "liboqs"))]
+mod imp {
+    use super::SlhDsaKeypair;
+
+    impl SlhDsaKeypair {
+        pub fn generate() -> anyhow::Result<Self> {
+            anyhow::bail!("SLH-DSA is not available in the pure/wasm build")
+        }
+        pub fn sign(&self, _msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("SLH-DSA is not available in the pure/wasm build")
+        }
+    }
+
+    pub fn verify(_pubkey: &[u8], _msg: &[u8], _sig: &[u8]) -> bool {
+        false
     }
 }
 
 /// Verify a standalone SLH-DSA signature. Mirrors
 /// `verify_ml_dsa_65_component`'s shape/failure-mode (returns `false` rather
-/// than erroring on any malformed input) for the same reason: this is meant
-/// to slot into the same kind of "check one registered scheme's signature"
-/// call site `host_verify_signature` already has for the two phase-1
-/// schemes, once SLH-DSA is actually wired in there.
+/// than erroring on any malformed input). In the pure/wasm build this always
+/// returns `false` (SLH-DSA unavailable there).
 pub fn verify_slh_dsa_component(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    let Ok(sig_alg) = slh_dsa_sig() else { return false };
-    let Some(pk_ref) = sig_alg.public_key_from_bytes(pubkey) else {
-        return false;
-    };
-    let Some(sig_ref) = sig_alg.signature_from_bytes(sig) else {
-        return false;
-    };
-    sig_alg.verify(msg, sig_ref, pk_ref).is_ok()
+    imp::verify(pubkey, msg, sig)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "liboqs"))]
 mod tests {
     use super::*;
 
@@ -123,9 +163,6 @@ mod tests {
 
     #[test]
     fn real_key_and_signature_sizes_match_the_sha2_256s_simple_parameter_set() {
-        // Measured via a real liboqs round-trip (`--nocapture` probe),
-        // not assumed from the FIPS 205 table - matches this project's
-        // "measure, don't estimate" rule (see project-lessons-learned).
         let kp = SlhDsaKeypair::generate().unwrap();
         let sig = kp.sign(b"size probe").unwrap();
         assert_eq!(kp.public_key_bytes().len(), 64);

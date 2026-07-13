@@ -34,13 +34,14 @@ pub mod slh_dsa;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, VerifyingKey};
-use oqs::sig::{Algorithm as OqsAlgorithm, Sig};
+#[cfg(feature = "liboqs")]
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Once;
+
+mod mldsa;
 
 pub use registry::{
     combo_components, combo_from_components, slh_dsa_registry_entry, AlgorithmId, AlgorithmStatus, RegistryEntry,
@@ -49,15 +50,14 @@ pub use registry::{
 };
 pub use slh_dsa::{verify_slh_dsa_component, SlhDsaKeypair};
 
-static OQS_INIT: Once = Once::new();
-
+/// One-time liboqs init, used by the liboqs-backed halves (`mldsa`'s liboqs
+/// backend has its own; this one serves `slh_dsa`). No-op concept in the pure
+/// build, which has no liboqs.
+#[cfg(feature = "liboqs")]
 fn ensure_oqs_init() {
+    use std::sync::Once;
+    static OQS_INIT: Once = Once::new();
     OQS_INIT.call_once(oqs::init);
-}
-
-fn ml_dsa_65() -> anyhow::Result<Sig> {
-    ensure_oqs_init();
-    Sig::new(OqsAlgorithm::MlDsa65).map_err(|e| anyhow::anyhow!("liboqs ML-DSA-65 unavailable: {e}"))
 }
 
 mod hex_bytes {
@@ -212,7 +212,10 @@ pub struct Keypair {
 
 impl Keypair {
     /// Generates a keypair under the phase-1 default combo (Ed25519 +
-    /// ML-DSA-65, both mandatory).
+    /// ML-DSA-65, both mandatory). Random generation - the validator/CLI path;
+    /// available only in the `liboqs` build (needs system randomness and
+    /// liboqs keygen). The browser/WASM build uses `generate_from_seed`.
+    #[cfg(feature = "liboqs")]
     pub fn generate() -> anyhow::Result<Self> {
         Self::generate_ed25519_ml_dsa(None)
     }
@@ -221,16 +224,17 @@ impl Keypair {
     /// ML-DSA-65 + SLH-DSA) - see `registry::COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA`'s
     /// docs for the tradeoff (much larger signatures, higher fees, for
     /// high-value/long-lived accounts).
+    #[cfg(feature = "liboqs")]
     pub fn generate_with_slh_dsa() -> anyhow::Result<Self> {
         let slh_dsa = SlhDsaKeypair::generate()?;
         Self::generate_ed25519_ml_dsa(Some(slh_dsa))
     }
 
+    #[cfg(feature = "liboqs")]
     fn generate_ed25519_ml_dsa(slh_dsa: Option<SlhDsaKeypair>) -> anyhow::Result<Self> {
         let mut csprng = OsRng;
         let ed25519 = SigningKey::generate(&mut csprng);
-        let sig_alg = ml_dsa_65()?;
-        let (pk, sk) = sig_alg.keypair().map_err(|e| anyhow::anyhow!("ML-DSA-65 keygen failed: {e}"))?;
+        let (mldsa_pk, mldsa_sk) = mldsa::keypair()?;
         let combo = if slh_dsa.is_some() {
             COMBO_HYBRID_ED25519_ML_DSA_65_SLH_DSA
         } else {
@@ -239,9 +243,40 @@ impl Keypair {
         Ok(Keypair {
             combo,
             ed25519,
-            mldsa_pk: pk.into_vec(),
-            mldsa_sk: sk.into_vec(),
+            mldsa_pk,
+            mldsa_sk,
             slh_dsa,
+        })
+    }
+
+    /// Deterministically derives the mandatory Ed25519 + ML-DSA-65 keypair from
+    /// a single 32-byte master seed. This is the browser/WASM entry point: the
+    /// browser supplies real entropy (`crypto.getRandomValues`) as the seed and
+    /// keeps only it (nothing leaves the device). Two independent sub-seeds are
+    /// derived from the master via domain-separated SHA3-256 so the two schemes
+    /// don't share key material. Available in the `pure` build; also compiled in
+    /// the `liboqs` build for cross-testing, where it errors (liboqs has no
+    /// seeded ML-DSA keygen) - the node never uses it.
+    #[cfg(feature = "pure")]
+    pub fn generate_from_seed(master_seed: &[u8; 32]) -> anyhow::Result<Self> {
+        let ed_seed: [u8; 32] = Sha3_256::new()
+            .chain_update(b"qchain-ed25519-v1")
+            .chain_update(master_seed)
+            .finalize()
+            .into();
+        let mldsa_seed: [u8; 32] = Sha3_256::new()
+            .chain_update(b"qchain-ml-dsa-65-v1")
+            .chain_update(master_seed)
+            .finalize()
+            .into();
+        let ed25519 = SigningKey::from_bytes(&ed_seed);
+        let (mldsa_pk, mldsa_sk) = mldsa::keypair_from_seed(&mldsa_seed)?;
+        Ok(Keypair {
+            combo: COMBO_HYBRID_ED25519_ML_DSA_65,
+            ed25519,
+            mldsa_pk,
+            mldsa_sk,
+            slh_dsa: None,
         })
     }
 
@@ -266,16 +301,10 @@ impl Keypair {
 
     pub fn sign(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
         let ed_sig: DalekSignature = self.ed25519.sign(msg);
-        let sig_alg = ml_dsa_65()?;
-        let sk_ref = sig_alg
-            .secret_key_from_bytes(&self.mldsa_sk)
-            .ok_or_else(|| anyhow::anyhow!("corrupt ML-DSA-65 secret key"))?;
-        let mldsa_sig = sig_alg
-            .sign(msg, sk_ref)
-            .map_err(|e| anyhow::anyhow!("ML-DSA-65 signing failed: {e}"))?;
+        let mldsa_sig = mldsa::sign(&self.mldsa_sk, msg)?;
         let mut components = vec![
             KeyComponent { scheme: ALGORITHM_ED25519, bytes: ed_sig.to_bytes().to_vec() },
-            KeyComponent { scheme: ALGORITHM_ML_DSA_65, bytes: mldsa_sig.into_vec() },
+            KeyComponent { scheme: ALGORITHM_ML_DSA_65, bytes: mldsa_sig },
         ];
         if let Some(slh_dsa) = &self.slh_dsa {
             components.push(KeyComponent { scheme: ALGORITHM_SLH_DSA, bytes: slh_dsa.sign(msg)? });
@@ -356,14 +385,7 @@ pub fn verify_ed25519_component(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -
 /// Verify just the ML-DSA-65 half against a raw public key. See
 /// `verify_ed25519_component` docs for why this is exposed standalone.
 pub fn verify_ml_dsa_65_component(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    let Ok(sig_alg) = ml_dsa_65() else { return false };
-    let Some(pk_ref) = sig_alg.public_key_from_bytes(pubkey) else {
-        return false;
-    };
-    let Some(sig_ref) = sig_alg.signature_from_bytes(sig) else {
-        return false;
-    };
-    sig_alg.verify(msg, sig_ref, pk_ref).is_ok()
+    mldsa::verify(pubkey, msg, sig)
 }
 
 /// Length-prefixed encoding: `[u32 LE len][bytes] [u32 LE len][bytes] ...`.
