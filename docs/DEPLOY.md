@@ -358,8 +358,26 @@ Una interfaz simple (botones, no CLI) para que una persona común pueda
 crear wallets, ver balances en QCH y enviar transferencias. Reusa el
 *mismo* código de firma post-cuántica que el nodo (`qchain-crypto` /
 `qchain-core`), así que las transacciones que firma son byte-compatibles
-— el navegador es solo la UI, las claves privadas nunca salen de la
-máquina donde corre el wallet.
+— el navegador es solo la UI.
+
+### Dos wallets, dos puertas
+
+El servidor sirve **dos** wallets en el mismo puerto:
+
+| Ruta | Tipo | Contraseña | Dónde vive la clave |
+|---|---|---|---|
+| `/` (y `/wasm`) | **No-custodial** (por defecto) | **No pide** | En tu navegador (cifrada con tu contraseña vía WebCrypto) |
+| `/custodial` | Custodial (legado) | **Sí, obligatoria si se expone** | En el servidor |
+
+La puerta principal `/` es la **no-custodial**: un desconocido que abre la
+wallet desde cualquier navegador **no ve login** — la clave se genera y se
+cifra en su propio navegador, el servidor nunca la ve. La custodial (claves
+en el servidor) quedó en `/custodial` y sigue exigiendo contraseña, porque
+quien la alcance podría gastar esas claves.
+
+**La no-custodial (`/`) necesita HTTPS** (o localhost): los navegadores solo
+habilitan WebCrypto en un contexto seguro. Sobre `http://` plano muestra un
+aviso y no funciona. Ver **"HTTPS sin comprar dominio"** más abajo.
 
 ### El camino fácil: `deploy/install-wallet.sh`
 
@@ -386,6 +404,29 @@ Bajarla sin perder wallets: `sudo ./deploy/install-wallet.sh --uninstall`.
 sistema, pero si tu proveedor tiene un firewall aparte (Security List de
 Oracle Cloud, Security Group de AWS), tenés que abrir el `8090/TCP` ahí
 también desde su consola web.
+
+### HTTPS sin comprar dominio: `deploy/install-https.sh`
+
+Para que la wallet no-custodial (`/`) funcione desde internet hace falta
+HTTPS. Un solo comando lo resuelve **sin comprar dominio**:
+
+```
+sudo ./deploy/install-https.sh
+```
+
+Detecta tu IP pública, arma un dominio gratis con **sslip.io**
+(`129-80-59-17.sslip.io` → tu IP, sin configurar nada), instala **Caddy**
+como proxy y saca un certificado real de **Let's Encrypt** automáticamente.
+Al terminar entrás por `https://129-80-59-17.sslip.io/` — sin contraseña,
+con la clave cifrada en tu navegador.
+
+Si **sí** tenés dominio propio, apuntá su registro A a tu IP y corré
+`sudo ./deploy/install-https.sh --dominio wallet.tudominio.com`.
+
+**Falta un paso en la consola de la nube:** Let's Encrypt valida por el
+puerto **80** y el navegador entra por el **443**. Abrí ambos (TCP) en la
+Security List / firewall de tu proveedor (en Oracle: Networking → VCN →
+Security Lists → Ingress Rules). Sin eso el certificado no se emite.
 
 ### A mano (si preferís no usar el instalador)
 

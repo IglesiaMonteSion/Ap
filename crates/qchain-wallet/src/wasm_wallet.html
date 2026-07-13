@@ -221,8 +221,14 @@ $('s-btn').onclick = async ()=>{
 (async function(){
   // WebCrypto necesita un contexto seguro (HTTPS o localhost).
   if(!(window.isSecureContext && window.crypto && crypto.subtle)){
-    $('loading').innerHTML = '⚠️ Esta wallet cifra tu clave con WebCrypto, que requiere <b>HTTPS</b> (o acceso local). '+
-      'Sobre HTTP plano el navegador lo desactiva. Accedé por HTTPS o por túnel local para usarla.';
+    const host = location.hostname;
+    const httpsUrl = location.href.replace(/^http:/, 'https:');
+    $('loading').innerHTML = '⚠️ Esta wallet cifra tu clave <b>en tu navegador</b> con WebCrypto, que solo '+
+      'funciona sobre <b>HTTPS</b> (o en local). Estás entrando por HTTP plano.<br><br>'+
+      'Probá abrir <a href="'+httpsUrl+'" style="color:#a78bfa">'+httpsUrl+'</a>.<br><br>'+
+      'Si sos el operador del nodo y todavía no pusiste HTTPS, corré en la VPS:<br>'+
+      '<code style="background:#0003;padding:2px 6px;border-radius:6px">sudo ./deploy/install-https.sh</code><br>'+
+      'te da HTTPS gratis (sslip.io + Let’s Encrypt), sin comprar dominio.';
     return;
   }
   try{

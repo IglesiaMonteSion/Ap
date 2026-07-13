@@ -68,8 +68,15 @@ struct AppState {
     wallets_dir: PathBuf,
     fee_limit: u64,
     http: reqwest::Client,
-    /// If set, every request must carry HTTP Basic auth with this password.
+    /// If set, every request to a custodial route must carry HTTP Basic auth
+    /// with this password.
     password: Option<String>,
+    /// Whether the custodial (server-holds-the-keys) wallet is reachable at all.
+    /// False when the wallet is exposed to the network with no password: rather
+    /// than refuse to boot (which would also kill the safe non-custodial wallet
+    /// at `/`), we just serve a 403 on the custodial routes and keep the
+    /// key-less browser wallet available to everyone.
+    custodial_enabled: bool,
 }
 
 #[tokio::main]
@@ -82,15 +89,19 @@ async fn main() -> anyhow::Result<()> {
     let password = cli.password.or_else(|| std::env::var("QCHAIN_WALLET_PASSWORD").ok()).filter(|s| !s.is_empty());
     let exposed = cli.bind != "127.0.0.1" && cli.bind != "localhost";
 
-    // Fail-safe: never expose a key-holding wallet to the network with no
-    // password. Localhost-only needs none (only this machine can reach it).
+    // The custodial wallet (server holds the keys) is only reachable when it's
+    // safe: either we're localhost-only, or a password is set. Exposed with no
+    // password, the custodial routes are turned off (403) instead of refusing
+    // to boot - the safe, key-less non-custodial wallet at `/` stays up for
+    // everyone. This is why exposing without a password is no longer a hard
+    // error: the thing that used to be dangerous (open server-held keys) is now
+    // simply disabled, while the wallet a stranger actually lands on holds no
+    // keys on the server at all.
+    let custodial_enabled = !exposed || password.is_some();
     if exposed && password.is_none() {
-        anyhow::bail!(
-            "te estás por exponer la wallet a la red (--bind {}) SIN contraseña - cualquiera que llegue al puerto podría vaciar tus wallets.\n\
-             Poné una contraseña, idealmente por variable de entorno para que no quede en el historial:\n\
-             \n    QCHAIN_WALLET_PASSWORD='tu-clave-fuerte' qchain-wallet --bind {} ...\n",
-            cli.bind, cli.bind
-        );
+        println!("*** Sin contraseña y expuesta a la red: la wallet CUSTODIAL (/custodial) queda DESACTIVADA.");
+        println!("*** Solo la wallet no-custodial (/) - claves en el navegador - está disponible. Eso es lo seguro.");
+        println!("*** Si querés la custodial, poné una contraseña:  QCHAIN_WALLET_PASSWORD='...' qchain-wallet --bind {} ...", cli.bind);
     }
 
     let state = Arc::new(AppState {
@@ -99,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         fee_limit: cli.fee_limit,
         http: reqwest::Client::new(),
         password: password.clone(),
+        custodial_enabled,
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -109,6 +121,10 @@ async fn main() -> anyhow::Result<()> {
     // to the node's /tx (itself open) - no new attack surface. `/api/config`
     // and `/api/node` are read-only and shared by both wallets.
     let public = Router::new()
+        // The default landing page is the NON-CUSTODIAL wallet: keys live in
+        // the browser, so it needs no server login. This is what a stranger
+        // opening the wallet from any browser gets - no username/password.
+        .route("/", get(wasm_page))
         .route("/wasm", get(wasm_page))
         .route("/wasm/qchain_wasm.js", get(wasm_js))
         .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
@@ -118,11 +134,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/config", get(config))
         .route("/api/node", get(node_status));
 
-    // Protected routes: the custodial wallet (keys held on the server). These
-    // DO need the password gate - whoever reaches them could otherwise create,
-    // read, export or spend server-held wallets.
+    // Protected routes: the custodial wallet (keys held on the server), now at
+    // `/custodial`. These DO need the password gate - whoever reaches them could
+    // otherwise create, read, export or spend server-held wallets.
     let protected = Router::new()
-        .route("/", get(index))
+        .route("/custodial", get(index))
         .route("/api/wallets", get(list_wallets).post(new_wallet))
         .route("/api/balance/:address", get(balance))
         .route("/api/max/:name", get(max_amount))
@@ -161,6 +177,18 @@ async fn main() -> anyhow::Result<()> {
 /// set (localhost-only use). Honest limit: over plain HTTP the password is
 /// only base64-encoded, not encrypted - put HTTPS in front for real exposure.
 async fn require_auth(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    // Custodial wallet disabled (exposed to the network with no password set):
+    // refuse every custodial route outright. The non-custodial wallet at `/` is
+    // public and unaffected.
+    if !st.custodial_enabled {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from(
+                "la wallet custodial está desactivada (expuesta sin contraseña). \
+                 Usá la wallet no-custodial en / , o reiniciá con una contraseña.",
+            ))
+            .expect("static 403 response always builds");
+    }
     let Some(expected) = &st.password else {
         return next.run(req).await;
     };
