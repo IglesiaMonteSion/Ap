@@ -167,15 +167,51 @@ async fn main() -> anyhow::Result<()> {
     let consensus =
         if validators.stake_of(&self_id) >= validators.quorum_threshold() { ConsensusState::resuming_from(next_round) } else { ConsensusState::new() };
 
+    // Task #107 - DAG persistence. Reload every certificate this validator
+    // previously certified from local disk (`data_dir/dag`, a `sled` tree)
+    // instead of re-fetching the whole chain from peers one certificate at a
+    // time after a restart - the slow path a restart otherwise takes, since
+    // `round_checkpoint` deliberately persists only `next_round`, not the
+    // DAG (see `Engine::cert_log`). `None` for an in-memory node - nothing
+    // to persist or reload. Re-execution of the transactions these
+    // certificates carry is idempotent: `Ledger::apply_transaction`'s nonce
+    // check rejects an already-applied transaction before charging any fee
+    // or touching state, exactly as the pre-existing network-refetch restart
+    // already relied on. A cert that fails to decode (corrupt on disk) is
+    // skipped, not fatal - it is simply re-fetched from peers, exactly as
+    // every cert was before DAG persistence existed.
+    let cert_log: Option<sled::Db> = match &config.data_dir {
+        Some(dir) => Some(sled::open(dir.join("dag"))?),
+        None => None,
+    };
+    let mut dag = DagStore::new();
+    if let Some(db) = &cert_log {
+        let mut loaded = 0usize;
+        for entry in db.iter() {
+            let (_digest, bytes) = entry?;
+            match borsh::from_slice::<qchain_core::Certificate>(&bytes) {
+                Ok(cert) => {
+                    dag.insert(cert);
+                    loaded += 1;
+                }
+                Err(e) => tracing::warn!("skipping a corrupt certificate in the on-disk DAG log: {e}"),
+            }
+        }
+        if loaded > 0 {
+            tracing::info!("reloaded {loaded} certificates from the on-disk DAG log");
+        }
+    }
+
     let engine = Arc::new(Engine {
         self_id,
         keypair,
         validators,
         network,
         chain_id: config.chain_id(),
+        cert_log,
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
-            dag: DagStore::new(),
+            dag,
             consensus,
             mempool: HashMap::new(),
             batches: HashMap::new(),

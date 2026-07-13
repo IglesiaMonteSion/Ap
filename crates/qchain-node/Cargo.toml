@@ -18,6 +18,7 @@ qchain-stark = { path = "../qchain-stark" }
 serde.workspace = true
 serde_json.workspace = true
 borsh.workspace = true
+sled = "0.34"
 tokio.workspace = true
 axum.workspace = true
 clap.workspace = true

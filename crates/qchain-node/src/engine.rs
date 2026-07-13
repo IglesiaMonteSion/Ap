@@ -264,6 +264,41 @@ pub struct Engine {
     /// cross-network replay gap documented on `qchain_core::Message::
     /// chain_id`.
     pub chain_id: [u8; 32],
+    /// Optional on-disk log of every certificate this validator has inserted
+    /// into its DAG (a `sled` tree at `data_dir/dag`, `None` for an in-memory
+    /// node). Persisting the DAG is what lets a restarted validator reload
+    /// its certificates from local disk instead of re-fetching the entire
+    /// chain history from peers over the network one certificate at a time -
+    /// the slow path a restart otherwise takes, since `round_checkpoint`
+    /// deliberately persists only `next_round`, not the DAG. Re-execution of
+    /// already-applied transactions during the resulting local re-derivation
+    /// is harmless: `Ledger::apply_transaction` validates the nonce (rejecting
+    /// a replay) BEFORE charging any fee or touching state, so a restart
+    /// never double-charges or corrupts balances - the same idempotence the
+    /// pre-existing network-refetch restart already relied on.
+    pub cert_log: Option<sled::Db>,
+}
+
+impl Engine {
+    /// Inserts a verified certificate into the in-memory DAG and, if this
+    /// node persists to disk, appends it to the on-disk cert log so a restart
+    /// can reload it locally (see `Engine::cert_log`). Best-effort persist: a
+    /// disk error is logged, not fatal - a cert that fails to persist is
+    /// simply re-fetched from peers on the next restart, exactly as every
+    /// cert was before DAG persistence existed.
+    fn insert_certificate(&self, state: &mut EngineState, cert: Certificate) {
+        let digest = state.dag.insert(cert.clone());
+        if let Some(db) = &self.cert_log {
+            match borsh::to_vec(&cert) {
+                Ok(bytes) => {
+                    if let Err(e) = db.insert(digest, bytes) {
+                        tracing::warn!("failed to persist certificate {digest:?} to the DAG log: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("failed to encode certificate {digest:?} for the DAG log: {e}"),
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -764,7 +799,7 @@ impl Engine {
                 let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
-                    state.dag.insert(cert);
+                    self.insert_certificate(&mut state, cert);
                 }
                 self.request_missing_parents(&parents, from).await;
                 self.request_missing_batches(&batch_digests, from).await;
@@ -790,7 +825,7 @@ impl Engine {
                 let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
-                    state.dag.insert(cert);
+                    self.insert_certificate(&mut state, cert);
                 }
                 self.request_missing_parents(&parents, from).await;
                 self.request_missing_batches(&batch_digests, from).await;
@@ -1110,7 +1145,7 @@ impl Engine {
         let (vertex, _) = state.own_pending_vertex.take().unwrap();
         let signatures = state.pending_votes.remove(&vertex_digest).unwrap().into_iter().collect();
         let cert = Certificate { vertex, signatures };
-        state.dag.insert(cert.clone());
+        self.insert_certificate(&mut state, cert.clone());
         state.own_last_certificate = Some(cert.clone());
         Some(cert)
     }
