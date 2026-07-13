@@ -437,6 +437,31 @@ puerto **80** y el navegador entra por el **443**. Abrí ambos (TCP) en la
 Security List / firewall de tu proveedor (en Oracle: Networking → VCN →
 Security Lists → Ingress Rules). Sin eso el certificado no se emite.
 
+### HTTPS sin abrir puertos: `deploy/install-tunnel.sh` (túnel de Cloudflare)
+
+Si el firewall de la nube es un problema (Oracle Cloud, típicamente) y no
+podés/querés abrir 80/443, un túnel de Cloudflare te da HTTPS **sin abrir
+ningún puerto de entrada**: hace una conexión *saliente* desde tu VPS a
+Cloudflare, y Cloudflare te da una URL pública HTTPS que reenvía por esa
+conexión hasta tu wallet local.
+
+```
+sudo ./deploy/install-tunnel.sh
+```
+
+Instala `cloudflared` (binario oficial, detecta amd64/arm64 — Oracle free
+tier suele ser ARM), lo deja como servicio systemd, y te imprime la URL
+(`https://algo.trycloudflare.com/`). Ver la URL después:
+`sudo ./deploy/install-tunnel.sh --url`. Quitarlo:
+`sudo ./deploy/install-tunnel.sh --uninstall`.
+
+**Límite:** es un "quick tunnel" gratis y sin cuenta — la URL **cambia**
+cada vez que el túnel reinicia (reboot/crash). Para una URL **fija** hace
+falta una cuenta gratis de Cloudflare + un dominio propio (túnel con
+nombre): se crea con `cloudflared tunnel login`, `cloudflared tunnel create
+qchain`, y una regla DNS al hostname que elijas — Cloudflare documenta el
+flujo. El quick tunnel alcanza para probar/usar la wallet desde el celular.
+
 ### A mano (si preferís no usar el instalador)
 
 **Local (lo más seguro), por túnel SSH desde tu equipo:**
