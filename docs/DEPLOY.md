@@ -12,10 +12,14 @@ esto, y dejalo claro a cualquiera que invites a participar.
 ## El camino fácil: `deploy/install-node.sh`
 
 Si no tenés experiencia técnica (o simplemente querés algo rápido), no
-hace falta seguir el checklist manual de abajo. En una VPS Debian/Ubuntu
-fresca (o cualquier máquina Linux donde tengas `sudo`):
+hace falta seguir el checklist manual de abajo. Necesitás tres cosas: una
+VPS Debian/Ubuntu fresca, este repositorio en la máquina, y correr un
+comando. Desde cero:
 
 ```
+# 1. traé el repo a la máquina (o subilo por SFTP si es privado)
+git clone <url-del-repo> qchain && cd qchain
+# 2. corré el instalador
 sudo ./deploy/install-node.sh
 ```
 
@@ -33,10 +37,17 @@ tu clave privada (`chmod 600`), e instala el nodo como servicio
 activo). Al final te imprime la URL de la página de estado, cómo ver los
 logs, y un recordatorio de que el RPC no tiene autenticación.
 
-Requiere tener la imagen Docker (`qchain:latest`) ya cargada en la
-máquina (`docker load -i qchain-image.tar` o `docker pull`, ver más
-abajo) — el script verifica que la imagen realmente tenga los binarios
-de qchain antes de avanzar, y te avisa si falta o está rota.
+**No hace falta conseguir la imagen Docker por tu cuenta.** Como todavía
+no hay un registro público publicado, el instalador **construye la imagen
+desde el código de este mismo repo** la primera vez (un `docker build`
+automático — tarda varios minutos y baja las dependencias de compilación,
+después queda cacheado). Solo necesitás Docker con acceso a internet, que
+el propio script instala si falta. Si en el futuro publicás la imagen en
+un registro, `--image <registro/qchain:tag>` la baja en vez de compilar; y
+`--no-build` desactiva la compilación (solo intenta `docker pull` o cargar
+un `qchain-image.tar` que dejes junto al repo). En todos los casos el
+script verifica que la imagen realmente tenga los binarios de qchain antes
+de avanzar.
 
 Es seguro volver a correrlo: si ya generó tu clave o tu `config.json`,
 nunca los pisa (ni siquiera si un paso anterior falló a mitad de camino)

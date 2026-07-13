@@ -27,6 +27,8 @@ QCHAIN_HOME="${QCHAIN_HOME:-/opt/qchain}"
 MODO=""
 ASUMIR_SI=0
 UNINSTALL=0
+NO_BUILD=0
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_ORIGEN=""
 LISTEN_PORT_ARG=""
 RPC_PORT_ARG=""
@@ -54,6 +56,9 @@ Opciones:
   --listen-port <puerto> Puerto P2P a usar en modo "solo" (por defecto 9000).
   --rpc-port <puerto>    Puerto RPC a usar en modo "solo" (por defecto 8080).
   --yes, -y              No pedir confirmaciones (para instalación automatizada).
+  --no-build             No construir la imagen desde el código aunque falte;
+                         solo intentar 'docker pull' / cargar un tar. Útil si
+                         ya publicaste la imagen en un registro.
   --uninstall            Para y desinstala el servicio systemd. NO borra tu
                          clave, config.json, ni la carpeta data/.
   --help, -h             Muestra esta ayuda.
@@ -69,6 +74,7 @@ while [ $# -gt 0 ]; do
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
+    --no-build) NO_BUILD=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --help|-h) uso; exit 0 ;;
     *) error "opción desconocida: $1 (ver --help)" ;;
@@ -125,16 +131,58 @@ if ! docker info >/dev/null 2>&1; then
   error "Docker está instalado pero su servicio no está corriendo. Probá: sudo systemctl start docker"
 fi
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "La imagen '$IMAGE' no esta disponible en esta maquina todavia."
-  echo "Intentando 'docker pull $IMAGE'..."
-  if ! docker pull "$IMAGE" >/dev/null 2>&1; then
-    error "no se pudo obtener la imagen '$IMAGE'. Copiala vos mismo primero, por ejemplo:
-  docker load -i qchain-image.tar
-  docker tag <lo-que-cargaste> qchain:latest
-...y despues volve a correr este script."
+# Obtener la imagen. Como todavía no hay un registro público publicado, el
+# camino real y autocontenido para alguien sin conocimientos técnicos es
+# CONSTRUIRLA desde el código que este mismo repo trae: un solo comando, sin
+# tener que conseguir un tar misterioso de ningún lado. Solo hace falta este
+# repo en la máquina y Docker con acceso a internet (para bajar las
+# dependencias de compilación la primera vez). Orden de preferencia:
+#   - imagen custom pedida con --image  -> se intenta 'docker pull' primero
+#     (asumimos que nombraste un registro a propósito)
+#   - imagen por defecto (qchain:latest) -> se construye desde el Dockerfile
+#   - fallbacks para ambos: pull, o cargar 'qchain-image.tar' del repo
+obtener_imagen() {
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then return 0; fi
+
+  local es_custom=0
+  [ "$IMAGE" != "qchain:latest" ] && es_custom=1
+
+  # Imagen custom: intentar bajarla de su registro primero.
+  if [ "$es_custom" -eq 1 ]; then
+    echo "Intentando 'docker pull $IMAGE'..."
+    if docker pull "$IMAGE" >/dev/null 2>&1; then return 0; fi
   fi
-fi
+
+  # Construir desde el código (el camino normal hoy).
+  if [ "$NO_BUILD" -ne 1 ] && [ -f "$REPO_ROOT/Dockerfile" ]; then
+    decir "Construyendo la imagen de qchain desde el código"
+    echo "Esto compila todo desde cero y puede tardar VARIOS MINUTOS la primera"
+    echo "vez (después queda cacheado). Origen: $REPO_ROOT"
+    if docker build -t qchain:latest "$REPO_ROOT"; then
+      IMAGE="qchain:latest"
+      return 0
+    fi
+    echo "La construcción falló (ver el detalle arriba)."
+  fi
+
+  # Fallbacks: registro por defecto, o un tar que alguien te pasó.
+  if [ "$es_custom" -eq 0 ]; then
+    echo "Intentando 'docker pull $IMAGE'..."
+    if docker pull "$IMAGE" >/dev/null 2>&1; then return 0; fi
+  fi
+  if [ -f "$REPO_ROOT/qchain-image.tar" ]; then
+    decir "Cargando la imagen desde $REPO_ROOT/qchain-image.tar"
+    if docker load -i "$REPO_ROOT/qchain-image.tar"; then return 0; fi
+  fi
+
+  error "no pude construir ni obtener la imagen de qchain.
+  - Si estás en el repo: instalá Docker con acceso a internet y volvé a correr
+    (la construcción baja dependencias de compilación la primera vez).
+  - Si te pasaron un archivo 'qchain-image.tar': ponelo junto a este repo
+    (en $REPO_ROOT) y volvé a correr.
+  Detalle en docs/DEPLOY.md."
+}
+obtener_imagen
 if [ "$IMAGE" != "qchain:latest" ]; then
   docker tag "$IMAGE" qchain:latest
 fi
