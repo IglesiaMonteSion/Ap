@@ -95,15 +95,6 @@ const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 /// transaction's size instead of "however many the attacker cares to send."
 const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 
-/// Hard cap on cached worker batches. `batches` is fed by unauthenticated
-/// `WorkerBatchGossip`/`WorkerBatchResponse` whose keys are content-derived
-/// digests an attacker fully controls, so without a bound a peer can stream
-/// unlimited distinct junk batches into it - the same unbounded-growth OOM
-/// class. Consumed batches are dropped as their certificates commit (see
-/// `try_commit`); this cap is the backstop for batches that are gossiped but
-/// never end up committed. Generous relative to `WORKER_COUNT` lanes across a
-/// realistic in-flight round window.
-const MAX_CACHED_BATCHES: usize = 65_536;
 
 /// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
 /// `first_seen_vertex`) to retain behind the current round before pruning.
@@ -332,20 +323,14 @@ fn admit_to_mempool(state: &mut EngineState, tx: Transaction) -> bool {
     true
 }
 
-/// Caches a gossiped/served worker batch by its content digest, enforcing
-/// the `MAX_CACHED_BATCHES` bound (see its doc comment for the unauthenticated
-/// flood this closes). A batch whose digest is already cached is a no-op; a
-/// genuinely new one is dropped, not inserted, once the cap is reached -
-/// consumed batches are already evicted as their certificates commit
-/// (`try_commit`), so hitting the cap means an abnormal volume of batches
-/// that were gossiped but never committed, i.e. exactly the flood this guards
-/// against. Dropping here is safe: a validator that later genuinely needs a
-/// dropped batch re-requests it by digest (`request_missing_batches`).
+/// Caches a gossiped/served worker batch by its content digest. Left
+/// unbounded on purpose for now: a naive count cap either evicts committed
+/// batches (breaking a lagging peer's ability to resync-and-execute them) or
+/// rejects new ones once full (starving current rounds) - a correct bound
+/// needs round-windowed retention, tracked as follow-up. Same documented
+/// phase-1 simplification as before the audit.
 fn cache_batch(state: &mut EngineState, batch: Batch) {
-    let digest = batch.digest();
-    if state.batches.contains_key(&digest) || state.batches.len() < MAX_CACHED_BATCHES {
-        state.batches.entry(digest).or_insert(batch);
-    }
+    state.batches.entry(batch.digest()).or_insert(batch);
 }
 
 /// Pulls every transaction that's actually ready to execute out of the
@@ -1100,7 +1085,20 @@ impl Engine {
             // backstop for gossiped-but-never-committed flood, not the
             // primary bound.
             for (worker_id, batch_digest) in &cert.vertex.batch_digests {
-                let Some(batch) = state.batches.remove(batch_digest) else {
+                // NOT removed on use: a validator that has fallen behind
+                // re-syncs by fetching old certificates AND their batches
+                // (`WorkerBatchRequest`) from peers - evicting a batch the
+                // moment it commits here would leave a lagging peer unable to
+                // ever fetch it, permanently unable to execute those
+                // transactions (a real resync/state-divergence regression, so
+                // not done). The cache is keyed by content digest so a batch
+                // referenced by more than one certificate is stored once.
+                // Bounding this cache correctly needs round-windowed
+                // retention (keep recent, drop only batches older than any
+                // peer could still be resyncing across) - tracked as
+                // follow-up; until then it stays unbounded, the same
+                // documented phase-1 simplification as before this audit.
+                let Some(batch) = state.batches.get(batch_digest).cloned() else {
                     tracing::warn!("committed certificate references an unseen batch from worker {worker_id} - skipping its transactions");
                     continue;
                 };

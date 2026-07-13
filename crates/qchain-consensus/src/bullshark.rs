@@ -104,14 +104,48 @@ impl<'a> Bullshark<'a> {
                 }
             }
             None => {
-                // No certificate for this leader-slot is known locally at
-                // all, so there's no known support to measure - only the
-                // upper bound from whatever round+1 data is still
-                // missing. If even that alone can't reach quorum, this
-                // leader-slot (whether it's genuinely empty - a
-                // crashed/silent validator - or its certificate just
-                // hasn't synced here yet) can never directly commit.
-                if unknown_stake < quorum {
+                // The leader's own certificate is not known locally. It is
+                // NOT sound to declare this round permanently `Skipped` just
+                // because `unknown_stake < quorum` - that bound treats the
+                // support from every *known* round+1 certificate as zero,
+                // which is only true if none of them actually references the
+                // (unsynced) leader. A round+1 certificate that DOES
+                // reference the leader carries the leader's digest in its
+                // `parents`, but this validator can't recognize that without
+                // the leader's own certificate to compare against, so
+                // counting it as non-supporting is exactly the unsound step.
+                //
+                // **Real BFT safety bug this closes (found in the exhaustive
+                // pre-production audit).** Before this, a validator that had
+                // advanced past round `r` (committing round `r+1`'s anchor,
+                // whose leader happened to exclude the round-`r` leader `L`)
+                // while still missing `L`'s certificate would permanently
+                // `Skip` round `r`; when `L` finally synced it would re-resolve
+                // to `Committed(L)` and append `L` out of order - two honest
+                // validators committing different total orders (a fork). Low
+                // probability in practice (needs a validator 2+ rounds ahead
+                // yet still missing a prior leader's certificate despite the
+                // re-sync retries), but a genuine safety violation.
+                //
+                // The sound refinement: only conclude `Skipped` when the
+                // known support is provably, *permanently* zero - i.e. every
+                // known round+1 certificate has all of its parents present
+                // locally (so we can be sure none of them is the still-
+                // missing leader). In that state, known support is a fixed
+                // fact of 0 and the total possible support is at most
+                // `unknown_stake < quorum`, so `L` genuinely cannot commit -
+                // this is the genuinely-crashed-leader case, and skipping it
+                // keeps the chain live. If instead any known round+1
+                // certificate still has a missing parent, that parent COULD
+                // be `L` (it's exactly what `request_missing_parents` is
+                // fetching), so we must wait: `Undecided`. Once `L` (or the
+                // missing parents) sync, this resolves correctly - either the
+                // leader turns out present and its real support is measured
+                // by the `Some` arm above, or it's confirmed absent and
+                // skipped soundly here.
+                let known_support_is_permanently_zero =
+                    next_round_certs.iter().all(|c| c.vertex.parents.iter().all(|p| self.dag.contains(p)));
+                if unknown_stake < quorum && known_support_is_permanently_zero {
                     RoundOutcome::Skipped
                 } else {
                     RoundOutcome::Undecided
@@ -394,5 +428,102 @@ mod tests {
         let dag = DagStore::new();
         let bullshark = Bullshark::new(&dag, &validators);
         assert!(bullshark.leader_for_round(0).is_none());
+    }
+
+    fn cert(round: Round, author: ValidatorId, parents: Vec<Digest>) -> Certificate {
+        let vertex = qchain_core::Vertex { round, author, batch_digests: vec![], parents };
+        Certificate { vertex, signatures: vec![] }
+    }
+
+    /// The exact BFT safety bug the refined `direct_status` `None` arm
+    /// closes: a validator missing round `r`'s leader certificate must NOT
+    /// permanently `Skip` the round while round+1 certificates it *does*
+    /// hold reference that (still-unsynced) leader as a parent - doing so
+    /// lets it diverge from a peer that has the leader and commits it.
+    #[test]
+    fn a_missing_leader_referenced_by_a_known_child_is_undecided_not_skipped() {
+        let validators = validators(4);
+        let ids = validators.ids_sorted();
+        let r = 1;
+        // The four round-r certificates (one per validator). The leader's is
+        // the one we'll withhold from the "behind" validator's DAG.
+        let leader = {
+            let dag = DagStore::new();
+            Bullshark::new(&dag, &validators).leader_for_round(r).unwrap()
+        };
+        let round_r: Vec<Certificate> = ids.iter().map(|id| cert(r, *id, vec![])).collect();
+        let leader_digest = round_r.iter().find(|c| c.vertex.author == leader).unwrap().digest();
+
+        // Three round-(r+1) certificates, every one referencing the leader as
+        // a parent (so on a fully-synced validator the leader has 3-of-4
+        // support = quorum and commits directly).
+        let non_leaders: Vec<ValidatorId> = ids.iter().copied().filter(|id| *id != leader).collect();
+        let round_r1: Vec<Certificate> = non_leaders.iter().map(|id| cert(r + 1, *id, vec![leader_digest])).collect();
+
+        // "Behind" validator: has all three round-(r+1) certs but NOT the
+        // leader's round-r certificate. The three children reference the
+        // leader's digest, which is a *missing* parent here.
+        let mut behind = DagStore::new();
+        for c in &round_r1 {
+            behind.insert(c.clone());
+        }
+        // (also give it the two non-leader round-r certs so only the leader
+        // is genuinely missing, matching the real scenario)
+        for c in round_r.iter().filter(|c| c.vertex.author != leader) {
+            behind.insert(c.clone());
+        }
+        let b = Bullshark::new(&behind, &validators);
+        assert_eq!(
+            b.direct_status(r),
+            RoundOutcome::Undecided,
+            "a round whose leader is missing but is referenced as a parent by known children must be Undecided (wait for sync), never permanently Skipped"
+        );
+
+        // Fully-synced validator: add the leader's own cert. Now the leader
+        // has quorum support and commits directly - the outcome the behind
+        // validator must not be allowed to contradict by skipping.
+        let mut synced = DagStore::new();
+        for c in round_r.iter().chain(round_r1.iter()) {
+            synced.insert(c.clone());
+        }
+        let s = Bullshark::new(&synced, &validators);
+        assert_eq!(s.direct_status(r), RoundOutcome::Committed(leader_digest), "with the leader present and 3-of-4 support, it commits directly");
+    }
+
+    /// The crashed-leader liveness case the same code path must still allow:
+    /// when the leader genuinely produced no certificate (so no round+1
+    /// certificate references it and every known child's parents are all
+    /// present), the round is soundly `Skipped` so the chain keeps moving.
+    #[test]
+    fn a_genuinely_absent_leader_is_still_skipped_so_the_chain_stays_live() {
+        let validators = validators(4);
+        let ids = validators.ids_sorted();
+        let r = 1;
+        let leader = {
+            let dag = DagStore::new();
+            Bullshark::new(&dag, &validators).leader_for_round(r).unwrap()
+        };
+        // Round-r certs from the THREE non-leader validators only - the
+        // leader crashed and never certified round r.
+        let non_leaders: Vec<ValidatorId> = ids.iter().copied().filter(|id| *id != leader).collect();
+        let round_r: Vec<Certificate> = non_leaders.iter().map(|id| cert(r, *id, vec![])).collect();
+        let round_r_digests: Vec<Digest> = round_r.iter().map(|c| c.digest()).collect();
+        // Three round-(r+1) certs, each referencing only the present
+        // non-leader round-r certs (never the absent leader).
+        let round_r1: Vec<Certificate> = non_leaders.iter().map(|id| cert(r + 1, *id, round_r_digests.clone())).collect();
+
+        let mut dag = DagStore::new();
+        for c in round_r.iter().chain(round_r1.iter()) {
+            dag.insert(c.clone());
+        }
+        let b = Bullshark::new(&dag, &validators);
+        // known_stake = 3 (all round+1 certs present), unknown = 1 < quorum 3,
+        // and every child's parents are present (none is the absent leader),
+        // so known support is provably zero => sound permanent Skip.
+        assert_eq!(
+            b.direct_status(r),
+            RoundOutcome::Skipped,
+            "a genuinely-absent leader (no cert, no child references it, all child parents present) is soundly skipped to keep the chain live"
+        );
     }
 }
