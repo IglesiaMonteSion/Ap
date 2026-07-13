@@ -2,256 +2,440 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>qchain · Wallet</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2048%2048'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%237c5cff'/%3E%3Cstop%20offset='1'%20stop-color='%232f6df6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='48'%20height='48'%20rx='13'%20fill='url(%23g)'/%3E%3Ccircle%20cx='24'%20cy='22.5'%20r='9.5'%20fill='none'%20stroke='white'%20stroke-width='3.6'/%3E%3Crect%20x='27'%20y='27'%20width='11'%20height='3.8'%20rx='1.9'%20transform='rotate(45%2028%2030)'%20fill='white'/%3E%3C/svg%3E">
 <style>
   :root{
-    --bg:#f6f7f9; --card:#fff; --ink:#1a1f27; --muted:#6b7280; --line:#e5e7eb;
-    --accent:#2f6df6; --accent-ink:#fff; --good:#0a7d33; --good-bg:#e7f6ec;
-    --bad:#b42318; --bad-bg:#fdeceb;
+    --bg:#f4f5f8; --card:#ffffff; --ink:#141821; --muted:#6b7280; --line:#e6e8ee;
+    --brand1:#7c5cff; --brand2:#2f6df6; --good:#0a7d33; --good-bg:#e7f6ec;
+    --bad:#b42318; --bad-bg:#fdeceb; --field:#f1f2f6; --shadow:0 6px 24px rgba(20,24,40,.08);
   }
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0e1116; --card:#171b22; --ink:#e6e8eb; --muted:#9aa4b2; --line:#262c36;
-      --accent:#4b86ff; --good:#4ade80; --good-bg:#123322; --bad:#f87171; --bad-bg:#3a1a1a; }
+    :root{ --bg:#0b0e14; --card:#151a23; --ink:#eef0f4; --muted:#93a0b4; --line:#232a36;
+      --good:#4ade80; --good-bg:#12291d; --bad:#f87171; --bad-bg:#331a1a; --field:#1d232e;
+      --shadow:0 8px 30px rgba(0,0,0,.35); }
   }
   *{box-sizing:border-box}
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
-  .wrap{max-width:720px;margin:0 auto;padding:20px 16px 60px}
-  header{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:18px}
-  h1{font-size:22px;margin:0}
-  .node{font-size:12px;color:var(--muted)}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#999;margin-right:5px}
-  .dot.ok{background:var(--good)} .dot.bad{background:var(--bad)}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 16px;margin-bottom:16px}
-  .card h2{font-size:14px;margin:0 0 12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
-  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
-  input,select{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font-size:15px;font-family:inherit}
-  input:focus,select:focus{outline:2px solid var(--accent);border-color:transparent}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5;
+    -webkit-font-smoothing:antialiased}
+  .app{max-width:460px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;
+    background:var(--bg);position:relative}
+  .view{display:none;flex-direction:column;flex:1;padding:16px 18px 32px}
+  .view.active{display:flex;animation:fade .18s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  /* logo + brand */
+  .logo{width:44px;height:44px;flex:0 0 auto}
+  .logo-lg{width:84px;height:84px}
+  .brand-row{display:flex;align-items:center;gap:11px}
+  .brand-name{font-weight:800;font-size:19px;letter-spacing:-.02em}
+  .brand-name b{background:linear-gradient(90deg,var(--brand1),var(--brand2));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+
+  /* topbar */
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:6px 2px 14px}
+  .node-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);
+    background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 10px}
+  .dot{width:8px;height:8px;border-radius:50%;background:#98a2b3}
+  .dot.ok{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18)} .dot.bad{background:var(--bad)}
+
+  /* welcome */
+  .welcome{align-items:center;justify-content:center;text-align:center;gap:0}
+  .welcome .hero{margin:auto 0;display:flex;flex-direction:column;align-items:center;gap:16px}
+  .welcome h1{font-size:26px;margin:6px 0 0;letter-spacing:-.02em}
+  .welcome p{color:var(--muted);margin:0;max-width:300px}
+  .welcome .cta{width:100%;display:flex;flex-direction:column;gap:10px;margin-top:8px}
+  .badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--brand2);
+    background:color-mix(in srgb,var(--brand2) 12%,transparent);padding:5px 12px;border-radius:999px;font-weight:600}
+
+  /* cards / balance */
+  .balance-card{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
+    border-radius:22px;padding:22px 20px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .balance-card::after{content:"";position:absolute;right:-40px;top:-40px;width:150px;height:150px;
+    background:rgba(255,255,255,.12);border-radius:50%}
+  .balance-card .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;opacity:.9}
+  .balance-card .amt{font-size:34px;font-weight:800;margin-top:4px;letter-spacing:-.02em}
+  .balance-card .acct{margin-top:12px;display:flex;align-items:center;gap:8px;font-size:13px;opacity:.95}
+  .balance-card .acct .mono{font-family:ui-monospace,Menlo,monospace}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}
+  .section-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+    margin:22px 4px 10px;font-weight:700}
+
+  /* action buttons row */
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+  .act{display:flex;flex-direction:column;align-items:center;gap:7px;background:var(--card);
+    border:1px solid var(--line);border-radius:16px;padding:15px 8px;cursor:pointer;font-weight:600;
+    color:var(--ink);box-shadow:var(--shadow);transition:transform .08s}
+  .act:active{transform:scale(.97)}
+  .act .ic{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;color:#fff;
+    background:linear-gradient(135deg,var(--brand1),var(--brand2));font-size:19px}
+
+  /* generic buttons */
+  button,.btn{cursor:pointer;border:0;border-radius:14px;padding:14px 16px;font-size:16px;font-weight:700;
+    font-family:inherit;background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
+    box-shadow:0 2px 8px rgba(47,109,246,.28);transition:filter .1s,transform .08s}
+  button:active,.btn:active{transform:translateY(1px)}
+  button:disabled{opacity:.55;cursor:default;box-shadow:none}
+  .btn-sec{background:var(--card);color:var(--ink);border:1px solid var(--line);box-shadow:none}
+  .btn-ghost{background:transparent;color:var(--brand2);box-shadow:none;font-weight:600;padding:8px}
+  .btn-block{width:100%}
+  .backlink{background:none;color:var(--muted);font-weight:600;font-size:15px;padding:4px 0;
+    box-shadow:none;display:inline-flex;align-items:center;gap:6px;align-self:flex-start;margin-bottom:6px}
+
+  label{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px;font-weight:600}
+  input,textarea,select{width:100%;padding:14px;border:1px solid var(--line);border-radius:14px;
+    background:var(--field);color:var(--ink);font-size:16px;font-family:inherit}
+  textarea{resize:vertical;min-height:96px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  input:focus,textarea:focus,select:focus{outline:2px solid var(--brand2);border-color:transparent}
   .row{display:flex;gap:8px}
-  .row>*{flex:1}
-  button{cursor:pointer;border:0;border-radius:10px;padding:11px 16px;font-size:15px;font-weight:600;background:var(--accent);color:var(--accent-ink)}
-  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:500}
-  button:disabled{opacity:.6;cursor:default}
-  .wallet{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-top:1px solid var(--line)}
-  .wallet:first-child{border-top:0}
-  .wname{font-weight:600}
-  .waddr{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);cursor:pointer}
-  .wbal{text-align:right;white-space:nowrap}
-  .wbal .q{font-weight:700;font-size:16px}
-  .wbal .u{font-size:11px;color:var(--muted)}
-  .empty{color:var(--muted);font-size:14px;padding:6px 0}
-  .msg{padding:11px 12px;border-radius:10px;font-size:14px;margin-top:12px;display:none}
+
+  h2.view-title{font-size:22px;margin:2px 0 2px;letter-spacing:-.02em}
+  .view-sub{color:var(--muted);font-size:14px;margin:0 0 6px}
+  .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
+
+  .wallet-item{display:flex;align-items:center;gap:12px;padding:13px 6px;border-top:1px solid var(--line);cursor:pointer}
+  .wallet-item:first-child{border-top:0}
+  .wi-ic{width:38px;height:38px;border-radius:11px;flex:0 0 auto;background:linear-gradient(135deg,var(--brand1),var(--brand2));
+    display:grid;place-items:center;color:#fff;font-weight:800;font-size:15px}
+  .wi-main{min-width:0;flex:1}
+  .wi-name{font-weight:700}
+  .wi-addr{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .wi-bal{text-align:right;font-weight:700;white-space:nowrap}
+  .wi-check{color:var(--brand2);font-weight:800}
+
+  .tx{display:flex;align-items:center;gap:11px;padding:12px 6px;border-top:1px solid var(--line)}
+  .tx:first-child{border-top:0}
+  .tx-ic{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-size:15px;flex:0 0 auto}
+  .tx-in{background:var(--good-bg);color:var(--good)} .tx-out{background:var(--bad-bg);color:var(--bad)}
+  .tx-main{flex:1;min-width:0}
+  .tx-t{font-weight:600;font-size:14px}
+  .tx-s{font-size:11.5px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tx-amt{font-weight:700;white-space:nowrap;font-size:14px}
+  .tx-amt.in{color:var(--good)} .tx-amt.out{color:var(--ink)}
+
+  .qr-wrap{display:flex;justify-content:center;margin:6px 0 14px}
+  .qr-wrap img{width:220px;height:220px;border-radius:16px;background:#fff;padding:12px;border:1px solid var(--line)}
+  .addr-box{background:var(--field);border:1px solid var(--line);border-radius:14px;padding:14px;
+    font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all;text-align:center}
+
+  .empty{color:var(--muted);font-size:14px;padding:14px 4px;text-align:center}
+  .msg{padding:12px 14px;border-radius:12px;font-size:14px;margin-top:14px;display:none}
   .msg.ok{background:var(--good-bg);color:var(--good);display:block}
   .msg.err{background:var(--bad-bg);color:var(--bad);display:block}
-  .hint{font-size:12px;color:var(--muted);margin-top:6px}
-  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
-  .toast.show{opacity:1}
-  button{background:linear-gradient(180deg,var(--accent),color-mix(in srgb,var(--accent) 85%,#000));box-shadow:0 1px 2px rgba(0,0,0,.15)}
-  button.ghost{background:transparent;box-shadow:none}
-  h1{background:linear-gradient(90deg,var(--accent),#7aa2ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-  .total-card{background:linear-gradient(135deg,var(--accent),#1e50c8);border:0;color:#fff;text-align:center;padding:22px 16px}
-  .total-label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;opacity:.85}
-  .total-value{font-size:30px;font-weight:800;margin-top:4px;letter-spacing:-.01em}
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(10px);opacity:0;
+    background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:13px;
+    transition:.2s;pointer-events:none;z-index:50}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .grow{flex:1}
+  .center-col{display:flex;flex-direction:column;justify-content:center;flex:1}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>💠 qchain · Wallet</h1>
-    <div class="node"><span class="dot" id="dot"></span><span id="node-text">conectando…</span></div>
-  </header>
+<div class="app">
 
-  <!-- Crear wallet -->
-  <div class="card">
-    <h2>Crear una wallet</h2>
-    <label for="new-name">Nombre (solo letras, números, - y _)</label>
-    <div class="row">
-      <input id="new-name" placeholder="ej: ahorros" maxlength="64" autocomplete="off">
-      <button id="new-btn" style="flex:0 0 auto">Crear</button>
+  <!-- ===== BIENVENIDA ===== -->
+  <section class="view welcome" id="v-welcome">
+    <div class="hero">
+      <svg class="logo logo-lg" viewBox="0 0 48 48"><defs><linearGradient id="lg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#2f6df6"/></linearGradient></defs><rect width="48" height="48" rx="13" fill="url(#lg1)"/><circle cx="24" cy="22.5" r="9.5" fill="none" stroke="#fff" stroke-width="3.6"/><rect x="27" y="27" width="11" height="3.8" rx="1.9" transform="rotate(45 28 30)" fill="#fff"/></svg>
+      <span class="badge">🔒 seguridad post-cuántica</span>
+      <h1>qchain <b style="background:linear-gradient(90deg,var(--brand1),var(--brand2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent">Wallet</b></h1>
+      <p>Tu billetera para enviar y recibir QCH. Rápida, simple y protegida con criptografía resistente a computadoras cuánticas.</p>
     </div>
-    <div class="hint">La clave se guarda en este dispositivo. Guardá una copia del archivo: es tu wallet.</div>
-    <div class="msg" id="new-msg"></div>
-  </div>
+    <div class="cta">
+      <button class="btn-block" id="w-create">Crear una wallet</button>
+      <button class="btn-block btn-sec" id="w-import">Ya tengo una (importar)</button>
+    </div>
+  </section>
 
-  <!-- Total -->
-  <div class="card total-card">
-    <div class="total-label">Saldo total</div>
-    <div class="total-value" id="total-balance">– QCH</div>
-  </div>
+  <!-- ===== CREAR ===== -->
+  <section class="view" id="v-create">
+    <button class="backlink nav" data-to="welcome">← volver</button>
+    <div id="create-form">
+      <h2 class="view-title">Creá tu wallet</h2>
+      <p class="view-sub">Elegí un nombre para reconocerla. Vas a poder crear más después.</p>
+      <label for="c-name">Nombre de la wallet</label>
+      <input id="c-name" placeholder="ej: principal, ahorros…" maxlength="64" autocomplete="off">
+      <div class="hint">Solo letras, números, - y _.</div>
+      <div style="margin-top:20px"><button class="btn-block" id="c-btn">Crear wallet</button></div>
+      <div class="msg" id="c-msg"></div>
+    </div>
+    <div id="create-done" style="display:none">
+      <div style="text-align:center;margin-top:10px">
+        <div style="font-size:44px">🎉</div>
+        <h2 class="view-title">¡Wallet creada!</h2>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div class="section-title" style="margin:0 0 8px">Tu dirección (para recibir)</div>
+        <div class="addr-box" id="cd-addr"></div>
+        <button class="btn-block btn-sec" id="cd-copy" style="margin-top:10px">Copiar dirección</button>
+      </div>
+      <div class="card" style="margin-top:12px;border-color:var(--brand2)">
+        <div class="section-title" style="margin:0 0 6px;color:var(--brand2)">⚠️ Guardá tu respaldo</div>
+        <p class="hint" style="margin:0 0 10px">Esta wallet es una llave: si la perdés, perdés el acceso. Descargá el archivo de respaldo y guardalo en un lugar seguro.</p>
+        <a class="btn btn-block" id="cd-download" download>Descargar mi respaldo</a>
+      </div>
+      <div style="margin-top:16px"><button class="btn-block nav" data-to="home" id="cd-go">Entrar a mi wallet</button></div>
+    </div>
+  </section>
 
-  <!-- Mis wallets -->
-  <div class="card">
-    <h2 style="display:flex;justify-content:space-between;align-items:center">
+  <!-- ===== IMPORTAR ===== -->
+  <section class="view" id="v-import">
+    <button class="backlink nav" data-to="welcome">← volver</button>
+    <h2 class="view-title">Importar una wallet</h2>
+    <p class="view-sub">Pegá el contenido de tu archivo de respaldo (.json), o subilo.</p>
+    <label for="i-name">Nombre para esta wallet</label>
+    <input id="i-name" placeholder="ej: mi wallet" maxlength="64" autocomplete="off">
+    <label for="i-file">Archivo de respaldo</label>
+    <input id="i-file" type="file" accept=".json,application/json">
+    <label for="i-key">…o pegá el contenido</label>
+    <textarea id="i-key" placeholder='{"...":"..."}'></textarea>
+    <div style="margin-top:18px"><button class="btn-block" id="i-btn">Importar</button></div>
+    <div class="msg" id="i-msg"></div>
+  </section>
+
+  <!-- ===== HOME ===== -->
+  <section class="view" id="v-home">
+    <div class="topbar">
+      <div class="brand-row">
+        <svg class="logo" viewBox="0 0 48 48"><defs><linearGradient id="lg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#2f6df6"/></linearGradient></defs><rect width="48" height="48" rx="13" fill="url(#lg2)"/><circle cx="24" cy="22.5" r="9.5" fill="none" stroke="#fff" stroke-width="3.6"/><rect x="27" y="27" width="11" height="3.8" rx="1.9" transform="rotate(45 28 30)" fill="#fff"/></svg>
+        <span class="brand-name">qchain <b>Wallet</b></span>
+      </div>
+      <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
+    </div>
+
+    <div class="balance-card">
+      <div class="lbl">Saldo · <span id="h-name">—</span></div>
+      <div class="amt" id="h-balance">—</div>
+      <div class="acct"><span class="mono" id="h-addr">—</span><button class="btn-ghost" id="h-copy" style="color:#fff;padding:0 4px">copiar</button></div>
+    </div>
+
+    <div class="actions">
+      <div class="act nav" data-to="send"><div class="ic">↑</div>Enviar</div>
+      <div class="act nav" data-to="receive"><div class="ic">↓</div>Recibir</div>
+    </div>
+
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
       <span>Mis wallets</span>
-      <button class="ghost" id="refresh" style="padding:6px 10px;font-size:12px">↻ actualizar</button>
-    </h2>
-    <div id="wallets"><div class="empty">todavía no tenés wallets — creá una arriba</div></div>
-  </div>
-
-  <!-- Transferir -->
-  <div class="card">
-    <h2>Enviar</h2>
-    <label for="t-from">Desde</label>
-    <select id="t-from"></select>
-
-    <label for="t-to">Para (dirección de destino)</label>
-    <input id="t-to" placeholder="pegá una dirección, o elegí una wallet tuya abajo" autocomplete="off">
-    <select id="t-to-pick" style="margin-top:6px"><option value="">— o elegí una de mis wallets —</option></select>
-
-    <label for="t-amount">Monto (en QCH)</label>
-    <div class="row">
-      <input id="t-amount" placeholder="ej: 1.5" inputmode="decimal" autocomplete="off">
-      <button class="ghost" id="max-btn" style="flex:0 0 auto" title="enviar todo el saldo disponible menos el fee">máx</button>
+      <button class="btn-ghost nav" data-to="create" style="font-size:13px">＋ nueva</button>
     </div>
-    <div class="hint" id="fee-hint">1 QCH = 1.000.000.000 unidades. El fee de red se calcula solo al enviar.</div>
+    <div class="card" id="wallets-list"></div>
 
-    <div style="margin-top:14px"><button id="send-btn" style="width:100%">Enviar</button></div>
-    <div class="msg" id="send-msg"></div>
-  </div>
+    <div class="section-title">Actividad</div>
+    <div class="card" id="activity"><div class="empty">sin movimientos todavía</div></div>
+  </section>
+
+  <!-- ===== RECIBIR ===== -->
+  <section class="view" id="v-receive">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Recibir QCH</h2>
+    <p class="view-sub">Compartí este código o tu dirección para recibir fondos.</p>
+    <div class="qr-wrap"><img id="qr-img" alt="QR de tu dirección"></div>
+    <div class="addr-box" id="r-addr">—</div>
+    <div style="margin-top:12px"><button class="btn-block btn-sec" id="r-copy">Copiar dirección</button></div>
+  </section>
+
+  <!-- ===== ENVIAR ===== -->
+  <section class="view" id="v-send">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Enviar QCH</h2>
+    <div class="card" style="margin-top:4px">
+      <div class="section-title" style="margin:0 0 4px">Desde</div>
+      <div style="font-weight:700" id="s-from-name">—</div>
+      <div class="wi-addr" id="s-from-addr">—</div>
+    </div>
+    <label for="s-to">Dirección de destino</label>
+    <input id="s-to" placeholder="pegá la dirección de quien recibe" autocomplete="off">
+    <select id="s-to-pick" style="margin-top:8px"><option value="">— o elegí una de mis wallets —</option></select>
+    <label for="s-amount">Monto (QCH)</label>
+    <div class="row">
+      <input id="s-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
+      <button class="btn-sec" id="s-max" style="flex:0 0 auto;padding:14px 18px">máx</button>
+    </div>
+    <div class="hint" id="s-fee">El fee de red se calcula solo al enviar.</div>
+    <div style="margin-top:18px"><button class="btn-block" id="s-btn">Enviar</button></div>
+    <div class="msg" id="s-msg"></div>
+  </section>
+
 </div>
 <div class="toast" id="toast">copiado</div>
 
 <script>
 const $ = id => document.getElementById(id);
 let WALLETS = [];
+let active = localStorage.getItem("qchain_active") || null;
 
-function toast(t){ const el=$("toast"); el.textContent=t; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"),1200); }
-function short(s){ return s.length>16 ? s.slice(0,8)+"…"+s.slice(-6) : s; }
+function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); setTimeout(()=>e.classList.remove("show"),1300); }
+function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s||""); }
+function copy(t){ navigator.clipboard.writeText(t).then(()=>toast("copiado")); }
+function initials(n){ return (n||"?").slice(0,2).toUpperCase(); }
 
-// --- money (exact, via BigInt): 1 QCH = 1e9 unidades ---
-function qchToUnits(s){
-  s=(s||"").trim().replace(",",".");
-  if(!/^\d+(\.\d+)?$/.test(s)) throw new Error("monto inválido");
-  let [i,f=""]=s.split(".");
-  f=(f+"000000000").slice(0,9);
-  return (BigInt(i)*1000000000n+BigInt(f)).toString();
-}
-function unitsToQch(u){
-  u=BigInt(u);
-  const int=u/1000000000n;
-  let frac=(u%1000000000n).toString().padStart(9,"0").replace(/0+$/,"");
-  return frac ? `${int}.${frac}` : int.toString();
-}
-function fmt(intStr){ return intStr.replace(/\B(?=(\d{3})+(?!\d))/g,"."); }
-// Muestra un balance (en unidades) como QCH legible: separador de miles con
-// punto y decimales con coma. Ej: 100000000000 -> "100 QCH", 1500000000 -> "1,5 QCH".
-function qchDisp(units){
-  const q = unitsToQch(units);
-  const [i,f] = q.split(".");
-  return fmt(i) + (f ? ","+f : "") + " QCH";
-}
+// dinero exacto (BigInt), 1 QCH = 1e9 unidades
+function qchToUnits(s){ s=(s||"").trim().replace(",","."); if(!/^\d+(\.\d+)?$/.test(s)) throw new Error("monto inválido");
+  let [i,f=""]=s.split("."); f=(f+"000000000").slice(0,9); return (BigInt(i)*1000000000n+BigInt(f)).toString(); }
+function unitsToQch(u){ u=BigInt(u); const i=u/1000000000n; let f=(u%1000000000n).toString().padStart(9,"0").replace(/0+$/,""); return f?`${i}.${f}`:i.toString(); }
+function fmt(s){ return s.replace(/\B(?=(\d{3})+(?!\d))/g,"."); }
+function qchDisp(u){ const q=unitsToQch(u); const [i,f]=q.split("."); return fmt(i)+(f?","+f:"")+" QCH"; }
 
-async function api(path, opts){
-  const r = await fetch(path, opts);
-  const body = await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(body.error || ("error "+r.status));
-  return body;
+async function api(path, opts){ const r=await fetch(path,opts); const b=await r.json().catch(()=>({})); if(!r.ok) throw new Error(b.error||("error "+r.status)); return b; }
+
+function showView(name){
+  document.querySelectorAll(".view").forEach(v=>v.classList.remove("active"));
+  $("v-"+name).classList.add("active");
+  window.scrollTo(0,0);
+  if(name==="home") renderHome();
+  if(name==="receive") renderReceive();
+  if(name==="send") renderSend();
+}
+document.querySelectorAll(".nav").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
+
+function activeWallet(){ return WALLETS.find(w=>w.name===active) || WALLETS[0] || null; }
+
+async function loadWallets(){
+  try{ WALLETS = await api("/api/wallets"); }catch(e){ WALLETS=[]; }
+  if(WALLETS.length && !WALLETS.some(w=>w.name===active)){ active = WALLETS[0].name; localStorage.setItem("qchain_active",active); }
 }
 
 async function loadNode(){
   try{
-    // Vía el backend de la wallet (mismo origen) - el navegador no puede
-    // consultar el nodo directo (otro puerto = otro origen, sin CORS).
-    const st = await api("/api/node");
-    if(st.online === false) throw new Error("offline");
-    $("dot").className="dot ok";
-    $("node-text").textContent = `en vivo · v${st.version} · ronda ${st.next_round}`;
-  }catch(e){
-    $("dot").className="dot bad";
-    $("node-text").textContent="nodo no responde";
-  }
+    const st=await api("/api/node");
+    if(st.online===false) throw 0;
+    $("dot").className="dot ok"; $("node-text").textContent=`en vivo · v${st.version}`;
+  }catch(e){ $("dot").className="dot bad"; $("node-text").textContent="sin conexión"; }
 }
 
-async function loadWallets(){
-  try{
-    WALLETS = await api("/api/wallets");
-  }catch(e){ WALLETS=[]; }
-  // total de saldo (suma exacta con BigInt)
-  const total = WALLETS.reduce((a,w)=>a+BigInt(w.balance||"0"), 0n);
-  $("total-balance").textContent = qchDisp(total.toString());
-  const box=$("wallets");
-  if(WALLETS.length===0){ box.innerHTML='<div class="empty">todavía no tenés wallets — creá una arriba</div>'; }
-  else{
-    box.innerHTML = WALLETS.map(w=>`
-      <div class="wallet">
-        <div style="min-width:0">
-          <div class="wname">${w.name}</div>
-          <div class="waddr" data-copy="${w.address}" title="copiar">${short(w.address)}</div>
-        </div>
-        <div class="wbal"><div class="q">${qchDisp(w.balance)}</div></div>
-      </div>`).join("");
-    box.querySelectorAll(".waddr").forEach(el=>el.onclick=()=>{navigator.clipboard.writeText(el.dataset.copy);toast("dirección copiada");});
-  }
-  // Rellenar los selects, preservando lo que el usuario ya haya elegido (para
-  // que el auto-refresco no le cambie la selección mientras arma un envío).
-  const from=$("t-from"), pick=$("t-to-pick");
-  const prevFrom=from.value, prevPick=pick.value;
-  from.innerHTML = WALLETS.length? WALLETS.map(w=>`<option value="${w.name}">${w.name} — ${short(w.address)}</option>`).join("") : `<option value="">(creá una wallet primero)</option>`;
-  pick.innerHTML = `<option value="">— o elegí una de mis wallets —</option>` + WALLETS.map(w=>`<option value="${w.address}">${w.name} — ${short(w.address)}</option>`).join("");
-  if(prevFrom && WALLETS.some(w=>w.name===prevFrom)) from.value=prevFrom;
-  if(prevPick) pick.value=prevPick;
+function renderHome(){
+  const w=activeWallet();
+  if(!w){ showView("welcome"); return; }
+  $("h-name").textContent=w.name;
+  $("h-balance").textContent=qchDisp(w.balance);
+  $("h-addr").textContent=short(w.address);
+  $("h-copy").onclick=()=>copy(w.address);
+
+  const total=WALLETS.reduce((a,x)=>a+BigInt(x.balance||"0"),0n);
+  const box=$("wallets-list");
+  box.innerHTML = WALLETS.map(x=>`
+    <div class="wallet-item" data-name="${x.name}">
+      <div class="wi-ic">${initials(x.name)}</div>
+      <div class="wi-main"><div class="wi-name">${x.name}</div><div class="wi-addr">${short(x.address)}</div></div>
+      <div class="wi-bal">${qchDisp(x.balance)} ${x.name===active?'<span class="wi-check">✓</span>':''}</div>
+    </div>`).join("");
+  box.querySelectorAll(".wallet-item").forEach(el=>el.onclick=()=>{
+    active=el.dataset.name; localStorage.setItem("qchain_active",active); renderHome();
+  });
+  renderActivity(w.address);
 }
 
-$("new-btn").onclick = async ()=>{
-  const name=$("new-name").value.trim();
-  const msg=$("new-msg"); msg.className="msg"; msg.textContent="";
+async function renderActivity(addr){
+  const box=$("activity");
+  let txs=[];
+  try{ txs=await api("/api/transfers"); }catch(e){}
+  const mine=txs.filter(t=>t.from===addr||t.to===addr).slice(0,15);
+  if(!mine.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
+  box.innerHTML=mine.map(t=>{
+    const inc=t.to===addr;
+    return `<div class="tx">
+      <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
+      <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
+        <div class="tx-s">${inc?'de '+short(t.from):'a '+short(t.to)}</div></div>
+      <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${qchDisp(t.amount)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderReceive(){
+  const w=activeWallet(); if(!w) return;
+  $("qr-img").src="/api/qr/"+encodeURIComponent(w.address);
+  $("r-addr").textContent=w.address;
+  $("r-copy").onclick=()=>copy(w.address);
+}
+
+function renderSend(){
+  const w=activeWallet(); if(!w) return;
+  $("s-from-name").textContent=w.name;
+  $("s-from-addr").textContent=w.address;
+  $("s-fee").textContent="El fee de red se calcula solo al enviar.";
+  $("s-amount").value=""; $("s-to").value="";
+  const pick=$("s-to-pick");
+  pick.innerHTML=`<option value="">— o elegí una de mis wallets —</option>`+WALLETS.filter(x=>x.name!==w.name).map(x=>`<option value="${x.address}">${x.name} — ${short(x.address)}</option>`).join("");
+  const msg=$("s-msg"); msg.className="msg"; msg.textContent="";
+}
+$("s-to-pick").onchange=e=>{ if(e.target.value) $("s-to").value=e.target.value; };
+
+// crear
+$("c-btn").onclick=async()=>{
+  const name=$("c-name").value.trim(); const msg=$("c-msg"); msg.className="msg"; msg.textContent="";
   if(!name){ msg.className="msg err"; msg.textContent="poné un nombre"; return; }
-  $("new-btn").disabled=true;
+  $("c-btn").disabled=true;
   try{
-    const w = await api("/api/wallets",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name})});
-    msg.className="msg ok"; msg.innerHTML=`Wallet <b>${w.name}</b> creada.<br>Dirección: <span style="font-family:monospace;font-size:12px">${w.address}</span>`;
-    $("new-name").value="";
-    await loadWallets();
+    const w=await api("/api/wallets",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name})});
+    await loadWallets(); active=w.name; localStorage.setItem("qchain_active",active);
+    $("cd-addr").textContent=w.address;
+    $("cd-copy").onclick=()=>copy(w.address);
+    $("cd-download").href="/api/export/"+encodeURIComponent(w.name);
+    $("create-form").style.display="none"; $("create-done").style.display="block";
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
-  $("new-btn").disabled=false;
+  $("c-btn").disabled=false;
 };
 
-$("t-to-pick").onchange = e=>{ if(e.target.value){ $("t-to").value=e.target.value; } };
+// importar
+$("i-file").onchange=async e=>{ const f=e.target.files[0]; if(f) $("i-key").value=await f.text(); };
+$("i-btn").onclick=async()=>{
+  const name=$("i-name").value.trim(), keypair=$("i-key").value.trim(); const msg=$("i-msg"); msg.className="msg"; msg.textContent="";
+  if(!name){ msg.className="msg err"; msg.textContent="poné un nombre"; return; }
+  if(!keypair){ msg.className="msg err"; msg.textContent="subí o pegá tu archivo de respaldo"; return; }
+  $("i-btn").disabled=true;
+  try{
+    const w=await api("/api/import",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name,keypair})});
+    await loadWallets(); active=w.name; localStorage.setItem("qchain_active",active);
+    toast("wallet importada"); showView("home");
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("i-btn").disabled=false;
+};
 
-$("send-btn").onclick = async ()=>{
-  const from=$("t-from").value, to=$("t-to").value.trim(), amountQch=$("t-amount").value.trim();
-  const msg=$("send-msg"); msg.className="msg"; msg.textContent="";
-  if(!from){ msg.className="msg err"; msg.textContent="elegí desde qué wallet enviar"; return; }
+// máximo
+$("s-max").onclick=async()=>{
+  const w=activeWallet(); if(!w) return;
+  $("s-max").disabled=true;
+  try{
+    const r=await api("/api/max/"+encodeURIComponent(w.name));
+    if(BigInt(r.max)<=0n){ $("s-fee").textContent="saldo insuficiente incluso para el fee"; }
+    else{ $("s-amount").value=unitsToQch(r.max); $("s-fee").textContent=`máximo: ${qchDisp(r.max)} · fee: ${qchDisp(r.fee)}`; }
+  }catch(e){ $("s-fee").textContent=e.message; }
+  $("s-max").disabled=false;
+};
+
+// enviar
+$("s-btn").onclick=async()=>{
+  const w=activeWallet(); const to=$("s-to").value.trim(), amt=$("s-amount").value.trim();
+  const msg=$("s-msg"); msg.className="msg"; msg.textContent="";
+  if(!w) return;
   if(!to){ msg.className="msg err"; msg.textContent="poné la dirección de destino"; return; }
-  let amount;
-  try{ amount=qchToUnits(amountQch); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1.5)"; return; }
-  $("send-btn").disabled=true; msg.className="msg"; msg.textContent="enviando…"; msg.style.display="block";
+  let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
+  $("s-btn").disabled=true; msg.className="msg"; msg.style.display="block"; msg.textContent="enviando…";
   try{
-    const r = await api("/api/transfer",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from,to,amount})});
-    msg.className="msg ok"; msg.innerHTML=`✓ Enviado ${amountQch} QCH.<br><span style="font-size:12px">hash: <span style="font-family:monospace">${r.tx.hash||""}</span></span>`;
-    $("t-amount").value="";
-    setTimeout(loadWallets, 1500);
+    const r=await api("/api/transfer",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from:w.name,to,amount})});
+    msg.className="msg ok"; msg.innerHTML=`✓ Enviaste ${amt} QCH`;
+    $("s-amount").value=""; $("s-to").value="";
+    setTimeout(async()=>{ await loadWallets(); }, 1500);
+    setTimeout(()=>showView("home"), 1800);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
-  $("send-btn").disabled=false;
+  $("s-btn").disabled=false;
 };
 
-// "máx": pregunta al server el saldo menos el fee real (calculado con la
-// firma real de esta wallet) y lo pone en el campo de monto, ya en QCH.
-$("max-btn").onclick = async ()=>{
-  const from=$("t-from").value;
-  const msg=$("send-msg"); msg.className="msg"; msg.textContent="";
-  if(!from){ msg.className="msg err"; msg.textContent="elegí desde qué wallet enviar"; return; }
-  $("max-btn").disabled=true;
-  try{
-    const r = await api("/api/max/"+encodeURIComponent(from));
-    if(BigInt(r.max) <= 0n){
-      msg.className="msg err"; msg.textContent="esta wallet no tiene saldo suficiente ni para el fee";
-      $("fee-hint").textContent="1 QCH = 1.000.000.000 unidades. El fee de red se calcula solo al enviar.";
-    }else{
-      $("t-amount").value = unitsToQch(r.max);
-      $("fee-hint").textContent = `máximo enviable: ${qchDisp(r.max)} · fee de red: ${qchDisp(r.fee)}`;
-    }
-  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
-  $("max-btn").disabled=false;
-};
+$("w-create").onclick=()=>{ $("create-form").style.display="block"; $("create-done").style.display="none"; $("c-name").value=""; $("c-msg").textContent=""; showView("create"); };
+$("w-import").onclick=()=>showView("import");
 
-$("refresh").onclick = ()=>{ loadWallets(); loadNode(); };
-
-loadNode(); loadWallets();
-// Auto-refresco: los saldos y el estado del nodo se actualizan solos, sin
-// tener que apretar "actualizar". loadWallets preserva la selección del form.
-setInterval(loadWallets, 4000);
-setInterval(loadNode, 4000);
+// arranque
+(async function(){
+  await loadWallets(); await loadNode();
+  showView(WALLETS.length ? "home" : "welcome");
+  setInterval(async()=>{ await loadWallets(); if($("v-home").classList.contains("active")) renderHome(); }, 5000);
+  setInterval(loadNode, 5000);
+})();
 </script>
 </body>
 </html>

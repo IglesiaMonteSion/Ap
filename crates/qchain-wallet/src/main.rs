@@ -107,6 +107,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/balance/:address", get(balance))
         .route("/api/max/:name", get(max_amount))
         .route("/api/transfer", post(transfer))
+        .route("/api/qr/:address", get(qr_code))
+        .route("/api/transfers", get(recent_transfers))
+        .route("/api/import", post(import_wallet))
+        .route("/api/export/:name", get(export_wallet))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -294,6 +298,71 @@ async fn transfer(State(st): State<Arc<AppState>>, Json(req): Json<TransferReq>)
     }
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true, "tx": body, "from": payer.pubkey().to_string(), "to": to_pk.to_string(), "amount": amount.to_string() })))
+}
+
+/// A QR code (SVG) of an address, so someone can scan it to send funds -
+/// standard "receive" UX. Generated server-side (pure-Rust `qrcode`) so the
+/// page stays self-contained with no external QR service.
+async fn qr_code(Path(address): Path<String>) -> Result<Response, ApiError> {
+    let code = qrcode::QrCode::new(address.as_bytes())
+        .map_err(|e| ApiError::bad(format!("no se pudo generar el QR: {e}")))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#111827"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/svg+xml")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(svg))
+        .map_err(ApiError::internal)
+}
+
+/// The node's recent transfers, proxied (same-origin) so the browser can show
+/// per-wallet activity by filtering this list by address client-side.
+async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let resp = st.http.get(format!("{}/transfers?limit=100", st.rpc)).send().await.map_err(ApiError::internal)?;
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    name: String,
+    /// The full contents of a keypair `.json` file (a real qchain key backup).
+    keypair: String,
+}
+
+/// Import an existing wallet from its key-file contents (the "ya tengo una
+/// wallet" flow). Validated by actually parsing it as a real keypair; a bad
+/// file is rejected and not kept.
+async fn import_wallet(State(st): State<Arc<AppState>>, Json(req): Json<ImportReq>) -> Result<Json<WalletInfo>, ApiError> {
+    let name = sanitize_name(&req.name)?;
+    let path = wallet_path(&st, &name)?;
+    if path.exists() {
+        return Err(ApiError::bad(format!("ya existe una wallet llamada '{name}'")));
+    }
+    std::fs::write(&path, req.keypair.as_bytes()).map_err(ApiError::internal)?;
+    match qchain_crypto::read_keypair_file(&path) {
+        Ok(kp) => Ok(Json(WalletInfo { name, address: kp.pubkey().to_string(), balance: "0".to_string() })),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(ApiError::bad(format!("el archivo no es una clave válida de qchain: {e}")))
+        }
+    }
+}
+
+/// Download a wallet's key file - the user's backup ("es tu wallet, guardala").
+async fn export_wallet(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Result<Response, ApiError> {
+    let name = sanitize_name(&name)?;
+    let path = wallet_path(&st, &name)?;
+    let content = std::fs::read_to_string(&path).map_err(|_| ApiError::bad(format!("no encontré la wallet '{name}'")))?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.json\""))
+        .body(Body::from(content))
+        .map_err(ApiError::internal)
 }
 
 // ---- helpers --------------------------------------------------------------
