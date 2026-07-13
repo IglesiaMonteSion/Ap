@@ -14,3 +14,6 @@ bs58.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 sha3.workspace = true
+
+[dev-dependencies]
+ml-dsa = "0.1"
