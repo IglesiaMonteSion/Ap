@@ -280,6 +280,7 @@
 const $ = id => document.getElementById(id);
 let WALLETS = [];
 let active = localStorage.getItem("qchain_active") || null;
+let lastListSig = "";
 
 function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); setTimeout(()=>e.classList.remove("show"),1300); }
 function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s||""); }
@@ -328,25 +329,36 @@ function renderHome(){
   $("h-addr").textContent=short(w.address);
   $("h-copy").onclick=()=>copy(w.address);
 
-  const total=WALLETS.reduce((a,x)=>a+BigInt(x.balance||"0"),0n);
   const box=$("wallets-list");
-  box.innerHTML = WALLETS.map(x=>`
-    <div class="wallet-item" data-name="${x.name}">
-      <div class="wi-ic">${initials(x.name)}</div>
-      <div class="wi-main"><div class="wi-name">${x.name}</div><div class="wi-addr">${short(x.address)}</div></div>
-      <div class="wi-bal">${qchDisp(x.balance)} ${x.name===active?'<span class="wi-check">✓</span>':''}</div>
-    </div>`).join("");
-  box.querySelectorAll(".wallet-item").forEach(el=>el.onclick=()=>{
-    active=el.dataset.name; localStorage.setItem("qchain_active",active); renderHome();
-  });
+  // Igual que la actividad: redibujar la lista de wallets solo si cambió
+  // (nombres, saldos o cuál está activa), para no parpadear en cada refresco.
+  const listSig=active+"|"+WALLETS.map(x=>x.name+":"+x.balance).join(",");
+  if(listSig!==lastListSig){
+    lastListSig=listSig;
+    box.innerHTML = WALLETS.map(x=>`
+      <div class="wallet-item" data-name="${x.name}">
+        <div class="wi-ic">${initials(x.name)}</div>
+        <div class="wi-main"><div class="wi-name">${x.name}</div><div class="wi-addr">${short(x.address)}</div></div>
+        <div class="wi-bal">${qchDisp(x.balance)} ${x.name===active?'<span class="wi-check">✓</span>':''}</div>
+      </div>`).join("");
+    box.querySelectorAll(".wallet-item").forEach(el=>el.onclick=()=>{
+      active=el.dataset.name; localStorage.setItem("qchain_active",active); renderHome();
+    });
+  }
   renderActivity(w.address);
 }
 
+let lastActivitySig="";
 async function renderActivity(addr){
   const box=$("activity");
-  let txs=[];
-  try{ txs=await api("/api/transfers"); }catch(e){}
+  let txs;
+  try{ txs=await api("/api/transfers"); }catch(e){ return; } // ante un error de red no borramos lo que ya se ve
   const mine=txs.filter(t=>t.from===addr||t.to===addr).slice(0,15);
+  // Solo tocamos el DOM si la actividad cambió de verdad; si no, evitamos el
+  // "apagón"/parpadeo de reescribir la lista idéntica cada pocos segundos.
+  const sig=addr+"|"+mine.map(t=>t.tx_hash).join(",");
+  if(sig===lastActivitySig) return;
+  lastActivitySig=sig;
   if(!mine.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
   box.innerHTML=mine.map(t=>{
     const inc=t.to===addr;

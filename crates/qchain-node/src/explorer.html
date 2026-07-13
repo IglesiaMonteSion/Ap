@@ -450,6 +450,7 @@ async function refreshEquivocations() {
 
 let transfersOffset = 0;
 const TRANSFERS_PAGE = 20;
+let lastTransfersSig = "";
 
 async function loadTransfers(reset = false) {
   if (reset) {
@@ -461,6 +462,9 @@ async function loadTransfers(reset = false) {
   const loadMore = document.getElementById("load-more");
   try {
     const rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=${transfersOffset}`);
+    // Keep the auto-refresh signature in sync when we (re)load the first page,
+    // so it doesn't immediately re-trigger a rebuild right after a manual load.
+    if (transfersOffset === 0) lastTransfersSig = rows.map(r => r.tx_hash).join(",");
     if (transfersOffset === 0 && rows.length === 0) {
       emptyNote.hidden = false;
       loadMore.hidden = true;
@@ -479,6 +483,21 @@ async function loadTransfers(reset = false) {
     emptyNote.textContent = `error cargando transferencias: ${e.message}`;
     emptyNote.hidden = false;
   }
+}
+
+// Smooth auto-refresh of the recent-activity list: fetch the first page and
+// only rebuild the table when it actually changed. Rebuilding unconditionally
+// every few seconds cleared the tbody first, causing a visible flicker/
+// "blackout" even when nothing was new. Skips entirely while the user has
+// paged down (so "cargar más" isn't clobbered).
+async function autoRefreshTransfers() {
+  if (transfersOffset > TRANSFERS_PAGE) return;
+  let rows;
+  try { rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=0`); }
+  catch (e) { return; }
+  const sig = rows.map(r => r.tx_hash).join(",");
+  if (sig === lastTransfersSig) return; // sin cambios -> no tocar el DOM, sin parpadeo
+  loadTransfers(true);
 }
 
 function accountCard(title, address, before, after) {
@@ -556,13 +575,9 @@ refreshEquivocations();
 loadTransfers(true);
 setInterval(refreshStatus, 2000);
 setInterval(refreshEquivocations, 15000);
-// Auto-refresco de "actividad reciente": recarga la primera página sola cada
-// 3s para que las transferencias nuevas aparezcan sin apretar "actualizar".
-// Solo cuando el usuario está en la primera página (si apretó "cargar más",
-// no le pisamos lo que está mirando).
-setInterval(() => {
-  if (transfersOffset <= TRANSFERS_PAGE) loadTransfers(true);
-}, 3000);
+// Auto-refresco de "actividad reciente" sin parpadeo: solo redibuja si la
+// lista cambió de verdad (ver autoRefreshTransfers).
+setInterval(autoRefreshTransfers, 3000);
 </script>
 </body>
 </html>

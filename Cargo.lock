@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-cli"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-consensus"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "qchain-core",
  "qchain-crypto",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-execution"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-faucet"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-governance"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "borsh",
  "qchain-core",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-network"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-node"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-simulation"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "qchain-consensus",
  "qchain-core",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-stark"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "hex",
  "qchain-core",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-storage"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-wallet"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
