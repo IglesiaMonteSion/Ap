@@ -13,6 +13,7 @@ members = [
     "crates/qchain-node",
     "crates/qchain-cli",
     "crates/qchain-faucet",
+    "crates/qchain-wallet",
 ]
 
 [workspace.package]

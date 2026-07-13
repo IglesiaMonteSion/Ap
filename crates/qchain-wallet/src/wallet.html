@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qchain · Wallet</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#1a1f27; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#2f6df6; --accent-ink:#fff; --good:#0a7d33; --good-bg:#e7f6ec;
+    --bad:#b42318; --bad-bg:#fdeceb;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0e1116; --card:#171b22; --ink:#e6e8eb; --muted:#9aa4b2; --line:#262c36;
+      --accent:#4b86ff; --good:#4ade80; --good-bg:#123322; --bad:#f87171; --bad-bg:#3a1a1a; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
+  .wrap{max-width:720px;margin:0 auto;padding:20px 16px 60px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:22px;margin:0}
+  .node{font-size:12px;color:var(--muted)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#999;margin-right:5px}
+  .dot.ok{background:var(--good)} .dot.bad{background:var(--bad)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 16px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input,select{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font-size:15px;font-family:inherit}
+  input:focus,select:focus{outline:2px solid var(--accent);border-color:transparent}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  button{cursor:pointer;border:0;border-radius:10px;padding:11px 16px;font-size:15px;font-weight:600;background:var(--accent);color:var(--accent-ink)}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:500}
+  button:disabled{opacity:.6;cursor:default}
+  .wallet{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-top:1px solid var(--line)}
+  .wallet:first-child{border-top:0}
+  .wname{font-weight:600}
+  .waddr{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);cursor:pointer}
+  .wbal{text-align:right;white-space:nowrap}
+  .wbal .q{font-weight:700;font-size:16px}
+  .wbal .u{font-size:11px;color:var(--muted)}
+  .empty{color:var(--muted);font-size:14px;padding:6px 0}
+  .msg{padding:11px 12px;border-radius:10px;font-size:14px;margin-top:12px;display:none}
+  .msg.ok{background:var(--good-bg);color:var(--good);display:block}
+  .msg.err{background:var(--bad-bg);color:var(--bad);display:block}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>💠 qchain · Wallet</h1>
+    <div class="node"><span class="dot" id="dot"></span><span id="node-text">conectando…</span></div>
+  </header>
+
+  <!-- Crear wallet -->
+  <div class="card">
+    <h2>Crear una wallet</h2>
+    <label for="new-name">Nombre (solo letras, números, - y _)</label>
+    <div class="row">
+      <input id="new-name" placeholder="ej: ahorros" maxlength="64" autocomplete="off">
+      <button id="new-btn" style="flex:0 0 auto">Crear</button>
+    </div>
+    <div class="hint">La clave se guarda en este dispositivo. Guardá una copia del archivo: es tu wallet.</div>
+    <div class="msg" id="new-msg"></div>
+  </div>
+
+  <!-- Mis wallets -->
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center">
+      <span>Mis wallets</span>
+      <button class="ghost" id="refresh" style="padding:6px 10px;font-size:12px">↻ actualizar</button>
+    </h2>
+    <div id="wallets"><div class="empty">todavía no tenés wallets — creá una arriba</div></div>
+  </div>
+
+  <!-- Transferir -->
+  <div class="card">
+    <h2>Enviar</h2>
+    <label for="t-from">Desde</label>
+    <select id="t-from"></select>
+
+    <label for="t-to">Para (dirección de destino)</label>
+    <input id="t-to" placeholder="pegá una dirección, o elegí una wallet tuya abajo" autocomplete="off">
+    <select id="t-to-pick" style="margin-top:6px"><option value="">— o elegí una de mis wallets —</option></select>
+
+    <label for="t-amount">Monto (en QCH)</label>
+    <input id="t-amount" placeholder="ej: 1.5" inputmode="decimal" autocomplete="off">
+    <div class="hint">1 QCH = 1.000.000.000 unidades. El fee de red es ~0,001 QCH.</div>
+
+    <div style="margin-top:14px"><button id="send-btn" style="width:100%">Enviar</button></div>
+    <div class="msg" id="send-msg"></div>
+  </div>
+</div>
+<div class="toast" id="toast">copiado</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let WALLETS = [];
+
+function toast(t){ const el=$("toast"); el.textContent=t; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"),1200); }
+function short(s){ return s.length>16 ? s.slice(0,8)+"…"+s.slice(-6) : s; }
+
+// --- money (exact, via BigInt): 1 QCH = 1e9 unidades ---
+function qchToUnits(s){
+  s=(s||"").trim().replace(",",".");
+  if(!/^\d+(\.\d+)?$/.test(s)) throw new Error("monto inválido");
+  let [i,f=""]=s.split(".");
+  f=(f+"000000000").slice(0,9);
+  return (BigInt(i)*1000000000n+BigInt(f)).toString();
+}
+function unitsToQch(u){
+  u=BigInt(u);
+  const int=u/1000000000n;
+  let frac=(u%1000000000n).toString().padStart(9,"0").replace(/0+$/,"");
+  return frac ? `${int}.${frac}` : int.toString();
+}
+function fmt(intStr){ return intStr.replace(/\B(?=(\d{3})+(?!\d))/g,"."); }
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(body.error || ("error "+r.status));
+  return body;
+}
+
+async function loadNode(){
+  try{
+    const cfg = await api("/api/config");
+    const st = await (await fetch(cfg.rpc + "/status")).json();
+    $("dot").className="dot ok";
+    $("node-text").textContent = `nodo ${short(cfg.rpc.replace(/^https?:\/\//,""))} · v${st.version} · ronda ${st.next_round}`;
+  }catch(e){
+    $("dot").className="dot bad";
+    $("node-text").textContent="nodo no responde";
+  }
+}
+
+async function loadWallets(){
+  try{
+    WALLETS = await api("/api/wallets");
+  }catch(e){ WALLETS=[]; }
+  const box=$("wallets");
+  if(WALLETS.length===0){ box.innerHTML='<div class="empty">todavía no tenés wallets — creá una arriba</div>'; }
+  else{
+    box.innerHTML = WALLETS.map(w=>`
+      <div class="wallet">
+        <div style="min-width:0">
+          <div class="wname">${w.name}</div>
+          <div class="waddr" data-copy="${w.address}" title="copiar">${short(w.address)}</div>
+        </div>
+        <div class="wbal"><div class="q">${fmt(unitsToQch(w.balance).split(".")[0])}${unitsToQch(w.balance).includes(".")?","+unitsToQch(w.balance).split(".")[1]:""} QCH</div><div class="u">${fmt(w.balance)} unidades</div></div>
+      </div>`).join("");
+    box.querySelectorAll(".waddr").forEach(el=>el.onclick=()=>{navigator.clipboard.writeText(el.dataset.copy);toast("dirección copiada");});
+  }
+  // fill selects
+  const from=$("t-from"), pick=$("t-to-pick");
+  from.innerHTML = WALLETS.length? WALLETS.map(w=>`<option value="${w.name}">${w.name} — ${short(w.address)}</option>`).join("") : `<option value="">(creá una wallet primero)</option>`;
+  pick.innerHTML = `<option value="">— o elegí una de mis wallets —</option>` + WALLETS.map(w=>`<option value="${w.address}">${w.name} — ${short(w.address)}</option>`).join("");
+}
+
+$("new-btn").onclick = async ()=>{
+  const name=$("new-name").value.trim();
+  const msg=$("new-msg"); msg.className="msg"; msg.textContent="";
+  if(!name){ msg.className="msg err"; msg.textContent="poné un nombre"; return; }
+  $("new-btn").disabled=true;
+  try{
+    const w = await api("/api/wallets",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name})});
+    msg.className="msg ok"; msg.innerHTML=`Wallet <b>${w.name}</b> creada.<br>Dirección: <span style="font-family:monospace;font-size:12px">${w.address}</span>`;
+    $("new-name").value="";
+    await loadWallets();
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("new-btn").disabled=false;
+};
+
+$("t-to-pick").onchange = e=>{ if(e.target.value){ $("t-to").value=e.target.value; } };
+
+$("send-btn").onclick = async ()=>{
+  const from=$("t-from").value, to=$("t-to").value.trim(), amountQch=$("t-amount").value.trim();
+  const msg=$("send-msg"); msg.className="msg"; msg.textContent="";
+  if(!from){ msg.className="msg err"; msg.textContent="elegí desde qué wallet enviar"; return; }
+  if(!to){ msg.className="msg err"; msg.textContent="poné la dirección de destino"; return; }
+  let amount;
+  try{ amount=qchToUnits(amountQch); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1.5)"; return; }
+  $("send-btn").disabled=true; msg.className="msg"; msg.textContent="enviando…"; msg.style.display="block";
+  try{
+    const r = await api("/api/transfer",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from,to,amount})});
+    msg.className="msg ok"; msg.innerHTML=`✓ Enviado ${amountQch} QCH.<br><span style="font-size:12px">hash: <span style="font-family:monospace">${r.tx.hash||""}</span></span>`;
+    $("t-amount").value="";
+    setTimeout(loadWallets, 1500);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("send-btn").disabled=false;
+};
+
+$("refresh").onclick = ()=>{ loadWallets(); loadNode(); };
+
+loadNode(); loadWallets();
+setInterval(loadNode, 15000);
+</script>
+</body>
+</html>

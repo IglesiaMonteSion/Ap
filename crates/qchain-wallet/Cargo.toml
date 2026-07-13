@@ -1,0 +1,22 @@
+[package]
+name = "qchain-wallet"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "qchain-wallet"
+path = "src/main.rs"
+
+[dependencies]
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-execution = { path = "../qchain-execution" }
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hex.workspace = true
