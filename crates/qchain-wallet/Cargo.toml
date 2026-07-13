@@ -20,3 +20,4 @@ reqwest.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 hex.workspace = true
+base64 = "0.22"

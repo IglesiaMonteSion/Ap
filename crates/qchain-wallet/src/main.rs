@@ -16,11 +16,14 @@
 //! this port can spend the wallets it holds. Exposing it beyond localhost is
 //! possible (`--bind`) but warned against loudly.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::body::Body;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{Html, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use clap::Parser;
 use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{Keypair, Pubkey};
@@ -49,6 +52,13 @@ struct Cli {
     /// simple es ~1.002.780; este es solo el límite de seguridad.
     #[arg(long, default_value_t = 10_000_000)]
     fee_limit: u64,
+    /// Contraseña para entrar a la wallet (usuario: cualquiera). OBLIGATORIA si
+    /// la exponés fuera de localhost (`--bind` != 127.0.0.1), porque quien
+    /// llega al puerto puede gastar las wallets. También se puede pasar por la
+    /// variable de entorno QCHAIN_WALLET_PASSWORD (mejor, no queda en el
+    /// historial de comandos).
+    #[arg(long)]
+    password: Option<String>,
 }
 
 struct AppState {
@@ -56,17 +66,37 @@ struct AppState {
     wallets_dir: PathBuf,
     fee_limit: u64,
     http: reqwest::Client,
+    /// If set, every request must carry HTTP Basic auth with this password.
+    password: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.wallets_dir)?;
+
+    // Password: from --password or the env var (env is preferred - it doesn't
+    // land in shell history). Empty = none.
+    let password = cli.password.or_else(|| std::env::var("QCHAIN_WALLET_PASSWORD").ok()).filter(|s| !s.is_empty());
+    let exposed = cli.bind != "127.0.0.1" && cli.bind != "localhost";
+
+    // Fail-safe: never expose a key-holding wallet to the network with no
+    // password. Localhost-only needs none (only this machine can reach it).
+    if exposed && password.is_none() {
+        anyhow::bail!(
+            "te estás por exponer la wallet a la red (--bind {}) SIN contraseña - cualquiera que llegue al puerto podría vaciar tus wallets.\n\
+             Poné una contraseña, idealmente por variable de entorno para que no quede en el historial:\n\
+             \n    QCHAIN_WALLET_PASSWORD='tu-clave-fuerte' qchain-wallet --bind {} ...\n",
+            cli.bind, cli.bind
+        );
+    }
+
     let state = Arc::new(AppState {
         rpc: cli.rpc.trim_end_matches('/').to_string(),
         wallets_dir: cli.wallets_dir.clone(),
         fee_limit: cli.fee_limit,
         http: reqwest::Client::new(),
+        password: password.clone(),
     });
 
     let app = Router::new()
@@ -75,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/wallets", get(list_wallets).post(new_wallet))
         .route("/api/balance/:address", get(balance))
         .route("/api/transfer", post(transfer))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
@@ -82,14 +113,46 @@ async fn main() -> anyhow::Result<()> {
     println!("Wallet web abierta en:  http://{addr}");
     println!("Hablando con el nodo:   {}", cli.rpc);
     println!("Wallets guardadas en:   {}", cli.wallets_dir.display());
-    if cli.bind != "127.0.0.1" && cli.bind != "localhost" {
+    if password.is_some() {
+        println!("Protección:             contraseña activada (el navegador la va a pedir)");
+    }
+    if exposed {
         println!();
-        println!("*** ADVERTENCIA: la estás exponiendo fuera de localhost ({}). Cualquiera que", cli.bind);
-        println!("*** llegue a este puerto puede VACIAR tus wallets. Usá 127.0.0.1 salvo que");
-        println!("*** sepas exactamente lo que hacés (p.ej. detrás de un túnel SSH).");
+        println!("*** Expuesta a la red en {}. Está protegida por contraseña, pero sobre HTTP", cli.bind);
+        println!("*** la clave viaja SIN cifrar - para uso serio poné un proxy con HTTPS (TLS)");
+        println!("*** adelante. Para un testnet sin valor real, alcanza.");
     }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// HTTP Basic auth gate. If a password is configured, every request (the page
+/// and the API) must carry `Authorization: Basic base64(user:password)` with
+/// the right password (any username). Returns 401 with a `WWW-Authenticate`
+/// challenge so the browser shows a login prompt. A no-op when no password is
+/// set (localhost-only use). Honest limit: over plain HTTP the password is
+/// only base64-encoded, not encrypted - put HTTPS in front for real exposure.
+async fn require_auth(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let Some(expected) = &st.password else {
+        return next.run(req).await;
+    };
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Basic "))
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|creds| creds.split_once(':').map(|(_, pass)| pass.to_string()));
+    if provided.as_deref() == Some(expected.as_str()) {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::WWW_AUTHENTICATE, "Basic realm=\"qchain wallet\"")
+            .body(Body::from("autenticación requerida"))
+            .expect("static 401 response always builds")
+    }
 }
 
 async fn index() -> Html<&'static str> {

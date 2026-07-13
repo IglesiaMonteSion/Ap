@@ -352,6 +352,57 @@ transacciones `Transfer` de una sola instrucción (staking/gobernanza no
 generan un recibo). Para eso — o para consultar contra un nodo
 específico por CLI — usar `qchain-cli`.
 
+## Wallet web (`qchain-wallet`) — crear wallets y transferir desde el navegador
+
+Una interfaz simple (botones, no CLI) para que una persona común pueda
+crear wallets, ver balances en QCH y enviar transferencias. Reusa el
+*mismo* código de firma post-cuántica que el nodo (`qchain-crypto` /
+`qchain-core`), así que las transacciones que firma son byte-compatibles
+— el navegador es solo la UI, las claves privadas nunca salen de la
+máquina donde corre el wallet.
+
+**Local (lo más seguro), por túnel SSH desde tu equipo:**
+
+```
+# en la VPS del nodo (escucha solo en localhost, sin contraseña):
+docker run --rm --network host -v /opt/qchain/wallets:/wallets \
+  qchain:latest qchain-wallet --rpc http://127.0.0.1:8080 --wallets-dir /wallets
+
+# en tu equipo, abrí un túnel y entrá a http://127.0.0.1:8090
+ssh -L 8090:127.0.0.1:8090 usuario@<ip-de-la-vps>
+```
+
+**Expuesta a internet (requiere contraseña, sin excepción):** el wallet
+guarda **claves privadas** — quien alcance el puerto puede gastar las
+wallets. Por eso, si la exponés (`--bind 0.0.0.0`), el binario **se niega
+a arrancar sin una contraseña**. Pasala por variable de entorno para que
+no quede en el historial de comandos:
+
+```
+docker run --rm --network host -v /opt/qchain/wallets:/wallets \
+  -e QCHAIN_WALLET_PASSWORD='una-clave-fuerte' \
+  qchain:latest qchain-wallet --rpc http://127.0.0.1:8080 \
+  --wallets-dir /wallets --bind 0.0.0.0 --port 8090
+```
+
+Después abrí el puerto 8090 en el firewall (los dos niveles en Oracle
+Cloud):
+
+```
+# nivel SO:
+sudo iptables -I INPUT 1 -p tcp --dport 8090 -j ACCEPT
+# nivel nube: agregar una Ingress Rule para el puerto 8090/TCP en la
+#             Security List de la subred (consola de OCI)
+```
+
+El navegador va a pedir usuario/contraseña (el usuario es cualquiera, la
+contraseña es la que pusiste). Queda accesible en `http://<ip>:8090`.
+
+**Límite honesto:** sobre HTTP plano la contraseña viaja solo en base64
+(HTTP Basic), no cifrada — para uso con valor real poné un proxy con
+HTTPS/TLS adelante. Para un testnet sin valor real, la contraseña + el
+firewall alcanzan.
+
 ## Seguridad real, no cosmética
 
 - El RPC (`/tx`, `/account/:addr`, etc.) no tiene autenticación —
