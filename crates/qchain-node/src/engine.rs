@@ -116,6 +116,19 @@ static STARK_PROOF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::con
 const MAX_CONCURRENT_SNAPSHOTS: usize = 2;
 static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SNAPSHOTS);
 
+/// How long a captured point-in-time snapshot stays servable before the node
+/// re-captures a fresh one (see `CachedSnapshot`). Long enough that a client
+/// can page through a large state within one snapshot without it rotating,
+/// short enough that a snapshot's extra `O(state)` memory is not held
+/// indefinitely after the last syncing peer finishes.
+const SNAPSHOT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Accounts returned per `snapshot_page` call - bounds a single page's wire
+/// size (and JSON-decode memory on the client) regardless of total state
+/// size. The client keyset-paginates (`after` the last address it saw) until
+/// it gets a short page.
+const SNAPSHOT_PAGE_SIZE: usize = 1_000;
+
 
 /// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
 /// `first_seen_vertex`) to retain behind the current round before pruning.
@@ -305,6 +318,11 @@ pub struct Engine {
     /// never double-charges or corrupts balances - the same idempotence the
     /// pre-existing network-refetch restart already relied on.
     pub cert_log: Option<sled::Db>,
+    /// A cached consistent point-in-time snapshot for paginated serving, so a
+    /// far-behind peer can download the state in bounded pages that all hash
+    /// to one root (see `CachedSnapshot`/`snapshot_page`). Lazily captured on
+    /// first request, refreshed past `SNAPSHOT_CACHE_TTL`.
+    pub snapshot_cache: Mutex<Option<std::sync::Arc<CachedSnapshot>>>,
 }
 
 impl Engine {
@@ -351,7 +369,7 @@ pub struct SnapshotMeta {
 }
 
 /// One account in a state snapshot, keyed by its address.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SnapshotAccount {
     pub address: Pubkey,
     pub account: qchain_core::Account,
@@ -372,6 +390,32 @@ pub struct StateSnapshot {
     pub round: Round,
     pub merkle_root: String,
     pub accounts: Vec<SnapshotAccount>,
+}
+
+/// One page of a paginated snapshot (`GET /snapshot/page`). Carries the
+/// `merkle_root` of the consistent point-in-time snapshot it was sliced from
+/// so a client can detect the server's cached snapshot rotating mid-download
+/// (root changes) and restart, rather than stitching pages from two
+/// different states into a set that hashes to neither.
+#[derive(Serialize, Deserialize)]
+pub struct SnapshotPage {
+    pub round: Round,
+    pub merkle_root: String,
+    pub accounts: Vec<SnapshotAccount>,
+}
+
+/// A consistent point-in-time snapshot the node caches so it can serve it in
+/// bounded pages (`snapshot_page`) without the account set shifting under a
+/// multi-request download - the state advances every round, so paginating the
+/// live store directly would make each page a different state and no
+/// accumulated set would ever hash to a single root. Held behind a short TTL
+/// (`SNAPSHOT_CACHE_TTL`); the `Arc<Vec<..>>` lets pages and the full-snapshot
+/// path share one immutable copy instead of re-collecting the store each call.
+pub struct CachedSnapshot {
+    round: Round,
+    merkle_root: String,
+    accounts: std::sync::Arc<Vec<SnapshotAccount>>,
+    captured: tokio::time::Instant,
 }
 
 /// What `GET /stark_proof` hands back to a light client - a real
@@ -556,24 +600,19 @@ impl Engine {
         (state.ledger.merkle_root(), state.ledger.transfer_receipts().len())
     }
 
-    /// Header of a state snapshot - the round, account-state Merkle root, and
-    /// account count, without the (potentially large) account set itself.
-    pub async fn snapshot_meta(&self) -> SnapshotMeta {
-        let state = self.state.lock().await;
-        let root = state.ledger.merkle_root();
-        let account_count = state.ledger.store().iter().count();
-        SnapshotMeta { round: state.next_round, merkle_root: hex::encode(root), account_count }
-    }
-
-    /// A full, self-consistent account-state snapshot: the round, its Merkle
-    /// root, and every account (sorted by address for a deterministic wire
-    /// order), all captured atomically under the state lock so the root
-    /// genuinely matches the accounts. The heavy copy is taken under the lock
-    /// but the JSON serialization happens in the caller (`rpc`) after the
-    /// lock is dropped, and a permit bounds how many run at once
-    /// (`MAX_CONCURRENT_SNAPSHOTS`). See `StateSnapshot` for the trust model.
-    pub async fn snapshot(&self) -> StateSnapshot {
-        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
+    /// Returns a fresh-enough consistent point-in-time snapshot, capturing a
+    /// new one (accounts copied out and sorted by address) only when the
+    /// cache is empty or older than `SNAPSHOT_CACHE_TTL`. The capture holds
+    /// the snapshot-cache lock throughout so two concurrent syncing peers
+    /// never both pay for a capture; the account copy is taken under the
+    /// state lock and everything else runs after it is dropped.
+    async fn cached_snapshot(&self) -> std::sync::Arc<CachedSnapshot> {
+        let mut guard = self.snapshot_cache.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.captured.elapsed() < SNAPSHOT_CACHE_TTL {
+                return cached.clone();
+            }
+        }
         let (round, root, mut accounts) = {
             let state = self.state.lock().await;
             let accounts: Vec<SnapshotAccount> =
@@ -581,7 +620,50 @@ impl Engine {
             (state.next_round, state.ledger.merkle_root(), accounts)
         };
         accounts.sort_by(|a, b| a.address.to_bytes().cmp(&b.address.to_bytes()));
-        StateSnapshot { round, merkle_root: hex::encode(root), accounts }
+        let captured = std::sync::Arc::new(CachedSnapshot {
+            round,
+            merkle_root: hex::encode(root),
+            accounts: std::sync::Arc::new(accounts),
+            captured: tokio::time::Instant::now(),
+        });
+        *guard = Some(captured.clone());
+        captured
+    }
+
+    /// Header of the current consistent snapshot - round, Merkle root, and
+    /// account count. A syncing peer reads this first, then keyset-paginates
+    /// `snapshot_page` against the same cached snapshot (matched by root).
+    pub async fn snapshot_meta(&self) -> SnapshotMeta {
+        let cached = self.cached_snapshot().await;
+        SnapshotMeta { round: cached.round, merkle_root: cached.merkle_root.clone(), account_count: cached.accounts.len() }
+    }
+
+    /// One keyset page of the cached snapshot: up to `SNAPSHOT_PAGE_SIZE`
+    /// accounts whose address sorts strictly after `after` (or from the start
+    /// if `after` is `None`), carrying the snapshot's root so the client can
+    /// tell if the cached snapshot rotated mid-download. Bounds a single
+    /// response's size independent of total state size.
+    pub async fn snapshot_page(&self, after: Option<Pubkey>) -> SnapshotPage {
+        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
+        let cached = self.cached_snapshot().await;
+        let start = match after {
+            Some(a) => cached.accounts.partition_point(|x| x.address.to_bytes() <= a.to_bytes()),
+            None => 0,
+        };
+        let end = (start + SNAPSHOT_PAGE_SIZE).min(cached.accounts.len());
+        let accounts = cached.accounts[start..end].to_vec();
+        SnapshotPage { round: cached.round, merkle_root: cached.merkle_root.clone(), accounts }
+    }
+
+    /// The full account set in one response, served from the same cached
+    /// consistent snapshot as the paginated path. Kept for small states and
+    /// simple clients / direct inspection; a far-behind peer downloading a
+    /// large state should prefer `snapshot_page`. Permit-bounded, since the
+    /// clone is `O(state)`.
+    pub async fn snapshot(&self) -> StateSnapshot {
+        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
+        let cached = self.cached_snapshot().await;
+        StateSnapshot { round: cached.round, merkle_root: cached.merkle_root.clone(), accounts: (*cached.accounts).clone() }
     }
 
     /// The most recent `limit` captured `TransferReceipt`s (newest

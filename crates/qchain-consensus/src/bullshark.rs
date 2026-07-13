@@ -233,44 +233,78 @@ impl<'a> Bullshark<'a> {
     /// the existing liveness guarantee that new data always gets a fair
     /// re-check - only the redundant *within-one-call* re-exploration is
     /// eliminated.
-    fn walk_causal_history(&self, digest: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>, memo: &mut HashMap<Digest, bool>) -> bool {
-        if seen.contains(&digest) {
-            return true;
+    ///
+    /// **Iterative, not recursive, on purpose.** A causal history can be
+    /// thousands of rounds deep on a long-lived chain, and a recursive walk
+    /// would overflow the stack. This is an explicit-stack post-order DFS
+    /// that reproduces the recursive version's output byte-for-byte: each
+    /// node is emitted into `ordered` only after all of its (above-barrier)
+    /// parents, parents are visited in sorted order, `memo` caches per-call
+    /// and `seen` short-circuits across calls, and the `gc_floor` barrier
+    /// cuts a node's parents off exactly as before. The `Enter`/`Exit`
+    /// two-phase marker is what gives post-order (a node's `Exit` runs only
+    /// after its whole subtree); because the stack is LIFO, a shared ancestor
+    /// reached via a second path is always already in `memo` by the time that
+    /// path re-enters it, so it is never re-expanded - the same anti-blowup
+    /// guarantee the per-call memo gave the recursive version.
+    fn walk_causal_history(&self, root: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>, memo: &mut HashMap<Digest, bool>) -> bool {
+        enum Step {
+            Enter(Digest),
+            Exit(Digest),
         }
-        if let Some(&resolved) = memo.get(&digest) {
-            return resolved;
-        }
-        let Some(cert) = self.dag.get(&digest) else {
-            memo.insert(digest, false);
-            return false;
-        };
-        let mut parents = cert.vertex.parents.clone();
-        parents.sort();
-        let mut all_parents_resolved = true;
-        // A certificate at round `r` lists parents from round `r - 1`. Once
-        // `r <= gc_floor` those parents belong to the pruned, permanently-
-        // committed region (see `gc_floor`): they are treated as resolved
-        // without recursion, so a restart re-derivation that walks a
-        // retained-window leader's ancestry stops cleanly at the barrier
-        // instead of failing on a certificate that was legitimately dropped.
-        if cert.vertex.round > self.gc_floor {
-            for parent in parents {
-                if !self.walk_causal_history(parent, seen, ordered, memo) {
-                    all_parents_resolved = false;
-                    // Keep going, don't short-circuit - a sibling reachable via
-                    // a different parent may still be fully resolved and
-                    // should still commit on its own merits.
+        let mut stack = vec![Step::Enter(root)];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Enter(digest) => {
+                    if seen.contains(&digest) || memo.contains_key(&digest) {
+                        continue;
+                    }
+                    let Some(cert) = self.dag.get(&digest) else {
+                        memo.insert(digest, false);
+                        continue;
+                    };
+                    // A certificate at round `r` lists parents from round
+                    // `r - 1`. Once `r <= gc_floor` those parents belong to
+                    // the pruned, permanently-committed region (see
+                    // `gc_floor`): they are treated as resolved without being
+                    // visited, so a restart re-derivation stops cleanly at the
+                    // barrier instead of failing on a dropped certificate.
+                    if cert.vertex.round <= self.gc_floor {
+                        seen.insert(digest);
+                        ordered.push(digest);
+                        memo.insert(digest, true);
+                        continue;
+                    }
+                    let mut parents = cert.vertex.parents.clone();
+                    parents.sort();
+                    // Exit runs after every parent's subtree (LIFO); parents
+                    // pushed in reverse so they pop in sorted order, matching
+                    // the recursive `for parent in sorted(parents)` emission.
+                    stack.push(Step::Exit(digest));
+                    for parent in parents.into_iter().rev() {
+                        stack.push(Step::Enter(parent));
+                    }
+                }
+                Step::Exit(digest) => {
+                    if seen.contains(&digest) || memo.contains_key(&digest) {
+                        continue;
+                    }
+                    let cert = self.dag.get(&digest).expect("a digest present at Enter is still present at Exit");
+                    let all_parents_resolved = cert.vertex.parents.iter().all(|p| seen.contains(p) || memo.get(p).copied().unwrap_or(false));
+                    if all_parents_resolved {
+                        seen.insert(digest);
+                        ordered.push(digest);
+                        memo.insert(digest, true);
+                    } else {
+                        // A sibling reachable via a different parent already
+                        // committed on its own merits during the walk; only
+                        // this digest's own chain is still unresolved.
+                        memo.insert(digest, false);
+                    }
                 }
             }
         }
-        if !all_parents_resolved {
-            memo.insert(digest, false);
-            return false;
-        }
-        seen.insert(digest);
-        ordered.push(digest);
-        memo.insert(digest, true);
-        true
+        seen.contains(&root)
     }
 
     /// Extend the total order across every leader round in `from_round
@@ -397,31 +431,40 @@ impl<'a> Bullshark<'a> {
     /// determined because some certificate along a still-unexplored path
     /// is missing locally. See `resolve` for why that distinction is
     /// load-bearing, not pedantic.
+    ///
+    /// Iterative for the same stack-depth reason as `walk_causal_history`.
+    /// Equivalent to the recursive tri-state: `Some(true)` the moment any
+    /// fully-present path reaches `target`; `None` if no present path reaches
+    /// it but some path ran into a certificate missing locally (still being
+    /// resynced - can't yet conclude "unreachable"); `Some(false)` only when
+    /// every path is definitively present and none reaches `target`. The
+    /// global `undecided` flag captures the recursive `any_undecided`
+    /// propagation exactly, since a `None` bubbles up through any node that
+    /// finds no `Some(true)` among its parents. The `gc_floor` barrier stops
+    /// a path as a definite non-reach (the target is always a round being
+    /// resolved, `>= gc_floor`, so it can never lie in the pruned region).
     fn reaches(&self, from: Digest, target: Digest, visited: &mut HashSet<Digest>) -> Option<bool> {
-        if from == target {
-            return Some(true);
-        }
-        if !visited.insert(from) {
-            return Some(false);
-        }
-        let cert = self.dag.get(&from)?;
-        // Below the GC barrier there is no retained history left to search,
-        // and none is needed: the reachability `target` is always a round
-        // being resolved (>= the consensus floor >= `gc_floor`), so it can
-        // never lie in the pruned region a barrier certificate's parents
-        // point into. Stopping here matches `walk_causal_history`'s barrier.
-        if cert.vertex.round <= self.gc_floor {
-            return Some(false);
-        }
-        let mut any_undecided = false;
-        for &parent in &cert.vertex.parents {
-            match self.reaches(parent, target, visited) {
-                Some(true) => return Some(true),
-                Some(false) => {}
-                None => any_undecided = true,
+        let mut undecided = false;
+        let mut stack = vec![from];
+        while let Some(node) = stack.pop() {
+            if node == target {
+                return Some(true);
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            let Some(cert) = self.dag.get(&node) else {
+                undecided = true;
+                continue;
+            };
+            if cert.vertex.round <= self.gc_floor {
+                continue;
+            }
+            for &parent in &cert.vertex.parents {
+                stack.push(parent);
             }
         }
-        if any_undecided {
+        if undecided {
             None
         } else {
             Some(false)
@@ -534,6 +577,33 @@ mod tests {
         }
         let s = Bullshark::new(&synced, &validators);
         assert_eq!(s.direct_status(r), RoundOutcome::Committed(leader_digest), "with the leader present and 3-of-4 support, it commits directly");
+    }
+
+    /// The iterative `walk_causal_history` must handle a causal chain far
+    /// deeper than the native stack could recurse (the whole reason it was
+    /// converted from recursion). Also pins the exact post-order: a linear
+    /// chain emits ancestor-first, byte-identical to what the recursive
+    /// version produced.
+    #[test]
+    fn walk_causal_history_handles_a_chain_far_deeper_than_the_recursion_limit() {
+        let validators = validators(1);
+        let author = validators.ids_sorted()[0];
+        let mut dag = DagStore::new();
+        let depth: u64 = 200_000;
+        let mut prev: Vec<Digest> = vec![];
+        let mut digests = Vec::with_capacity(depth as usize);
+        for r in 0..depth {
+            let d = dag.insert(cert(r, author, prev.clone()));
+            digests.push(d);
+            prev = vec![d];
+        }
+        let bull = Bullshark::new(&dag, &validators);
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut memo = HashMap::new();
+        assert!(bull.walk_causal_history(*digests.last().unwrap(), &mut seen, &mut ordered, &mut memo), "a fully-present deep chain must resolve");
+        assert_eq!(ordered.len() as u64, depth, "every certificate in the chain is emitted exactly once");
+        assert_eq!(ordered, digests, "a linear chain must emit ancestor-first (deepest first), identical to the recursive post-order");
     }
 
     /// The crashed-leader liveness case the same code path must still allow:

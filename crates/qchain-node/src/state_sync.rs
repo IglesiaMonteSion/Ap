@@ -16,7 +16,7 @@
 //! verified catch-up against a value obtained independently.
 
 use qchain_node::config::NodeConfig;
-use qchain_node::engine::{SnapshotMeta, StateSnapshot};
+use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot};
 use qchain_storage::IncrementalStateTree;
 
 /// Fetch a state snapshot from the configured peers and verify it before the
@@ -56,10 +56,10 @@ pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<Stat
         }
     }
 
-    // 2. Pull the full snapshot from the first peer that answered.
+    // 2. Pull the snapshot from the first peer that answered, page by page
+    //    (bounded response size regardless of state size).
     let source = metas[0].0.trim_end_matches('/');
-    let snapshot: StateSnapshot =
-        client.get(format!("{source}/snapshot")).send().await?.error_for_status()?.json().await?;
+    let snapshot = fetch_snapshot_paginated(&client, source).await?;
 
     // 3. Internal consistency: rebuild the real state tree from the accounts
     //    and require it to hash to the claimed root - catches any account
@@ -87,6 +87,48 @@ pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<Stat
     }
 
     Ok(snapshot)
+}
+
+/// Download a full snapshot from `source` by keyset pagination against its
+/// cached consistent snapshot: read the header, then page with `after=<last
+/// address>` until a short page. Every page must carry the header's root (the
+/// server's cached snapshot is immutable within its TTL); if it rotates
+/// mid-download the whole download is retried a few times before giving up.
+async fn fetch_snapshot_paginated(client: &reqwest::Client, source: &str) -> anyhow::Result<StateSnapshot> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match try_fetch_snapshot_paginated(client, source).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(e) => {
+                tracing::warn!("state-sync: snapshot download attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("state-sync: snapshot download failed")))
+}
+
+async fn try_fetch_snapshot_paginated(client: &reqwest::Client, source: &str) -> anyhow::Result<StateSnapshot> {
+    let meta: SnapshotMeta = client.get(format!("{source}/snapshot/meta")).send().await?.error_for_status()?.json().await?;
+    let mut accounts = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let url = match &after {
+            Some(a) => format!("{source}/snapshot/page?after={a}"),
+            None => format!("{source}/snapshot/page"),
+        };
+        let page: SnapshotPage = client.get(&url).send().await?.error_for_status()?.json().await?;
+        if page.merkle_root != meta.merkle_root {
+            anyhow::bail!("the server's cached snapshot rotated mid-download (root {} -> {})", meta.merkle_root, page.merkle_root);
+        }
+        if page.accounts.is_empty() {
+            break;
+        }
+        after = Some(page.accounts.last().expect("page is non-empty").address.to_string());
+        accounts.extend(page.accounts);
+    }
+    Ok(StateSnapshot { round: meta.round, merkle_root: meta.merkle_root, accounts })
 }
 
 /// Rebuild the real state tree from a snapshot's accounts and require it to

@@ -269,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         network,
         chain_id: config.chain_id(),
         cert_log,
+        snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
             dag,

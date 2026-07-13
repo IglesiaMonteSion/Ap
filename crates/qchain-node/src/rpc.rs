@@ -2,7 +2,7 @@
 //! wallet/client traffic - what `qchain-cli` talks to. Deliberately small:
 //! submit a transaction, read an account, read node status.
 
-use crate::engine::{Engine, SnapshotMeta, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
+use crate::engine::{Engine, SnapshotMeta, SnapshotPage, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -28,7 +28,28 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/chain_id", get(chain_id))
         .route("/snapshot/meta", get(snapshot_meta))
         .route("/snapshot", get(snapshot))
+        .route("/snapshot/page", get(snapshot_page))
         .with_state(engine)
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotPageQuery {
+    /// Keyset cursor: return accounts whose address sorts strictly after this
+    /// (the address string as it appears in a prior page's last entry).
+    /// Omitted for the first page.
+    after: Option<String>,
+}
+
+/// One keyset page of the cached consistent snapshot - see
+/// `Engine::snapshot_page`. The client pages with `after=<last address>`
+/// until it gets a short page, checking every page carries the same
+/// `merkle_root` (else the server's snapshot rotated and it restarts).
+async fn snapshot_page(State(engine): State<Arc<Engine>>, Query(query): Query<SnapshotPageQuery>) -> Result<Json<SnapshotPage>, (StatusCode, String)> {
+    let after = match query.after {
+        Some(hex_addr) => Some(hex_addr.parse::<Pubkey>().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?),
+        None => None,
+    };
+    Ok(Json(engine.snapshot_page(after).await))
 }
 
 /// Header of this validator's account-state snapshot - round, Merkle root,

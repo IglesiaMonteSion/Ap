@@ -40,6 +40,12 @@ pub struct Batch {
 impl Batch {
     pub fn digest(&self) -> Digest {
         let mut hasher = Sha3_256::new();
+        // Length-prefix the transaction list so a batch's digest is an
+        // unambiguous function of its exact contents - see `Vertex::digest`
+        // for the full rationale (here the elements are fixed-size 32-byte
+        // hashes so the risk is smaller, but framing it is free and keeps
+        // every digest in this module consistently domain-separated).
+        hasher.update((self.transactions.len() as u64).to_le_bytes());
         for tx in &self.transactions {
             hasher.update(tx.hash());
         }
@@ -66,14 +72,30 @@ pub struct Vertex {
 }
 
 impl Vertex {
+    /// Length-prefix each variable-length vector before hashing it. Without
+    /// the prefixes, the boundary between `batch_digests` and `parents` is
+    /// not encoded in the byte stream, so two different vertices could in
+    /// principle hash the same input (e.g. a `(worker_id, digest)` entry vs.
+    /// a `parents` digest that happen to line up across the boundary). Not
+    /// exploitable in practice - `parents` are real certificate digests an
+    /// attacker cannot freely choose - but a content-addressed identifier
+    /// should be an unambiguous function of its contents regardless. Framing
+    /// each vector with its length (and prefixing `Batch::digest` the same
+    /// way) closes it. Format-breaking on purpose: this changes every
+    /// certificate digest, so all validators must run a build that agrees on
+    /// it - done pre-mainnet, before any long-lived chain depends on the old
+    /// encoding. `chain_id` (a hash of genesis config, not of any vertex) is
+    /// unaffected.
     pub fn digest(&self) -> Digest {
         let mut hasher = Sha3_256::new();
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.author.to_bytes());
+        hasher.update((self.batch_digests.len() as u64).to_le_bytes());
         for (worker_id, digest) in &self.batch_digests {
             hasher.update([*worker_id]);
             hasher.update(digest);
         }
+        hasher.update((self.parents.len() as u64).to_le_bytes());
         for p in &self.parents {
             hasher.update(p);
         }
@@ -156,5 +178,26 @@ mod tests {
         let b = Batch { transactions: vec![] };
         let b2 = Batch { transactions: vec![] };
         assert_eq!(b.digest(), b2.digest());
+    }
+
+    /// With the length prefixes, the split of content between `batch_digests`
+    /// and `parents` is part of the digest, not just the concatenated bytes.
+    /// Here both vertices carry the exact same two 32-byte values in the same
+    /// order across the boundary (one as a worker-0 batch entry, one as a
+    /// parent) - only the boundary differs. They must hash differently.
+    #[test]
+    fn vertex_digest_encodes_the_batch_parents_boundary_not_just_the_concatenation() {
+        let author = Pubkey::system_program_id();
+        let x = [4u8; 32];
+        let y = [5u8; 32];
+        let a = Vertex { round: 1, author, batch_digests: vec![(0, x), (0, y)], parents: vec![] };
+        let b = Vertex { round: 1, author, batch_digests: vec![(0, x)], parents: vec![y] };
+        assert_ne!(a.digest(), b.digest(), "moving a value from batch_digests to parents must change the digest");
+
+        // Length framing also distinguishes "one parent" from "no parents"
+        // even when the batch side would otherwise absorb the difference.
+        let c = Vertex { round: 1, author, batch_digests: vec![], parents: vec![x, y] };
+        let d = Vertex { round: 1, author, batch_digests: vec![], parents: vec![x] };
+        assert_ne!(c.digest(), d.digest());
     }
 }

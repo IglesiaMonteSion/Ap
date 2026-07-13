@@ -78,8 +78,30 @@ impl SledStore {
     /// propagated rather than papered over - a validator that can't open
     /// its own state should refuse to start, not silently run in some
     /// degraded mode.
+    ///
+    /// A full validation pass runs up front: every stored entry is checked
+    /// to be a 32-byte key with a Borsh-decodable `Account` value, and any
+    /// failure is returned as a descriptive `Err` here at startup rather
+    /// than surfacing later as a mid-consensus panic deep in `get`/`iter`.
+    /// This is what lets those hot-path methods keep their `expect`s as
+    /// genuine post-validation invariants: nothing this store hands back at
+    /// runtime can fail to decode, because `open` already proved the whole
+    /// database decodes (and only `set` - which only ever writes a freshly
+    /// Borsh-encoded `Account` - mutates it afterward). Fail-loud is
+    /// deliberate for a ledger: a corrupt on-disk balance must stop the node,
+    /// never be silently treated as absent/zero (which could mint or destroy
+    /// value) - the same "refuse to run degraded" stance, just reported as a
+    /// clean error instead of a panic.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let db = sled::open(path)?;
+        for entry in db.iter() {
+            let (key_bytes, value_bytes) = entry.map_err(|e| anyhow::anyhow!("reading the state database at {} failed: {e}", path.display()))?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!("corrupt state database at {}: a key is {} bytes, expected a 32-byte address", path.display(), key_bytes.len());
+            }
+            borsh::from_slice::<Account>(&value_bytes)
+                .map_err(|e| anyhow::anyhow!("corrupt state database at {}: an account value failed to decode ({e}) - refusing to run on damaged state", path.display()))?;
+        }
         Ok(SledStore { db })
     }
 }
@@ -87,6 +109,8 @@ impl SledStore {
 impl StateStore for SledStore {
     fn get(&self, key: &Pubkey) -> Option<Account> {
         let bytes = self.db.get(key.to_bytes()).expect("sled get should not fail on a healthy database")?;
+        // Cannot fail: `open` validated every existing value decodes, and the
+        // only writer since is `set`, which only writes encoded `Account`s.
         Some(borsh::from_slice(&bytes).expect("a value written by this same store must decode as an Account"))
     }
 
@@ -100,6 +124,10 @@ impl StateStore for SledStore {
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = (Pubkey, Account)> + '_> {
+        // All three `expect`s are post-`open`-validation invariants: `open`
+        // already proved every key is 32 bytes and every value decodes as an
+        // `Account`, and only `set` (which writes only encoded `Account`s at
+        // 32-byte keys) has run since.
         Box::new(self.db.iter().map(|entry| {
             let (key_bytes, value_bytes) = entry.expect("sled iteration should not fail on a healthy database");
             let key = Pubkey::new(key_bytes.as_ref().try_into().expect("every key this store ever wrote is exactly 32 bytes"));
@@ -132,6 +160,41 @@ mod tests {
         let key = Pubkey::new([1u8; 32]);
         store.set(key, sample_account(100));
         assert_eq!(store.get(&key), Some(sample_account(100)));
+    }
+
+    /// `open` must reject a database with an undecodable account value up
+    /// front, as a clean error - not defer it to a mid-run panic. Fail-loud
+    /// on corrupt own-disk state is deliberate (a silently-dropped balance
+    /// could mint or destroy value), but it should be a startup error, not a
+    /// panic deep in consensus.
+    #[test]
+    fn open_rejects_a_database_with_a_corrupt_account_value() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // Write a valid 32-byte key with a value that is not a Borsh
+            // `Account`, directly via sled (bypassing `set`'s encoding).
+            let raw = sled::open(dir.path()).unwrap();
+            raw.insert([9u8; 32], b"this is not a borsh-encoded account".to_vec()).unwrap();
+            raw.flush().unwrap();
+        }
+        let result = SledStore::open(dir.path());
+        let err = match result {
+            Ok(_) => panic!("a corrupt value must make open fail, not succeed"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("corrupt state database"), "the error must clearly name the corruption, got: {err}");
+    }
+
+    #[test]
+    fn open_accepts_a_clean_database_written_by_set() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = SledStore::open(dir.path()).unwrap();
+            store.set(Pubkey::new([1u8; 32]), sample_account(42));
+        }
+        // Reopening a database this store itself wrote must pass validation.
+        let store = SledStore::open(dir.path()).expect("a database written only via set must reopen cleanly");
+        assert_eq!(store.get(&Pubkey::new([1u8; 32])), Some(sample_account(42)));
     }
 
     #[test]
