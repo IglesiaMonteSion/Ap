@@ -173,3 +173,5 @@ Con fase 2 cerrada (6/6, incluyendo `qchain-stark` conectado de punta a punta a 
 
 ## Preferencia de trabajo del usuario (cómo operar)
 El usuario pidió explícitamente: **no dar contexto/explicación en cada paso — solo hacer el trabajo directamente, y al final dar un resumen corto** con (a) qué se hizo, (b) qué falta, y (c) con qué continuar. Mantener la narración intermedia al mínimo; el detalle va en los commits, los docs y este archivo, no en mensajes por cada acción. **Siempre ir más allá de lo pedido**: revisar todo a fondo, no dejar nada suelto, optimizar y auditar seguridad de forma proactiva.
+
+**Despliegue del usuario (VPS Oracle `129.80.59.17`, repo en `/home/ubuntu/qchain`):** el nodo y la wallet ya corren como **servicios systemd** (via `deploy/install-node.sh` / `deploy/install-wallet.sh`) — NO dar más el `docker run` a mano para la wallet, eso quedó obsoleto. Actualizar es: `cd /home/ubuntu/qchain && git pull && sudo ./deploy/update-node.sh && sudo systemctl restart qchain-wallet`. Reiniciar solo la wallet: `sudo systemctl restart qchain-wallet`. SSH: `ssh -i "/Users/edereco/Documents/New project 2/vpn-oracle-free-ssh" ubuntu@129.80.59.17`.
