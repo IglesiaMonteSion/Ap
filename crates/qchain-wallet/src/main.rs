@@ -114,6 +114,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/import", post(import_wallet))
         .route("/api/export/:name", get(export_wallet))
         .route("/api/export-encrypted", post(export_encrypted))
+        // Non-custodial (WASM) wallet: keys are generated, encrypted and used
+        // entirely in the browser. The server only serves the static assets
+        // and relays RPC (it never sees a private key).
+        .route("/wasm", get(wasm_page))
+        .route("/wasm/qchain_wasm.js", get(wasm_js))
+        .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
+        .route("/api/chain_id", get(chain_id_ep))
+        .route("/api/account/:address", get(account_ep))
+        .route("/api/relay-tx", post(relay_tx))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -170,6 +179,64 @@ async fn index() -> Html<&'static str> {
 
 async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "rpc": st.rpc }))
+}
+
+// ---- non-custodial WASM wallet (keys live in the browser) ----------------
+
+async fn wasm_page() -> Html<&'static str> {
+    Html(include_str!("wasm_wallet.html"))
+}
+
+async fn wasm_js() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/javascript")
+        .body(Body::from(include_str!("wasm_assets/qchain_wasm.js")))
+        .expect("static js response always builds")
+}
+
+async fn wasm_bg() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/wasm")
+        .body(Body::from(&include_bytes!("wasm_assets/qchain_wasm_bg.wasm")[..]))
+        .expect("static wasm response always builds")
+}
+
+/// The network's chain id (hex), so the browser can sign a chain-bound tx.
+async fn chain_id_ep(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let cid = fetch_chain_id(&st).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({ "chain_id": hex::encode(cid) })))
+}
+
+/// An account's balance and nonce - both needed to build a transaction in the
+/// browser (the nonce especially). Proxied so it's same-origin (no CORS).
+async fn account_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección inválida: {e}")))?;
+    let acct = fetch_account(&st, &pk).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "address": pk.to_string(),
+        "balance": acct.as_ref().map(|a| a.balance).unwrap_or(0).to_string(),
+        "nonce": acct.map(|a| a.nonce).unwrap_or(0),
+    })))
+}
+
+/// Relay a browser-signed transaction (raw signed-Transaction JSON) to the
+/// node's `/tx`. The server never signs anything - it just forwards, so the
+/// key stays in the browser. Same-origin relay avoids the node needing CORS.
+async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+    let resp = st
+        .http
+        .post(format!("{}/tx", st.rpc))
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+    if !resp.status().is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(ApiError::bad(format!("el nodo rechazó la transacción: {msg}")));
+    }
+    let v: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(v))
 }
 
 /// The node's `/status`, proxied through this server. The browser can't fetch
