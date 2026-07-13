@@ -131,6 +131,25 @@ const ROUND_STATE_RETENTION: Round = 512;
 /// snapshot territory, out of scope for reactive per-digest resync.
 const BATCH_RETENTION_ROUNDS: Round = 1_024;
 
+/// How many rounds of certified DAG history to retain behind the consensus
+/// *finalized floor* (`ConsensusState::finalized_floor`) before garbage-
+/// collecting older certificates from both the in-memory `DagStore` and the
+/// on-disk cert log. Without this the DAG grows one certificate per validator
+/// per round forever - an attacker cannot inflate it (only quorum-certified
+/// certificates enter), but a genuinely long-lived chain would still climb in
+/// RAM and disk without bound. Pruned rounds are permanently committed history
+/// whose account effects already persisted; the matching `Bullshark::gc_floor`
+/// barrier lets a restarted node re-derive its retained window without walking
+/// off the bottom of the pruned DAG. Kept `<=` `BATCH_RETENTION_ROUNDS` so a
+/// certificate is never dropped while a peer resyncing it could still fetch it
+/// but not its worker batch (which would leave that peer unable to execute the
+/// certificate's transactions) - certificates are pruned no later than their
+/// batches, never earlier. Comfortably larger than any reactive per-digest
+/// resync gap; a peer further behind than this is in snapshot territory,
+/// already out of scope for reactive resync (same boundary the batch cache
+/// draws).
+const DAG_RETENTION_ROUNDS: Round = 1_024;
+
 /// How many of `available` receipts a single `/stark_proof` call actually
 /// proves, given what the caller requested (`None` meaning "all of them").
 /// Always `<= MAX_STARK_PROOF_RECEIPTS` and `<= available` - see
@@ -1108,6 +1127,34 @@ impl Engine {
                 state.batches.remove(&digest);
                 state.batch_seen_round.remove(&digest);
             }
+        }
+
+        // Garbage-collect the certified DAG below the finalized floor minus
+        // `DAG_RETENTION_ROUNDS` - the round-windowed bound on the otherwise-
+        // unbounded in-memory `DagStore` *and* the on-disk cert log (#107).
+        // Uses the consensus *finalized* floor, never `next_round`: only
+        // rounds permanently committed/skipped and already walked into `seen`
+        // are safe to drop, and the retention margin keeps them long past any
+        // reactive resync. Raising `gc_floor` in lock-step is what keeps a
+        // restart able to re-derive against the same barrier (see
+        // `ConsensusState::set_gc_floor`); it also stops `extend_order` from
+        // re-resolving the pruned rounds (which would now resolve to
+        // `Undecided`, breaking the order). Best-effort on the on-disk side: a
+        // failed delete just leaves a dead key to be re-pruned next tick.
+        let gc_floor = state.consensus.finalized_floor().saturating_sub(DAG_RETENTION_ROUNDS);
+        if gc_floor > state.consensus.gc_floor() {
+            let removed = state.dag.prune_below(gc_floor);
+            if !removed.is_empty() {
+                if let Some(db) = &self.cert_log {
+                    for digest in &removed {
+                        if let Err(e) = db.remove(digest) {
+                            tracing::warn!("failed to delete pruned certificate {digest:?} from the DAG log: {e}");
+                        }
+                    }
+                }
+                tracing::debug!("pruned {} certificates below round {gc_floor} from the DAG", removed.len());
+            }
+            state.consensus.set_gc_floor(gc_floor);
         }
     }
 

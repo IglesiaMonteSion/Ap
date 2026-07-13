@@ -46,11 +46,33 @@ use std::collections::{HashMap, HashSet};
 pub struct Bullshark<'a> {
     dag: &'a DagStore,
     validators: &'a ValidatorSet,
+    /// GC barrier: any certificate whose round is strictly below this is
+    /// treated as already-committed permanent history and its slot in a
+    /// causal walk is satisfied without requiring the certificate to be
+    /// present. `0` disables the barrier (nothing pruned). This is what lets
+    /// `DagStore::prune_below` drop old committed rounds without stalling a
+    /// restarted node whose `seen` set (not persisted) starts empty and
+    /// would otherwise try to walk a leader's full ancestry down into the
+    /// pruned region and fail. During *live* operation the barrier is never
+    /// actually reached - `walk_causal_history`/`reaches` short-circuit on
+    /// `seen` (which already holds every committed digest) long before a
+    /// walk descends anywhere near `gc_floor` - so it only affects the
+    /// empty-`seen` restart re-derivation, keeping it a no-op on the hot
+    /// path. Sound across validators with *different* floors: the barrier
+    /// only suppresses re-emitting history already committed (and applied,
+    /// idempotently) in a prior life, never changes the relative order of
+    /// rounds at or above either validator's floor - see
+    /// `ConsensusState::set_gc_floor`.
+    gc_floor: Round,
 }
 
 impl<'a> Bullshark<'a> {
     pub fn new(dag: &'a DagStore, validators: &'a ValidatorSet) -> Self {
-        Bullshark { dag, validators }
+        Bullshark { dag, validators, gc_floor: 0 }
+    }
+
+    pub fn with_gc_floor(dag: &'a DagStore, validators: &'a ValidatorSet, gc_floor: Round) -> Self {
+        Bullshark { dag, validators, gc_floor }
     }
 
     /// Deterministic, stake-agnostic leader selection: every honest
@@ -225,12 +247,20 @@ impl<'a> Bullshark<'a> {
         let mut parents = cert.vertex.parents.clone();
         parents.sort();
         let mut all_parents_resolved = true;
-        for parent in parents {
-            if !self.walk_causal_history(parent, seen, ordered, memo) {
-                all_parents_resolved = false;
-                // Keep going, don't short-circuit - a sibling reachable via
-                // a different parent may still be fully resolved and
-                // should still commit on its own merits.
+        // A certificate at round `r` lists parents from round `r - 1`. Once
+        // `r <= gc_floor` those parents belong to the pruned, permanently-
+        // committed region (see `gc_floor`): they are treated as resolved
+        // without recursion, so a restart re-derivation that walks a
+        // retained-window leader's ancestry stops cleanly at the barrier
+        // instead of failing on a certificate that was legitimately dropped.
+        if cert.vertex.round > self.gc_floor {
+            for parent in parents {
+                if !self.walk_causal_history(parent, seen, ordered, memo) {
+                    all_parents_resolved = false;
+                    // Keep going, don't short-circuit - a sibling reachable via
+                    // a different parent may still be fully resolved and
+                    // should still commit on its own merits.
+                }
             }
         }
         if !all_parents_resolved {
@@ -263,7 +293,15 @@ impl<'a> Bullshark<'a> {
     /// locally-available evidence and permanently disagree - not a
     /// hypothetical, confirmed twice while building this (see the module
     /// docs' two-bug history).
-    pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>) -> Vec<Digest> {
+    /// Returns the newly-finalized digests together with the round the walk
+    /// stopped at - the first round not yet permanently resolved (or
+    /// `up_to_round + 1` if every round through `up_to_round` finalized).
+    /// Every round strictly below that value is now permanently committed or
+    /// skipped *and* fully walked into `seen`, so a caller can advance its
+    /// start round to it (never re-resolving settled history each call) and,
+    /// far enough below it, garbage-collect the DAG - see
+    /// `ConsensusState::advance`/`set_gc_floor`.
+    pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>) -> (Vec<Digest>, Round) {
         let mut ordered = Vec::new();
         // Scoped to this one call only - see `walk_causal_history`'s doc
         // comment for the real exponential-blowup bug this closes. Many
@@ -290,7 +328,7 @@ impl<'a> Bullshark<'a> {
                 RoundOutcome::Undecided => break,
             }
         }
-        ordered
+        (ordered, round)
     }
 
     /// Resolves round `round`'s ultimate fate: `Committed(digest)` if its
@@ -367,6 +405,14 @@ impl<'a> Bullshark<'a> {
             return Some(false);
         }
         let cert = self.dag.get(&from)?;
+        // Below the GC barrier there is no retained history left to search,
+        // and none is needed: the reachability `target` is always a round
+        // being resolved (>= the consensus floor >= `gc_floor`), so it can
+        // never lie in the pruned region a barrier certificate's parents
+        // point into. Stopping here matches `walk_causal_history`'s barrier.
+        if cert.vertex.round <= self.gc_floor {
+            return Some(false);
+        }
         let mut any_undecided = false;
         for &parent in &cert.vertex.parents {
             match self.reaches(parent, target, visited) {

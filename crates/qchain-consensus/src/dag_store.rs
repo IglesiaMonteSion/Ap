@@ -53,6 +53,40 @@ impl DagStore {
         self.highest_round
     }
 
+    /// The lowest round for which any certificate is still present. `0` for
+    /// an empty store. After `prune_below(gc)` this is the real bottom of
+    /// the retained window - the value a restarting node reads back to learn
+    /// where its persisted (and now pruned) DAG actually starts, so it can
+    /// set the same GC barrier the pruned rounds were finalized under (see
+    /// `Bullshark`'s `gc_floor` and `ConsensusState::set_gc_floor`).
+    pub fn lowest_round(&self) -> Round {
+        self.by_round.keys().copied().min().unwrap_or(0)
+    }
+
+    /// Drop every certificate strictly below `round`, returning the digests
+    /// removed (so a caller persisting the DAG can delete the same keys from
+    /// its on-disk log). Only ever called with a `round` far below the
+    /// consensus finalized floor (see `qchain-node::engine`'s
+    /// `DAG_RETENTION_ROUNDS`): the rounds it removes are permanently
+    /// committed history whose account effects already persisted, and no
+    /// future leader's causal walk needs them once the matching GC barrier
+    /// is set (`Bullshark::gc_floor`). `highest_round` is left untouched -
+    /// pruning the old tail never lowers the frontier.
+    pub fn prune_below(&mut self, round: Round) -> Vec<Digest> {
+        let mut removed = Vec::new();
+        let rounds_to_drop: Vec<Round> = self.by_round.keys().copied().filter(|r| *r < round).collect();
+        for r in rounds_to_drop {
+            if let Some(authors) = self.by_round.remove(&r) {
+                for (_author, digest) in authors {
+                    if self.by_digest.remove(&digest).is_some() {
+                        removed.push(digest);
+                    }
+                }
+            }
+        }
+        removed
+    }
+
     pub fn contains(&self, digest: &Digest) -> bool {
         self.by_digest.contains_key(digest)
     }

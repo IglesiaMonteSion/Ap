@@ -53,10 +53,34 @@ pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool
 /// node's block-application loop actually consumes.
 pub struct ConsensusState {
     seen: HashSet<Digest>,
-    /// The round `advance` starts walking from - always `0` for a fresh
-    /// validator (`new`), but see `resuming_from` for why a restarted one
-    /// needs a different value.
+    /// The round `advance` starts walking from - `0` for a fresh validator
+    /// (`new`), `starting_round` for a restarted one (`resuming_from`), and
+    /// only ever moved forward by `set_gc_floor` when the DAG is actually
+    /// pruned. Deliberately NOT advanced to the finalized floor every call:
+    /// `resolve` can return `Skipped` for a round whose leader certificate is
+    /// merely not synced *yet* (it stays sound because `direct_status`
+    /// guarantees such a round is also unreachable, so the skip is permanent
+    /// *given current data*) - but under certificate loss a late resync can
+    /// still legitimately revise a *recent* round, so `extend_order` must
+    /// keep re-resolving from a fixed low point rather than racing its start
+    /// round up to the frontier. A live DST reproduced a real safety
+    /// violation (two honest validators diverging) when this was advanced
+    /// eagerly. It is only safe to move it up to `gc_floor`, which lags the
+    /// finalized floor by `DAG_RETENTION_ROUNDS` - far enough behind the
+    /// frontier that no in-flight resync can still touch those rounds.
     from_round: Round,
+    /// Tracks how far consensus has *permanently* finalized (first round not
+    /// yet committed/skipped-permanently), advanced monotonically after each
+    /// `advance`. Used only to decide how much of the DAG is safe to garbage-
+    /// collect (`finalized_floor`); never used as the `extend_order` start
+    /// round - see `from_round` for why racing the start round forward is
+    /// unsafe under certificate loss.
+    finalized_floor: Round,
+    /// GC barrier handed to `Bullshark` (see its `gc_floor` field): rounds
+    /// strictly below this have been pruned from the DAG and are treated as
+    /// permanently-committed history during causal walks. Only ever raised,
+    /// never lowered, and always kept far below the finalized floor.
+    gc_floor: Round,
 }
 
 impl Default for ConsensusState {
@@ -67,7 +91,7 @@ impl Default for ConsensusState {
 
 impl ConsensusState {
     pub fn new() -> Self {
-        ConsensusState { seen: HashSet::new(), from_round: 0 }
+        ConsensusState { seen: HashSet::new(), from_round: 0, finalized_floor: 0, gc_floor: 0 }
     }
 
     /// For a validator resuming from a persisted round checkpoint whose DAG
@@ -117,7 +141,42 @@ impl ConsensusState {
     /// first place - `new()` is not just safe there, it's the only
     /// correct choice.
     pub fn resuming_from(starting_round: Round) -> Self {
-        ConsensusState { seen: HashSet::new(), from_round: starting_round }
+        ConsensusState { seen: HashSet::new(), from_round: starting_round, finalized_floor: starting_round, gc_floor: 0 }
+    }
+
+    /// The first round not yet permanently finalized - everything strictly
+    /// below is committed/skipped and applied. The node's safe upper bound
+    /// on what it may garbage-collect (it prunes well below this, by
+    /// `DAG_RETENTION_ROUNDS`, so late causal walks still find any orphaned
+    /// but referenced ancestor).
+    pub fn finalized_floor(&self) -> Round {
+        self.finalized_floor
+    }
+
+    pub fn gc_floor(&self) -> Round {
+        self.gc_floor
+    }
+
+    /// Raise the GC barrier to `round` (monotonic - a lower value is
+    /// ignored). Called two ways: live, right after `DagStore::prune_below`
+    /// drops the matching old rounds; and once at startup, set to the
+    /// reloaded DAG's `lowest_round` so a node that persisted a *pruned* DAG
+    /// re-derives its retained window against the same barrier those rounds
+    /// were finalized under (its `seen` set didn't survive the restart, so
+    /// the barrier is what stops the re-derivation walking off the bottom of
+    /// the pruned DAG - see `Bullshark::gc_floor`). Also nudges `from_round`
+    /// up to the barrier: a round below the barrier has no certificates left
+    /// to resolve, so `extend_order` must never start there.
+    pub fn set_gc_floor(&mut self, round: Round) {
+        if round > self.gc_floor {
+            self.gc_floor = round;
+        }
+        if round > self.from_round {
+            self.from_round = round;
+        }
+        if round > self.finalized_floor {
+            self.finalized_floor = round;
+        }
     }
 
     /// Re-evaluates leader commitment across the whole DAG (cheap at
@@ -125,8 +184,19 @@ impl ConsensusState {
     /// tradeoff) and returns any certificate digests newly finalized into
     /// the total order since the last call.
     pub fn advance(&mut self, dag: &DagStore, validators: &ValidatorSet) -> Vec<Digest> {
-        let bullshark = Bullshark::new(dag, validators);
-        bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen)
+        let bullshark = Bullshark::with_gc_floor(dag, validators, self.gc_floor);
+        let (ordered, stopped_at) = bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen);
+        // Record how far consensus has permanently finalized (the first
+        // still-unresolved round), monotonically. This drives DAG garbage
+        // collection only - it is deliberately NOT fed back into `from_round`
+        // (see that field's doc comment for the real safety violation eager
+        // advancement caused under certificate loss). `extend_order` keeps
+        // starting from the fixed `from_round` so a late resync can still
+        // revise a recent round.
+        if stopped_at > self.finalized_floor {
+            self.finalized_floor = stopped_at;
+        }
+        ordered
     }
 
     pub fn ordered_count(&self) -> usize {
@@ -274,6 +344,67 @@ mod tests {
         let direct = ConsensusState::new().advance(&dag_full, &validators);
 
         assert_eq!(combined, direct, "incremental advancement must match ordering the full DAG in one call");
+    }
+
+    /// Garbage-collecting old rounds from the DAG below the finalized floor,
+    /// with the matching `gc_floor` barrier raised in lock-step, must not
+    /// change or lose any of the committed total order - the safety property
+    /// the whole DAG-pruning scheme rests on. Models a live node: advance,
+    /// prune, raise the barrier, advance again.
+    #[test]
+    fn pruning_below_the_finalized_floor_never_changes_the_committed_order() {
+        let (tvs, validators) = make_validators(4);
+        let dag = build_dag(&tvs, 12);
+        let baseline = ConsensusState::new().advance(&dag, &validators);
+        assert!(!baseline.is_empty());
+
+        let mut state = ConsensusState::new();
+        let mut got = state.advance(&dag, &validators);
+        // Prune a couple of rounds below where consensus has finalized, and
+        // raise the barrier exactly as `prune_stale_round_state` does.
+        let gc = state.finalized_floor().saturating_sub(2);
+        assert!(gc > 0, "the test DAG must finalize far enough to leave a real prune margin");
+        let mut pruned = build_dag(&tvs, 12);
+        let removed = pruned.prune_below(gc);
+        assert!(!removed.is_empty(), "there must be old rounds to actually prune");
+        state.set_gc_floor(gc);
+        got.extend(state.advance(&pruned, &validators));
+
+        assert_eq!(got, baseline, "a GC below the finalized floor (barrier raised in lock-step) must leave the committed order identical");
+    }
+
+    /// The restart path the GC barrier exists for: `seen` does not survive a
+    /// process restart, so a node that persisted a *pruned* DAG must
+    /// re-derive its retained window from scratch - and must stop cleanly at
+    /// the barrier instead of walking a retained leader's ancestry off the
+    /// bottom of the pruned DAG and stalling. The re-derived order must be
+    /// exactly the retained tail of the full committed order.
+    #[test]
+    fn a_restart_re_derives_the_retained_window_against_the_barrier_without_stalling() {
+        let (tvs, validators) = make_validators(4);
+        let dag_full = build_dag(&tvs, 12);
+        let baseline = ConsensusState::new().advance(&dag_full, &validators);
+        assert!(!baseline.is_empty());
+
+        let gc = 4;
+        let mut pruned = build_dag(&tvs, 12);
+        pruned.prune_below(gc);
+        assert_eq!(pruned.lowest_round(), gc, "prune leaves the retained window starting exactly at gc");
+
+        // Exactly what `main.rs` does on restart: fresh state (empty `seen`),
+        // barrier set from the reloaded DAG's real lowest round.
+        let mut restarted = ConsensusState::new();
+        restarted.set_gc_floor(pruned.lowest_round());
+        let after_restart = restarted.advance(&pruned, &validators);
+
+        assert!(!after_restart.is_empty(), "a restarted node must re-derive its retained window, never stall at the barrier");
+        let expected_tail: Vec<Digest> =
+            baseline.iter().copied().filter(|d| pruned.get(d).map(|c| c.vertex.round >= gc).unwrap_or(false)).collect();
+        assert_eq!(after_restart, expected_tail, "restart re-derivation must reproduce exactly the retained tail of the committed order");
+        // And nothing below the barrier may sneak back in.
+        for d in &after_restart {
+            assert!(pruned.get(d).unwrap().vertex.round >= gc, "no digest below the GC barrier may appear in the re-derived order");
+        }
     }
 
     /// One validator never proposes at all (a crashed/silent validator) -

@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     // case costs nothing here - it's exactly what already worked before
     // this fix existed, and that path never even reaches `resuming_from`'s
     // added behavior in the first place.
-    let consensus =
+    let mut consensus =
         if validators.stake_of(&self_id) >= validators.quorum_threshold() { ConsensusState::resuming_from(next_round) } else { ConsensusState::new() };
 
     // Task #107 - DAG persistence. Reload every certificate this validator
@@ -200,6 +200,17 @@ async fn main() -> anyhow::Result<()> {
         if loaded > 0 {
             tracing::info!("reloaded {loaded} certificates from the on-disk DAG log");
         }
+    }
+    // If this node persisted a *pruned* DAG (a long-lived validator that
+    // garbage-collected old rounds - see `engine::DAG_RETENTION_ROUNDS`), its
+    // reloaded DAG starts at some round > 0. Set the consensus GC barrier to
+    // that real bottom so the re-derivation (whose `seen` set didn't survive
+    // the restart) stops cleanly at the pruned boundary instead of trying to
+    // walk a retained-window leader's ancestry off into the dropped region.
+    // A never-pruned DAG has `lowest_round == 0`, making this a no-op that
+    // preserves the existing restart behavior exactly.
+    if !dag.is_empty() {
+        consensus.set_gc_floor(dag.lowest_round());
     }
 
     let engine = Arc::new(Engine {
