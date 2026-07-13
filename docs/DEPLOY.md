@@ -206,6 +206,45 @@ unidad `deploy/systemd/qchain-faucet.service` usa el mismo patrón
 (`--network host`, `Restart=on-failure`), pero hay que instalarla y
 abrir su puerto a mano, ver más abajo.
 
+### Recuperar un validador muy atrasado (state-sync)
+
+Un validador que estuvo caído mucho tiempo (más de ~1.024 rondas, la
+ventana de retención del DAG) no puede reincorporarse pidiendo
+certificados uno por uno: sus pares ya podaron esa historia vieja. La
+recuperación es state-sync, igual que en Cosmos: se borra el estado local
+y se arranca de nuevo apuntando a pares sanos, que sirven un snapshot
+verificado del estado de cuentas.
+
+En el `config.json` del validador a recuperar, agregar los RPC de dos o
+tres pares sanos:
+
+```
+"state_sync_peers": [
+  "http://<ip-par-1>:8080",
+  "http://<ip-par-2>:8080",
+  "http://<ip-par-3>:8080"
+]
+```
+
+Luego, en la VPS de ese validador:
+
+```
+sudo systemctl stop qchain-validator
+sudo rm -rf /opt/qchain/data        # borrar SOLO el estado local, nunca keypair.json
+sudo systemctl start qchain-validator
+journalctl -u qchain-validator -f   # buscar "state-synced N accounts at round R"
+```
+
+El nodo descarga el snapshot, **reconstruye el árbol de Merkle y exige
+que la raíz coincida** con la reclamada (rechaza un snapshot manipulado),
+y si dos pares reportan raíces distintas para la misma ronda, aborta en
+vez de sincronizar desde una vista bifurcada. Para una verificación aún
+más fuerte, un operador puede fijar un ancla obtenida por fuera:
+`"state_sync_trusted_root": "<hex>", "state_sync_trusted_round": <n>` —
+solo acepta el snapshot si coincide exacto. Sin `state_sync_peers` el
+arranque es el de siempre (un nodo con `data_dir` existente resume normal;
+uno fresco siembra génesis y arranca desde la ronda 0).
+
 ## Faucet
 
 Quien vaya a operar el faucet corre, en cualquier máquina con acceso al

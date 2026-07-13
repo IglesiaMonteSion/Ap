@@ -49,6 +49,26 @@ pub struct NodeConfig {
     /// unchanged.
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
+    /// RPC URLs of peers this node may state-sync from when it starts with
+    /// an empty local store (a fresh join, or an operator recovering a
+    /// validator that fell further behind than `DAG_RETENTION_ROUNDS` by
+    /// wiping `data_dir` and restarting). Empty (the default) keeps the
+    /// original behavior exactly: a fresh node seeds genesis and replays
+    /// from round 0. When set, the node fetches a verified account-state
+    /// snapshot (`GET /snapshot`) instead of replaying pruned history it
+    /// could never fetch. See `main.rs`'s state-sync path.
+    #[serde(default)]
+    pub state_sync_peers: Vec<String>,
+    /// Optional out-of-band trust anchor for state-sync (Cosmos-style
+    /// `trust_height`/`trust_hash`): if set, a fetched snapshot is accepted
+    /// only if its `(round, merkle_root)` matches this exactly - turning
+    /// state-sync from "trust the source peer" (weak subjectivity) into a
+    /// fully verified catch-up against a value the operator obtained
+    /// independently. Hex-encoded 32-byte root.
+    #[serde(default)]
+    pub state_sync_trusted_root: Option<String>,
+    #[serde(default)]
+    pub state_sync_trusted_round: Option<u64>,
 }
 
 fn default_round_interval_ms() -> u64 {
@@ -93,6 +113,9 @@ mod tests {
             genesis,
             round_interval_ms: 500,
             data_dir: None,
+            state_sync_peers: Vec::new(),
+            state_sync_trusted_root: None,
+            state_sync_trusted_round: None,
         }
     }
 

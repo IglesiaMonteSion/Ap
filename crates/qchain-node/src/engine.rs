@@ -59,7 +59,7 @@ use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Trans
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::Ledger;
 use qchain_network::{NetMessage, Network};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -106,6 +106,15 @@ const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 /// parallel proof.
 const MAX_CONCURRENT_STARK_PROOFS: usize = 2;
 static STARK_PROOF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_STARK_PROOFS);
+
+/// Caps concurrent full-state snapshot serves (`GET /snapshot`). Serving a
+/// snapshot copies the entire account set out from under the state lock -
+/// cheap per call at testnet scale but linear in state size and
+/// unauthenticated, so an unbounded fan-out of concurrent pulls could pin
+/// memory/CPU. Excess callers queue for a permit, same pattern as
+/// `MAX_CONCURRENT_STARK_PROOFS`.
+const MAX_CONCURRENT_SNAPSHOTS: usize = 2;
+static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SNAPSHOTS);
 
 
 /// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
@@ -328,6 +337,43 @@ pub struct StatusResponse {
     pub executed_transactions: u64,
 }
 
+/// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
+/// far-behind peer or a fresh joining validator reads first to learn a
+/// server's current round, account-state Merkle root, and size before
+/// deciding to pull the full account set. The `(round, merkle_root)` pair is
+/// also what a cross-check or an operator-provided trust anchor compares
+/// against (see `main.rs`'s state-sync path).
+#[derive(Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub round: Round,
+    pub merkle_root: String,
+    pub account_count: usize,
+}
+
+/// One account in a state snapshot, keyed by its address.
+#[derive(Serialize, Deserialize)]
+pub struct SnapshotAccount {
+    pub address: Pubkey,
+    pub account: qchain_core::Account,
+}
+
+/// A full account-state snapshot (`GET /snapshot`): every account this
+/// validator holds, sorted by address for determinism, plus the round and
+/// Merkle root they are consistent with. A receiver rebuilds the same
+/// `IncrementalStateTree` from `accounts` and checks the root matches
+/// `merkle_root` before trusting a single byte of it - the snapshot is only
+/// as authentic as the source peer (weak subjectivity) unless the operator
+/// also pins a `(round, root)` trust anchor, exactly the Cosmos state-sync
+/// trust model. This is the real catch-up path for a validator that fell
+/// further behind than `DAG_RETENTION_ROUNDS`, whose peers have pruned the
+/// old certificates it would otherwise need to replay history.
+#[derive(Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub round: Round,
+    pub merkle_root: String,
+    pub accounts: Vec<SnapshotAccount>,
+}
+
 /// What `GET /stark_proof` hands back to a light client - a real
 /// Winterfell proof (hex-encoded via its own `to_bytes`, since `Proof`
 /// itself has no serde impl) alongside the public inputs and Merkle
@@ -508,6 +554,34 @@ impl Engine {
     pub async fn merkle_root(&self) -> ([u8; 32], usize) {
         let state = self.state.lock().await;
         (state.ledger.merkle_root(), state.ledger.transfer_receipts().len())
+    }
+
+    /// Header of a state snapshot - the round, account-state Merkle root, and
+    /// account count, without the (potentially large) account set itself.
+    pub async fn snapshot_meta(&self) -> SnapshotMeta {
+        let state = self.state.lock().await;
+        let root = state.ledger.merkle_root();
+        let account_count = state.ledger.store().iter().count();
+        SnapshotMeta { round: state.next_round, merkle_root: hex::encode(root), account_count }
+    }
+
+    /// A full, self-consistent account-state snapshot: the round, its Merkle
+    /// root, and every account (sorted by address for a deterministic wire
+    /// order), all captured atomically under the state lock so the root
+    /// genuinely matches the accounts. The heavy copy is taken under the lock
+    /// but the JSON serialization happens in the caller (`rpc`) after the
+    /// lock is dropped, and a permit bounds how many run at once
+    /// (`MAX_CONCURRENT_SNAPSHOTS`). See `StateSnapshot` for the trust model.
+    pub async fn snapshot(&self) -> StateSnapshot {
+        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
+        let (round, root, mut accounts) = {
+            let state = self.state.lock().await;
+            let accounts: Vec<SnapshotAccount> =
+                state.ledger.store().iter().map(|(address, account)| SnapshotAccount { address, account }).collect();
+            (state.next_round, state.ledger.merkle_root(), accounts)
+        };
+        accounts.sort_by(|a, b| a.address.to_bytes().cmp(&b.address.to_bytes()));
+        StateSnapshot { round, merkle_root: hex::encode(root), accounts }
     }
 
     /// The most recent `limit` captured `TransferReceipt`s (newest
@@ -699,7 +773,7 @@ impl Engine {
                     tracing::warn!("dropping vertex proposal from {from} - author_signature does not verify");
                     return;
                 }
-                self.request_missing_parents(&vertex.parents, from).await;
+                self.request_missing_parents(&vertex.parents, vertex.round.saturating_sub(1), from).await;
                 self.request_missing_batches(&vertex.batch_digests, from).await;
                 let key = (vertex.round, vertex.author);
                 {
@@ -814,13 +888,14 @@ impl Engine {
                     tracing::warn!("dropping certificate that fails quorum verification");
                     return;
                 }
+                let parent_round = cert.vertex.round.saturating_sub(1);
                 let parents = cert.vertex.parents.clone();
                 let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
                     self.insert_certificate(&mut state, cert);
                 }
-                self.request_missing_parents(&parents, from).await;
+                self.request_missing_parents(&parents, parent_round, from).await;
                 self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
             }
@@ -840,13 +915,14 @@ impl Engine {
                     tracing::warn!("dropping certificate response that fails quorum verification");
                     return;
                 }
+                let parent_round = cert.vertex.round.saturating_sub(1);
                 let parents = cert.vertex.parents.clone();
                 let batch_digests = cert.vertex.batch_digests.clone();
                 {
                     let mut state = self.state.lock().await;
                     self.insert_certificate(&mut state, cert);
                 }
-                self.request_missing_parents(&parents, from).await;
+                self.request_missing_parents(&parents, parent_round, from).await;
                 self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
             }
@@ -878,9 +954,20 @@ impl Engine {
     /// this existed (see `project-lessons-learned`), not a hypothetical
     /// gap. `from` is asked because it just sent a message referencing
     /// these digests as parents, so it must have had them itself.
-    async fn request_missing_parents(&self, parents: &[Digest], from: ValidatorId) {
+    async fn request_missing_parents(&self, parents: &[Digest], parent_round: Round, from: ValidatorId) {
         let missing: Vec<Digest> = {
             let mut state = self.state.lock().await;
+            // Never chase parents below the GC barrier: they are permanently-
+            // committed history this node treats as settled (see
+            // `Bullshark::gc_floor`), the peers likely pruned them anyway
+            // (`DAG_RETENTION_ROUNDS`), and ordering does not need them. This
+            // is what bounds a state-synced node's back-fill to the recent
+            // window instead of cascading parent requests all the way down to
+            // a peer's own retention floor. A no-op for a never-pruned node
+            // (`gc_floor == 0`, `parent_round` never below it).
+            if parent_round < state.consensus.gc_floor() {
+                return;
+            }
             let missing: Vec<Digest> = parents.iter().copied().filter(|d| !state.dag.contains(d)).collect();
             for &digest in &missing {
                 state.pending_cert_requests.insert(digest, from);

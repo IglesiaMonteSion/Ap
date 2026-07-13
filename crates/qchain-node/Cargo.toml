@@ -21,6 +21,7 @@ borsh.workspace = true
 sled = "0.34"
 tokio.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod state_sync;
+
 #[derive(Parser)]
 #[command(about = "qchain phase-1 testnet validator")]
 struct Cli {
@@ -70,11 +72,40 @@ async fn main() -> anyhow::Result<()> {
     // discarding any governance decisions made in a prior run. `is_fresh`
     // (empty store) is what actually distinguishes "first boot" from
     // "restart" - `InMemoryStore` is always fresh by construction.
-    let store: Box<dyn StateStore> = match &config.data_dir {
+    let mut store: Box<dyn StateStore> = match &config.data_dir {
         Some(dir) => Box::new(SledStore::open(dir)?),
         None => Box::new(InMemoryStore::new()),
     };
-    let is_fresh = store.iter().next().is_none();
+    let mut is_fresh = store.iter().next().is_none();
+
+    // State-sync bootstrap (see `NodeConfig::state_sync_peers`): the real
+    // catch-up path for a validator that fell further behind than
+    // `engine::DAG_RETENTION_ROUNDS` - its peers pruned the old certificates
+    // it would otherwise replay from round 0, so there is nothing to fetch
+    // per-digest. Instead, on an empty local store with state-sync peers
+    // configured, pull a *verified* account-state snapshot and install it,
+    // then resume consensus from the snapshot's round. Only runs on a fresh
+    // store: a node with existing state resumes normally (an operator
+    // recovers a hopelessly-behind validator by wiping `data_dir` and
+    // restarting, exactly the Cosmos state-sync recovery flow).
+    let mut synced_round: Option<u64> = None;
+    if is_fresh && !config.state_sync_peers.is_empty() {
+        let snapshot = state_sync::fetch_verified_snapshot(&config).await?;
+        for acc in &snapshot.accounts {
+            store.set(acc.address, acc.account.clone());
+        }
+        tracing::info!(
+            "state-synced {} accounts at round {} (verified root {})",
+            snapshot.accounts.len(),
+            snapshot.round,
+            snapshot.merkle_root
+        );
+        synced_round = Some(snapshot.round);
+        // The snapshot already contains every account, including the genesis
+        // program singletons - genesis seeding must be skipped or it would
+        // overwrite real state with genesis defaults.
+        is_fresh = false;
+    }
 
     // Real bug found while live-auditing the persistence work (see
     // `engine.rs`'s `propose_round` doc comment for the full story): the
@@ -87,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     // whole network. `round_checkpoint_path` is `None` for an in-memory
     // node - nothing to restore, since it's always fresh next process
     // start anyway.
-    let (round_checkpoint_path, next_round) = match &config.data_dir {
+    let (round_checkpoint_path, mut next_round) = match &config.data_dir {
         Some(dir) => {
             let path = dir.join("round_checkpoint");
             let resumed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
@@ -95,6 +126,15 @@ async fn main() -> anyhow::Result<()> {
         }
         None => (None, 0),
     };
+    // A just-installed snapshot fixes the round to resume consensus from -
+    // ahead of both a fresh node's `0` and any (necessarily older) round
+    // checkpoint. Persist it so a later ordinary restart resumes correctly.
+    if let Some(round) = synced_round {
+        next_round = round;
+        if let Some(path) = &round_checkpoint_path {
+            let _ = std::fs::write(path, round.to_string());
+        }
+    }
 
     let mut ledger = Ledger::new(store)?;
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
@@ -211,6 +251,15 @@ async fn main() -> anyhow::Result<()> {
     // preserves the existing restart behavior exactly.
     if !dag.is_empty() {
         consensus.set_gc_floor(dag.lowest_round());
+    }
+    // After a state-sync the DAG is empty but consensus must not try to
+    // resolve or walk anything below the snapshot round - there are no
+    // certificates for that pruned history, and the account effects are
+    // already installed. Set the barrier (and start watermark) to the
+    // snapshot round, the same role `round_checkpoint` plays for an ordinary
+    // restart; peers supply certificates from here forward via normal resync.
+    if let Some(round) = synced_round {
+        consensus.set_gc_floor(round);
     }
 
     let engine = Arc::new(Engine {

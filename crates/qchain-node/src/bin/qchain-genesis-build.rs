@@ -123,6 +123,9 @@ fn main() -> anyhow::Result<()> {
             genesis: genesis.clone(),
             round_interval_ms: cli.round_interval_ms,
             data_dir: Some(PathBuf::from(&cli.data_dir_name)),
+            state_sync_peers: Vec::new(),
+            state_sync_trusted_root: None,
+            state_sync_trusted_round: None,
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;

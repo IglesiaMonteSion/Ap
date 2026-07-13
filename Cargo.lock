@@ -1965,6 +1965,7 @@ dependencies = [
  "qchain-network",
  "qchain-stark",
  "qchain-storage",
+ "reqwest",
  "serde",
  "serde_json",
  "sha3",

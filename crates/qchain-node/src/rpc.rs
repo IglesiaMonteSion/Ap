@@ -2,7 +2,7 @@
 //! wallet/client traffic - what `qchain-cli` talks to. Deliberately small:
 //! submit a transaction, read an account, read node status.
 
-use crate::engine::{Engine, StarkProofError, StarkProofResponse, StatusResponse};
+use crate::engine::{Engine, SnapshotMeta, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -26,7 +26,26 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers/:hash", get(get_transfer))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
+        .route("/snapshot/meta", get(snapshot_meta))
+        .route("/snapshot", get(snapshot))
         .with_state(engine)
+}
+
+/// Header of this validator's account-state snapshot - round, Merkle root,
+/// and account count. A far-behind peer reads this before pulling the full
+/// snapshot (see `GET /snapshot`), and it doubles as the value a cross-check
+/// or an operator trust anchor compares against.
+async fn snapshot_meta(State(engine): State<Arc<Engine>>) -> Json<SnapshotMeta> {
+    Json(engine.snapshot_meta().await)
+}
+
+/// Full account-state snapshot - the real catch-up path for a validator that
+/// fell further behind than the DAG retention window (its peers pruned the
+/// old certificates it would otherwise replay). The receiver rebuilds the
+/// Merkle tree and verifies the root before trusting any of it; see
+/// `qchain_node::engine::StateSnapshot` for the trust model.
+async fn snapshot(State(engine): State<Arc<Engine>>) -> Json<StateSnapshot> {
+    Json(engine.snapshot().await)
 }
 
 /// This network's genesis-derived identity (`NodeConfig::chain_id`'s doc
