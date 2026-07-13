@@ -201,6 +201,11 @@
       <a href="/equivocation_evidence" target="_blank" rel="noopener">ver evidencia cruda</a>
     </section>
 
+    <section id="update-banner" class="banner" hidden>
+      ⬆️ <span id="update-banner-text"></span> — actualizá con
+      <code>sudo ./deploy/update-node.sh</code>
+    </section>
+
     <section class="stat-grid">
       <div class="stat-card">
         <div class="stat-label">ronda actual</div>
@@ -340,6 +345,15 @@ async function refreshStatus() {
     document.getElementById("stat-round").textContent = fmtNum(status.next_round);
     validatorAddr = status.validator;
     document.getElementById("stat-validator").textContent = short(validatorAddr, 10, 8);
+
+    const updateBanner = document.getElementById("update-banner");
+    if (status.update_available) {
+      document.getElementById("update-banner-text").textContent =
+        `Hay una versión más nueva disponible (${status.update_available}). Este nodo corre la ${status.version}.`;
+      updateBanner.hidden = false;
+    } else {
+      updateBanner.hidden = true;
+    }
 
     const now = Date.now();
     if (lastRoundSample && now > lastRoundSample.t) {

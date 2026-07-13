@@ -26,6 +26,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers/:hash", get(get_transfer))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
+        .route("/version", get(version))
         .route("/snapshot/meta", get(snapshot_meta))
         .route("/snapshot", get(snapshot))
         .route("/snapshot/page", get(snapshot_page))
@@ -75,6 +76,15 @@ async fn snapshot(State(engine): State<Arc<Engine>>) -> Json<StateSnapshot> {
 /// cross-network replay gap documented on `qchain_core::Message::chain_id`.
 async fn chain_id(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(json!({ "chain_id": hex::encode(engine.chain_id) }))
+}
+
+/// This node's software version, plus a newer version if one has been heard
+/// from a validator-set peer ("there is an update available"). Backs both a
+/// direct check and the dashboard's update banner. See
+/// `qchain_node::engine::NODE_VERSION` and the version-announce mechanism.
+async fn version(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    let status = engine.status().await;
+    Json(json!({ "version": status.version, "update_available": status.update_available }))
 }
 
 /// A minimal, self-contained status page - not a real block explorer (no

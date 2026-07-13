@@ -104,6 +104,30 @@ const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 /// fixed multiple of one proof, regardless of how many callers arrive at
 /// once; excess callers queue for a permit rather than each starting a fresh
 /// parallel proof.
+/// This node's software version (`MAJOR.MINOR.PATCH`), taken straight from
+/// the crate version so it can never drift from the actual build. Announced
+/// periodically to peers and reported on `/version`/`/status`; the whole
+/// upgrade-notification mechanism keys off it. Bump the workspace version in
+/// the root `Cargo.toml` to cut a new release (started at `1.0.0`).
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether semantic version `a` is strictly newer than `b` (both
+/// `MAJOR.MINOR.PATCH`). A malformed version compares as not-newer, so a
+/// garbage announcement can never raise a false "update available".
+fn version_is_newer(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<(u64, u64, u64)> {
+        let mut it = v.trim().split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    }
+    match (parse(a), parse(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => false,
+    }
+}
+
 const MAX_CONCURRENT_STARK_PROOFS: usize = 2;
 static STARK_PROOF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_STARK_PROOFS);
 
@@ -290,6 +314,13 @@ pub struct EngineState {
     /// fetch it and submit `StakingInstruction::ReportEquivocation` to
     /// slash the offending validator's self-stake.
     pub equivocation_evidence: HashMap<(Round, ValidatorId), EquivocationEvidence>,
+    /// The highest software version this node has heard a real validator-set
+    /// peer announce (`NetMessage::VersionAnnounce`) that is strictly newer
+    /// than this node's own `NODE_VERSION` - i.e. "there is an update out
+    /// there." Surfaced on `/status`, `/version`, and the dashboard so the
+    /// operator knows to upgrade. `None` means this node is at least as new
+    /// as everything it has heard. Never drives any protocol behavior.
+    pub update_available: Option<String>,
 }
 
 pub struct Engine {
@@ -353,6 +384,12 @@ pub struct StatusResponse {
     pub next_round: Round,
     pub dag_certificates: usize,
     pub executed_transactions: u64,
+    /// The software version this node is running (`NODE_VERSION`).
+    pub version: String,
+    /// A strictly-newer version heard from a validator-set peer, if any -
+    /// "there is an update available." `None` when up to date. See
+    /// `EngineState::update_available`.
+    pub update_available: Option<String>,
 }
 
 /// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
@@ -795,6 +832,8 @@ impl Engine {
             next_round: state.next_round,
             dag_certificates: state.dag.len(),
             executed_transactions: state.executed,
+            version: NODE_VERSION.to_string(),
+            update_available: state.update_available.clone(),
         }
     }
 
@@ -1023,7 +1062,35 @@ impl Engine {
                 let mut state = self.state.lock().await;
                 cache_batch(&mut state, batch);
             }
+            NetMessage::VersionAnnounce { version } => {
+                // Advisory only (see the message's doc comment). Trust it just
+                // enough to nudge the operator: the sender must be a real
+                // member of the validator set, and the version must parse and
+                // be strictly newer than ours. Never affects consensus.
+                if self.validators.get(&from).is_none() {
+                    return;
+                }
+                if version_is_newer(&version, NODE_VERSION) {
+                    let mut state = self.state.lock().await;
+                    let is_new = state.update_available.as_deref().map(|cur| version_is_newer(&version, cur)).unwrap_or(true);
+                    if is_new {
+                        state.update_available = Some(version.clone());
+                        tracing::warn!(
+                            "ACTUALIZACIÓN DISPONIBLE: un validador está corriendo la versión {version} (esta corre {NODE_VERSION}). Actualizá con: sudo ./deploy/update-node.sh"
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// Broadcasts this node's software version to its peers (see
+    /// `NetMessage::VersionAnnounce`). Called on a slow cadence from the tick
+    /// loop - cheap, and how the whole no-central-server update-notification
+    /// mechanism propagates: as some validators upgrade, the ones still on an
+    /// older build hear the newer version and raise their `update_available`.
+    pub async fn announce_version(&self) {
+        self.network.broadcast(&NetMessage::VersionAnnounce { version: NODE_VERSION.to_string() }).await;
     }
 
     /// Requests, from `from`, any of `parents` this validator doesn't
@@ -1605,7 +1672,19 @@ mod tests {
             own_last_certificate: None,
             first_seen_vertex: HashMap::new(),
             equivocation_evidence: HashMap::new(),
+            update_available: None,
         }
+    }
+
+    #[test]
+    fn version_comparison_only_flags_a_strictly_newer_valid_version() {
+        assert!(version_is_newer("1.1.0", "1.0.0"));
+        assert!(version_is_newer("1.0.1", "1.0.0"));
+        assert!(version_is_newer("2.0.0", "1.9.9"));
+        assert!(!version_is_newer("1.0.0", "1.0.0"), "same version is not an update");
+        assert!(!version_is_newer("1.0.0", "1.0.1"), "an older version must not flag an update");
+        assert!(!version_is_newer("garbage", "1.0.0"), "a malformed version must never flag an update");
+        assert!(!version_is_newer("1.0", "1.0.0"), "an incomplete version is treated as malformed, not an update");
     }
 
     fn tx(payer: &Keypair, nonce: u64) -> Transaction {

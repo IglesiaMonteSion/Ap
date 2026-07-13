@@ -82,6 +82,18 @@ pub enum NetMessage {
     WorkerBatchRequest { worker_id: WorkerId, digest: Digest },
     /// Reply to a `WorkerBatchRequest` - the batch itself.
     WorkerBatchResponse { worker_id: WorkerId, batch: Batch },
+    /// A periodic announcement of the software version this validator is
+    /// running (semantic `MAJOR.MINOR.PATCH`). Purely informational - it
+    /// never affects consensus. A validator that hears a *strictly newer*
+    /// version from a peer that is a real member of the validator set raises
+    /// an "update available" flag its operator can see (`/status`, the
+    /// dashboard, the logs), so a node running on constantly-improving
+    /// software learns an upgrade exists without any central update server.
+    /// Deliberately advisory only: the transport is unauthenticated, so a
+    /// peer could over-claim its version - the worst case is a spurious
+    /// "go check for an update" notice, never an automatic action, and only
+    /// ever from an id that is actually in the validator set.
+    VersionAnnounce { version: String },
 }
 
 /// Every message on the wire is wrapped with the sender's validator id -

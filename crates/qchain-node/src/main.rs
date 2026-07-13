@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
             own_last_certificate: None,
             first_seen_vertex: HashMap::new(),
             equivocation_evidence: HashMap::new(),
+            update_available: None,
         }),
     });
 
@@ -344,6 +345,22 @@ async fn main() -> anyhow::Result<()> {
                 engine.propose_round().await;
                 engine.retry_pending_resync_requests().await;
                 engine.prune_stale_round_state().await;
+            }
+        });
+    }
+
+    {
+        // Slow, separate cadence for the version announcement (see
+        // `Engine::announce_version` / `NetMessage::VersionAnnounce`): the
+        // whole no-central-server update-notification mechanism. Every 30s is
+        // plenty - a peer that upgrades is noticed within one interval, and it
+        // adds negligible traffic (one tiny message per peer per interval).
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                engine.announce_version().await;
             }
         });
     }

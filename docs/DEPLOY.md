@@ -256,6 +256,37 @@ solo acepta el snapshot si coincide exacto. Sin `state_sync_peers` el
 arranque es el de siempre (un nodo con `data_dir` existente resume normal;
 uno fresco siembra génesis y arranca desde la ronda 0).
 
+## Actualizar un nodo (versiones y avisos de actualización)
+
+Cada nodo corre una **versión** (`MAJOR.MINOR.PATCH`, arranca en `1.0.0`,
+tomada del `Cargo.toml` del workspace). La versión se puede consultar en
+`GET /version` y aparece en `GET /status` y en la página de estado.
+
+**Aviso automático de actualización, sin servidor central:** cada validador
+anuncia su versión a sus pares cada 30s. Si un validador escucha a otro
+validador (real, del conjunto) corriendo una versión **más nueva**, levanta
+la bandera `update_available` — visible en `/version`, `/status`, la página
+de estado (banner ⬆️) y un `WARN` en los logs. Así, a medida que algunos
+validadores actualizan, los que quedan viejos se enteran solos de que hay
+una versión nueva. Es solo un aviso (nunca afecta el consenso ni actúa
+automáticamente) y solo lo levanta un par que de verdad está en el conjunto
+de validadores.
+
+**Para actualizar un nodo** (desde el repo, en la VPS del nodo):
+
+```
+git pull                        # traé el código nuevo
+sudo ./deploy/update-node.sh    # reconstruye la imagen y reinicia el nodo
+```
+
+`update-node.sh` muestra la versión actual vs. la del repo, reconstruye
+`qchain:latest` desde el código, y reinicia el servicio systemd. **Tu clave,
+`config.json` y `data/` no se tocan** — el nodo resume su estado exacto desde
+`data_dir` (balances, nonces, DAG, todo). Es seguro correrlo aunque no haya
+cambios. Para cortar una versión nueva (cuando hagas mejoras): subí `version`
+en el `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador
+corre `update-node.sh`.
+
 ## Faucet
 
 Quien vaya a operar el faucet corre, en cualquier máquina con acceso al

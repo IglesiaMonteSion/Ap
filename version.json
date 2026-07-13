@@ -1,0 +1,5 @@
+{
+  "version": "1.0.0",
+  "released": "genesis",
+  "notes": "Primera versión pública de qchain. La versión que corre cada nodo se toma del Cargo.toml del workspace (env!(CARGO_PKG_VERSION)) y se anuncia a los pares; este archivo es la referencia humana/tooling de la última versión. Para cortar una nueva versión: subí `version` en Cargo.toml (raíz), actualizá este archivo, commiteá, y recompilá/actualizá los nodos con deploy/update-node.sh."
+}
