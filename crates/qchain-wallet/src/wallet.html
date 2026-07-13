@@ -4,108 +4,111 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>qchain · Wallet</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2048%2048'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%237c5cff'/%3E%3Cstop%20offset='1'%20stop-color='%232f6df6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='48'%20height='48'%20rx='13'%20fill='url(%23g)'/%3E%3Ccircle%20cx='24'%20cy='22.5'%20r='9.5'%20fill='none'%20stroke='white'%20stroke-width='3.6'/%3E%3Crect%20x='27'%20y='27'%20width='11'%20height='3.8'%20rx='1.9'%20transform='rotate(45%2028%2030)'%20fill='white'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%23a78bfa'/%3E%3Cstop%20offset='1'%20stop-color='%236690ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='64'%20height='64'%20rx='16'%20fill='%230b0f1a'/%3E%3Cellipse%20cx='32'%20cy='32'%20rx='20'%20ry='8'%20fill='none'%20stroke='url(%23g)'%20stroke-width='2.5'%20transform='rotate(30%2032%2032)'/%3E%3Cellipse%20cx='32'%20cy='32'%20rx='20'%20ry='8'%20fill='none'%20stroke='url(%23g)'%20stroke-width='2.5'%20transform='rotate(-30%2032%2032)'/%3E%3Cpath%20d='M32%2022%20L40%2027%20L40%2037%20L32%2042%20L24%2037%20L24%2027%20Z'%20fill='url(%23g)'/%3E%3C/svg%3E">
 <style>
   :root{
-    --bg:#f4f5f8; --card:#ffffff; --ink:#141821; --muted:#6b7280; --line:#e6e8ee;
-    --brand1:#7c5cff; --brand2:#2f6df6; --good:#0a7d33; --good-bg:#e7f6ec;
-    --bad:#b42318; --bad-bg:#fdeceb; --field:#f1f2f6; --shadow:0 6px 24px rgba(20,24,40,.08);
-  }
-  @media (prefers-color-scheme: dark){
-    :root{ --bg:#0b0e14; --card:#151a23; --ink:#eef0f4; --muted:#93a0b4; --line:#232a36;
-      --good:#4ade80; --good-bg:#12291d; --bad:#f87171; --bad-bg:#331a1a; --field:#1d232e;
-      --shadow:0 8px 30px rgba(0,0,0,.35); }
+    --bg:#070912; --ink:#eef1f8; --muted:#8b93ab; --line:rgba(255,255,255,.09);
+    --card:rgba(255,255,255,.035); --card-solid:#0f131f; --field:rgba(255,255,255,.045);
+    --brand1:#a78bfa; --brand2:#6690ff; --brand-soft:rgba(124,120,255,.14);
+    --good:#5be3a0; --good-bg:rgba(60,220,150,.10); --bad:#ff7a7a; --bad-bg:rgba(255,90,90,.10);
+    --glow:0 0 40px rgba(124,110,255,.25);
   }
   *{box-sizing:border-box}
   html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--ink);
+  body{margin:0;color:var(--ink);background:#070912;
     font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5;
     -webkit-font-smoothing:antialiased}
-  .app{max-width:460px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;
-    background:var(--bg);position:relative}
-  .view{display:none;flex-direction:column;flex:1;padding:16px 18px 32px}
-  .view.active{display:flex;animation:fade .18s ease}
-  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  .app{max-width:460px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;position:relative;
+    background:
+      radial-gradient(900px 420px at 50% -8%, rgba(124,92,255,.20), transparent 62%),
+      radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.12), transparent 60%),
+      radial-gradient(600px 500px at 0% 100%, rgba(90,80,220,.10), transparent 60%),
+      #070912;}
+  .view{display:none;flex-direction:column;flex:1;padding:18px 18px 34px}
+  .view.active{display:flex;animation:fade .2s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
-  /* logo + brand */
   .logo{width:44px;height:44px;flex:0 0 auto}
-  .logo-lg{width:84px;height:84px}
+  .logo-lg{width:110px;height:110px}
   .brand-row{display:flex;align-items:center;gap:11px}
   .brand-name{font-weight:800;font-size:19px;letter-spacing:-.02em}
-  .brand-name b{background:linear-gradient(90deg,var(--brand1),var(--brand2));
+  .grad{background:linear-gradient(90deg,var(--brand1),var(--brand2));
     -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 
-  /* topbar */
-  .topbar{display:flex;align-items:center;justify-content:space-between;padding:6px 2px 14px}
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:4px 2px 16px}
   .node-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);
-    background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 10px}
-  .dot{width:8px;height:8px;border-radius:50%;background:#98a2b3}
-  .dot.ok{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18)} .dot.bad{background:var(--bad)}
+    background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 11px;backdrop-filter:blur(8px)}
+  .dot{width:8px;height:8px;border-radius:50%;background:#8792a8}
+  .dot.ok{background:#34e39b;box-shadow:0 0 0 3px rgba(52,227,155,.18),0 0 8px rgba(52,227,155,.7)} .dot.bad{background:var(--bad)}
 
-  /* welcome */
   .welcome{align-items:center;justify-content:center;text-align:center;gap:0}
-  .welcome .hero{margin:auto 0;display:flex;flex-direction:column;align-items:center;gap:16px}
-  .welcome h1{font-size:26px;margin:6px 0 0;letter-spacing:-.02em}
-  .welcome p{color:var(--muted);margin:0;max-width:300px}
-  .welcome .cta{width:100%;display:flex;flex-direction:column;gap:10px;margin-top:8px}
-  .badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--brand2);
-    background:color-mix(in srgb,var(--brand2) 12%,transparent);padding:5px 12px;border-radius:999px;font-weight:600}
+  .welcome .hero{margin:auto 0 24px;display:flex;flex-direction:column;align-items:center;gap:14px}
+  .welcome h1{font-size:30px;margin:8px 0 0;letter-spacing:-.02em;font-weight:800}
+  .welcome p{color:var(--muted);margin:0;max-width:310px;font-size:15px}
+  .welcome .cta{width:100%;display:flex;flex-direction:column;gap:12px}
+  .badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#c9c2ff;font-weight:600;
+    background:var(--brand-soft);border:1px solid rgba(140,130,255,.28);padding:6px 13px;border-radius:999px}
 
-  /* cards / balance */
-  .balance-card{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
-    border-radius:22px;padding:22px 20px;box-shadow:var(--shadow);position:relative;overflow:hidden}
-  .balance-card::after{content:"";position:absolute;right:-40px;top:-40px;width:150px;height:150px;
-    background:rgba(255,255,255,.12);border-radius:50%}
-  .balance-card .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;opacity:.9}
-  .balance-card .amt{font-size:34px;font-weight:800;margin-top:4px;letter-spacing:-.02em}
-  .balance-card .acct{margin-top:12px;display:flex;align-items:center;gap:8px;font-size:13px;opacity:.95}
+  .balance-card{border-radius:22px;padding:22px 20px;position:relative;overflow:hidden;
+    background:linear-gradient(140deg, rgba(124,92,255,.28), rgba(60,110,255,.12) 55%, rgba(255,255,255,.03));
+    border:1px solid rgba(140,130,255,.28);box-shadow:var(--glow)}
+  .balance-card::after{content:"";position:absolute;right:-50px;top:-60px;width:170px;height:170px;
+    background:radial-gradient(circle,rgba(150,130,255,.35),transparent 70%);border-radius:50%}
+  .balance-card .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:#c3c9e0}
+  .balance-card .amt{font-size:34px;font-weight:800;margin-top:5px;letter-spacing:-.02em}
+  .balance-card .acct{margin-top:14px;display:flex;align-items:center;gap:8px;font-size:13px;color:#c3c9e0}
   .balance-card .acct .mono{font-family:ui-monospace,Menlo,monospace}
 
-  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}
-  .section-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
-    margin:22px 4px 10px;font-weight:700}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;backdrop-filter:blur(10px)}
+  .card.accent{border-color:rgba(140,130,255,.32);box-shadow:0 0 30px rgba(124,110,255,.12)}
+  .section-title{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+    margin:24px 4px 10px;font-weight:700}
 
-  /* action buttons row */
-  .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
-  .act{display:flex;flex-direction:column;align-items:center;gap:7px;background:var(--card);
-    border:1px solid var(--line);border-radius:16px;padding:15px 8px;cursor:pointer;font-weight:600;
-    color:var(--ink);box-shadow:var(--shadow);transition:transform .08s}
-  .act:active{transform:scale(.97)}
-  .act .ic{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;color:#fff;
-    background:linear-gradient(135deg,var(--brand1),var(--brand2));font-size:19px}
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}
+  .act{display:flex;flex-direction:column;align-items:center;gap:8px;background:var(--card);
+    border:1px solid var(--line);border-radius:16px;padding:16px 8px;cursor:pointer;font-weight:600;
+    color:var(--ink);transition:transform .08s,border-color .15s;backdrop-filter:blur(10px)}
+  .act:hover{border-color:rgba(140,130,255,.4)} .act:active{transform:scale(.97)}
+  .act .ic{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#fff;font-size:20px;font-weight:700;
+    background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 6px 18px rgba(102,120,255,.35)}
 
-  /* generic buttons */
-  button,.btn{cursor:pointer;border:0;border-radius:14px;padding:14px 16px;font-size:16px;font-weight:700;
+  button,.btn{cursor:pointer;border:0;border-radius:15px;padding:15px 16px;font-size:16px;font-weight:700;
     font-family:inherit;background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
-    box-shadow:0 2px 8px rgba(47,109,246,.28);transition:filter .1s,transform .08s}
-  button:active,.btn:active{transform:translateY(1px)}
-  button:disabled{opacity:.55;cursor:default;box-shadow:none}
-  .btn-sec{background:var(--card);color:var(--ink);border:1px solid var(--line);box-shadow:none}
-  .btn-ghost{background:transparent;color:var(--brand2);box-shadow:none;font-weight:600;padding:8px}
+    box-shadow:0 8px 24px rgba(102,120,255,.35);transition:filter .12s,transform .08s}
+  button:hover,.btn:hover{filter:brightness(1.07)} button:active,.btn:active{transform:translateY(1px)}
+  button:disabled{opacity:.5;cursor:default;box-shadow:none}
+  .btn-sec{background:var(--card);color:var(--ink);border:1px solid rgba(140,130,255,.3);box-shadow:none;backdrop-filter:blur(8px)}
+  .btn-sec:hover{filter:none;border-color:rgba(140,130,255,.55)}
+  .btn-outline{background:transparent;color:#c9c2ff;border:1px solid rgba(140,130,255,.4);box-shadow:none}
+  .btn-ghost{background:transparent;color:var(--brand1);box-shadow:none;font-weight:600;padding:8px}
+  .btn-ghost:hover{filter:none}
   .btn-block{width:100%}
   .backlink{background:none;color:var(--muted);font-weight:600;font-size:15px;padding:4px 0;
-    box-shadow:none;display:inline-flex;align-items:center;gap:6px;align-self:flex-start;margin-bottom:6px}
+    box-shadow:none;display:inline-flex;align-items:center;gap:6px;align-self:flex-start;margin-bottom:8px}
+  .backlink:hover{filter:none;color:var(--ink)}
 
-  label{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px;font-weight:600}
+  label{display:block;font-size:13px;color:var(--muted);margin:15px 0 6px;font-weight:600}
   input,textarea,select{width:100%;padding:14px;border:1px solid var(--line);border-radius:14px;
     background:var(--field);color:var(--ink);font-size:16px;font-family:inherit}
-  textarea{resize:vertical;min-height:96px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
-  input:focus,textarea:focus,select:focus{outline:2px solid var(--brand2);border-color:transparent}
+  input::placeholder,textarea::placeholder{color:#5b6480}
+  textarea{resize:vertical;min-height:92px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--brand1);box-shadow:0 0 0 3px rgba(140,130,255,.18)}
   .row{display:flex;gap:8px}
 
-  h2.view-title{font-size:22px;margin:2px 0 2px;letter-spacing:-.02em}
+  h2.view-title{font-size:23px;margin:2px 0 2px;letter-spacing:-.02em;font-weight:800}
   .view-sub{color:var(--muted);font-size:14px;margin:0 0 6px}
-  .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
+  .hint{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.5}
+  .hint a{color:#9aa2bd}
 
   .wallet-item{display:flex;align-items:center;gap:12px;padding:13px 6px;border-top:1px solid var(--line);cursor:pointer}
   .wallet-item:first-child{border-top:0}
   .wi-ic{width:38px;height:38px;border-radius:11px;flex:0 0 auto;background:linear-gradient(135deg,var(--brand1),var(--brand2));
-    display:grid;place-items:center;color:#fff;font-weight:800;font-size:15px}
+    display:grid;place-items:center;color:#fff;font-weight:800;font-size:15px;box-shadow:0 4px 12px rgba(102,120,255,.3)}
   .wi-main{min-width:0;flex:1}
   .wi-name{font-weight:700}
   .wi-addr{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .wi-bal{text-align:right;font-weight:700;white-space:nowrap}
-  .wi-check{color:var(--brand2);font-weight:800}
+  .wi-check{color:var(--brand1);font-weight:800}
 
   .tx{display:flex;align-items:center;gap:11px;padding:12px 6px;border-top:1px solid var(--line)}
   .tx:first-child{border-top:0}
@@ -117,21 +120,20 @@
   .tx-amt{font-weight:700;white-space:nowrap;font-size:14px}
   .tx-amt.in{color:var(--good)} .tx-amt.out{color:var(--ink)}
 
-  .qr-wrap{display:flex;justify-content:center;margin:6px 0 14px}
-  .qr-wrap img{width:220px;height:220px;border-radius:16px;background:#fff;padding:12px;border:1px solid var(--line)}
-  .addr-box{background:var(--field);border:1px solid var(--line);border-radius:14px;padding:14px;
+  .qr-wrap{display:flex;justify-content:center;margin:8px 0 16px}
+  .qr-wrap img{width:224px;height:224px;border-radius:18px;background:#fff;padding:14px;box-shadow:var(--glow)}
+  .addr-box{background:var(--field);border:1px solid var(--line);border-radius:14px;padding:15px;
     font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all;text-align:center}
 
-  .empty{color:var(--muted);font-size:14px;padding:14px 4px;text-align:center}
+  .empty{color:var(--muted);font-size:14px;padding:16px 4px;text-align:center}
   .msg{padding:12px 14px;border-radius:12px;font-size:14px;margin-top:14px;display:none}
-  .msg.ok{background:var(--good-bg);color:var(--good);display:block}
-  .msg.err{background:var(--bad-bg);color:var(--bad);display:block}
+  .msg.ok{background:var(--good-bg);color:var(--good);border:1px solid rgba(60,220,150,.25);display:block}
+  .msg.err{background:var(--bad-bg);color:var(--bad);border:1px solid rgba(255,90,90,.25);display:block}
   .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(10px);opacity:0;
-    background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:13px;
+    background:#161b2b;color:var(--ink);border:1px solid var(--line);padding:10px 16px;border-radius:12px;font-size:13px;
     transition:.2s;pointer-events:none;z-index:50}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-  .grow{flex:1}
-  .center-col{display:flex;flex-direction:column;justify-content:center;flex:1}
+  .shield{width:64px;height:64px;flex:0 0 auto}
 </style>
 </head>
 <body>
@@ -140,14 +142,14 @@
   <!-- ===== BIENVENIDA ===== -->
   <section class="view welcome" id="v-welcome">
     <div class="hero">
-      <svg class="logo logo-lg" viewBox="0 0 48 48"><defs><linearGradient id="lg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#2f6df6"/></linearGradient></defs><rect width="48" height="48" rx="13" fill="url(#lg1)"/><circle cx="24" cy="22.5" r="9.5" fill="none" stroke="#fff" stroke-width="3.6"/><rect x="27" y="27" width="11" height="3.8" rx="1.9" transform="rotate(45 28 30)" fill="#fff"/></svg>
+      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="ag1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl1" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl1)"><g fill="none" stroke="url(#ag1)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag1)"/><path d="M32 20.5 L42 26.3 L32 32 Z" fill="#fff" opacity=".22"/></g></svg>
       <span class="badge">🔒 seguridad post-cuántica</span>
-      <h1>qchain <b style="background:linear-gradient(90deg,var(--brand1),var(--brand2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent">Wallet</b></h1>
-      <p>Tu billetera para enviar y recibir QCH. Rápida, simple y protegida con criptografía resistente a computadoras cuánticas.</p>
+      <h1>qchain <span class="grad">Wallet</span></h1>
+      <p>Tu billetera cuántica para enviar y recibir QCH. Protegida con criptografía resistente a computadoras cuánticas.</p>
     </div>
     <div class="cta">
-      <button class="btn-block" id="w-create">Crear una wallet</button>
-      <button class="btn-block btn-sec" id="w-import">Ya tengo una (importar)</button>
+      <button class="btn-block" id="w-create">Crear nueva wallet</button>
+      <button class="btn-block btn-outline" id="w-import">Restaurar wallet existente</button>
     </div>
   </section>
 
@@ -164,22 +166,27 @@
       <div class="msg" id="c-msg"></div>
     </div>
     <div id="create-done" style="display:none">
-      <div style="text-align:center;margin-top:10px">
-        <div style="font-size:44px">🎉</div>
-        <h2 class="view-title">¡Wallet creada!</h2>
+      <div style="text-align:center;margin-top:6px">
+        <svg class="logo logo-lg" style="width:96px;height:96px" viewBox="0 0 64 64"><defs><linearGradient id="ag3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl3" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl3)"><g fill="none" stroke="url(#ag3)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag3)"/><path d="M32 20.5 L42 26.3 L32 32 Z" fill="#fff" opacity=".22"/></g></svg>
+        <h2 class="view-title" style="margin-top:6px">¡Wallet <span class="grad">creada!</span></h2>
+        <p class="view-sub" style="text-align:center">Tu nueva wallet cuántica está lista</p>
       </div>
       <div class="card" style="margin-top:12px">
         <div class="section-title" style="margin:0 0 8px">Tu dirección (para recibir)</div>
         <div class="addr-box" id="cd-addr"></div>
-        <button class="btn-block btn-sec" id="cd-copy" style="margin-top:10px">Copiar dirección</button>
+        <span class="badge" style="margin-top:12px">◉ Red Cuántica</span>
+        <button class="btn-block btn-sec" id="cd-copy" style="margin-top:14px">Copiar dirección</button>
       </div>
-      <div class="card" style="margin-top:12px;border-color:var(--brand2)">
-        <div class="section-title" style="margin:0 0 6px;color:var(--brand2)">⚠️ Guardá tu respaldo</div>
-        <p class="hint" style="margin:0 0 10px">Esta wallet es una llave: si la perdés, perdés el acceso. Descargá el respaldo y guardalo en un lugar seguro. Protegelo con una contraseña para que, aunque alguien consiga el archivo, no pueda usarlo.</p>
+      <div class="card accent" style="margin-top:14px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <svg class="shield" viewBox="0 0 48 48"><defs><linearGradient id="sh1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="shg" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="1.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#shg)"><path d="M24 5 L40 11 V23 C40 33 33 40 24 43 C15 40 8 33 8 23 V11 Z" fill="url(#sh1)" opacity=".92"/><circle cx="24" cy="21" r="4.2" fill="#0b0f1a"/><rect x="22.4" y="23" width="3.2" height="7" rx="1.6" fill="#0b0f1a"/></g></svg>
+          <div><div style="font-weight:800;font-size:16px">Guarda tu respaldo</div><div class="hint" style="margin:2px 0 0">Esta wallet es tu llave maestra.</div></div>
+        </div>
+        <p class="hint" style="margin:0 0 12px">Si la perdés, perdés el acceso. Protegela con una contraseña: aunque alguien consiga el archivo, sin la contraseña es inútil.</p>
         <label for="cd-pass" style="margin-top:0">Contraseña del respaldo (mín. 6)</label>
         <input id="cd-pass" type="password" placeholder="elegí una contraseña para el archivo" autocomplete="new-password">
         <button class="btn-block" id="cd-download" style="margin-top:12px">🔒 Descargar respaldo protegido</button>
-        <div class="hint" style="margin-top:10px">Anotá esta contraseña: la vas a necesitar para restaurar. <a href="#" id="cd-plain" style="color:var(--muted)">descargar sin cifrar (avanzado)</a></div>
+        <div class="hint" style="margin-top:10px">Anotá esta contraseña: la vas a necesitar para restaurar. <a href="#" id="cd-plain">descargar sin cifrar (avanzado)</a></div>
         <div class="msg" id="cd-msg"></div>
       </div>
       <div style="margin-top:16px"><button class="btn-block nav" data-to="home" id="cd-go">Entrar a mi wallet</button></div>
@@ -189,8 +196,8 @@
   <!-- ===== IMPORTAR ===== -->
   <section class="view" id="v-import">
     <button class="backlink nav" data-to="welcome">← volver</button>
-    <h2 class="view-title">Importar una wallet</h2>
-    <p class="view-sub">Pegá el contenido de tu archivo de respaldo (.json), o subilo.</p>
+    <h2 class="view-title">Restaurar wallet</h2>
+    <p class="view-sub">Subí tu archivo de respaldo (.json) o pegá su contenido.</p>
     <label for="i-name">Nombre para esta wallet</label>
     <input id="i-name" placeholder="ej: mi wallet" maxlength="64" autocomplete="off">
     <label for="i-file">Archivo de respaldo</label>
@@ -207,8 +214,8 @@
   <section class="view" id="v-home">
     <div class="topbar">
       <div class="brand-row">
-        <svg class="logo" viewBox="0 0 48 48"><defs><linearGradient id="lg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#2f6df6"/></linearGradient></defs><rect width="48" height="48" rx="13" fill="url(#lg2)"/><circle cx="24" cy="22.5" r="9.5" fill="none" stroke="#fff" stroke-width="3.6"/><rect x="27" y="27" width="11" height="3.8" rx="1.9" transform="rotate(45 28 30)" fill="#fff"/></svg>
-        <span class="brand-name">qchain <b>Wallet</b></span>
+        <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl2" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl2)"><g fill="none" stroke="url(#ag2)" stroke-width="1.8" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag2)"/></g></svg>
+        <span class="brand-name">qchain <span class="grad">Wallet</span></span>
       </div>
       <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
     </div>
