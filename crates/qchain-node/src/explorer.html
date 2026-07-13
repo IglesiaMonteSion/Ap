@@ -512,6 +512,13 @@ refreshEquivocations();
 loadTransfers(true);
 setInterval(refreshStatus, 2000);
 setInterval(refreshEquivocations, 15000);
+// Auto-refresco de "actividad reciente": recarga la primera página sola cada
+// 3s para que las transferencias nuevas aparezcan sin apretar "actualizar".
+// Solo cuando el usuario está en la primera página (si apretó "cargar más",
+// no le pisamos lo que está mirando).
+setInterval(() => {
+  if (transfersOffset <= TRANSFERS_PAGE) loadTransfers(true);
+}, 3000);
 </script>
 </body>
 </html>

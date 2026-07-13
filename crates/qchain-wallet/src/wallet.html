@@ -118,6 +118,13 @@ function unitsToQch(u){
   return frac ? `${int}.${frac}` : int.toString();
 }
 function fmt(intStr){ return intStr.replace(/\B(?=(\d{3})+(?!\d))/g,"."); }
+// Muestra un balance (en unidades) como QCH legible: separador de miles con
+// punto y decimales con coma. Ej: 100000000000 -> "100 QCH", 1500000000 -> "1,5 QCH".
+function qchDisp(units){
+  const q = unitsToQch(units);
+  const [i,f] = q.split(".");
+  return fmt(i) + (f ? ","+f : "") + " QCH";
+}
 
 async function api(path, opts){
   const r = await fetch(path, opts);
@@ -151,14 +158,18 @@ async function loadWallets(){
           <div class="wname">${w.name}</div>
           <div class="waddr" data-copy="${w.address}" title="copiar">${short(w.address)}</div>
         </div>
-        <div class="wbal"><div class="q">${fmt(unitsToQch(w.balance).split(".")[0])}${unitsToQch(w.balance).includes(".")?","+unitsToQch(w.balance).split(".")[1]:""} QCH</div><div class="u">${fmt(w.balance)} unidades</div></div>
+        <div class="wbal"><div class="q">${qchDisp(w.balance)}</div></div>
       </div>`).join("");
     box.querySelectorAll(".waddr").forEach(el=>el.onclick=()=>{navigator.clipboard.writeText(el.dataset.copy);toast("dirección copiada");});
   }
-  // fill selects
+  // Rellenar los selects, preservando lo que el usuario ya haya elegido (para
+  // que el auto-refresco no le cambie la selección mientras arma un envío).
   const from=$("t-from"), pick=$("t-to-pick");
+  const prevFrom=from.value, prevPick=pick.value;
   from.innerHTML = WALLETS.length? WALLETS.map(w=>`<option value="${w.name}">${w.name} — ${short(w.address)}</option>`).join("") : `<option value="">(creá una wallet primero)</option>`;
   pick.innerHTML = `<option value="">— o elegí una de mis wallets —</option>` + WALLETS.map(w=>`<option value="${w.address}">${w.name} — ${short(w.address)}</option>`).join("");
+  if(prevFrom && WALLETS.some(w=>w.name===prevFrom)) from.value=prevFrom;
+  if(prevPick) pick.value=prevPick;
 }
 
 $("new-btn").onclick = async ()=>{
@@ -197,7 +208,10 @@ $("send-btn").onclick = async ()=>{
 $("refresh").onclick = ()=>{ loadWallets(); loadNode(); };
 
 loadNode(); loadWallets();
-setInterval(loadNode, 15000);
+// Auto-refresco: los saldos y el estado del nodo se actualizan solos, sin
+// tener que apretar "actualizar". loadWallets preserva la selección del form.
+setInterval(loadWallets, 4000);
+setInterval(loadNode, 4000);
 </script>
 </body>
 </html>
