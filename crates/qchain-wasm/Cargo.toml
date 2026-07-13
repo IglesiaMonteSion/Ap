@@ -22,3 +22,18 @@ wasm-bindgen = "0.2"
 [[bin]]
 name = "qchain-wasm-signer"
 path = "src/bin/signer.rs"
+
+# Optimizado para TAMAÑO, no velocidad: este .wasm se descarga en el navegador,
+# así que cada KB cuenta más que unos microsegundos de firma. `opt-level="z"`
+# (mínimo tamaño), `lto=true` (elimina código muerto entre crates), 1 unidad de
+# codegen (mejor inlining/DCE a costa de tiempo de compilación) y `panic=abort`
+# (sin la maquinaria de unwinding, inútil en wasm). `strip` saca símbolos.
+# Después de compilar, deploy/build-wasm-wallet.sh corre `wasm-opt -Oz` encima,
+# que recorta otro tanto. La firma sigue siendo la misma (post-cuántica real);
+# esto solo achica el binario, no cambia el comportamiento.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
