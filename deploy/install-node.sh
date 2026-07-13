@@ -408,3 +408,26 @@ echo "Recordatorio de seguridad: el RPC ($RPC_PORT) no tiene autenticación -"
 echo "cualquiera que llegue a él puede consultar balances y enviar transacciones"
 echo "propias firmadas (no puede robar fondos ajenos, pero sí ver la actividad"
 echo "y saturarlo). Esto sigue siendo un testnet - no pongas valor real detrás."
+
+# ---------------------------------------------------------------------------
+# Oferta: instalar también la wallet web (crear wallets y transferir desde el
+# navegador, con botones en vez de la CLI). Es opcional y reutiliza la misma
+# imagen que acabamos de preparar - por eso lo ofrecemos acá, ya con todo listo.
+# ---------------------------------------------------------------------------
+INSTALAR_WALLET=0
+if [ "$ASUMIR_SI" -ne 1 ]; then
+  decir "¿Querés abrir también la wallet web?"
+  echo "Es una página para crear wallets, ver balances y transferir desde el"
+  echo "navegador (sin usar comandos). Queda protegida con una contraseña."
+  read -rp "Instalar la wallet web ahora? [s/N] " resp
+  case "$resp" in s|S|si|Si|SI) INSTALAR_WALLET=1 ;; esac
+fi
+if [ "$INSTALAR_WALLET" -eq 1 ]; then
+  QCHAIN_HOME="$QCHAIN_HOME" "$SCRIPT_DIR/install-wallet.sh" --rpc-port "$RPC_PORT" --home "$QCHAIN_HOME" \
+    || echo "La wallet no se pudo instalar ahora, pero tu nodo sigue funcionando. Podés instalarla después con: sudo ./install-wallet.sh"
+else
+  echo
+  echo "Tip: para manejar tus fondos desde el navegador (crear wallets y"
+  echo "transferir con botones), instalá la wallet web cuando quieras:"
+  echo "  sudo ./install-wallet.sh"
+fi

@@ -1,0 +1,29 @@
+[Unit]
+Description=qchain web wallet
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+# Reads the password from /opt/qchain/wallet.env (chmod 600, root-only) and
+# passes it to the container by NAME (`-e QCHAIN_WALLET_PASSWORD`, no value)
+# so the secret never appears in the process arguments / `docker inspect`
+# args. The wallet stores its key files under /opt/qchain/wallets. Uses
+# --network host so --bind/--port land directly on the machine's interface,
+# same as the validator unit. Ports are the defaults (RPC 8080, wallet 8090);
+# install-wallet.sh rewrites them if you chose others.
+Type=simple
+WorkingDirectory=/opt/qchain
+EnvironmentFile=/opt/qchain/wallet.env
+ExecStartPre=-/usr/bin/docker rm -f qchain-wallet
+ExecStart=/usr/bin/docker run --rm --name qchain-wallet \
+  --network host \
+  -e QCHAIN_WALLET_PASSWORD \
+  -v /opt/qchain/wallets:/wallets -w /qchain \
+  qchain:latest qchain-wallet --rpc http://127.0.0.1:8080 --wallets-dir /wallets --bind 0.0.0.0 --port 8090
+ExecStop=/usr/bin/docker stop qchain-wallet
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

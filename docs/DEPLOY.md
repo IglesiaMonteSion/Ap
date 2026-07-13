@@ -361,6 +361,34 @@ crear wallets, ver balances en QCH y enviar transferencias. Reusa el
 — el navegador es solo la UI, las claves privadas nunca salen de la
 máquina donde corre el wallet.
 
+### El camino fácil: `deploy/install-wallet.sh`
+
+Un solo comando deja la wallet web funcionando, protegida con contraseña,
+abierta al navegador y arrancando sola si la máquina se reinicia:
+
+```
+sudo ./deploy/install-wallet.sh
+```
+
+Te pregunta la contraseña (o te genera una fuerte y te la muestra), abre
+el puerto en el firewall del sistema, y la instala como servicio systemd
+(`qchain-wallet`). Al terminar te da la URL (`http://<tu-ip>:8090/`) y
+cómo entrar (usuario: cualquiera; contraseña: la que definiste). Si
+instalaste el nodo en modo "solo", la wallet de prueba con fondos aparece
+automáticamente en el navegador como **"banco"**, lista para repartir
+monedas de prueba a las wallets que crees.
+
+`install-node.sh` también te *ofrece* instalarla al final. Cambiar la
+contraseña después: `sudo ./deploy/install-wallet.sh --password 'nueva' --yes`.
+Bajarla sin perder wallets: `sudo ./deploy/install-wallet.sh --uninstall`.
+
+**Recordá el firewall de la nube:** el instalador abre el puerto en el
+sistema, pero si tu proveedor tiene un firewall aparte (Security List de
+Oracle Cloud, Security Group de AWS), tenés que abrir el `8090/TCP` ahí
+también desde su consola web.
+
+### A mano (si preferís no usar el instalador)
+
 **Local (lo más seguro), por túnel SSH desde tu equipo:**
 
 ```
