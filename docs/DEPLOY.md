@@ -287,6 +287,15 @@ cambios. Para cortar una versión nueva (cuando hagas mejoras): subí `version`
 en el `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador
 corre `update-node.sh`.
 
+**Cómo elegir el número de versión:**
+- **Cambio chico** (fix puntual, ajuste de UI, tooling, mejora menor): subí el
+  último dígito. Ej: `1.9.0 → 1.9.1 → 1.9.2`.
+- **Cambio grande** (fase nueva, feature mayor, cambio de protocolo/consenso o
+  criptografía, algo que rompe compatibilidad): subí la versión mayor. Ej:
+  `1.9 → 2.0`.
+- Regla de dedo: si toca el formato de wire, el consenso o la cripto → grande;
+  si es aditivo/correctivo y un nodo viejo sigue conviviendo → chico.
+
 ## Faucet
 
 Quien vaya a operar el faucet corre, en cualquier máquina con acceso al
