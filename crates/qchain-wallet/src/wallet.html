@@ -175,8 +175,12 @@
       </div>
       <div class="card" style="margin-top:12px;border-color:var(--brand2)">
         <div class="section-title" style="margin:0 0 6px;color:var(--brand2)">⚠️ Guardá tu respaldo</div>
-        <p class="hint" style="margin:0 0 10px">Esta wallet es una llave: si la perdés, perdés el acceso. Descargá el archivo de respaldo y guardalo en un lugar seguro.</p>
-        <a class="btn btn-block" id="cd-download" download>Descargar mi respaldo</a>
+        <p class="hint" style="margin:0 0 10px">Esta wallet es una llave: si la perdés, perdés el acceso. Descargá el respaldo y guardalo en un lugar seguro. Protegelo con una contraseña para que, aunque alguien consiga el archivo, no pueda usarlo.</p>
+        <label for="cd-pass" style="margin-top:0">Contraseña del respaldo (mín. 6)</label>
+        <input id="cd-pass" type="password" placeholder="elegí una contraseña para el archivo" autocomplete="new-password">
+        <button class="btn-block" id="cd-download" style="margin-top:12px">🔒 Descargar respaldo protegido</button>
+        <div class="hint" style="margin-top:10px">Anotá esta contraseña: la vas a necesitar para restaurar. <a href="#" id="cd-plain" style="color:var(--muted)">descargar sin cifrar (avanzado)</a></div>
+        <div class="msg" id="cd-msg"></div>
       </div>
       <div style="margin-top:16px"><button class="btn-block nav" data-to="home" id="cd-go">Entrar a mi wallet</button></div>
     </div>
@@ -193,6 +197,8 @@
     <input id="i-file" type="file" accept=".json,application/json">
     <label for="i-key">…o pegá el contenido</label>
     <textarea id="i-key" placeholder='{"...":"..."}'></textarea>
+    <label for="i-pass">Contraseña del respaldo <span style="font-weight:400">(solo si está cifrado)</span></label>
+    <input id="i-pass" type="password" placeholder="dejá vacío si tu respaldo no tiene contraseña" autocomplete="off">
     <div style="margin-top:18px"><button class="btn-block" id="i-btn">Importar</button></div>
     <div class="msg" id="i-msg"></div>
   </section>
@@ -375,21 +381,37 @@ $("c-btn").onclick=async()=>{
     await loadWallets(); active=w.name; localStorage.setItem("qchain_active",active);
     $("cd-addr").textContent=w.address;
     $("cd-copy").onclick=()=>copy(w.address);
-    $("cd-download").href="/api/export/"+encodeURIComponent(w.name);
     $("create-form").style.display="none"; $("create-done").style.display="block";
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
   $("c-btn").disabled=false;
 };
 
+// descargar respaldo protegido con contraseña (keystore cifrado)
+$("cd-download").onclick=async()=>{
+  const w=activeWallet(); if(!w) return;
+  const pass=$("cd-pass").value; const msg=$("cd-msg"); msg.className="msg"; msg.textContent="";
+  if(pass.length<6){ msg.className="msg err"; msg.textContent="la contraseña debe tener al menos 6 caracteres"; return; }
+  $("cd-download").disabled=true;
+  try{
+    const r=await fetch("/api/export-encrypted",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:w.name,password:pass})});
+    if(!r.ok){ const b=await r.json().catch(()=>({})); throw new Error(b.error||"error"); }
+    const blob=await r.blob(), url=URL.createObjectURL(blob), a=document.createElement("a");
+    a.href=url; a.download=w.name+".qchain-keystore.json"; a.click(); URL.revokeObjectURL(url);
+    msg.className="msg ok"; msg.textContent="✓ respaldo descargado. Guardalo bien junto con su contraseña.";
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("cd-download").disabled=false;
+};
+$("cd-plain").onclick=e=>{ e.preventDefault(); const w=activeWallet(); if(w) window.location.href="/api/export/"+encodeURIComponent(w.name); };
+
 // importar
 $("i-file").onchange=async e=>{ const f=e.target.files[0]; if(f) $("i-key").value=await f.text(); };
 $("i-btn").onclick=async()=>{
-  const name=$("i-name").value.trim(), keypair=$("i-key").value.trim(); const msg=$("i-msg"); msg.className="msg"; msg.textContent="";
+  const name=$("i-name").value.trim(), keypair=$("i-key").value.trim(), password=$("i-pass").value; const msg=$("i-msg"); msg.className="msg"; msg.textContent="";
   if(!name){ msg.className="msg err"; msg.textContent="poné un nombre"; return; }
   if(!keypair){ msg.className="msg err"; msg.textContent="subí o pegá tu archivo de respaldo"; return; }
   $("i-btn").disabled=true;
   try{
-    const w=await api("/api/import",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name,keypair})});
+    const w=await api("/api/import",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name,keypair,password})});
     await loadWallets(); active=w.name; localStorage.setItem("qchain_active",active);
     toast("wallet importada"); showView("home");
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }

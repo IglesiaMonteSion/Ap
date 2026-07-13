@@ -33,6 +33,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod keystore;
+
 #[derive(Parser)]
 #[command(about = "Wallet web local para qchain: crear wallets, ver balances y transferir")]
 struct Cli {
@@ -111,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/transfers", get(recent_transfers))
         .route("/api/import", post(import_wallet))
         .route("/api/export/:name", get(export_wallet))
+        .route("/api/export-encrypted", post(export_encrypted))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -330,20 +333,37 @@ async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>
 #[derive(Deserialize)]
 struct ImportReq {
     name: String,
-    /// The full contents of a keypair `.json` file (a real qchain key backup).
+    /// The full contents of a keypair `.json` file (a real qchain key backup),
+    /// OR an encrypted keystore JSON (with `qchain_keystore`) - in that case
+    /// `password` is required to decrypt it first.
     keypair: String,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// Import an existing wallet from its key-file contents (the "ya tengo una
-/// wallet" flow). Validated by actually parsing it as a real keypair; a bad
-/// file is rejected and not kept.
+/// wallet" flow). Accepts either a plain key file or a password-encrypted
+/// keystore (auto-detected). Validated by actually parsing the result as a
+/// real keypair; a bad file is rejected and not kept.
 async fn import_wallet(State(st): State<Arc<AppState>>, Json(req): Json<ImportReq>) -> Result<Json<WalletInfo>, ApiError> {
     let name = sanitize_name(&req.name)?;
     let path = wallet_path(&st, &name)?;
     if path.exists() {
         return Err(ApiError::bad(format!("ya existe una wallet llamada '{name}'")));
     }
-    std::fs::write(&path, req.keypair.as_bytes()).map_err(ApiError::internal)?;
+
+    // Encrypted keystore? Decrypt with the provided password first.
+    let content = match serde_json::from_str::<Value>(&req.keypair) {
+        Ok(v) if v.get("qchain_keystore").is_some() => {
+            let pw = req.password.as_deref().filter(|p| !p.is_empty()).ok_or_else(|| {
+                ApiError::bad("este respaldo está cifrado - hace falta la contraseña que usaste al descargarlo".to_string())
+            })?;
+            keystore::decrypt(&v, pw).map_err(|e| ApiError::bad(e.to_string()))?
+        }
+        _ => req.keypair.clone(),
+    };
+
+    std::fs::write(&path, content.as_bytes()).map_err(ApiError::internal)?;
     match qchain_crypto::read_keypair_file(&path) {
         Ok(kp) => Ok(Json(WalletInfo { name, address: kp.pubkey().to_string(), balance: "0".to_string() })),
         Err(e) => {
@@ -353,7 +373,9 @@ async fn import_wallet(State(st): State<Arc<AppState>>, Json(req): Json<ImportRe
     }
 }
 
-/// Download a wallet's key file - the user's backup ("es tu wallet, guardala").
+/// Download a wallet's key file, unencrypted - the raw backup. Kept for
+/// advanced use; the password-protected `export-encrypted` is the recommended
+/// path (see below).
 async fn export_wallet(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Result<Response, ApiError> {
     let name = sanitize_name(&name)?;
     let path = wallet_path(&st, &name)?;
@@ -362,6 +384,30 @@ async fn export_wallet(State(st): State<Arc<AppState>>, Path(name): Path<String>
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.json\""))
         .body(Body::from(content))
+        .map_err(ApiError::internal)
+}
+
+#[derive(Deserialize)]
+struct ExportEncReq {
+    name: String,
+    password: String,
+}
+
+/// Download a wallet's backup **encrypted with a password** (a keystore). Even
+/// if someone gets the file, it's useless without the password. Recommended
+/// over the plain export.
+async fn export_encrypted(State(st): State<Arc<AppState>>, Json(req): Json<ExportEncReq>) -> Result<Response, ApiError> {
+    let name = sanitize_name(&req.name)?;
+    if req.password.chars().count() < 6 {
+        return Err(ApiError::bad("la contraseña del respaldo debe tener al menos 6 caracteres".to_string()));
+    }
+    let path = wallet_path(&st, &name)?;
+    let content = std::fs::read_to_string(&path).map_err(|_| ApiError::bad(format!("no encontré la wallet '{name}'")))?;
+    let keystore_json = keystore::encrypt(&content, &req.password).map_err(ApiError::internal)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.qchain-keystore.json\""))
+        .body(Body::from(keystore_json))
         .map_err(ApiError::internal)
 }
 
