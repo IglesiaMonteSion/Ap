@@ -3,8 +3,15 @@ name = "qchain-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Forwarded to qchain-crypto so the whole data-type layer can compile either
+# for the node (liboqs) or the browser/WASM wallet (pure). See qchain-crypto.
+default = ["liboqs"]
+liboqs = ["qchain-crypto/liboqs"]
+pure = ["qchain-crypto/pure"]
+
 [dependencies]
-qchain-crypto = { path = "../qchain-crypto" }
+qchain-crypto = { path = "../qchain-crypto", default-features = false }
 serde.workspace = true
 borsh.workspace = true
 sha3.workspace = true

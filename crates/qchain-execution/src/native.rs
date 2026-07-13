@@ -163,6 +163,20 @@ use borsh::BorshDeserialize;
 mod tests {
     use super::*;
 
+    /// The browser/WASM wallet (`qchain-wasm`) can't depend on this crate
+    /// (wasmtime doesn't target wasm), so it replicates the Borsh encoding of
+    /// `SystemInstruction::Transfer { amount }` as `[1u8] ++ amount.to_le_bytes()`.
+    /// This guards that assumption: if the enum ever changes shape or order,
+    /// this fails and the wasm signer must be updated to match.
+    #[test]
+    fn transfer_instruction_encoding_is_stable() {
+        let amount = 0x0102_0304_0506_0708u64;
+        let encoded = borsh::to_vec(&SystemInstruction::Transfer { amount }).unwrap();
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&amount.to_le_bytes());
+        assert_eq!(encoded, expected, "wasm wallet's hand-rolled Transfer encoding is out of sync");
+    }
+
     #[test]
     fn transfer_moves_balance() {
         let from = qchain_crypto::Keypair::generate().unwrap().pubkey();

@@ -1,0 +1,24 @@
+[package]
+name = "qchain-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Browser/WASM self-custody signing for qchain (keys never leave the device)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The pure backend: no liboqs (C), compiles to wasm32. Byte-compatible with the
+# node's liboqs (proven in qchain-crypto/tests/wasm_feasibility.rs).
+qchain-core = { path = "../qchain-core", default-features = false, features = ["pure"] }
+qchain-crypto = { path = "../qchain-crypto", default-features = false, features = ["pure"] }
+serde_json = "1"
+hex = "0.4"
+anyhow = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[[bin]]
+name = "qchain-wasm-signer"
+path = "src/bin/signer.rs"

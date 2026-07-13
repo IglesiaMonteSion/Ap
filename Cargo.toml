@@ -15,6 +15,11 @@ members = [
     "crates/qchain-faucet",
     "crates/qchain-wallet",
 ]
+# Built separately for wasm32 (browser self-custody signing). Kept out of the
+# workspace so `cargo build --workspace` never unifies its `pure` crypto
+# feature with the node's `liboqs` feature (the two backends are mutually
+# exclusive). Build it with: cd crates/qchain-wasm && wasm-pack build / cargo build.
+exclude = ["crates/qchain-wasm"]
 
 [workspace.package]
 version = "1.7.0"
