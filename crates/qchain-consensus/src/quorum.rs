@@ -51,7 +51,16 @@ impl ValidatorSet {
     /// strictly greater than `2/3` of total stake (i.e. `2f+1` out of
     /// `n = 3f+1`).
     pub fn quorum_threshold(&self) -> u64 {
-        (self.total_stake * 2) / 3 + 1
+        // Computed in `u128` to preserve the exact `(2*total)/3 + 1` value
+        // without overflowing: `total_stake * 2` overflows `u64` once total
+        // stake exceeds `u64::MAX / 2` (~9.2e18), which is reachable with a
+        // large token supply. A wrapped threshold would be catastrophic - a
+        // tiny quorum bar means a sub-`f` set of validators trivially forms a
+        // "quorum," collapsing BFT safety entirely. `u128` cannot overflow
+        // for any `u64` total, and the `+1`/division match the original
+        // exactly (unlike reordering to `(total/3)*2+1`, which changes the
+        // value); the result always fits back in `u64` since it's `<= total`.
+        ((self.total_stake as u128 * 2) / 3 + 1) as u64
     }
 
     pub fn stake_of(&self, id: &ValidatorId) -> u64 {
