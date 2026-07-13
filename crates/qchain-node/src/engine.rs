@@ -95,6 +95,18 @@ const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 /// transaction's size instead of "however many the attacker cares to send."
 const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 
+/// How many `GET /stark_proof` proofs may be generated concurrently across
+/// the whole node. Each proof is already row-capped (`MAX_STARK_PROOF_RECEIPTS`)
+/// so one call's cost is bounded, but `prove_batch` is CPU-heavy and the
+/// endpoint is unauthenticated - without a concurrency bound, N simultaneous
+/// callers each pin a core (the proof is built outside the state lock, so
+/// they genuinely run in parallel). This caps total proving CPU to a small
+/// fixed multiple of one proof, regardless of how many callers arrive at
+/// once; excess callers queue for a permit rather than each starting a fresh
+/// parallel proof.
+const MAX_CONCURRENT_STARK_PROOFS: usize = 2;
+static STARK_PROOF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_STARK_PROOFS);
+
 
 /// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
 /// `first_seen_vertex`) to retain behind the current round before pruning.
@@ -106,6 +118,18 @@ const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 /// only grows on genuine, slashable misbehavior). Comfortably larger than any
 /// resync gap a live validator recovers across in practice.
 const ROUND_STATE_RETENTION: Round = 512;
+
+/// How many rounds a cached worker batch is retained behind the current
+/// round before eviction (see `EngineState::batch_seen_round`). Bounds the
+/// `batches` map - fed by unauthenticated gossip whose content-addressed
+/// digests an attacker fully controls - without breaking resync: a lagging
+/// peer that reconnects within this window can still fetch every batch it
+/// needs (`WorkerBatchRequest`), while junk batches that are never committed
+/// are dropped once they age out. Deliberately larger than
+/// `ROUND_STATE_RETENTION` (and than any resync a live validator recovers
+/// across in practice); a peer more than this many rounds behind is in
+/// snapshot territory, out of scope for reactive per-digest resync.
+const BATCH_RETENTION_ROUNDS: Round = 1_024;
 
 /// How many of `available` receipts a single `/stark_proof` call actually
 /// proves, given what the caller requested (`None` meaning "all of them").
@@ -161,6 +185,15 @@ pub struct EngineState {
     /// ignored, keeping whichever transaction arrived first.
     pub mempool: HashMap<Pubkey, BTreeMap<u64, Transaction>>,
     pub batches: HashMap<Digest, Batch>,
+    /// The round at which each cached batch was first seen (this node's
+    /// `next_round` at cache time) - used only to evict batches by round
+    /// window in `prune_stale_round_state`, closing the unbounded-`batches`
+    /// OOM (an unauthenticated `WorkerBatchGossip` flood of distinct junk
+    /// digests) without breaking resync: batches stay cached for a generous
+    /// `BATCH_RETENTION_ROUNDS` window - long enough for a normal lagging
+    /// peer to fetch them (`WorkerBatchRequest`), evicted only once no peer
+    /// resyncing within that window could still need them.
+    pub batch_seen_round: HashMap<Digest, Round>,
     pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     pub own_pending_vertex: Option<(Vertex, MultiSignature)>,
     pub next_round: Round,
@@ -323,14 +356,18 @@ fn admit_to_mempool(state: &mut EngineState, tx: Transaction) -> bool {
     true
 }
 
-/// Caches a gossiped/served worker batch by its content digest. Left
-/// unbounded on purpose for now: a naive count cap either evicts committed
-/// batches (breaking a lagging peer's ability to resync-and-execute them) or
-/// rejects new ones once full (starving current rounds) - a correct bound
-/// needs round-windowed retention, tracked as follow-up. Same documented
-/// phase-1 simplification as before the audit.
+/// Caches a gossiped/served worker batch by its content digest, tagging it
+/// with the current round so `prune_stale_round_state` can evict it once it
+/// ages past `BATCH_RETENTION_ROUNDS` - the round-windowed bound that closes
+/// the unbounded-`batches` OOM without breaking resync (see
+/// `EngineState::batch_seen_round`). The tag is only set on first insert, so
+/// a batch's retention clock starts when this node first sees it and isn't
+/// refreshed by re-gossip.
 fn cache_batch(state: &mut EngineState, batch: Batch) {
-    state.batches.entry(batch.digest()).or_insert(batch);
+    let digest = batch.digest();
+    if state.batches.insert(digest, batch).is_none() {
+        state.batch_seen_round.insert(digest, state.next_round);
+    }
 }
 
 /// Pulls every transaction that's actually ready to execute out of the
@@ -528,6 +565,12 @@ impl Engine {
             })
             .collect();
 
+        // Bound how many of these CPU-heavy proofs run at once across the
+        // whole node - see `MAX_CONCURRENT_STARK_PROOFS`. Held only around the
+        // proving/verifying, after the state lock has already been dropped, so
+        // it never serializes ordinary node work, only the expensive
+        // unauthenticated endpoint against itself.
+        let _permit = STARK_PROOF_PERMITS.acquire().await.expect("stark-proof semaphore is never closed");
         let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).map_err(|e| StarkProofError::Prove(e.to_string()))?;
         qchain_stark::verify_batch_bound_to_state(proof.clone(), pub_inputs.clone(), &bindings)
             .map_err(|e| StarkProofError::ChainBroken(e.to_string()))?;
@@ -1013,12 +1056,24 @@ impl Engine {
     /// pruned here which gain an entry every single round unconditionally.
     pub async fn prune_stale_round_state(&self) {
         let mut state = self.state.lock().await;
-        let horizon = state.next_round.saturating_sub(ROUND_STATE_RETENTION);
-        if horizon == 0 {
-            return;
+        let round_horizon = state.next_round.saturating_sub(ROUND_STATE_RETENTION);
+        if round_horizon > 0 {
+            state.voted_for.retain(|(round, _), _| *round >= round_horizon);
+            state.first_seen_vertex.retain(|(round, _), _| *round >= round_horizon);
         }
-        state.voted_for.retain(|(round, _), _| *round >= horizon);
-        state.first_seen_vertex.retain(|(round, _), _| *round >= horizon);
+
+        // Evict worker batches older than `BATCH_RETENTION_ROUNDS` - the
+        // round-windowed bound on the otherwise-unbounded `batches` cache
+        // (fed by unauthenticated gossip). Kept long enough that a peer
+        // resyncing within the window can still fetch them.
+        let batch_horizon = state.next_round.saturating_sub(BATCH_RETENTION_ROUNDS);
+        if batch_horizon > 0 {
+            let stale: Vec<Digest> = state.batch_seen_round.iter().filter(|(_, &seen)| seen < batch_horizon).map(|(&d, _)| d).collect();
+            for digest in stale {
+                state.batches.remove(&digest);
+                state.batch_seen_round.remove(&digest);
+            }
+        }
     }
 
     /// Records a vote toward whichever vertex this validator currently has
@@ -1286,6 +1341,7 @@ mod tests {
             consensus: ConsensusState::new(),
             mempool: HashMap::new(),
             batches: HashMap::new(),
+            batch_seen_round: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round: 0,

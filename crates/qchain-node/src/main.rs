@@ -179,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             consensus,
             mempool: HashMap::new(),
             batches: HashMap::new(),
+            batch_seen_round: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round,
