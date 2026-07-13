@@ -1,9 +1,19 @@
+# syntax=docker/dockerfile:1
 # Builds all qchain binaries (qchain-node, qchain-genesis-build, qchain the
 # wallet CLI, qchain-faucet, qchain-wallet the web wallet) into one runtime
-# image. `oqs`'s
-# "vendored" feature builds liboqs from C source bundled inside the crate
-# itself (no network access needed at build time) via cmake + a C/C++
+# image. `oqs`'s "vendored" feature builds liboqs from C source bundled inside
+# the crate itself (no network access needed at build time) via cmake + a C/C++
 # compiler; bindgen (also used by oqs-sys) needs libclang.
+#
+# FAST UPDATES: the build step uses BuildKit *cache mounts* for cargo's
+# registry and the target/ dir, so they persist across `docker build` runs on
+# the same machine. The first build compiles everything (liboqs, wasmtime,
+# winterfell - the slow part); every later build (an update) only recompiles
+# the qchain crates whose source actually changed, cutting an update from
+# minutes to seconds. Because the compiled binaries live in the cache mount
+# (which isn't available to later stages), they're copied out to /out in the
+# same RUN. Requires BuildKit (default in modern Docker; the deploy scripts set
+# DOCKER_BUILDKIT=1 to be safe).
 FROM rust:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,21 +22,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet && \
+    mkdir -p /out && \
+    cp target/release/qchain-node \
+       target/release/qchain-genesis-build \
+       target/release/qchain \
+       target/release/qchain-faucet \
+       target/release/qchain-wallet /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/qchain-node /usr/local/bin/qchain-node
-COPY --from=builder /build/target/release/qchain-genesis-build /usr/local/bin/qchain-genesis-build
-COPY --from=builder /build/target/release/qchain /usr/local/bin/qchain
-COPY --from=builder /build/target/release/qchain-faucet /usr/local/bin/qchain-faucet
-COPY --from=builder /build/target/release/qchain-wallet /usr/local/bin/qchain-wallet
+COPY --from=builder /out/qchain-node /usr/local/bin/qchain-node
+COPY --from=builder /out/qchain-genesis-build /usr/local/bin/qchain-genesis-build
+COPY --from=builder /out/qchain /usr/local/bin/qchain
+COPY --from=builder /out/qchain-faucet /usr/local/bin/qchain-faucet
+COPY --from=builder /out/qchain-wallet /usr/local/bin/qchain-wallet
 
-# No fixed ENTRYPOINT/CMD - this image bundles four different binaries
-# (validator, coordinator tool, wallet CLI, faucet), each meant to be
-# invoked explicitly. See docs/DEPLOY.md for real invocations, e.g.:
+# No fixed ENTRYPOINT/CMD - this image bundles several binaries (validator,
+# coordinator tool, wallet CLI, faucet, web wallet), each meant to be invoked
+# explicitly. See docs/DEPLOY.md for real invocations, e.g.:
 #   docker run -v $PWD:/qchain -w /qchain --network host <image> \
 #     qchain-node --config node1.json
 WORKDIR /qchain

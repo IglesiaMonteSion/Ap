@@ -113,7 +113,7 @@ obtener_imagen() {
   fi
   if [ "$NO_BUILD" -ne 1 ] && [ -f "$REPO_ROOT/Dockerfile" ]; then
     decir "Construyendo la imagen de qchain desde el código (puede tardar varios minutos la primera vez)"
-    if docker build -t qchain:latest "$REPO_ROOT"; then IMAGE="qchain:latest"; return 0; fi
+    if DOCKER_BUILDKIT=1 docker build -t qchain:latest "$REPO_ROOT"; then IMAGE="qchain:latest"; return 0; fi
   fi
   if [ "$es_custom" -eq 0 ]; then
     if docker pull "$IMAGE" >/dev/null 2>&1; then return 0; fi

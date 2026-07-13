@@ -134,6 +134,33 @@
     transition:.2s;pointer-events:none;z-index:50}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .shield{width:64px;height:64px;flex:0 0 auto}
+  .mono{font-family:ui-monospace,Menlo,monospace}
+
+  /* --- tema claro (se activa con data-theme="light") --- */
+  :root[data-theme="light"]{
+    --bg:#eef0f7; --ink:#141a2b; --muted:#5c6478; --line:rgba(20,24,50,.10);
+    --card:rgba(255,255,255,.75); --card-solid:#ffffff; --field:#eceef6;
+    --good:#0a7d43; --good-bg:rgba(16,150,90,.10); --bad:#c0392b; --bad-bg:rgba(200,60,50,.08);
+    --glow:0 10px 30px rgba(110,100,230,.14);
+  }
+  :root[data-theme="light"] .app{
+    background:
+      radial-gradient(900px 420px at 50% -8%, rgba(124,92,255,.14), transparent 62%),
+      radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.08), transparent 60%),
+      #eef0f7;}
+  :root[data-theme="light"] input::placeholder,:root[data-theme="light"] textarea::placeholder{color:#9aa1b5}
+
+  /* --- configuración --- */
+  .icon-btn{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;padding:0;font-size:18px;
+    background:var(--card);border:1px solid var(--line);color:var(--ink);box-shadow:none;backdrop-filter:blur(8px)}
+  .icon-btn:hover{filter:none;border-color:rgba(140,130,255,.4)}
+  .row-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 4px;border-top:1px solid var(--line)}
+  .row-item:first-child{border-top:0}
+  .seg{display:inline-flex;background:var(--field);border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
+  .seg button{background:transparent;color:var(--muted);box-shadow:none;font-size:13px;font-weight:600;padding:8px 12px;border-radius:9px}
+  .seg button.on{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;box-shadow:0 4px 12px rgba(102,120,255,.3)}
+  .danger{background:var(--bad-bg);color:var(--bad);border:1px solid rgba(255,90,90,.28);box-shadow:none}
+  .danger:hover{filter:none}
 </style>
 </head>
 <body>
@@ -217,7 +244,10 @@
         <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl2" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl2)"><g fill="none" stroke="url(#ag2)" stroke-width="1.8" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag2)"/></g></svg>
         <span class="brand-name">qchain <span class="grad">Wallet</span></span>
       </div>
-      <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
+        <button class="icon-btn nav" data-to="settings" title="configuración" aria-label="configuración">⚙</button>
+      </div>
     </div>
 
     <div class="balance-card">
@@ -273,6 +303,47 @@
     <div class="msg" id="s-msg"></div>
   </section>
 
+  <!-- ===== CONFIGURACIÓN ===== -->
+  <section class="view" id="v-settings">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Configuración</h2>
+
+    <div class="section-title">Apariencia</div>
+    <div class="card">
+      <div class="row-item">
+        <div><div style="font-weight:600">Tema</div><div class="hint" style="margin:0">Claro, oscuro o según tu sistema</div></div>
+        <div class="seg" id="theme-seg">
+          <button data-theme-set="light">Claro</button>
+          <button data-theme-set="dark">Oscuro</button>
+          <button data-theme-set="auto">Auto</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">Respaldo de esta wallet</div>
+    <div class="card accent">
+      <div style="font-weight:700" id="set-wallet-name">—</div>
+      <div class="wi-addr" id="set-wallet-addr" style="margin-bottom:4px">—</div>
+      <label for="set-pass" style="margin-top:8px">Contraseña del respaldo (mín. 6)</label>
+      <input id="set-pass" type="password" placeholder="protegé tu archivo con una contraseña" autocomplete="new-password">
+      <button class="btn-block" id="set-download" style="margin-top:12px">🔒 Descargar respaldo (.json)</button>
+      <div class="hint" style="margin-top:10px">El archivo cifrado es tu llave: guardalo con su contraseña. <a href="#" id="set-plain">descargar sin cifrar (avanzado)</a></div>
+      <div class="msg" id="set-msg"></div>
+    </div>
+
+    <div class="section-title">Red</div>
+    <div class="card">
+      <div class="row-item"><span class="hint" style="margin:0">Nodo (RPC)</span><span class="mono" id="set-rpc" style="font-size:12px">—</span></div>
+      <div class="row-item"><span class="hint" style="margin:0">Versión</span><span id="set-ver">—</span></div>
+      <div class="row-item"><span class="hint" style="margin:0">Estado</span><span id="set-status">—</span></div>
+    </div>
+
+    <div style="margin-top:22px"><button class="btn-block danger" id="set-logout">Cerrar sesión</button></div>
+    <div class="hint" style="text-align:center;margin-top:8px">Volvés a la pantalla de inicio. No se borran tus wallets.</div>
+
+    <div class="hint" style="text-align:center;margin-top:22px;opacity:.7">qchain Wallet · <span id="set-appver">—</span></div>
+  </section>
+
 </div>
 <div class="toast" id="toast">copiado</div>
 
@@ -303,8 +374,53 @@ function showView(name){
   if(name==="home") renderHome();
   if(name==="receive") renderReceive();
   if(name==="send") renderSend();
+  if(name==="settings") renderSettings();
 }
 document.querySelectorAll(".nav").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
+
+// --- tema claro / oscuro / auto ---
+function resolveTheme(setting){ return setting==="auto" ? (window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark") : setting; }
+function applyTheme(setting){
+  localStorage.setItem("qchain_theme", setting);
+  document.documentElement.dataset.theme = resolveTheme(setting);
+  document.querySelectorAll("#theme-seg button").forEach(b=>b.classList.toggle("on", b.dataset.themeSet===setting));
+}
+// seguir el sistema en vivo cuando está en "auto"
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change",()=>{
+  if((localStorage.getItem("qchain_theme")||"dark")==="auto") applyTheme("auto");
+});
+document.querySelectorAll("#theme-seg button").forEach(b=>b.addEventListener("click",()=>applyTheme(b.dataset.themeSet)));
+
+// --- descarga de respaldo (compartida por crear y configuración) ---
+async function downloadBackup(name, pass, msgEl){
+  msgEl.className="msg"; msgEl.textContent="";
+  if(pass.length<6){ msgEl.className="msg err"; msgEl.textContent="la contraseña debe tener al menos 6 caracteres"; return; }
+  try{
+    const r=await fetch("/api/export-encrypted",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name,password:pass})});
+    if(!r.ok){ const b=await r.json().catch(()=>({})); throw new Error(b.error||"error"); }
+    const blob=await r.blob(), url=URL.createObjectURL(blob), a=document.createElement("a");
+    a.href=url; a.download=name+".qchain-keystore.json"; a.click(); URL.revokeObjectURL(url);
+    msgEl.className="msg ok"; msgEl.textContent="✓ respaldo descargado. Guardalo junto con su contraseña.";
+  }catch(e){ msgEl.className="msg err"; msgEl.textContent=e.message; }
+}
+
+async function renderSettings(){
+  const w=activeWallet(); if(!w){ showView("welcome"); return; }
+  applyTheme(localStorage.getItem("qchain_theme")||"dark");
+  $("set-wallet-name").textContent=w.name;
+  $("set-wallet-addr").textContent=w.address;
+  try{ const cfg=await api("/api/config"); $("set-rpc").textContent=cfg.rpc.replace(/^https?:\/\//,""); }catch(e){}
+  try{ const st=await api("/api/node"); const on=st.online!==false;
+    $("set-ver").textContent=on?("v"+st.version):"—"; $("set-appver").textContent=on?("v"+st.version):"—";
+    $("set-status").innerHTML=on?'<span style="color:var(--good)">en vivo</span>':'<span style="color:var(--bad)">sin conexión</span>';
+  }catch(e){}
+}
+$("set-download").onclick=()=>{ const w=activeWallet(); if(w) downloadBackup(w.name, $("set-pass").value, $("set-msg")); };
+$("set-plain").onclick=e=>{ e.preventDefault(); const w=activeWallet(); if(w) window.location.href="/api/export/"+encodeURIComponent(w.name); };
+$("set-logout").onclick=()=>{
+  localStorage.removeItem("qchain_active"); active=null; lastListSig=""; lastActivitySig="";
+  toast("sesión cerrada"); showView("welcome");
+};
 
 function activeWallet(){ return WALLETS.find(w=>w.name===active) || WALLETS[0] || null; }
 
@@ -472,6 +588,7 @@ $("w-import").onclick=()=>showView("import");
 
 // arranque
 (async function(){
+  applyTheme(localStorage.getItem("qchain_theme")||"dark");
   await loadWallets(); await loadNode();
   showView(WALLETS.length ? "home" : "welcome");
   setInterval(async()=>{ await loadWallets(); if($("v-home").classList.contains("active")) renderHome(); }, 5000);

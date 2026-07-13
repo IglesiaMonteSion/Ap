@@ -57,7 +57,7 @@ fi
 
 # 2. Reconstruir la imagen desde el código actual
 decir "Reconstruyendo la imagen qchain:latest desde el código (puede tardar unos minutos)"
-docker build -t qchain:latest "$REPO_ROOT"
+DOCKER_BUILDKIT=1 docker build -t qchain:latest "$REPO_ROOT"
 
 # 3. Reiniciar el servicio (estado y clave intactos)
 decir "Reiniciando el nodo"

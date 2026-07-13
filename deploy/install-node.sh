@@ -165,7 +165,7 @@ obtener_imagen() {
     decir "Construyendo la imagen de qchain desde el código"
     echo "Esto compila todo desde cero y puede tardar VARIOS MINUTOS la primera"
     echo "vez (después queda cacheado). Origen: $REPO_ROOT"
-    if docker build -t qchain:latest "$REPO_ROOT"; then
+    if DOCKER_BUILDKIT=1 docker build -t qchain:latest "$REPO_ROOT"; then
       IMAGE="qchain:latest"
       return 0
     fi
