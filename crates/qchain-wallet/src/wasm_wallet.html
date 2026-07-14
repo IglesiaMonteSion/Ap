@@ -218,11 +218,22 @@
   <section class="view" id="v-import">
     <button class="backlink nav" data-to="welcome">← volver</button>
     <h2 class="view-title">Restaurar wallet</h2>
-    <p class="view-sub">Pegá tu semilla (o subí el archivo de respaldo) y elegí una contraseña nueva para este dispositivo.</p>
-    <label for="i-seed">Semilla de recuperación</label>
-    <textarea id="i-seed" placeholder="pegá tu semilla (64 caracteres) o el contenido del .json"></textarea>
-    <label for="i-file">…o subí el archivo de respaldo</label>
-    <input id="i-file" type="file" accept=".json,.txt,application/json">
+    <div class="seg" id="import-mode" style="margin:8px 0 4px">
+      <button data-mode="seed" class="on">Semilla</button>
+      <button data-mode="shamir">Fragmentos</button>
+    </div>
+    <div id="imp-seed-box">
+      <p class="view-sub">Pegá tu semilla (o subí el archivo de respaldo).</p>
+      <label for="i-seed">Semilla de recuperación</label>
+      <textarea id="i-seed" placeholder="pegá tu semilla (64 caracteres) o el contenido del .json"></textarea>
+      <label for="i-file">…o subí el archivo de respaldo</label>
+      <input id="i-file" type="file" accept=".json,.txt,application/json">
+    </div>
+    <div id="imp-shamir-box" style="display:none">
+      <p class="view-sub">Pegá tus fragmentos Shamir, uno por línea. Con juntar los suficientes alcanza.</p>
+      <label for="i-shares">Fragmentos (uno por línea)</label>
+      <textarea id="i-shares" placeholder="QS1-...&#10;QS1-...&#10;QS1-..." style="min-height:120px"></textarea>
+    </div>
     <label for="i-pass">Contraseña nueva (mín. 8)</label>
     <input id="i-pass" type="password" placeholder="para cifrarla en este navegador" autocomplete="new-password">
     <div style="margin-top:18px"><button class="btn-block" id="i-btn">Restaurar</button></div>
@@ -332,6 +343,8 @@
           <button class="btn-sec" id="set-download" style="flex:1">Descargar .json</button>
         </div>
       </div>
+      <button class="btn-block btn-outline nav" data-to="shamir" style="margin-top:12px">🧩 Respaldo avanzado (fragmentos)</button>
+      <div class="hint" style="margin-top:8px">Partí tu semilla en varios fragmentos y repartilos. Sin un punto único de falla.</div>
     </div>
 
     <div class="section-title">Red</div>
@@ -346,6 +359,30 @@
     <div class="hint center" style="margin-top:8px">Solo la vas a poder recuperar con tu semilla. No afecta tus fondos en la red.</div>
 
     <div class="hint center" style="margin-top:22px;opacity:.7">qchain Wallet · <span id="set-appver">—</span></div>
+  </section>
+
+  <!-- ===== RESPALDO SHAMIR ===== -->
+  <section class="view" id="v-shamir">
+    <button class="backlink nav" data-to="settings">← volver</button>
+    <h2 class="view-title">Respaldo en <span class="grad">fragmentos</span></h2>
+    <p class="view-sub">Dividí tu semilla en varios fragmentos y guardalos por separado. Necesitás juntar solo algunos para recuperar la wallet; con menos, no se puede saber nada.</p>
+    <div class="card">
+      <label>Esquema</label>
+      <div class="seg" id="shamir-preset">
+        <button data-k="2" data-n="3" class="on">2 de 3</button>
+        <button data-k="3" data-n="5">3 de 5</button>
+        <button data-k="2" data-n="2">2 de 2</button>
+      </div>
+      <div class="hint" id="shamir-desc">"2 de 3": 3 fragmentos, juntás 2 para recuperar. Aguantás perder 1.</div>
+      <button class="btn-block" id="shamir-gen" style="margin-top:16px">Generar fragmentos</button>
+      <div class="msg" id="shamir-msg"></div>
+    </div>
+    <div id="shamir-out" style="display:none">
+      <div class="section-title">Tus fragmentos — guardá cada uno por separado</div>
+      <div class="card" id="shamir-list"></div>
+      <button class="btn-block btn-sec" id="shamir-dl" style="margin-top:12px">Descargar todos (.txt)</button>
+      <div class="hint" style="margin-top:8px">⚠️ Cualquiera que junte los fragmentos suficientes controla tus fondos. Guardalos en lugares distintos.</div>
+    </div>
   </section>
 
 </div>
@@ -395,6 +432,61 @@ async function decryptSeed(store, password){
   const key=await deriveKey(password, ub64(store.salt));
   const pt=await crypto.subtle.decrypt({name:'AES-GCM', iv:ub64(store.iv)}, key, ub64(store.ct));
   return new Uint8Array(pt);
+}
+
+// ---- Shamir Secret Sharing sobre GF(256) ----
+// Parte la semilla en N fragmentos donde K reconstruyen y K-1 no revelan NADA.
+// Todo pasa en el navegador; la semilla nunca sale de acá. Formato de fragmento:
+// "QS1-" + hex([K, N, x, chk0, chk1, y0..y31]) = 37 bytes. Los 2 bytes de
+// checksum (primeros de SHA-256 de la semilla) solo sirven para avisar si los
+// fragmentos no encajan; no revelan la semilla (256 bits de entropía).
+const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
+// tablas exp/log con generador 3 (x·3 = xtime(x) XOR x). Ojo: 2 NO es
+// generador de GF(256) bajo 0x11b (cicla antes de 255); 3 sí lo es.
+(function(){ let x=1; for(let i=0;i<255;i++){ GF_EXP[i]=x; GF_LOG[x]=i; const t=((x<<1)^((x&0x80)?0x11b:0))&0xff; x=t^x; } for(let i=255;i<512;i++) GF_EXP[i]=GF_EXP[i-255]; })();
+function gmul(a,b){ return (a===0||b===0)?0:GF_EXP[GF_LOG[a]+GF_LOG[b]]; }
+function gdiv(a,b){ return a===0?0:GF_EXP[GF_LOG[a]-GF_LOG[b]+255]; }
+function gpoly(coeffs,x){ let r=0; for(let i=coeffs.length-1;i>=0;i--) r=gmul(r,x)^coeffs[i]; return r; }
+
+async function shamirSplit(seed, k, n){
+  const digest=new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
+  const shares=[]; for(let x=1;x<=n;x++) shares.push({x, ys:new Uint8Array(32)});
+  for(let pos=0;pos<32;pos++){
+    const coeffs=new Uint8Array(k); coeffs[0]=seed[pos];
+    if(k>1) crypto.getRandomValues(coeffs.subarray(1));   // K-1 coeficientes al azar
+    for(const sh of shares) sh.ys[pos]=gpoly(coeffs, sh.x);
+  }
+  return shares.map(sh=>{
+    const buf=new Uint8Array(37);
+    buf[0]=k; buf[1]=n; buf[2]=sh.x; buf[3]=digest[0]; buf[4]=digest[1]; buf.set(sh.ys,5);
+    return "QS1-"+hex(buf);
+  });
+}
+async function shamirCombine(shareStrs){
+  const parsed=shareStrs.map(s=>{
+    s=s.trim().replace(/^QS1-/i,'').toLowerCase();
+    if(!/^[0-9a-f]{74}$/.test(s)) throw new Error('un fragmento tiene formato inválido');
+    const b=fromHex(s); return {k:b[0], n:b[1], x:b[2], chk:[b[3],b[4]], ys:b.slice(5)};
+  });
+  if(!parsed.length) throw new Error('pegá tus fragmentos');
+  const k=parsed[0].k;
+  const seen=new Set(), use=[];
+  for(const p of parsed){ if(!seen.has(p.x)){ seen.add(p.x); use.push(p); } }
+  if(use.length<k) throw new Error(`necesitás al menos ${k} fragmentos distintos (tenés ${use.length})`);
+  const sel=use.slice(0,k);
+  const seed=new Uint8Array(32);
+  for(let pos=0;pos<32;pos++){
+    let acc=0;
+    for(let i=0;i<k;i++){
+      let num=1, den=1;
+      for(let j=0;j<k;j++){ if(j===i) continue; num=gmul(num, sel[j].x); den=gmul(den, sel[i].x ^ sel[j].x); }
+      acc ^= gmul(sel[i].ys[pos], gdiv(num,den));
+    }
+    seed[pos]=acc;
+  }
+  const digest=new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
+  if(digest[0]!==sel[0].chk[0]||digest[1]!==sel[0].chk[1]) throw new Error('los fragmentos no coinciden o faltan algunos');
+  return seed;
 }
 
 // ---- navegación entre vistas ----
@@ -522,34 +614,92 @@ $("b-copy").onclick=()=>copy($("b-seed").textContent);
 $("b-download").onclick=()=>downloadSeed();
 $("b-done").onclick=()=>showView("home");
 
-// restaurar
+// restaurar — dos modos: semilla directa o fragmentos Shamir
+let importMode="seed";
 $("i-file").onchange=async e=>{ const f=e.target.files[0]; if(f) $("i-seed").value=(await f.text()).trim(); };
-$("i-btn").onclick=async()=>{
-  const raw=$("i-seed").value.trim(), p=$("i-pass").value, msg=$("i-msg"); msg.className="msg"; msg.textContent="";
-  let seedHex=raw;
+document.querySelectorAll("#import-mode button").forEach(b=>b.onclick=()=>{
+  importMode=b.dataset.mode;
+  document.querySelectorAll("#import-mode button").forEach(x=>x.classList.toggle("on", x===b));
+  $("imp-seed-box").style.display   = importMode==="seed"   ? "block":"none";
+  $("imp-shamir-box").style.display = importMode==="shamir" ? "block":"none";
+  const msg=$("i-msg"); msg.className="msg"; msg.textContent="";
+});
+
+async function seedFromSeedMode(msg){
+  let raw=$("i-seed").value.trim(), seedHex=raw;
   if(raw.startsWith("{")){
-    let obj; try{ obj=JSON.parse(raw); }catch(e){ msg.className="msg err"; msg.textContent="el archivo no es válido"; return; }
-    // ¿Es un respaldo de la wallet CUSTODIAL (otro formato)? Avisar en vez de fallar críptico.
+    let obj; try{ obj=JSON.parse(raw); }catch(e){ throw new Error("el archivo no es válido"); }
     if(!obj.seed && (obj.ciphertext||obj.kdf||obj.public||obj.secret||obj.keypair)){
       msg.className="msg err";
       msg.innerHTML='Este respaldo es de la wallet <b>custodial</b> (otro formato). Restauralo en '+
         '<a href="/custodial" style="color:#c9c2ff">/custodial</a>, no acá. Esta wallet usa una semilla de 64 caracteres.';
-      return;
+      throw new Error("__handled__");
     }
     seedHex=(obj.seed||"").trim();
   }
   seedHex=seedHex.replace(/^0x/,"").toLowerCase();
-  if(!/^[0-9a-f]{64}$/.test(seedHex)){ msg.className="msg err"; msg.textContent="la semilla debe tener 64 caracteres hex (o subí el .json de respaldo de ESTA wallet)"; return; }
-  if(p.length<8){ msg.className="msg err"; msg.textContent="la contraseña nueva debe tener al menos 8 caracteres"; return; }
+  if(!/^[0-9a-f]{64}$/.test(seedHex)) throw new Error("la semilla debe tener 64 caracteres hex (o subí el .json de respaldo de ESTA wallet)");
+  return fromHex(seedHex);
+}
+
+$("i-btn").onclick=async()=>{
+  const p=$("i-pass").value, msg=$("i-msg"); msg.className="msg"; msg.textContent="";
   $("i-btn").disabled=true;
   try{
-    const seed=fromHex(seedHex);
+    let seed;
+    if(importMode==="shamir"){
+      const lines=$("i-shares").value.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean);
+      if(!lines.length) throw new Error("pegá tus fragmentos, uno por línea");
+      seed=await shamirCombine(lines);
+    }else{
+      seed=await seedFromSeedMode(msg);
+    }
+    if(p.length<8) throw new Error("la contraseña nueva debe tener al menos 8 caracteres");
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
     SEED=seed;
     toast("wallet restaurada"); showView("home");
-  }catch(e){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; }
+  }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
   $("i-btn").disabled=false;
+};
+
+// respaldo Shamir (generar)
+let shamirK=2, shamirN=3, shamirShares=[];
+document.querySelectorAll("#shamir-preset button").forEach(b=>b.onclick=()=>{
+  shamirK=+b.dataset.k; shamirN=+b.dataset.n;
+  document.querySelectorAll("#shamir-preset button").forEach(x=>x.classList.toggle("on", x===b));
+  $("shamir-desc").textContent=`"${shamirK} de ${shamirN}": ${shamirN} fragmentos, juntás ${shamirK} para recuperar. Aguantás perder ${shamirN-shamirK}.`;
+  $("shamir-out").style.display="none";
+});
+$("shamir-gen").onclick=async()=>{
+  const msg=$("shamir-msg"); msg.className="msg"; msg.textContent="";
+  if(!SEED){ msg.className="msg err"; msg.textContent="desbloqueá la wallet primero"; return; }
+  $("shamir-gen").disabled=true;
+  try{
+    shamirShares=await shamirSplit(SEED, shamirK, shamirN);
+    $("shamir-list").innerHTML=shamirShares.map((s,i)=>`
+      <div class="row-item" style="align-items:flex-start">
+        <div style="min-width:0;flex:1">
+          <div style="font-weight:700;margin-bottom:4px">Fragmento ${i+1} de ${shamirN}</div>
+          <div class="mono" style="font-size:11px;word-break:break-all;color:var(--muted)">${s}</div>
+        </div>
+        <button class="btn-sec" data-share="${i}" style="flex:0 0 auto;padding:8px 12px;font-size:13px">copiar</button>
+      </div>`).join("");
+    $("shamir-list").querySelectorAll("button[data-share]").forEach(btn=>btn.onclick=()=>copy(shamirShares[+btn.dataset.share]));
+    $("shamir-out").style.display="block";
+  }catch(e){ msg.className="msg err"; msg.textContent="no se pudo generar: "+e.message; }
+  $("shamir-gen").disabled=false;
+};
+$("shamir-dl").onclick=()=>{
+  const addr=myAddress();
+  const txt=`qchain Wallet — respaldo Shamir (${shamirK} de ${shamirN})\n`+
+    `dirección: ${addr}\n`+
+    `Necesitás juntar ${shamirK} de estos ${shamirN} fragmentos para recuperar la wallet.\n`+
+    `Restaurar: wallet -> Restaurar -> Fragmentos -> pegá ${shamirK} de ellos.\n\n`+
+    shamirShares.map((s,i)=>`Fragmento ${i+1}:\n${s}`).join("\n\n")+"\n";
+  const blob=new Blob([txt],{type:"text/plain"}), url=URL.createObjectURL(blob), a=document.createElement("a");
+  a.href=url; a.download="qchain-shamir-backup.txt"; a.click(); URL.revokeObjectURL(url);
+  toast("fragmentos descargados");
 };
 
 // desbloquear
