@@ -318,20 +318,16 @@
     <div style="text-align:center;margin-top:6px">
       <svg class="shield" style="width:72px;height:72px" viewBox="0 0 48 48"><defs><linearGradient id="sh1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><g><path d="M24 5 L40 11 V23 C40 33 33 40 24 43 C15 40 8 33 8 23 V11 Z" fill="url(#sh1)" opacity=".92"/><circle cx="24" cy="21" r="4.2" fill="#0b0f1a"/><rect x="22.4" y="23" width="3.2" height="7" rx="1.6" fill="#0b0f1a"/></g></svg>
       <h2 class="view-title" style="margin-top:8px">Guardá tu <span class="grad">respaldo</span></h2>
-      <p class="view-sub center">Esta semilla <b>es tu wallet</b>. Si perdés este dispositivo y no la tenés, perdés el acceso para siempre.</p>
+      <p class="view-sub center">Tu wallet vive en este dispositivo. Hacé un respaldo <b>ahora</b>: si lo perdés y no tenés respaldo, perdés el acceso para siempre.</p>
     </div>
     <div class="card accent" style="margin-top:8px">
-      <div class="section-title" style="margin:0 0 8px">Tu semilla de recuperación</div>
-      <div class="seedbox" id="b-seed"></div>
-      <div class="row" style="margin-top:12px">
-        <button class="btn-sec" id="b-copy" style="flex:1">Copiar</button>
-        <button class="btn-sec" id="b-download" style="flex:1">Descargar .json</button>
-      </div>
-      <div class="hint">Guardala en un lugar seguro y offline. Cualquiera que la tenga controla tus fondos.</div>
+      <div class="section-title" style="margin:0 0 8px">Respaldo cifrado</div>
+      <div class="hint" style="margin-top:0">Un archivo <b>.json cifrado con tu contraseña</b> (PBKDF2 + AES-256-GCM). Aunque alguien consiga el archivo, sin tu contraseña no sirve.</div>
+      <button class="btn-block btn-sec" id="b-download" style="margin-top:12px">Descargar respaldo cifrado (.json)</button>
     </div>
-    <button class="btn-block btn-outline nav" data-to="shamir" style="margin-top:12px">🧩 O dividila en fragmentos (Shamir)</button>
-    <div class="hint" style="margin-top:6px">Avanzado: repartí tu semilla en varios fragmentos (ej. 2 de 3). También disponible después en Configuración.</div>
-    <div style="margin-top:16px"><button class="btn-block" id="b-done">Ya la guardé, entrar</button></div>
+    <button class="btn-block btn-outline nav" data-to="shamir" style="margin-top:12px">🧩 O dividilo en fragmentos (Shamir)</button>
+    <div class="hint" style="margin-top:6px">Avanzado: repartí tu respaldo en varios fragmentos (ej. 2 de 3), sin un punto único de falla. También disponible después en Configuración.</div>
+    <div style="margin-top:16px"><button class="btn-block" id="b-done">Ya lo guardé, entrar</button></div>
   </section>
 
   <!-- ===== RESTAURAR ===== -->
@@ -343,9 +339,9 @@
       <button data-mode="shamir">Fragmentos</button>
     </div>
     <div id="imp-seed-box">
-      <p class="view-sub">Pegá tu semilla (o subí el archivo de respaldo).</p>
-      <label for="i-seed">Semilla de recuperación</label>
-      <textarea id="i-seed" placeholder="pegá tu semilla (64 caracteres) o el contenido del .json"></textarea>
+      <p class="view-sub">Subí tu archivo de respaldo <b>.json cifrado</b> (o pegá su contenido). Si es cifrado, poné su contraseña abajo.</p>
+      <label for="i-seed">Respaldo</label>
+      <textarea id="i-seed" placeholder="subí/pegá tu respaldo .json cifrado (o una semilla de 64 hex)"></textarea>
       <label for="i-file">…o subí el archivo de respaldo</label>
       <input id="i-file" type="file" accept=".json,.txt,application/json">
     </div>
@@ -354,8 +350,8 @@
       <label for="i-shares">Fragmentos (palabras)</label>
       <textarea id="i-shares" placeholder="academic acid acne … (32 palabras)&#10;&#10;academic agency ahead … (otro fragmento)" style="min-height:130px"></textarea>
     </div>
-    <label for="i-pass">Contraseña nueva (mín. 8)</label>
-    <input id="i-pass" type="password" placeholder="para cifrarla en este navegador" autocomplete="new-password">
+    <label for="i-pass">Contraseña (mín. 8)</label>
+    <input id="i-pass" type="password" placeholder="la de tu respaldo cifrado — también cifra la wallet en este navegador" autocomplete="new-password">
     <div style="margin-top:18px"><button class="btn-block" id="i-btn">Restaurar</button></div>
     <div class="msg" id="i-msg"></div>
   </section>
@@ -482,18 +478,12 @@
 
     <div class="section-title">Respaldo</div>
     <div class="card accent">
-      <div style="font-weight:700">Tu semilla de recuperación</div>
-      <p class="hint" style="margin:2px 0 12px">Es la única forma de recuperar esta wallet en otro dispositivo. Guardala offline.</p>
-      <button class="btn-block btn-sec" id="set-reveal">Ver / descargar semilla</button>
-      <div id="set-seed-wrap" style="display:none;margin-top:12px">
-        <div class="seedbox" id="set-seed"></div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn-sec" id="set-copy" style="flex:1">Copiar</button>
-          <button class="btn-sec" id="set-download" style="flex:1">Descargar .json</button>
-        </div>
-      </div>
+      <div style="font-weight:700">Respaldo de recuperación</div>
+      <p class="hint" style="margin:2px 0 12px">La forma de recuperar esta wallet en otro dispositivo. Elegí un método y guardalo offline.</p>
+      <button class="btn-block btn-sec" id="set-download">Descargar respaldo cifrado (.json)</button>
+      <div class="hint" style="margin:8px 0 0">Archivo <b>.json cifrado con tu contraseña</b> (PBKDF2 + AES-256-GCM): un archivo robado no sirve sin la contraseña.</div>
       <button class="btn-block btn-outline nav" data-to="shamir" style="margin-top:12px">🧩 Respaldo avanzado (fragmentos)</button>
-      <div class="hint" style="margin-top:8px">Partí tu semilla en varios fragmentos y repartilos. Sin un punto único de falla.</div>
+      <div class="hint" style="margin-top:8px">Partí tu respaldo en varios fragmentos y repartilos. Sin un punto único de falla.</div>
     </div>
 
     <div class="section-title">Red</div>
@@ -544,6 +534,7 @@ const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
 const TX_BYTES = 5571n; // tamaño real de una transferencia híbrida firmada (documentado)
 let SEED = null;        // Uint8Array(32), solo en memoria mientras está desbloqueada
+let PW = null;          // contraseña en memoria (solo para cifrar el respaldo sin re-preguntar); nunca se persiste ni se muestra
 let lastActivitySig = "";
 let nodeTimer = null, balTimer = null;
 
@@ -773,7 +764,6 @@ function renderSend(){
 
 async function renderSettings(){
   applyTheme(localStorage.getItem("qchain_theme")||"dark");
-  $("set-seed-wrap").style.display="none";
   try{ const cfg=await api("/api/config"); $("set-rpc").textContent=cfg.rpc.replace(/^https?:\/\//,""); }catch(e){}
   try{ const st=await api("/api/node"); const on=st.online!==false;
     $("set-ver").textContent=on?("v"+st.version):"—"; $("set-appver").textContent=on?("v"+st.version):"—";
@@ -782,13 +772,22 @@ async function renderSettings(){
 }
 
 // ---- descargar semilla como archivo ----
-function downloadSeed(){
+// Respaldo CIFRADO: la semilla nunca se guarda ni descarga en claro. El .json
+// lleva solo el ciphertext (PBKDF2-SHA256 + AES-256-GCM, mismo esquema que ya
+// usa la wallet para guardar la semilla en el navegador). Un archivo robado no
+// sirve sin la contraseña. Se restaura en la wallet tipeando esa contraseña.
+async function downloadEncryptedBackup(){
+  if(!SEED){ toast("desbloqueá la wallet primero"); return; }
+  let pw=PW;
+  if(!pw){ pw=prompt("Contraseña para cifrar el respaldo (mínimo 8):")||""; if(pw.length<8){ toast("contraseña muy corta"); return; } }
   const addr=myAddress();
-  const data=JSON.stringify({ type:"qchain-wallet-seed", version:1, address:addr, seed:hex(SEED),
-    note:"Semilla de recuperación de tu wallet qchain. Guardala en secreto y offline." }, null, 2);
+  const store=await encryptSeed(SEED, pw);   // { v, salt, iv, ct }
+  const data=JSON.stringify({ type:"qchain-wallet-encrypted-backup", version:2, address:addr,
+    kdf:"PBKDF2-SHA256", cipher:"AES-256-GCM", ...store,
+    note:"Respaldo CIFRADO de una wallet qchain no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
   const blob=new Blob([data],{type:"application/json"}), url=URL.createObjectURL(blob), a=document.createElement("a");
   a.href=url; a.download="qchain-wallet-backup.json"; a.click(); URL.revokeObjectURL(url);
-  toast("respaldo descargado");
+  toast("respaldo cifrado descargado");
 }
 
 // ==================== flujos ====================
@@ -806,14 +805,12 @@ $("c-btn").onclick=async()=>{
     const seed=crypto.getRandomValues(new Uint8Array(32));       // entropía real del navegador
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed;
-    $("b-seed").textContent=hex(seed);
+    SEED=seed; PW=p;
     showView("backup");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo crear: "+e.message; }
   $("c-btn").disabled=false;
 };
-$("b-copy").onclick=()=>copy($("b-seed").textContent);
-$("b-download").onclick=()=>downloadSeed();
+$("b-download").onclick=()=>downloadEncryptedBackup();
 $("b-done").onclick=()=>showView("home");
 
 // restaurar — dos modos: semilla directa o fragmentos Shamir
@@ -827,20 +824,32 @@ document.querySelectorAll("#import-mode button").forEach(b=>b.onclick=()=>{
   const msg=$("i-msg"); msg.className="msg"; msg.textContent="";
 });
 
-async function seedFromSeedMode(msg){
+async function seedFromSeedMode(msg, password){
   let raw=$("i-seed").value.trim(), seedHex=raw;
   if(raw.startsWith("{")){
     let obj; try{ obj=JSON.parse(raw); }catch(e){ throw new Error("el archivo no es válido"); }
+    // Respaldo CIFRADO nuevo (v2): tiene salt/iv/ct. Se descifra con la misma
+    // contraseña que se pone abajo (tu contraseña de wallet).
+    if(obj.type==="qchain-wallet-encrypted-backup" || (obj.salt && obj.iv && obj.ct && !obj.seed)){
+      if(!password || password.length<8) throw new Error("poné la contraseña de tu respaldo abajo para descifrarlo");
+      let seed;
+      try{ seed=await decryptSeed(obj, password); }
+      catch(e){ throw new Error("contraseña incorrecta para este respaldo cifrado"); }
+      if(seed.length!==32) throw new Error("el respaldo cifrado no contiene una semilla válida");
+      return seed;
+    }
+    // Respaldo de la wallet CUSTODIAL (otro formato) → redirigir.
     if(!obj.seed && (obj.ciphertext||obj.kdf||obj.public||obj.secret||obj.keypair)){
       msg.className="msg err";
       msg.innerHTML='Este respaldo es de la wallet <b>custodial</b> (otro formato). Restauralo en '+
         '<a href="/custodial" style="color:#c9c2ff">/custodial</a>, no acá. Esta wallet usa una semilla de 64 caracteres.';
       throw new Error("__handled__");
     }
+    // Respaldo viejo en texto plano (v1, obj.seed) o hex pegado → compatibilidad.
     seedHex=(obj.seed||"").trim();
   }
   seedHex=seedHex.replace(/^0x/,"").toLowerCase();
-  if(!/^[0-9a-f]{64}$/.test(seedHex)) throw new Error("la semilla debe tener 64 caracteres hex (o subí el .json de respaldo de ESTA wallet)");
+  if(!/^[0-9a-f]{64}$/.test(seedHex)) throw new Error("pegá tu respaldo (.json cifrado o semilla de 64 hex) o subí el archivo");
   return fromHex(seedHex);
 }
 
@@ -860,12 +869,12 @@ $("i-btn").onclick=async()=>{
         mnemonics=[]; for(let i=0;i<all.length;i+=32) mnemonics.push(all.slice(i,i+32).join(" ")); }
       seed=await shamirCombine(mnemonics);
     }else{
-      seed=await seedFromSeedMode(msg);
+      seed=await seedFromSeedMode(msg, p);
     }
-    if(p.length<8) throw new Error("la contraseña nueva debe tener al menos 8 caracteres");
+    if(p.length<8) throw new Error("la contraseña debe tener al menos 8 caracteres");
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed;
+    SEED=seed; PW=p;
     toast("wallet restaurada"); showView("home");
   }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
   $("i-btn").disabled=false;
@@ -917,6 +926,7 @@ $("u-btn").onclick=async()=>{
   try{
     const store=JSON.parse(localStorage.getItem(LS_KEY));
     SEED=await decryptSeed(store, p);
+    PW=p;
     $("u-pass").value="";
     showView("home");
   }catch(e){ msg.className="msg err"; msg.textContent="contraseña incorrecta"; }
@@ -1170,10 +1180,8 @@ async function stakeAction(kind, pos){
 }
 
 // configuración
-$("set-reveal").onclick=()=>{ $("set-seed").textContent=hex(SEED); $("set-seed-wrap").style.display="block"; };
-$("set-copy").onclick=()=>copy(hex(SEED));
-$("set-download").onclick=()=>downloadSeed();
-$("set-lock").onclick=()=>{ SEED=null; $("u-pass").value=""; showView("unlock"); };
+$("set-download").onclick=()=>downloadEncryptedBackup();
+$("set-lock").onclick=()=>{ SEED=null; PW=null; $("u-pass").value=""; showView("unlock"); };
 $("set-remove").onclick=()=>{
   if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu semilla. ¿Seguir?")){
     localStorage.removeItem(LS_KEY); location.reload();
