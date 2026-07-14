@@ -81,6 +81,20 @@ pub struct ConsensusState {
     /// permanently-committed history during causal walks. Only ever raised,
     /// never lowered, and always kept far below the finalized floor.
     gc_floor: Round,
+    /// Memoizes rounds that resolved to `Committed(digest)` across `advance`
+    /// calls. `from_round` is deliberately never raced forward (see its doc),
+    /// so `extend_order` re-resolves the whole `[from_round, frontier]` window
+    /// every call - O(window x n) stake sums per incoming certificate, the
+    /// dominant cost at n=100+ (found by an audit). A `Committed` verdict is
+    /// *monotone*: it means round r+1 certificates carrying >= quorum stake
+    /// already reference r's leader, and certificates are only ever added
+    /// (above `gc_floor`), so the support can never fall back below quorum -
+    /// the verdict is permanent. Caching only `Committed` (never `Skipped` /
+    /// `Undecided`, which a late resync can still legitimately revise - the
+    /// exact reason `from_round` stays put) lets a re-resolution of a settled
+    /// round be an O(1) lookup while preserving byte-identical output. Pruned
+    /// below `gc_floor` (those rounds are gone from the DAG anyway).
+    committed_cache: std::collections::HashMap<Round, Digest>,
 }
 
 impl Default for ConsensusState {
@@ -91,7 +105,7 @@ impl Default for ConsensusState {
 
 impl ConsensusState {
     pub fn new() -> Self {
-        ConsensusState { seen: HashSet::new(), from_round: 0, finalized_floor: 0, gc_floor: 0 }
+        ConsensusState { seen: HashSet::new(), from_round: 0, finalized_floor: 0, gc_floor: 0, committed_cache: std::collections::HashMap::new() }
     }
 
     /// For a validator resuming from a persisted round checkpoint whose DAG
@@ -141,7 +155,7 @@ impl ConsensusState {
     /// first place - `new()` is not just safe there, it's the only
     /// correct choice.
     pub fn resuming_from(starting_round: Round) -> Self {
-        ConsensusState { seen: HashSet::new(), from_round: starting_round, finalized_floor: starting_round, gc_floor: 0 }
+        ConsensusState { seen: HashSet::new(), from_round: starting_round, finalized_floor: starting_round, gc_floor: 0, committed_cache: std::collections::HashMap::new() }
     }
 
     /// The first round not yet permanently finalized - everything strictly
@@ -170,6 +184,9 @@ impl ConsensusState {
     pub fn set_gc_floor(&mut self, round: Round) {
         if round > self.gc_floor {
             self.gc_floor = round;
+            // Pruned rounds are gone from the DAG and never re-resolved; drop
+            // their cached `Committed` verdicts so the cache can't grow forever.
+            self.committed_cache.retain(|&r, _| r >= round);
         }
         if round > self.from_round {
             self.from_round = round;
@@ -185,7 +202,7 @@ impl ConsensusState {
     /// the total order since the last call.
     pub fn advance(&mut self, dag: &DagStore, validators: &ValidatorSet) -> Vec<Digest> {
         let bullshark = Bullshark::with_gc_floor(dag, validators, self.gc_floor);
-        let (ordered, stopped_at) = bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen);
+        let (ordered, stopped_at) = bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen, &mut self.committed_cache);
         // Record how far consensus has permanently finalized (the first
         // still-unresolved round), monotonically. This drives DAG garbage
         // collection only - it is deliberately NOT fed back into `from_round`

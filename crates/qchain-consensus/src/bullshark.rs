@@ -335,7 +335,7 @@ impl<'a> Bullshark<'a> {
     /// start round to it (never re-resolving settled history each call) and,
     /// far enough below it, garbage-collect the DAG - see
     /// `ConsensusState::advance`/`set_gc_floor`.
-    pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>) -> (Vec<Digest>, Round) {
+    pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>, committed_cache: &mut HashMap<Round, Digest>) -> (Vec<Digest>, Round) {
         let mut ordered = Vec::new();
         // Scoped to this one call only - see `walk_causal_history`'s doc
         // comment for the real exponential-blowup bug this closes. Many
@@ -346,7 +346,22 @@ impl<'a> Bullshark<'a> {
         let mut memo = HashMap::new();
         let mut round = from_round;
         while round <= up_to_round {
-            match self.resolve(round, up_to_round) {
+            // A `Committed` verdict is permanent (see `ConsensusState::
+            // committed_cache`): once cached, skip the O(n) re-resolution and
+            // reuse it - byte-identical, since the digest can never change. Only
+            // `Committed` is cached; `Skipped`/`Undecided` are always recomputed
+            // so a late resync can still revise them (why `from_round` stays put).
+            let outcome = match committed_cache.get(&round) {
+                Some(&digest) => RoundOutcome::Committed(digest),
+                None => {
+                    let o = self.resolve(round, up_to_round);
+                    if let RoundOutcome::Committed(d) = o {
+                        committed_cache.insert(round, d);
+                    }
+                    o
+                }
+            };
+            match outcome {
                 RoundOutcome::Committed(digest) => {
                     if !self.walk_causal_history(digest, seen, &mut ordered, &mut memo) {
                         break;

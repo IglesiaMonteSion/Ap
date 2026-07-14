@@ -1523,6 +1523,15 @@ impl Engine {
     /// validator makes, keeping ledger state consistent across the
     /// network.
     async fn try_commit(&self) {
+        // Receipts to persist are collected here and written to disk AFTER the
+        // state lock is released - a `sled` insert is blocking I/O, and doing it
+        // under the single global `EngineState` mutex (which every message
+        // handler and RPC read contends on) needlessly serialized disk latency
+        // into the consensus hot path. The write is best-effort/idempotent
+        // (keyed by tx hash, re-derivable), so persisting a moment later, off
+        // the lock, changes nothing about correctness (see `persist_receipt`).
+        let mut to_persist: Vec<TransferReceipt> = Vec::new();
+        {
         let mut state = self.state.lock().await;
         let state = &mut *state;
         let newly_ordered = state.consensus.advance(&state.dag, &self.validators);
@@ -1570,16 +1579,17 @@ impl Engine {
                             // check above and captures nothing, so this never
                             // double-writes. Cloned out to end the immutable borrow
                             // before the next mutable `apply_transaction`.
-                            let new: Vec<TransferReceipt> =
-                                state.ledger.transfer_receipts()[receipts_before..].to_vec();
-                            for r in &new {
-                                self.persist_receipt(r);
-                            }
+                            to_persist.extend_from_slice(&state.ledger.transfer_receipts()[receipts_before..]);
                         }
                         Err(e) => tracing::warn!("transaction execution failed: {e}"),
                     }
                 }
             }
+        }
+        } // state lock released here
+        // Blocking disk writes, now off the state lock (see the note at the top).
+        for r in &to_persist {
+            self.persist_receipt(r);
         }
     }
 
