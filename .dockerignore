@@ -1,3 +1,21 @@
+# Mantener el build context de Docker chico = builds/updates más rápidos.
+# Docker envía el context entero al daemon antes de construir; sin esto, los
+# ~15GB de target/ y los ~400MB de crates/qchain-wasm/target viajan en cada
+# `docker build`, aunque las cache mounts los ignoren después.
 target
+**/target
 **/*.rs.bk
 .git
+.gitignore
+
+# artefactos de build del wasm y datos de nodos de prueba locales
+crates/qchain-wasm/pkg
+data
+**/data
+wallets
+*.log
+
+# docs y compose no los necesita el build de la imagen
+docs
+deploy/compose
+*.md

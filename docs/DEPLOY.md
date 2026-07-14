@@ -287,6 +287,11 @@ cambios. Para cortar una versión nueva (cuando hagas mejoras): subí `version`
 en el `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador
 corre `update-node.sh`.
 
+**Actualización rápida de solo la wallet** (cambios de interfaz — lo más
+frecuente): `sudo ./deploy/update-wallet.sh` reconstruye la imagen (rápido
+con la cache) y reinicia **solo** `qchain-wallet`, sin reiniciar el
+validador. Usá `update-node.sh` cuando cambie el nodo/consenso.
+
 **Cómo elegir el número de versión:**
 - **Cambio chico** (fix puntual, ajuste de UI, tooling, mejora menor): subí el
   último dígito. Ej: `1.9.0 → 1.9.1 → 1.9.2`.

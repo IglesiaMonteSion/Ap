@@ -504,6 +504,21 @@ mod tests {
     use super::*;
     use crate::ids::{STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 
+    #[test]
+    fn stake_instruction_encoding_is_stable() {
+        // The WASM wallet (crates/qchain-wasm) hand-rolls these encodings to
+        // avoid depending on this crate (which pulls wasmtime, no wasm target).
+        // If the enum ever changes, this guard fails so the wallet is updated.
+        let validator = Pubkey::new([7u8; 32]);
+        let amount = 0x0102_0304_0506_0708u64;
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(&validator.to_bytes());
+        expected.extend_from_slice(&amount.to_le_bytes());
+        assert_eq!(borsh::to_vec(&StakingInstruction::Delegate { validator, amount }).unwrap(), expected, "wasm Delegate encoding out of sync");
+        assert_eq!(borsh::to_vec(&StakingInstruction::Undelegate).unwrap(), vec![1u8], "wasm Undelegate encoding out of sync");
+        assert_eq!(borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(), vec![2u8], "wasm ClaimReward encoding out of sync");
+    }
+
     fn wallet_with(balance: u64) -> Account {
         Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) }
     }
