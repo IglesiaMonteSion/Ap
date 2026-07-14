@@ -364,6 +364,7 @@
       <p class="view-sub center">Ingresá tu contraseña para desbloquear la wallet en este dispositivo.</p>
     </div>
     <div class="cta" style="width:100%">
+      <button class="btn-block btn-sec" id="u-bio" style="display:none;margin-bottom:12px">🔑 Desbloquear con Face ID / huella</button>
       <input id="u-pass" type="password" placeholder="tu contraseña" autocomplete="current-password">
       <button class="btn-block" id="u-btn" style="margin-top:12px">Desbloquear</button>
       <div class="msg" id="u-msg"></div>
@@ -486,6 +487,15 @@
       <div class="hint" style="margin-top:8px">Partí tu respaldo en varios fragmentos y repartilos. Sin un punto único de falla.</div>
     </div>
 
+    <div class="section-title" id="bio-section-title" style="display:none">Desbloqueo rápido</div>
+    <div class="card" id="bio-card" style="display:none">
+      <div style="font-weight:700">Face ID / huella</div>
+      <p class="hint" style="margin:2px 0 12px">Desbloqueá con el biométrico de tu teléfono. La clave se guarda en el <b>hardware seguro</b> del dispositivo (no en el navegador); tu contraseña sigue funcionando siempre como respaldo.</p>
+      <button class="btn-block btn-sec" id="bio-enable">Activar Face ID / huella</button>
+      <button class="btn-block btn-outline" id="bio-disable" style="display:none">Desactivar en este dispositivo</button>
+      <div class="msg" id="bio-msg"></div>
+    </div>
+
     <div class="section-title">Red</div>
     <div class="card">
       <div class="row-item"><span class="hint" style="margin:0">Nodo (RPC)</span><span class="mono" id="set-rpc" style="font-size:12px">—</span></div>
@@ -532,6 +542,7 @@ import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, si
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
+const BIO_KEY = "qchain_bio_v1";   // semilla cifrada con una clave del enclave seguro (WebAuthn PRF)
 const TX_BYTES = 5571n; // tamaño real de una transferencia híbrida firmada (documentado)
 let SEED = null;        // Uint8Array(32), solo en memoria mientras está desbloqueada
 let PW = null;          // contraseña en memoria (solo para cifrar el respaldo sin re-preguntar); nunca se persiste ni se muestra
@@ -544,6 +555,69 @@ function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s
 function copy(t){ navigator.clipboard.writeText(t).then(()=>toast("copiado")); }
 function b64(b){ return btoa(String.fromCharCode(...b)); }
 function ub64(s){ return Uint8Array.from(atob(s), c=>c.charCodeAt(0)); }
+
+// ---- Desbloqueo biométrico (Face ID / Touch ID / huella) vía WebAuthn PRF ----
+// La semilla se cifra con una clave que SOLO sale del enclave seguro del
+// teléfono (Secure Enclave / StrongBox) tras un biométrico exitoso — nunca
+// vive en el navegador. La contraseña sigue como respaldo (nunca se elimina).
+// Requiere un autenticador de plataforma con la extensión PRF (iOS/Safari
+// recientes, Android/Chrome). Si no está soportado, la opción no se ofrece.
+function bioEnabled(){ return !!localStorage.getItem(BIO_KEY); }
+async function bioAvailable(){
+  try{
+    if(!(window.PublicKeyCredential && window.isSecureContext)) return false;
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  }catch(e){ return false; }
+}
+// Obtiene la clave AES derivada del PRF del enclave (pide biométrico). Devuelve
+// null si el navegador/teléfono no soporta PRF (no se puede cifrar con esto).
+async function bioKeyFromAssertion(credId, salt){
+  const assertion = await navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),   // local-only, no se verifica en servidor: solo nos importa el PRF
+    allowCredentials: credId ? [{ type:"public-key", id: credId }] : [],
+    userVerification: "required",
+    timeout: 60000,
+    extensions: { prf: { eval: { first: salt } } },
+  }});
+  const ext = assertion.getClientExtensionResults();
+  const prf = ext && ext.prf && ext.prf.results && ext.prf.results.first;
+  if(!prf) return null;   // el autenticador no soporta PRF
+  return crypto.subtle.importKey('raw', new Uint8Array(prf), {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
+// Activa el biométrico: crea una credencial de plataforma, obtiene su PRF y
+// cifra la semilla con esa clave. Requiere la wallet desbloqueada (SEED).
+async function enrollBiometric(){
+  if(!SEED) throw new Error("desbloqueá la wallet primero");
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    // rp.id se OMITE a propósito: el navegador usa el dominio del origen actual
+    // (correcto en un dominio real o localhost). Una IP cruda no es un rp.id
+    // válido por spec, así que ahí el biométrico no se ofrece — un despliegue
+    // real usa un dominio (tu túnel de Cloudflare o dominio propio).
+    rp: { name: "QCHAIN Wallet" },
+    user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "qchain-wallet", displayName: "QCHAIN Wallet" },
+    pubKeyCredParams: [{type:"public-key", alg:-7},{type:"public-key", alg:-257}],
+    authenticatorSelection: { authenticatorAttachment:"platform", userVerification:"required", residentKey:"required" },
+    timeout: 60000,
+    extensions: { prf: {} },
+  }});
+  const credId = new Uint8Array(cred.rawId);
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const key = await bioKeyFromAssertion(credId, salt);
+  if(!key) throw new Error("tu teléfono/navegador no soporta el cifrado por biométrico (WebAuthn PRF) todavía. Seguí usando la contraseña.");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, SEED));
+  localStorage.setItem(BIO_KEY, JSON.stringify({ v:1, credId:b64(credId), salt:b64(salt), iv:b64(iv), ct:b64(ct) }));
+}
+// Desbloquea con el biométrico: pide el PRF y descifra la semilla.
+async function unlockWithBiometric(){
+  const store = JSON.parse(localStorage.getItem(BIO_KEY));
+  const key = await bioKeyFromAssertion(ub64(store.credId), ub64(store.salt));
+  if(!key) throw new Error("no se pudo obtener la clave del biométrico");
+  const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv:ub64(store.iv)}, key, ub64(store.ct));
+  return new Uint8Array(pt);
+}
+function disableBiometric(){ localStorage.removeItem(BIO_KEY); }
 function hex(b){ return [...b].map(x=>x.toString(16).padStart(2,'0')).join(''); }
 function fromHex(s){ const a=new Uint8Array(s.length/2); for(let i=0;i<a.length;i++)a[i]=parseInt(s.substr(i*2,2),16); return a; }
 
@@ -669,6 +743,7 @@ function showView(name){
   if(name==="send") renderSend();
   if(name==="staking") renderStaking();
   if(name==="settings") renderSettings();
+  if(name==="unlock") refreshBioUnlockBtn();
 }
 document.querySelectorAll(".nav").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
 
@@ -764,6 +839,7 @@ function renderSend(){
 
 async function renderSettings(){
   applyTheme(localStorage.getItem("qchain_theme")||"dark");
+  refreshBioSettings();
   try{ const cfg=await api("/api/config"); $("set-rpc").textContent=cfg.rpc.replace(/^https?:\/\//,""); }catch(e){}
   try{ const st=await api("/api/node"); const on=st.online!==false;
     $("set-ver").textContent=on?("v"+st.version):"—"; $("set-appver").textContent=on?("v"+st.version):"—";
@@ -805,7 +881,7 @@ $("c-btn").onclick=async()=>{
     const seed=crypto.getRandomValues(new Uint8Array(32));       // entropía real del navegador
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed; PW=p;
+    SEED=seed; PW=p; disableBiometric();
     showView("backup");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo crear: "+e.message; }
   $("c-btn").disabled=false;
@@ -874,7 +950,7 @@ $("i-btn").onclick=async()=>{
     if(p.length<8) throw new Error("la contraseña debe tener al menos 8 caracteres");
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed; PW=p;
+    SEED=seed; PW=p; disableBiometric();
     toast("wallet restaurada"); showView("home");
   }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
   $("i-btn").disabled=false;
@@ -932,9 +1008,24 @@ $("u-btn").onclick=async()=>{
   }catch(e){ msg.className="msg err"; msg.textContent="contraseña incorrecta"; }
   $("u-btn").disabled=false;
 };
+// Muestra el botón de biométrico en la pantalla de bloqueo solo si está activado.
+async function refreshBioUnlockBtn(){
+  const btn=$("u-bio"); if(!btn) return;
+  btn.style.display = bioEnabled() ? "block" : "none";
+}
+$("u-bio").onclick=async()=>{
+  const msg=$("u-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="esperando Face ID / huella…";
+  $("u-bio").disabled=true;
+  try{
+    SEED=await unlockWithBiometric();
+    msg.textContent=""; $("u-pass").value="";
+    showView("home");
+  }catch(e){ msg.className="msg err"; msg.textContent="no se pudo con biométrico — usá tu contraseña"; }
+  $("u-bio").disabled=false;
+};
 $("u-reset").onclick=()=>{
-  if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu semilla. ¿Seguir?")){
-    localStorage.removeItem(LS_KEY); location.reload();
+  if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu respaldo. ¿Seguir?")){
+    localStorage.removeItem(LS_KEY); localStorage.removeItem(BIO_KEY); location.reload();
   }
 };
 
@@ -1183,9 +1274,38 @@ async function stakeAction(kind, pos){
 $("set-download").onclick=()=>downloadEncryptedBackup();
 $("set-lock").onclick=()=>{ SEED=null; PW=null; $("u-pass").value=""; showView("unlock"); };
 $("set-remove").onclick=()=>{
-  if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu semilla. ¿Seguir?")){
-    localStorage.removeItem(LS_KEY); location.reload();
+  if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu respaldo. ¿Seguir?")){
+    localStorage.removeItem(LS_KEY); localStorage.removeItem(BIO_KEY); location.reload();
   }
+};
+
+// ---- desbloqueo biométrico (Settings) ----
+// Muestra la tarjeta solo si el dispositivo tiene autenticador de plataforma
+// (Face ID / Touch ID / huella). Alterna Activar/Desactivar según el estado.
+async function refreshBioSettings(){
+  const avail = await bioAvailable();
+  $("bio-section-title").style.display = avail ? "block" : "none";
+  $("bio-card").style.display = avail ? "block" : "none";
+  if(!avail) return;
+  const on = bioEnabled();
+  $("bio-enable").style.display = on ? "none" : "block";
+  $("bio-disable").style.display = on ? "block" : "none";
+  $("bio-msg").className="msg"; $("bio-msg").textContent="";
+}
+$("bio-enable").onclick=async()=>{
+  const msg=$("bio-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="registrando tu biométrico…";
+  $("bio-enable").disabled=true;
+  try{
+    await enrollBiometric();
+    msg.className="msg ok"; msg.textContent="✓ Face ID / huella activado en este dispositivo";
+    await refreshBioSettings();
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message||"no se pudo activar"; }
+  $("bio-enable").disabled=false;
+};
+$("bio-disable").onclick=async()=>{
+  disableBiometric();
+  await refreshBioSettings();
+  $("bio-msg").className="msg ok"; $("bio-msg").style.display="block"; $("bio-msg").textContent="biométrico desactivado — seguís con tu contraseña";
 };
 
 // ==================== campo cuántico (canvas) ====================
@@ -1253,6 +1373,7 @@ function runBoot(){
 
   await loadNode();
   await bootDone;                             // no revelar hasta que la animación termine
+  refreshBioUnlockBtn();                      // botón de biométrico en la pantalla de bloqueo si está activado
   showView(localStorage.getItem(LS_KEY) ? "unlock" : "welcome");
 
   // refrescos en vivo (sin parpadeo: la actividad solo se redibuja si cambió)
