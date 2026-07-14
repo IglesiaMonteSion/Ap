@@ -365,7 +365,7 @@ qchain propose-set-dust-threshold --value &lt;unidades&gt; ...</pre>
 
     <section class="panel" id="detail-panel" hidden>
       <div class="panel-header">
-        <h2>detalle de transferencia</h2>
+        <h2 id="detail-title">detalle de transferencia</h2>
         <button id="close-detail" class="btn-ghost">cerrar ✕</button>
       </div>
       <div id="detail-body"></div>
@@ -647,7 +647,9 @@ async function loadActivity(force = false) {
     const meta = STAKE_TYPE[s.kind] || { label: s.kind, cls: "" };
     // "hacia / detalle" = the counterparty most useful per action.
     const to = s.kind === "delegate" ? s.validator : s.staker;
-    items.push({ round: s.round || 0, hash: s.tx_hash, click: false,
+    // `raw` carries the full staking event so the row opens a detail panel too
+    // (same as a transfer) - every field is already in the list response.
+    items.push({ round: s.round || 0, hash: s.tx_hash, click: true, raw: s,
       type: meta.label, from: s.staker, to, amount: s.amount, cls: meta.cls });
   }
   items.sort((a, b) => b.round - a.round);
@@ -661,7 +663,12 @@ async function loadActivity(force = false) {
   for (const i of shown) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${i.type}</td><td class="mono">${short(i.from)}</td><td class="mono">${short(i.to)}</td><td class="amount ${i.cls}">${qch(i.amount)}</td><td>${fmtNum(i.round)}</td>`;
-    if (i.click) { tr.style.cursor = "pointer"; tr.addEventListener("click", () => showTransfer(i.hash)); }
+    if (i.click) {
+      tr.style.cursor = "pointer";
+      // Staking rows carry `raw` and open the staking detail; transfers open the
+      // transfer detail (before/after balances + Merkle proofs).
+      tr.addEventListener("click", () => (i.raw ? showStaking(i.raw) : showTransfer(i.hash)));
+    }
     body.appendChild(tr);
   }
 }
@@ -678,9 +685,38 @@ function accountCard(title, address, before, after) {
   </div>`;
 }
 
+// Staking detail: rendered straight from the list item (every field is already
+// in the /staking_activity response - no extra endpoint), same panel and look
+// as a transfer's detail. staker/validator/stake_account are base58, kind is a
+// fixed enum, amount/round numeric, tx_hash hex - all injection-safe charsets,
+// same as showTransfer.
+function showStaking(s) {
+  const panel = document.getElementById("detail-panel");
+  const out = document.getElementById("detail-body");
+  document.getElementById("detail-title").textContent = "detalle de staking";
+  panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const kindLabel = (STAKE_TYPE[s.kind] || { label: s.kind }).label;
+  out.innerHTML = `
+    <div class="kv">
+      <dt>tipo</dt><dd>${kindLabel}</dd>
+      <dt>hash</dt><dd class="mono">${s.tx_hash}</dd>
+      <dt>monto</dt><dd>${qch(s.amount)}</dd>
+      <dt>staker (dueño)</dt><dd class="mono">${short(s.staker, 10, 8)}</dd>
+      <dt>validador</dt><dd class="mono">${short(s.validator, 10, 8)}</dd>
+      <dt>cuenta de stake</dt><dd class="mono">${short(s.stake_account, 10, 8)}</dd>
+      <dt>ronda</dt><dd>${fmtNum(s.round)}</dd>
+    </div>
+    <details>
+      <summary>ver JSON crudo</summary>
+      <pre>${JSON.stringify(s, null, 2)}</pre>
+    </details>`;
+}
+
 async function showTransfer(hash) {
   const panel = document.getElementById("detail-panel");
   const out = document.getElementById("detail-body");
+  document.getElementById("detail-title").textContent = "detalle de transferencia";
   panel.hidden = false;
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   out.innerHTML = "cargando…";
