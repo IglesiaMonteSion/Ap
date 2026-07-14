@@ -43,6 +43,26 @@ pub const FEE_ADJUST_DENOMINATOR: u64 = 8;
 /// The fee surges above this under load and decays back to it when load clears.
 pub const FEE_MIN_BASE_FEE_PER_BYTE: u64 = BASE_FEE_PER_BYTE_UNITS;
 
+/// EIP-1559 elasticity: the per-round inclusion LIMIT is this multiple of the
+/// target (`FEE_TARGET_BYTES_PER_ROUND`). Below the limit everything ready is
+/// included and the base fee just drifts toward target; once demand exceeds the
+/// limit the highest-`priority_fee` transactions win inclusion and the rest wait
+/// a round - which is what makes the priority fee actually buy queue-jumping
+/// under congestion (before this, with no cap, every ready tx was included every
+/// round, so the tip only affected order, never inclusion). 2 = Ethereum's
+/// gas-limit/gas-target ratio.
+pub const FEE_ELASTICITY_MULTIPLIER: u64 = 2;
+/// Hard cap on the bytes a validator packs into ONE round's own proposal
+/// (target x elasticity ~= 1 MB ~= 180 standard transfers). This is a LOCAL
+/// block-building policy, NOT a consensus rule: each validator caps its own
+/// proposal independently off its own mempool view, so it can never fork state
+/// (execution applies exactly what the committed batches contain, and the
+/// dynamic base fee reads the real committed bytes either way). Honest limit:
+/// it bounds one validator's proposal, so in a multi-proposer round the total
+/// committed can still scale with the validator count - a finer global per-round
+/// cap is a deeper fee-market design left as a follow-up.
+pub const FEE_MAX_BYTES_PER_ROUND: u64 = FEE_TARGET_BYTES_PER_ROUND * FEE_ELASTICITY_MULTIPLIER;
+
 /// On-chain accumulator for the dynamic base fee, stored in its own
 /// `FEE_STATE_ACCOUNT_ID` account (see `ids.rs` for why it is separate from
 /// `EconomicParams`). `epoch_round` is the round currently accumulating; when a

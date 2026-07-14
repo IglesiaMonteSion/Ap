@@ -834,7 +834,51 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
     // Highest tip first. Stable so equal-tip payers keep their prior relative
     // order (deterministic given the same mempool contents).
     groups.sort_by(|a, b| b.0.cmp(&a.0));
-    groups.into_iter().flat_map(|(_, run)| run).collect()
+
+    // Per-round inclusion cap (EIP-1559 block limit, see FEE_MAX_BYTES_PER_ROUND):
+    // take the highest-tip prefix that fits, defer the rest back to the mempool.
+    let (selected, deferred) = select_within_cap(groups, qchain_execution::params::FEE_MAX_BYTES_PER_ROUND);
+    // Re-queue the deferred txs (same admission path, so the per-payer cap and
+    // dedup still apply). They were removed from their queues above; putting them
+    // back keeps them for the next round instead of dropping them.
+    for tx in deferred {
+        admit_to_mempool(state, tx);
+    }
+    selected
+}
+
+/// Given tip-ordered payer groups (each a contiguous nonce run) and a byte cap,
+/// split them into (selected, deferred): the highest-tip prefix of transactions
+/// whose cumulative byte size fits under `cap`, and the rest. A payer's nonce
+/// run is never split-with-a-gap - once one of its txs is deferred, every later
+/// tx of that same payer is deferred too (including a higher nonce while
+/// deferring a lower one would just fail at execution). At least one transaction
+/// is always selected, so a single tx larger than the whole cap can't wedge the
+/// round forever. Pure function of its inputs, so it is unit-tested directly.
+/// This is what makes the priority fee buy real queue-jumping under congestion:
+/// when demand exceeds `cap`, the higher-tip payers (sorted first) fill the
+/// round and the lower-tip ones wait.
+fn select_within_cap(
+    groups: Vec<(u64, Vec<Transaction>)>,
+    cap: u64,
+) -> (Vec<Transaction>, Vec<Transaction>) {
+    let mut selected: Vec<Transaction> = Vec::new();
+    let mut deferred: Vec<Transaction> = Vec::new();
+    let mut used_bytes: u64 = 0;
+    for (_, run) in groups {
+        let mut deferring = false;
+        for tx in run {
+            let sz = tx.byte_size() as u64;
+            if !deferring && (selected.is_empty() || used_bytes.saturating_add(sz) <= cap) {
+                used_bytes = used_bytes.saturating_add(sz);
+                selected.push(tx);
+            } else {
+                deferring = true;
+                deferred.push(tx);
+            }
+        }
+    }
+    (selected, deferred)
 }
 
 impl Engine {
@@ -2107,6 +2151,49 @@ mod tests {
 
     fn tx(payer: &Keypair, nonce: u64) -> Transaction {
         Transaction::new_signed(payer, nonce, [0u8; 32], 1, vec![]).unwrap()
+    }
+
+    /// The per-round inclusion cap (see `FEE_MAX_BYTES_PER_ROUND`): under
+    /// congestion the highest-tip transactions fill the round and the rest wait,
+    /// which is what makes the priority fee buy real queue-jumping. Also checks
+    /// the two safety properties: a nonce run is never split with a gap, and at
+    /// least one tx is always selected even if it alone exceeds the cap.
+    #[test]
+    fn inclusion_cap_takes_highest_tip_prefix_defers_rest_and_never_splits_a_nonce_run() {
+        let a = Keypair::generate().unwrap();
+        let b = Keypair::generate().unwrap();
+        let c = Keypair::generate().unwrap();
+        let ta = tx(&a, 0);
+        let sz = ta.byte_size() as u64;
+
+        // Groups already in tip-desc order (as `drain_ready_transactions` sorts
+        // them): a > b > c. A cap of two tx-widths must take a and b, defer c.
+        let groups = vec![
+            (100u64, vec![ta.clone()]),
+            (50u64, vec![tx(&b, 0)]),
+            (10u64, vec![tx(&c, 0)]),
+        ];
+        let (sel, def) = select_within_cap(groups, sz * 2);
+        assert_eq!(sel.len(), 2, "cap of two tx-widths selects the two highest-tip txs");
+        assert_eq!(def.len(), 1, "the lowest-tip tx is deferred to a later round");
+        assert_eq!(def[0].message.payer, c.pubkey(), "the deferred tx is the lowest-tip payer's");
+
+        // At least one tx is always selected, even one bigger than the whole cap.
+        let (sel1, def1) = select_within_cap(vec![(0u64, vec![ta.clone()])], 1);
+        assert_eq!(sel1.len(), 1, "a single oversized tx is still included (no wedge)");
+        assert!(def1.is_empty());
+
+        // A payer's nonce run is never split with a gap: only the fitting prefix
+        // is taken, the rest of THAT run (higher nonces) is deferred as a block.
+        let run = vec![tx(&a, 0), tx(&a, 1), tx(&a, 2)];
+        let (sel2, def2) = select_within_cap(vec![(0u64, run)], sz + 1);
+        assert_eq!(sel2.len(), 1, "only the first nonce of the run fits under the cap");
+        assert_eq!(sel2[0].message.nonce, 0);
+        assert_eq!(
+            def2.iter().map(|t| t.message.nonce).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the higher nonces are deferred together, never a nonce-1-without-nonce-0 gap"
+        );
     }
 
     /// The permanent-fork fix (see `EngineState::pending_execution`): a
