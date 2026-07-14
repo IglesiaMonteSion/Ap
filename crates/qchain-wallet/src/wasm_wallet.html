@@ -230,9 +230,9 @@
       <input id="i-file" type="file" accept=".json,.txt,application/json">
     </div>
     <div id="imp-shamir-box" style="display:none">
-      <p class="view-sub">Pegá tus fragmentos Shamir, uno por línea. Con juntar los suficientes alcanza.</p>
-      <label for="i-shares">Fragmentos (uno por línea)</label>
-      <textarea id="i-shares" placeholder="QS1-...&#10;QS1-...&#10;QS1-..." style="min-height:120px"></textarea>
+      <p class="view-sub">Pegá tus fragmentos (las palabras), separando cada uno con una línea en blanco. Con juntar los suficientes alcanza.</p>
+      <label for="i-shares">Fragmentos (palabras)</label>
+      <textarea id="i-shares" placeholder="academic acid acne … (32 palabras)&#10;&#10;academic agency ahead … (otro fragmento)" style="min-height:130px"></textarea>
     </div>
     <label for="i-pass">Contraseña nueva (mín. 8)</label>
     <input id="i-pass" type="password" placeholder="para cifrarla en este navegador" autocomplete="new-password">
@@ -448,6 +448,32 @@ function gmul(a,b){ return (a===0||b===0)?0:GF_EXP[GF_LOG[a]+GF_LOG[b]]; }
 function gdiv(a,b){ return a===0?0:GF_EXP[GF_LOG[a]-GF_LOG[b]+255]; }
 function gpoly(coeffs,x){ let r=0; for(let i=coeffs.length-1;i>=0;i--) r=gmul(r,x)^coeffs[i]; return r; }
 
+// Lista de palabras oficial de SLIP-39 (1024 = 2^10, 10 bits por palabra).
+const SLIP39=["academic","acid","acne","acquire","acrobat","activity","actress","adapt","adequate","adjust","admit","adorn","adult","advance","advocate","afraid","again","agency","agree","aide","aircraft","airline","airport","ajar","alarm","album","alcohol","alien","alive","alpha","already","alto","aluminum","always","amazing","ambition","amount","amuse","analysis","anatomy","ancestor","ancient","angel","angry","animal","answer","antenna","anxiety","apart","aquatic","arcade","arena","argue","armed","artist","artwork","aspect","auction","august","aunt","average","aviation","avoid","award","away","axis","axle","beam","beard","beaver","become","bedroom","behavior","being","believe","belong","benefit","best","beyond","bike","biology","birthday","bishop","black","blanket","blessing","blimp","blind","blue","body","bolt","boring","born","both","boundary","bracelet","branch","brave","breathe","briefing","broken","brother","browser","bucket","budget","building","bulb","bulge","bumpy","bundle","burden","burning","busy","buyer","cage","calcium","camera","campus","canyon","capacity","capital","capture","carbon","cards","careful","cargo","carpet","carve","category","cause","ceiling","center","ceramic","champion","change","charity","check","chemical","chest","chew","chubby","cinema","civil","class","clay","cleanup","client","climate","clinic","clock","clogs","closet","clothes","club","cluster","coal","coastal","coding","column","company","corner","costume","counter","course","cover","cowboy","cradle","craft","crazy","credit","cricket","criminal","crisis","critical","crowd","crucial","crunch","crush","crystal","cubic","cultural","curious","curly","custody","cylinder","daisy","damage","dance","darkness","database","daughter","deadline","deal","debris","debut","decent","decision","declare","decorate","decrease","deliver","demand","density","deny","depart","depend","depict","deploy","describe","desert","desire","desktop","destroy","detailed","detect","device","devote","diagnose","dictate","diet","dilemma","diminish","dining","diploma","disaster","discuss","disease","dish","dismiss","display","distance","dive","divorce","document","domain","domestic","dominant","dough","downtown","dragon","dramatic","dream","dress","drift","drink","drove","drug","dryer","duckling","duke","duration","dwarf","dynamic","early","earth","easel","easy","echo","eclipse","ecology","edge","editor","educate","either","elbow","elder","election","elegant","element","elephant","elevator","elite","else","email","emerald","emission","emperor","emphasis","employer","empty","ending","endless","endorse","enemy","energy","enforce","engage","enjoy","enlarge","entrance","envelope","envy","epidemic","episode","equation","equip","eraser","erode","escape","estate","estimate","evaluate","evening","evidence","evil","evoke","exact","example","exceed","exchange","exclude","excuse","execute","exercise","exhaust","exotic","expand","expect","explain","express","extend","extra","eyebrow","facility","fact","failure","faint","fake","false","family","famous","fancy","fangs","fantasy","fatal","fatigue","favorite","fawn","fiber","fiction","filter","finance","findings","finger","firefly","firm","fiscal","fishing","fitness","flame","flash","flavor","flea","flexible","flip","float","floral","fluff","focus","forbid","force","forecast","forget","formal","fortune","forward","founder","fraction","fragment","frequent","freshman","friar","fridge","friendly","frost","froth","frozen","fumes","funding","furl","fused","galaxy","game","garbage","garden","garlic","gasoline","gather","general","genius","genre","genuine","geology","gesture","glad","glance","glasses","glen","glimpse","goat","golden","graduate","grant","grasp","gravity","gray","greatest","grief","grill","grin","grocery","gross","group","grownup","grumpy","guard","guest","guilt","guitar","gums","hairy","hamster","hand","hanger","harvest","have","havoc","hawk","hazard","headset","health","hearing","heat","helpful","herald","herd","hesitate","hobo","holiday","holy","home","hormone","hospital","hour","huge","human","humidity","hunting","husband","hush","husky","hybrid","idea","identify","idle","image","impact","imply","improve","impulse","include","income","increase","index","indicate","industry","infant","inform","inherit","injury","inmate","insect","inside","install","intend","intimate","invasion","involve","iris","island","isolate","item","ivory","jacket","jerky","jewelry","join","judicial","juice","jump","junction","junior","junk","jury","justice","kernel","keyboard","kidney","kind","kitchen","knife","knit","laden","ladle","ladybug","lair","lamp","language","large","laser","laundry","lawsuit","leader","leaf","learn","leaves","lecture","legal","legend","legs","lend","length","level","liberty","library","license","lift","likely","lilac","lily","lips","liquid","listen","literary","living","lizard","loan","lobe","location","losing","loud","loyalty","luck","lunar","lunch","lungs","luxury","lying","lyrics","machine","magazine","maiden","mailman","main","makeup","making","mama","manager","mandate","mansion","manual","marathon","march","market","marvel","mason","material","math","maximum","mayor","meaning","medal","medical","member","memory","mental","merchant","merit","method","metric","midst","mild","military","mineral","minister","miracle","mixed","mixture","mobile","modern","modify","moisture","moment","morning","mortgage","mother","mountain","mouse","move","much","mule","multiple","muscle","museum","music","mustang","nail","national","necklace","negative","nervous","network","news","nuclear","numb","numerous","nylon","oasis","obesity","object","observe","obtain","ocean","often","olympic","omit","oral","orange","orbit","order","ordinary","organize","ounce","oven","overall","owner","paces","pacific","package","paid","painting","pajamas","pancake","pants","papa","paper","parcel","parking","party","patent","patrol","payment","payroll","peaceful","peanut","peasant","pecan","penalty","pencil","percent","perfect","permit","petition","phantom","pharmacy","photo","phrase","physics","pickup","picture","piece","pile","pink","pipeline","pistol","pitch","plains","plan","plastic","platform","playoff","pleasure","plot","plunge","practice","prayer","preach","predator","pregnant","premium","prepare","presence","prevent","priest","primary","priority","prisoner","privacy","prize","problem","process","profile","program","promise","prospect","provide","prune","public","pulse","pumps","punish","puny","pupal","purchase","purple","python","quantity","quarter","quick","quiet","race","racism","radar","railroad","rainbow","raisin","random","ranked","rapids","raspy","reaction","realize","rebound","rebuild","recall","receiver","recover","regret","regular","reject","relate","remember","remind","remove","render","repair","repeat","replace","require","rescue","research","resident","response","result","retailer","retreat","reunion","revenue","review","reward","rhyme","rhythm","rich","rival","river","robin","rocky","romantic","romp","roster","round","royal","ruin","ruler","rumor","sack","safari","salary","salon","salt","satisfy","satoshi","saver","says","scandal","scared","scatter","scene","scholar","science","scout","scramble","screw","script","scroll","seafood","season","secret","security","segment","senior","shadow","shaft","shame","shaped","sharp","shelter","sheriff","short","should","shrimp","sidewalk","silent","silver","similar","simple","single","sister","skin","skunk","slap","slavery","sled","slice","slim","slow","slush","smart","smear","smell","smirk","smith","smoking","smug","snake","snapshot","sniff","society","software","soldier","solution","soul","source","space","spark","speak","species","spelling","spend","spew","spider","spill","spine","spirit","spit","spray","sprinkle","square","squeeze","stadium","staff","standard","starting","station","stay","steady","step","stick","stilt","story","strategy","strike","style","subject","submit","sugar","suitable","sunlight","superior","surface","surprise","survive","sweater","swimming","swing","switch","symbolic","sympathy","syndrome","system","tackle","tactics","tadpole","talent","task","taste","taught","taxi","teacher","teammate","teaspoon","temple","tenant","tendency","tension","terminal","testify","texture","thank","that","theater","theory","therapy","thorn","threaten","thumb","thunder","ticket","tidy","timber","timely","ting","tofu","together","tolerate","total","toxic","tracks","traffic","training","transfer","trash","traveler","treat","trend","trial","tricycle","trip","triumph","trouble","true","trust","twice","twin","type","typical","ugly","ultimate","umbrella","uncover","undergo","unfair","unfold","unhappy","union","universe","unkind","unknown","unusual","unwrap","upgrade","upstairs","username","usher","usual","valid","valuable","vampire","vanish","various","vegan","velvet","venture","verdict","verify","very","veteran","vexed","victim","video","view","vintage","violence","viral","visitor","visual","vitamins","vocal","voice","volume","voter","voting","walnut","warmth","warn","watch","wavy","wealthy","weapon","webcam","welcome","welfare","western","width","wildlife","window","wine","wireless","wisdom","withdraw","wits","wolf","woman","work","worthy","wrap","wrist","writing","wrote","year","yelp","yield","yoga","zero"];
+const WIDX=new Map(SLIP39.map((w,i)=>[w,i]));
+
+// Un fragmento son 37 bytes [K,N,x,chk0,chk1,y0..y31]. Para mostrarlo como
+// PALABRAS estilo SLIP-39 se le agregan 3 bytes de checksum (SHA-256 del
+// fragmento) -> 40 bytes = 320 bits = 32 palabras de 10 bits. El checksum
+// detecta un error de tipeo antes de intentar reconstruir.
+async function shareToWords(payload){
+  const chk=new Uint8Array(await crypto.subtle.digest('SHA-256', payload));
+  const full=new Uint8Array(40); full.set(payload,0); full.set(chk.slice(0,3),37);
+  let acc=0,bits=0,out=[];
+  for(const b of full){ acc=(acc<<8)|b; bits+=8; while(bits>=10){ bits-=10; out.push(SLIP39[(acc>>bits)&0x3ff]); } }
+  return out.join(' ');
+}
+async function wordsToShare(mnemonic){
+  const idx=mnemonic.trim().split(/\s+/).map(w=>{ const i=WIDX.get(w.toLowerCase()); if(i===undefined) throw new Error('palabra desconocida: "'+w+'"'); return i; });
+  if(idx.length!==32) throw new Error('cada fragmento son 32 palabras (este tiene '+idx.length+')');
+  let acc=0,bits=0,out=[];
+  for(const i of idx){ acc=(acc<<10)|i; bits+=10; while(bits>=8){ bits-=8; out.push((acc>>bits)&0xff); } }
+  const full=Uint8Array.from(out), payload=full.slice(0,37), chk=full.slice(37,40);
+  const d=new Uint8Array(await crypto.subtle.digest('SHA-256', payload));
+  if(d[0]!==chk[0]||d[1]!==chk[1]||d[2]!==chk[2]) throw new Error('un fragmento tiene un error de tipeo (checksum)');
+  return payload;
+}
+
 async function shamirSplit(seed, k, n){
   const digest=new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
   const shares=[]; for(let x=1;x<=n;x++) shares.push({x, ys:new Uint8Array(32)});
@@ -456,23 +482,22 @@ async function shamirSplit(seed, k, n){
     if(k>1) crypto.getRandomValues(coeffs.subarray(1));   // K-1 coeficientes al azar
     for(const sh of shares) sh.ys[pos]=gpoly(coeffs, sh.x);
   }
-  return shares.map(sh=>{
+  const out=[];
+  for(const sh of shares){
     const buf=new Uint8Array(37);
     buf[0]=k; buf[1]=n; buf[2]=sh.x; buf[3]=digest[0]; buf[4]=digest[1]; buf.set(sh.ys,5);
-    return "QS1-"+hex(buf);
-  });
+    out.push(await shareToWords(buf));   // cada fragmento = 32 palabras
+  }
+  return out;
 }
-async function shamirCombine(shareStrs){
-  const parsed=shareStrs.map(s=>{
-    s=s.trim().replace(/^QS1-/i,'').toLowerCase();
-    if(!/^[0-9a-f]{74}$/.test(s)) throw new Error('un fragmento tiene formato inválido');
-    const b=fromHex(s); return {k:b[0], n:b[1], x:b[2], chk:[b[3],b[4]], ys:b.slice(5)};
-  });
-  if(!parsed.length) throw new Error('pegá tus fragmentos');
+async function shamirCombine(mnemonics){
+  if(!mnemonics.length) throw new Error('pegá tus fragmentos');
+  const parsed=[];
+  for(const m of mnemonics){ const b=await wordsToShare(m); parsed.push({k:b[0], n:b[1], x:b[2], chk:[b[3],b[4]], ys:b.slice(5)}); }
   const k=parsed[0].k;
   const seen=new Set(), use=[];
   for(const p of parsed){ if(!seen.has(p.x)){ seen.add(p.x); use.push(p); } }
-  if(use.length<k) throw new Error(`necesitás al menos ${k} fragmentos distintos (tenés ${use.length})`);
+  if(use.length<k) throw new Error(`necesit\u00e1s al menos ${k} fragmentos distintos (ten\u00e9s ${use.length})`);
   const sel=use.slice(0,k);
   const seed=new Uint8Array(32);
   for(let pos=0;pos<32;pos++){
@@ -648,9 +673,15 @@ $("i-btn").onclick=async()=>{
   try{
     let seed;
     if(importMode==="shamir"){
-      const lines=$("i-shares").value.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean);
-      if(!lines.length) throw new Error("pegá tus fragmentos, uno por línea");
-      seed=await shamirCombine(lines);
+      const text=$("i-shares").value.trim();
+      if(!text) throw new Error("pegá tus fragmentos");
+      let blocks=text.split(/\n\s*\n/).map(s=>s.trim()).filter(Boolean);
+      let mnemonics;
+      if(blocks.length>1){ mnemonics=blocks; }             // un fragmento por bloque
+      else { const all=text.split(/\s+/).filter(Boolean);   // o todo seguido, en grupos de 32
+        if(all.length%32!==0) throw new Error("revisá: cada fragmento son 32 palabras");
+        mnemonics=[]; for(let i=0;i<all.length;i+=32) mnemonics.push(all.slice(i,i+32).join(" ")); }
+      seed=await shamirCombine(mnemonics);
     }else{
       seed=await seedFromSeedMode(msg);
     }
