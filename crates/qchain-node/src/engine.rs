@@ -177,6 +177,15 @@ const ROUND_STATE_RETENTION: Round = 512;
 /// snapshot territory, out of scope for reactive per-digest resync.
 const BATCH_RETENTION_ROUNDS: Round = 1_024;
 
+/// A vertex proposal whose `round` is more than this far ahead of our own
+/// `next_round` is rejected before voting. A legitimate proposal is at most a
+/// round or two ahead of the local frontier; a peer genuinely this far behind
+/// catches up via certificate resync / snapshot sync, not by having us vote on
+/// a round we can't validate. Blocks a Byzantine author from getting a vertex
+/// at `round = u64::MAX` certified (which would poison `DagStore::highest_round`
+/// and the ordering re-resolution). Generous - never rejects a healthy peer.
+const MAX_ROUND_LOOKAHEAD: Round = 1_024;
+
 /// How many rounds of certified DAG history to retain behind the consensus
 /// *finalized floor* (`ConsensusState::finalized_floor`) before garbage-
 /// collecting older certificates from both the in-memory `DagStore` and the
@@ -934,11 +943,36 @@ impl Engine {
                     tracing::warn!("dropping vertex proposal from {from} - author_signature does not verify");
                     return;
                 }
+                // Structural bounds before we act on the (attacker-controlled)
+                // vectors: a legitimate vertex references at most one round-(r-1)
+                // certificate per validator (`parents.len() <= n`) and at most
+                // `WORKER_COUNT` worker batches. Without this, a Byzantine author
+                // whose signature verifies could put millions of fabricated
+                // digests in `parents`/`batch_digests` and make every honest node
+                // register + forever-retry a resync request per digest (unbounded
+                // memory + outbound-bandwidth amplification from one message).
+                let n = self.validators.len();
+                if vertex.parents.len() > n {
+                    tracing::warn!("dropping vertex proposal from {from}: {} parents exceeds validator count {n}", vertex.parents.len());
+                    return;
+                }
+                if vertex.batch_digests.len() > WORKER_COUNT as usize {
+                    tracing::warn!("dropping vertex proposal from {from}: {} batch digests exceeds WORKER_COUNT", vertex.batch_digests.len());
+                    return;
+                }
                 self.request_missing_parents(&vertex.parents, vertex.round.saturating_sub(1), from).await;
                 self.request_missing_batches(&vertex.batch_digests, from).await;
                 let key = (vertex.round, vertex.author);
                 {
                     let mut state = self.state.lock().await;
+                    // Reject a proposal whose round is absurdly far ahead of the
+                    // local frontier (see MAX_ROUND_LOOKAHEAD) - stops a Byzantine
+                    // author from getting a `round = u64::MAX` vertex certified and
+                    // poisoning `highest_round`/the ordering re-resolution.
+                    if vertex.round > state.next_round.saturating_add(MAX_ROUND_LOOKAHEAD) {
+                        tracing::warn!("dropping vertex proposal from {from}: round {} is far ahead of frontier {}", vertex.round, state.next_round);
+                        return;
+                    }
                     // Real equivocation evidence, not just a local defense:
                     // the *first* validly-signed vertex seen for this
                     // (round, author) is kept around so that if a second,
@@ -1380,16 +1414,26 @@ impl Engine {
     /// closes the slow, attacker-free `voted_for`/`first_seen_vertex` OOM
     /// (see `ROUND_STATE_RETENTION`'s doc comment: without this these maps
     /// gain ~one entry per validator per round forever). Called every tick.
-    /// `equivocation_evidence` is deliberately NOT pruned here - it only ever
-    /// grows on genuine, slashable misbehavior (rare, and each entry is
-    /// real evidence someone may still want to submit), unlike the two maps
-    /// pruned here which gain an entry every single round unconditionally.
+    /// `equivocation_evidence` is capped at one entry per author (a Byzantine
+    /// validator can equivocate every round; one valid entry per author is
+    /// enough to slash them, so the rest are dropped).
     pub async fn prune_stale_round_state(&self) {
         let mut state = self.state.lock().await;
         let round_horizon = state.next_round.saturating_sub(ROUND_STATE_RETENTION);
         if round_horizon > 0 {
             state.voted_for.retain(|(round, _), _| *round >= round_horizon);
             state.first_seen_vertex.retain(|(round, _), _| *round >= round_horizon);
+        }
+
+        // Bound `equivocation_evidence` to at most one entry per author. A
+        // Byzantine validator can equivocate every round, and each round would
+        // otherwise leave a new, never-collected entry forever (a slow OOM under
+        // sustained misbehavior). One valid piece of evidence per author is
+        // enough to slash them - slashing burns the whole self-stake once - so
+        // keeping thousands of per-round entries buys nothing.
+        {
+            let mut seen_authors = std::collections::HashSet::new();
+            state.equivocation_evidence.retain(|(_, author), _| seen_authors.insert(*author));
         }
 
         // Evict worker batches older than `BATCH_RETENTION_ROUNDS` - the
