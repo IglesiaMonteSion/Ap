@@ -681,7 +681,9 @@ fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
     // number in release and wrongly admit; saturating pins it at `u64::MAX`
     // so an over-large fee simply makes nothing affordable, matching intent.
     let byte_fee = state.ledger.current_params().base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
-    balance >= byte_fee
+    // Must also cover the declared priority tip, charged up front alongside the
+    // base fee (see `Ledger::apply_transaction`).
+    balance >= byte_fee.saturating_add(tx.message.priority_fee)
 }
 
 /// Inserts `tx` into the per-account, nonce-ordered mempool, enforcing the
@@ -728,16 +730,29 @@ fn cache_batch(state: &mut EngineState, batch: Batch) {
 /// account's contribution for this round; everything after the gap stays
 /// queued, not silently dropped.
 fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
-    let mut ready = Vec::new();
+    // Ready txs are collected per payer (a contiguous nonce run each), then the
+    // per-payer runs are ordered by priority-fee tip so higher-tip senders are
+    // proposed first - an EIP-1559-style priority ordering. Crucially the sort
+    // is BY GROUP, never within a group: a single payer's nonce order is
+    // preserved (reordering nonce 1 before nonce 0 would just fail at execution),
+    // so the tip only reorders *across* independent payers. The tip key is the
+    // group's highest tip so a payer that tipped on any of its ready txs is
+    // prioritized as a whole.
+    let mut groups: Vec<(u64, Vec<Transaction>)> = Vec::new();
     let mut empty_accounts = Vec::new();
     for (payer, queue) in state.mempool.iter_mut() {
         let mut expected_nonce = state.ledger.store().get(payer).map(|a| a.nonce).unwrap_or(0);
         while queue.keys().next().is_some_and(|&n| n < expected_nonce) {
             queue.pop_first();
         }
+        let mut run = Vec::new();
         while let Some(tx) = queue.remove(&expected_nonce) {
-            ready.push(tx);
+            run.push(tx);
             expected_nonce += 1;
+        }
+        if !run.is_empty() {
+            let max_tip = run.iter().map(|t| t.message.priority_fee).max().unwrap_or(0);
+            groups.push((max_tip, run));
         }
         if queue.is_empty() {
             empty_accounts.push(*payer);
@@ -746,7 +761,10 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
     for payer in empty_accounts {
         state.mempool.remove(&payer);
     }
-    ready
+    // Highest tip first. Stable so equal-tip payers keep their prior relative
+    // order (deterministic given the same mempool contents).
+    groups.sort_by(|a, b| b.0.cmp(&a.0));
+    groups.into_iter().flat_map(|(_, run)| run).collect()
 }
 
 impl Engine {

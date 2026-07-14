@@ -38,3 +38,13 @@ pub const STAKING_REWARDS_POOL_ID: Pubkey = Pubkey::new([6u8; 32]);
 /// back to reading this owner + deserializing this data whenever
 /// `ix.program_id` isn't one of the fixed native ids.
 pub const LOADER_PROGRAM_ID: Pubkey = Pubkey::new([7u8; 32]);
+
+/// Well-known singleton holding the dynamic-fee bookkeeping (`FeeState`: the
+/// current fee epoch/round and the bytes committed in it so far). Kept in its
+/// OWN account rather than folded into `EconomicParams` so existing persisted
+/// `PARAMS` accounts (from a network deployed before dynamic fees) still
+/// deserialize unchanged - this account is simply absent there and created,
+/// deterministically, on the first transaction after the upgrade. The dynamic
+/// `base_fee_per_byte` itself stays in `EconomicParams`; only the accumulator
+/// lives here. See `Ledger::advance_dynamic_fee`.
+pub const FEE_STATE_ACCOUNT_ID: Pubkey = Pubkey::new([8u8; 32]);

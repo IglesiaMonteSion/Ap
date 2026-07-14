@@ -51,6 +51,13 @@ pub struct Message {
     pub chain_id: [u8; 32],
     /// Maximum total fee (base + priority + gas) the payer authorizes.
     pub fee_limit: u64,
+    /// Optional tip (in base units, flat) the payer adds ON TOP of the dynamic
+    /// base fee to prioritize this transaction under congestion - an EIP-1559-
+    /// style priority fee. Goes 100% to the block proposer (`fee_collector`),
+    /// never burned, so validators are incentivized to include higher-tip
+    /// transactions first. `0` (the default via `new_signed`) means no tip.
+    /// Signed as part of the message, so it can't be altered in flight.
+    pub priority_fee: u64,
     pub instructions: Vec<Instruction>,
 }
 
@@ -68,6 +75,19 @@ impl Transaction {
         fee_limit: u64,
         instructions: Vec<Instruction>,
     ) -> anyhow::Result<Self> {
+        Self::new_signed_with_priority(payer, nonce, chain_id, fee_limit, 0, instructions)
+    }
+
+    /// Like `new_signed` but with an explicit priority-fee tip (see
+    /// `Message::priority_fee`). `new_signed` is exactly this with tip `0`.
+    pub fn new_signed_with_priority(
+        payer: &Keypair,
+        nonce: u64,
+        chain_id: [u8; 32],
+        fee_limit: u64,
+        priority_fee: u64,
+        instructions: Vec<Instruction>,
+    ) -> anyhow::Result<Self> {
         let payer_keys = payer.public_key_bundle();
         let message = Message {
             version: 1,
@@ -76,6 +96,7 @@ impl Transaction {
             nonce,
             chain_id,
             fee_limit,
+            priority_fee,
             instructions,
         };
         let bytes = borsh::to_vec(&message).expect("message always serializes");

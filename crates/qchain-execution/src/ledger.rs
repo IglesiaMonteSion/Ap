@@ -4,7 +4,8 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+use crate::ids::{FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+use crate::params::{next_base_fee, FeeState, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
 use crate::receipt::{StakingEvent, StakingEventKind, TransferReceipt};
@@ -288,6 +289,69 @@ impl Ledger {
             .unwrap_or_default()
     }
 
+    /// The dynamic-fee accumulator (see `params::FeeState`), or a fresh default
+    /// if `FEE_STATE_ACCOUNT_ID` hasn't been created yet.
+    pub fn current_fee_state(&self) -> FeeState {
+        self.store
+            .get(&FEE_STATE_ACCOUNT_ID)
+            .and_then(|a| FeeState::try_from_slice(&a.data).ok())
+            .unwrap_or_default()
+    }
+
+    /// Advances the EIP-1559-style dynamic base fee. Called once per applied
+    /// transaction, INSIDE `apply_transaction` (so every write here lands in the
+    /// same committed state transition and the same Merkle root - keeping both
+    /// cross-validator determinism and the STARK receipt chain intact). It
+    /// accumulates this transaction's bytes into the current fee epoch (one
+    /// consensus round); when a transaction from a later round arrives, it
+    /// closes the previous epoch, nudging `base_fee_per_byte` up or down toward
+    /// `FEE_TARGET_BYTES_PER_ROUND` (see `next_base_fee`), and starts a fresh
+    /// epoch. All state (`FeeState`, `base_fee_per_byte`) is on-chain and
+    /// persisted, so a restarted validator resumes with the identical fee.
+    ///
+    /// This tx has already been charged at the pre-roll `base_fee` (a round's
+    /// fee is effectively set by the previous round's traffic, EIP-1559-style);
+    /// the roll here affects subsequent transactions, never retroactively this
+    /// one. Placed after the fee charge and before the receipt's `root_after`
+    /// capture on purpose.
+    fn advance_dynamic_fee(&mut self, current_round: Round, tx_bytes: u64) {
+        let existing = self.store.get(&FEE_STATE_ACCOUNT_ID);
+        let mut fs = existing
+            .as_ref()
+            .and_then(|a| FeeState::try_from_slice(&a.data).ok())
+            .unwrap_or(FeeState { epoch_round: current_round, epoch_bytes: 0 });
+
+        if existing.is_some() && current_round > fs.epoch_round {
+            // Close the previous epoch: adjust the base fee from its traffic.
+            let mut params = self.current_params();
+            let new_base = next_base_fee(params.base_fee_per_byte, fs.epoch_bytes, FEE_TARGET_BYTES_PER_ROUND);
+            if new_base != params.base_fee_per_byte {
+                params.base_fee_per_byte = new_base;
+                let mut pacct = self
+                    .store
+                    .get(&PARAMS_ACCOUNT_ID)
+                    .unwrap_or_else(|| Account::new_wallet(Pubkey::new([3u8; 32])));
+                pacct.data = borsh::to_vec(&params).expect("params always serialize");
+                self.write_account(PARAMS_ACCOUNT_ID, pacct);
+            }
+            fs.epoch_round = current_round;
+            fs.epoch_bytes = 0;
+        } else if existing.is_none() {
+            // First transaction after the dynamic-fee upgrade (or at genesis):
+            // just start the epoch, nothing to close yet. Deterministic: every
+            // validator hits this at the same committed transaction.
+            fs.epoch_round = current_round;
+            fs.epoch_bytes = 0;
+        }
+        fs.epoch_bytes = fs.epoch_bytes.saturating_add(tx_bytes);
+
+        // Persist. Program-owned (not system) so the dust sweep never touches
+        // it (and its balance is always 0 regardless).
+        let mut acct = existing.unwrap_or_else(|| Account::new_wallet(FEE_STATE_ACCOUNT_ID));
+        acct.data = borsh::to_vec(&fs).expect("FeeState always serializes");
+        self.write_account(FEE_STATE_ACCOUNT_ID, acct);
+    }
+
     /// The live on-chain algorithm registry - real, governance-mutable
     /// (see `governance.rs`'s `apply_registry_action`), falling back to
     /// `genesis_registry()` if `REGISTRY_ACCOUNT_ID` hasn't been seeded
@@ -370,7 +434,12 @@ impl Ledger {
         // check (`payer_can_afford_admission`). Saturation to `u64::MAX` here
         // means the payer simply can't afford it and the tx is rejected.
         let byte_fee = params.base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
-        if payer_account.balance < byte_fee {
+        // The optional priority-fee tip (see `Message::priority_fee`), charged
+        // on top of the base fee and paid 100% to the proposer. Saturating add
+        // so a maliciously huge tip can't wrap; the payer simply can't afford it.
+        let priority_fee = tx.message.priority_fee;
+        let upfront_fee = byte_fee.saturating_add(priority_fee);
+        if payer_account.balance < upfront_fee {
             return Err(ExecError::InsufficientFunds);
         }
         // Real enforcement of a field that used to be signed and
@@ -382,8 +451,8 @@ impl Ledger {
         // fee while a transaction sits in the mempool - the payer's own
         // declared ceiling from when they signed, not the network's
         // current price, is what should decide whether it still executes.
-        if byte_fee > tx.message.fee_limit {
-            return Err(ExecError::FeeExceedsLimit { actual: byte_fee, limit: tx.message.fee_limit });
+        if upfront_fee > tx.message.fee_limit {
+            return Err(ExecError::FeeExceedsLimit { actual: upfront_fee, limit: tx.message.fee_limit });
         }
         if payer_account.nonce != tx.message.nonce {
             return Err(ExecError::ProgramError(format!(
@@ -488,15 +557,32 @@ impl Ledger {
             None
         };
 
-        payer_account.balance -= byte_fee;
+        payer_account.balance -= upfront_fee;
         payer_account.nonce += 1;
         self.write_account(tx.message.payer, payer_account.clone());
 
+        // Only the BASE (byte) fee is split 50/50 burn/validators. The priority
+        // tip is NOT burned: it goes 100% to the proposer, as the whole point
+        // is to reward the validator that included a congested transaction.
         let burn_share = byte_fee / 2;
         let validator_share = byte_fee - burn_share;
         self.total_burned += burn_share;
         self.fee_burned = self.fee_burned.saturating_add(burn_share);
         self.credit_validator_share(*fee_collector, validator_share, &params)?;
+        if priority_fee > 0 {
+            // 100% of the tip to the proposer's own account (liquid commission,
+            // tracked like the base commission so the dashboard reflects it).
+            self.credit(*fee_collector, priority_fee);
+            self.validator_earned = self.validator_earned.saturating_add(priority_fee);
+            self.note_validator_commission(*fee_collector, priority_fee);
+        }
+
+        // Advance the EIP-1559-style dynamic base fee for subsequent rounds.
+        // Placed here - after the fee is charged, before the instructions run
+        // and before `root_after` is captured - so its on-chain writes are part
+        // of THIS transaction's committed state (deterministic across
+        // validators, and inside the STARK receipt's root chain).
+        self.advance_dynamic_fee(current_round, tx.byte_size() as u64);
 
         // Working set: the payer is always included (implicit participant,
         // e.g. as CreateAccount's funding source, even when no instruction
@@ -612,7 +698,7 @@ impl Ledger {
                 from,
                 to,
                 amount,
-                fee: byte_fee,
+                fee: upfront_fee,
                 root_before,
                 root_after,
                 from_before,
@@ -637,8 +723,8 @@ impl Ledger {
         // fee, see the security-review entry in `project-lessons-learned`),
         // so declaring too-low a `fee_limit` for a WASM call still costs
         // the byte fee, same as any other rejected transaction.
-        if byte_fee + total_gas_fee > tx.message.fee_limit {
-            return Err(ExecError::FeeExceedsLimit { actual: byte_fee + total_gas_fee, limit: tx.message.fee_limit });
+        if upfront_fee + total_gas_fee > tx.message.fee_limit {
+            return Err(ExecError::FeeExceedsLimit { actual: upfront_fee + total_gas_fee, limit: tx.message.fee_limit });
         }
 
         if total_gas_fee > 0 {
@@ -692,7 +778,7 @@ impl Ledger {
             self.staking_events.push(ev);
         }
 
-        Ok(byte_fee + total_gas_fee)
+        Ok(upfront_fee + total_gas_fee)
     }
 
     /// Accumulate one block-proposer's direct commission for the per-validator
@@ -876,6 +962,88 @@ mod tests {
         let mut ledger = Ledger::new(Box::new(InMemoryStore::new())).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    #[test]
+    fn priority_fee_is_charged_on_top_and_paid_entirely_to_the_validator() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 20_000_000);
+
+        let tip = 3_000_000u64;
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed_with_priority(&alice, 0, [0u8; 32], 50_000_000, tip, vec![ix]).unwrap();
+        let total_fee = ledger.apply_transaction(&tx, &validator, 0).unwrap();
+
+        // The byte (base) portion is total minus the tip.
+        let base_fee = total_fee - tip;
+        assert!(base_fee > 0);
+        // Payer paid amount + base + tip.
+        assert_eq!(ledger.get_balance(&alice.pubkey()), 20_000_000 - 2_000_000 - base_fee - tip);
+        // Validator got its half of the BASE fee PLUS the whole tip (tips aren't
+        // burned).
+        assert_eq!(ledger.get_balance(&validator), (base_fee - base_fee / 2) + tip);
+        // Only the base fee is burned; the tip is not.
+        assert_eq!(ledger.total_burned, base_fee / 2, "the tip must not be burned");
+        // The captured receipt's fee reflects base + tip (STARK conservation:
+        // from lost amount + base + tip).
+        let r = ledger.transfer_receipts().last().unwrap();
+        assert_eq!(r.fee, base_fee + tip);
+    }
+
+    #[test]
+    fn a_priority_tip_pushing_the_total_over_fee_limit_is_rejected() {
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 20_000_000);
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+        };
+        // fee_limit just above the base fee but below base+tip -> rejected.
+        let tx = Transaction::new_signed_with_priority(&alice, 0, [0u8; 32], 1_100_000, 5_000_000, vec![ix]).unwrap();
+        let res = ledger.apply_transaction(&tx, &Pubkey::system_program_id(), 0);
+        assert!(matches!(res, Err(ExecError::FeeExceedsLimit { .. })), "base+tip over fee_limit must reject, got {res:?}");
+    }
+
+    #[test]
+    fn dynamic_fee_epoch_rolls_on_round_change_and_stays_at_floor_under_light_load() {
+        // Two transfers in round 0 then one in round 1: the fee epoch must roll
+        // to round 1, and with only light load (well under target) the base fee
+        // stays pinned at the floor - never below it. (The rise-under-load math
+        // is covered by params::tests::next_base_fee_*.)
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 100_000_000);
+        let mk = |nonce: u64| {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+            };
+            Transaction::new_signed(&alice, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+        };
+        ledger.apply_transaction(&mk(0), &validator, 0).unwrap();
+        ledger.apply_transaction(&mk(1), &validator, 0).unwrap();
+        assert_eq!(ledger.current_fee_state().epoch_round, 0, "still in epoch 0 after two round-0 txs");
+        // A tx in round 1 closes epoch 0 (light load -> fee stays at floor).
+        ledger.apply_transaction(&mk(2), &validator, 1).unwrap();
+        assert_eq!(ledger.current_fee_state().epoch_round, 1, "epoch must roll to round 1");
+        assert_eq!(
+            ledger.current_params().base_fee_per_byte,
+            crate::params::FEE_MIN_BASE_FEE_PER_BYTE,
+            "light load must keep the base fee at the floor, never below"
+        );
     }
 
     #[test]
