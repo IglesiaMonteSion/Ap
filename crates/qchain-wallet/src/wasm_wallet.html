@@ -848,19 +848,31 @@ async function renderStaking(){
   }
   const list=$("st-list"), stakes=myStakes();
   if(!stakes.length){ list.innerHTML='<div class="empty">todavía no delegaste nada</div>'; return; }
-  list.innerHTML=stakes.map((s,i)=>`
-    <div class="row-item" style="align-items:flex-start">
+  // Estado en vivo por posición (recompensa pendiente + si ya se puede retirar).
+  const live=await Promise.all(stakes.map(s=>api("/api/stake/"+encodeURIComponent(s.stakeAccount)).catch(()=>null)));
+  list.innerHTML=stakes.map((s,i)=>{
+    const d=live[i];
+    const amount = (d&&d.exists) ? d.amount : s.amount;      // monto real on-chain si está
+    const reward = (d&&d.exists) ? d.pending_reward : null;
+    // ¿se puede retirar ya? (bonding y lock cumplidos). Si no hay datos, se permite intentar.
+    let ready=true, until=0;
+    if(d&&d.exists){ until=Math.max(d.bonding_until_round||0, d.locked_until_round||0); ready = (d.current_round||0) >= until; }
+    const rewardLine = reward!==null ? `<div class="hint" style="margin:2px 0 0">recompensa: <b style="color:var(--good)">${qchDisp(reward)}</b></div>` : '';
+    const lockLine = (!ready) ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">se puede retirar en la ronda ${until}</div>` : '';
+    return `<div class="row-item" style="align-items:flex-start">
       <div style="min-width:0;flex:1">
-        <div style="font-weight:700">${qchDisp(s.amount)}</div>
+        <div style="font-weight:700">${qchDisp(amount)}</div>
         <div class="wi-addr mono" style="font-size:11px">a ${short(s.validator)}</div>
+        ${rewardLine}${lockLine}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px">
         <button class="btn-sec" data-claim="${i}" style="padding:8px 12px;font-size:13px">Reclamar</button>
-        <button class="btn-sec" data-undel="${i}" style="padding:8px 12px;font-size:13px">Retirar</button>
+        <button class="btn-sec" data-undel="${i}" ${ready?'':'disabled'} style="padding:8px 12px;font-size:13px">Retirar</button>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   list.querySelectorAll("button[data-claim]").forEach(b=>b.onclick=()=>stakeAction("claim", stakes[+b.dataset.claim]));
-  list.querySelectorAll("button[data-undel]").forEach(b=>b.onclick=()=>stakeAction("undelegate", stakes[+b.dataset.undel]));
+  list.querySelectorAll("button[data-undel]:not([disabled])").forEach(b=>b.onclick=()=>stakeAction("undelegate", stakes[+b.dataset.undel]));
 }
 
 async function stakeCtx(){
@@ -892,16 +904,31 @@ $("st-delegate").onclick=async()=>{
 
 async function stakeAction(kind, pos){
   const msg=$("st-msg"); msg.className="msg"; msg.style.display="block";
-  msg.textContent=(kind==="claim"?"reclamando":"retirando")+" (firmando en tu navegador)…";
   try{
+    // Pre-chequeo real contra la cadena para no enviar una tx que la ejecución
+    // rechazaría (bonding/lock) - así el "enviado" no miente.
+    const d=await api("/api/stake/"+encodeURIComponent(pos.stakeAccount)).catch(()=>null);
+    if(kind==="undelegate" && d && d.exists){
+      const until=Math.max(d.bonding_until_round||0, d.locked_until_round||0);
+      if((d.current_round||0) < until){ msg.className="msg err"; msg.textContent=`todavía no podés retirar — disponible en la ronda ${until} (vas por la ${d.current_round})`; return; }
+    }
+    if(kind==="claim" && d && d.exists && Number(d.pending_reward)===0){ msg.className="msg err"; msg.textContent="no hay recompensa pendiente para reclamar todavía"; return; }
+    msg.className="msg"; msg.textContent=(kind==="claim"?"reclamando":"retirando")+" (firmando en tu navegador)…";
     const {nonce,chainId}=await stakeCtx();
     const txJson = kind==="claim"
       ? signClaimReward(SEED, pos.stakeAccount, nonce, chainId, 10000000n)
       : signUndelegate(SEED, pos.stakeAccount, nonce, chainId, 10000000n);
     await relaySigned(txJson);
-    if(kind==="undelegate") dropStake(pos.stakeAccount);
     msg.className="msg ok"; msg.textContent = kind==="claim" ? "✓ Recompensa reclamada" : "✓ Retiro enviado";
-    setTimeout(renderStaking, 1500);
+    // La posición se quita cuando la cadena confirma amount 0 (renderStaking lo
+    // relee); si en unas consultas sigue en cero, se poda.
+    setTimeout(async()=>{
+      if(kind==="undelegate"){
+        const after=await api("/api/stake/"+encodeURIComponent(pos.stakeAccount)).catch(()=>null);
+        if(after && after.exists && Number(after.amount)===0) dropStake(pos.stakeAccount);
+      }
+      renderStaking();
+    }, 1800);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
 }
 

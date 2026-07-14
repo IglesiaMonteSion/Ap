@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
         .route("/api/chain_id", get(chain_id_ep))
         .route("/api/account/:address", get(account_ep))
+        .route("/api/stake/:address", get(stake_ep))
         .route("/api/relay-tx", post(relay_tx))
         .route("/api/config", get(config))
         .route("/api/node", get(node_status))
@@ -259,6 +260,16 @@ async fn account_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>
         "balance": acct.as_ref().map(|a| a.balance).unwrap_or(0).to_string(),
         "nonce": acct.map(|a| a.nonce).unwrap_or(0),
     })))
+}
+
+/// Live state of a stake account, proxied from the node's `/stake/:address`
+/// (pending reward + bonding/lock rounds). Read-only, no keys - lets the
+/// non-custodial wallet show real rewards and pre-check an Undelegate.
+async fn stake_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    let url = format!("{}/stake/{}", st.rpc, address.trim());
+    let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
+    let val: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(val))
 }
 
 /// Relay a browser-signed transaction (raw signed-Transaction JSON) to the

@@ -218,7 +218,8 @@ fn read_pool(account: &Account) -> Result<RewardPoolData, ExecError> {
 
 /// The reward this position has earned but not yet been paid, given its
 /// `amount`/`reward_debt` and the pool's current `acc_reward_per_share`.
-fn pending_reward(amount: u64, reward_debt: u128, acc_reward_per_share: u128) -> u64 {
+/// Public so the node's `/stake/:address` RPC can report live pending reward.
+pub fn pending_reward(amount: u64, reward_debt: u128, acc_reward_per_share: u128) -> u64 {
     let accrued = (amount as u128).saturating_mul(acc_reward_per_share) / PRECISION;
     accrued.saturating_sub(reward_debt).min(u64::MAX as u128) as u64
 }

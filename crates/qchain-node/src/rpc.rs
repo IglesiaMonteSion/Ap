@@ -19,6 +19,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/", get(explorer))
         .route("/tx", post(submit_tx))
         .route("/account/:address", get(get_account))
+        .route("/stake/:address", get(get_stake))
         .route("/status", get(status))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
@@ -107,6 +108,45 @@ async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction
 async fn get_account(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<Account>, (StatusCode, String)> {
     let pk: Pubkey = address.parse().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
     engine.get_account(&pk).await.map(Json).ok_or((StatusCode::NOT_FOUND, "account not found".to_string()))
+}
+
+/// `/stake/:address` - live state of a stake account, so the wallet can show
+/// the real pending reward and pre-check whether an Undelegate would be
+/// accepted (bonding/lock periods) instead of submitting a tx that execution
+/// would reject. Returns `{exists:false}` for an address that isn't a stake
+/// account, so the caller can distinguish "not staked" from an error.
+async fn get_stake(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::{STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID};
+    use qchain_execution::staking::{pending_reward, RewardPoolData, StakeAccountData};
+    let pk: Pubkey = address.parse().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let Some(acct) = engine.get_account(&pk).await else {
+        return Ok(Json(json!({ "exists": false })));
+    };
+    if acct.owner != STAKING_PROGRAM_ID || acct.data.is_empty() {
+        return Ok(Json(json!({ "exists": false })));
+    }
+    let sad = StakeAccountData::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stake account decode: {e}")))?;
+    // Pool's running accumulator (0 if the pool was never seeded/accrued).
+    let acc_per_share = match engine.get_account(&STAKING_REWARDS_POOL_ID).await {
+        Some(pool) if !pool.data.is_empty() => RewardPoolData::try_from_slice(&pool.data).map(|p| p.acc_reward_per_share).unwrap_or(0),
+        _ => 0,
+    };
+    let pending = pending_reward(sad.amount, sad.reward_debt, acc_per_share);
+    // `next_round` is the round consensus is working on now - close enough for a
+    // UX pre-check of the 100-round bonding/lock windows.
+    let current_round = engine.status().await.next_round;
+    Ok(Json(json!({
+        "exists": true,
+        "owner": sad.owner.to_string(),
+        "validator": sad.validator.to_string(),
+        "amount": sad.amount,
+        "pending_reward": pending,
+        "locked_until_round": sad.locked_until_round,
+        "bonding_until_round": sad.bonding_until_round,
+        "unbonding_requested_at_round": sad.unbonding_requested_at_round,
+        "current_round": current_round,
+    })))
 }
 
 async fn status(State(engine): State<Arc<Engine>>) -> Json<StatusResponse> {
