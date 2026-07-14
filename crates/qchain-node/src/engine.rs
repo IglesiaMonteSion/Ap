@@ -371,6 +371,15 @@ pub struct Engine {
     /// dashboard shows no past activity even though the ledger state is intact.
     /// Best-effort persist, same contract as `cert_log`.
     pub receipt_log: Option<sled::Db>,
+    /// On-disk log of captured `StakingEvent`s (a `sled` tree at
+    /// `data_dir/staking`), so staking activity (Delegate/Undelegate/Claim)
+    /// survives a restart just like the transfer history. Same best-effort
+    /// contract as `receipt_log`.
+    pub staking_log: Option<sled::Db>,
+    /// Path to the persisted economics snapshot (`data_dir/economics`), a small
+    /// Borsh blob overwritten after each committing round so lifetime
+    /// burn/earnings totals survive a restart. `None` for an in-memory node.
+    pub economics_path: Option<std::path::PathBuf>,
 }
 
 impl Engine {
@@ -397,6 +406,51 @@ impl Engine {
                 }
                 Err(e) => tracing::warn!("failed to encode a transfer receipt for the log: {e}"),
             }
+        }
+    }
+
+    /// Appends a captured staking event to the on-disk log (mirror of
+    /// `persist_receipt`). Best-effort; a staking event that fails to persist
+    /// is simply missing from history after a restart, never a correctness
+    /// problem (balances are the source of truth).
+    fn persist_staking_event(&self, ev: &qchain_execution::StakingEvent) {
+        if let Some(db) = &self.staking_log {
+            let key = match db.generate_id() {
+                Ok(id) => id.to_be_bytes(),
+                Err(e) => {
+                    tracing::warn!("failed to allocate a staking-log id: {e}");
+                    return;
+                }
+            };
+            match serde_json::to_vec(ev) {
+                Ok(bytes) => {
+                    if let Err(e) = db.insert(key, bytes) {
+                        tracing::warn!("failed to persist a staking event: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("failed to encode a staking event for the log: {e}"),
+            }
+        }
+    }
+
+    /// Overwrites the persisted economics snapshot (`data_dir/economics`) with
+    /// the ledger's current running totals, so lifetime burn/earnings survive a
+    /// restart. Best-effort: written after each committing round, off the state
+    /// lock. A failed write just means the snapshot is slightly stale on the
+    /// next boot, re-catching up as new transactions commit.
+    async fn persist_economics(&self) {
+        let Some(path) = &self.economics_path else { return };
+        let snap = { self.state.lock().await.ledger.export_economics() };
+        match borsh::to_vec(&snap) {
+            Ok(bytes) => {
+                // Write to a temp file then rename, so a crash mid-write never
+                // leaves a truncated (undecodable) economics file.
+                let tmp = path.with_extension("tmp");
+                if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+                    tracing::warn!("failed to persist economics snapshot: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to encode economics snapshot: {e}"),
         }
     }
 
@@ -465,6 +519,10 @@ pub struct EconomicsResponse {
     pub dust_burned: u64,
     /// Total paid to validators as direct commission (network-wide).
     pub validator_earned: u64,
+    /// This specific validator's own accumulated commission (as `fee_collector`
+    /// when it proposed) - the honest "how much have I earned" number, distinct
+    /// from the network-wide `validator_earned`. Persisted, survives restarts.
+    pub own_commission: u64,
     /// Total routed into the shared staking rewards pool (network-wide).
     pub pool_earned: u64,
     /// Current balance sitting in the staking rewards pool, claimable by
@@ -814,6 +872,30 @@ impl Engine {
         all[start..end].iter().rev().cloned().collect()
     }
 
+    /// Captured staking activity (Delegate/Undelegate/ClaimReward), most recent
+    /// first, paginated the same way as `list_transfers`. Optionally filtered to
+    /// a single staker address, so the wallet can show *this* wallet's staking
+    /// activity in its own activity view.
+    pub async fn list_staking_events(
+        &self,
+        limit: usize,
+        offset: usize,
+        staker: Option<Pubkey>,
+    ) -> Vec<qchain_execution::StakingEvent> {
+        let state = self.state.lock().await;
+        let all = state.ledger.staking_events();
+        let filtered: Vec<qchain_execution::StakingEvent> = match staker {
+            Some(s) => all.iter().filter(|e| e.staker == s).cloned().collect(),
+            None => all.to_vec(),
+        };
+        if offset >= filtered.len() {
+            return Vec::new();
+        }
+        let end = filtered.len() - offset;
+        let start = end.saturating_sub(limit);
+        filtered[start..end].iter().rev().cloned().collect()
+    }
+
     /// A single captured receipt by its transaction hash, full detail
     /// (before/after balances and Merkle proofs) - `O(receipts)` linear
     /// scan, acceptable for the same reason the list above is: this is a
@@ -949,6 +1031,7 @@ impl Engine {
             fee_burned: state.ledger.fee_burned,
             dust_burned: state.ledger.dust_burned,
             validator_earned: state.ledger.validator_earned,
+            own_commission: state.ledger.commission_of(&self.self_id),
             pool_earned: state.ledger.pool_earned,
             reward_pool_balance,
             base_fee_per_byte: params.base_fee_per_byte,
@@ -1608,6 +1691,8 @@ impl Engine {
         // (keyed by tx hash, re-derivable), so persisting a moment later, off
         // the lock, changes nothing about correctness (see `persist_receipt`).
         let mut to_persist: Vec<TransferReceipt> = Vec::new();
+        let mut staking_to_persist: Vec<qchain_execution::StakingEvent> = Vec::new();
+        let mut economics_changed = false;
         {
         let mut state = self.state.lock().await;
         let state = &mut *state;
@@ -1647,6 +1732,7 @@ impl Engine {
                 };
                 for tx in &batch.transactions {
                     let receipts_before = state.ledger.transfer_receipts().len();
+                    let staking_before = state.ledger.staking_events().len();
                     match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
                         Ok(_) => {
                             state.executed += 1;
@@ -1657,6 +1743,12 @@ impl Engine {
                             // double-writes. Cloned out to end the immutable borrow
                             // before the next mutable `apply_transaction`.
                             to_persist.extend_from_slice(&state.ledger.transfer_receipts()[receipts_before..]);
+                            // Same for staking activity (Delegate/Undelegate/Claim).
+                            staking_to_persist.extend_from_slice(&state.ledger.staking_events()[staking_before..]);
+                            // Any applied transaction moves the economic counters
+                            // (at least a fee burn + validator credit), so flag a
+                            // re-persist of the economics snapshot after the lock.
+                            economics_changed = true;
                         }
                         Err(e) => tracing::warn!("transaction execution failed: {e}"),
                     }
@@ -1667,6 +1759,12 @@ impl Engine {
         // Blocking disk writes, now off the state lock (see the note at the top).
         for r in &to_persist {
             self.persist_receipt(r);
+        }
+        for ev in &staking_to_persist {
+            self.persist_staking_event(ev);
+        }
+        if economics_changed {
+            self.persist_economics().await;
         }
     }
 

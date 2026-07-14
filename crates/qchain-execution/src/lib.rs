@@ -14,6 +14,7 @@ pub use ids::{GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STA
 pub use ledger::{Ledger, Program, DEFAULT_FUEL_LIMIT};
 pub use native::{NativeProgram, SystemInstruction, SystemProgram};
 pub use params::EconomicParams;
-pub use receipt::TransferReceipt;
+pub use ledger::EconomicSnapshot;
+pub use receipt::{StakingEvent, StakingEventKind, TransferReceipt};
 pub use staking::{RewardPoolData, StakeAccountData, StakingInstruction, StakingProgram};
 pub use wasm::{WasmCallResult, WasmExecutor};

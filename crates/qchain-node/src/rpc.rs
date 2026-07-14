@@ -26,6 +26,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/stark_proof", get(stark_proof))
         .route("/transfers", get(list_transfers))
         .route("/transfers/:hash", get(get_transfer))
+        .route("/staking_activity", get(staking_activity))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
         .route("/version", get(version))
@@ -234,6 +235,62 @@ async fn get_transfer(State(engine): State<Arc<Engine>>, Path(hash): Path<String
     let bytes = hex::decode(&hash).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let tx_hash: [u8; 32] = bytes.try_into().map_err(|_| (StatusCode::BAD_REQUEST, "transaction hash must be 32 bytes".to_string()))?;
     engine.get_transfer(tx_hash).await.map(Json).ok_or((StatusCode::NOT_FOUND, "no receipt captured for that transaction hash".to_string()))
+}
+
+/// Wire shape of a captured staking action, with hex hashes and string
+/// addresses (the `StakingEvent`'s raw `[u8;32]`/`Pubkey` fields rendered for
+/// JSON), plus a lower-case `kind` string the UI can switch on.
+#[derive(serde::Serialize)]
+struct StakingSummary {
+    tx_hash: String,
+    kind: String,
+    staker: Pubkey,
+    validator: Pubkey,
+    stake_account: Pubkey,
+    amount: u64,
+    round: u64,
+}
+
+impl From<&qchain_execution::StakingEvent> for StakingSummary {
+    fn from(e: &qchain_execution::StakingEvent) -> Self {
+        let kind = match e.kind {
+            qchain_execution::StakingEventKind::Delegate => "delegate",
+            qchain_execution::StakingEventKind::Undelegate => "undelegate",
+            qchain_execution::StakingEventKind::ClaimReward => "claim_reward",
+        };
+        StakingSummary {
+            tx_hash: hex::encode(e.tx_hash),
+            kind: kind.to_string(),
+            staker: e.staker,
+            validator: e.validator,
+            stake_account: e.stake_account,
+            amount: e.amount,
+            round: e.round,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StakingActivityQuery {
+    #[serde(default = "default_transfers_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    /// Optional filter: only this staker's activity (base58 address). Used by
+    /// the wallet to show a single wallet's staking history.
+    staker: Option<String>,
+}
+
+/// Real staking activity (Delegate/Undelegate/ClaimReward), newest first -
+/// what the transfer list can't show, since staking never produces a
+/// `TransferReceipt`. Optionally filtered by `?staker=<address>`.
+async fn staking_activity(State(engine): State<Arc<Engine>>, Query(query): Query<StakingActivityQuery>) -> Result<Json<Vec<StakingSummary>>, (StatusCode, String)> {
+    let staker = match &query.staker {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().parse::<Pubkey>().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?),
+        _ => None,
+    };
+    let events = engine.list_staking_events(query.limit, query.offset, staker).await;
+    Ok(Json(events.iter().map(StakingSummary::from).collect()))
 }
 
 /// Every equivocation this validator has independently witnessed and

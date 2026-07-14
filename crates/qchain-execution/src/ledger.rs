@@ -4,10 +4,11 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
-use crate::receipt::TransferReceipt;
+use crate::receipt::{StakingEvent, StakingEventKind, TransferReceipt};
+use crate::staking::StakeAccountData;
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
@@ -23,6 +24,20 @@ pub const DEFAULT_FUEL_LIMIT: u64 = 5_000_000;
 pub enum Program {
     Native(Box<dyn NativeProgram>),
     Wasm { module_bytes: Vec<u8>, entry_point: String },
+}
+
+/// Persistable snapshot of a `Ledger`'s running economic counters. Written to
+/// `data_dir/economics` by `qchain-node` and restored on startup so lifetime
+/// burn/earnings totals survive a restart. `validator_commissions` is a `Vec`
+/// of pairs (not a map) for a stable Borsh encoding.
+#[derive(Clone, Default, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct EconomicSnapshot {
+    pub total_burned: u64,
+    pub fee_burned: u64,
+    pub dust_burned: u64,
+    pub validator_earned: u64,
+    pub pool_earned: u64,
+    pub validator_commissions: Vec<(Pubkey, u64)>,
 }
 
 pub struct Ledger {
@@ -70,6 +85,17 @@ pub struct Ledger {
     /// for exactly what's captured, why it's scoped this narrowly, and
     /// the deliberate "unbounded in-memory `Vec`" limitation.
     transfer_receipts: Vec<TransferReceipt>,
+    /// Captured staking actions (Delegate/Undelegate/ClaimReward), so the
+    /// dashboard can show staking activity that the transfer list can't
+    /// (staking instructions never produce a `TransferReceipt`). Same
+    /// in-memory/unbounded/reset-on-restart limitation as `transfer_receipts`.
+    staking_events: Vec<StakingEvent>,
+    /// Per-`fee_collector` (validator) running total of direct commission
+    /// earned, so a node can report *its own* real earnings (not just the
+    /// network-wide `validator_earned`). Keyed by the block proposer's
+    /// address; bounded by the validator-set size. Persisted by `qchain-node`
+    /// via `export_economics`/`import_economics` so it survives restarts.
+    validator_commissions: std::collections::BTreeMap<Pubkey, u64>,
 }
 
 impl Ledger {
@@ -94,6 +120,8 @@ impl Ledger {
             pool_earned: 0,
             tree,
             transfer_receipts: Vec::new(),
+            staking_events: Vec::new(),
+            validator_commissions: std::collections::BTreeMap::new(),
         })
     }
 
@@ -136,6 +164,51 @@ impl Ledger {
     /// re-append a duplicate receipt, keeping the restored history exact.
     pub fn restore_receipts(&mut self, receipts: Vec<TransferReceipt>) {
         self.transfer_receipts = receipts;
+    }
+
+    /// Captured staking activity (Delegate/Undelegate/ClaimReward), oldest
+    /// first - what the dashboard and the wallet's activity view render so
+    /// staking shows up alongside plain transfers.
+    pub fn staking_events(&self) -> &[StakingEvent] {
+        &self.staking_events
+    }
+
+    /// Restores staking activity loaded from disk on startup, same contract as
+    /// `restore_receipts` (nonce check prevents replayed txs re-appending).
+    pub fn restore_staking_events(&mut self, events: Vec<StakingEvent>) {
+        self.staking_events = events;
+    }
+
+    /// This validator's own accumulated direct commission (as `fee_collector`).
+    /// Distinct from the network-wide `validator_earned` total.
+    pub fn commission_of(&self, validator: &Pubkey) -> u64 {
+        self.validator_commissions.get(validator).copied().unwrap_or(0)
+    }
+
+    /// Serializable snapshot of the running economic counters, so `qchain-node`
+    /// can persist them to disk and they survive a restart (an in-memory `Vec`
+    /// alone would reset to zero, misreporting lifetime burn/earnings).
+    pub fn export_economics(&self) -> EconomicSnapshot {
+        EconomicSnapshot {
+            total_burned: self.total_burned,
+            fee_burned: self.fee_burned,
+            dust_burned: self.dust_burned,
+            validator_earned: self.validator_earned,
+            pool_earned: self.pool_earned,
+            validator_commissions: self.validator_commissions.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+
+    /// Restores previously-persisted economic counters on startup. Called once,
+    /// before any transaction replay - replayed transactions are nonce-rejected
+    /// and so never double-count into these totals.
+    pub fn import_economics(&mut self, snap: EconomicSnapshot) {
+        self.total_burned = snap.total_burned;
+        self.fee_burned = snap.fee_burned;
+        self.dust_burned = snap.dust_burned;
+        self.validator_earned = snap.validator_earned;
+        self.pool_earned = snap.pool_earned;
+        self.validator_commissions = snap.validator_commissions.into_iter().collect();
     }
 
     /// Writes an account directly into the store - genesis-time seeding
@@ -189,11 +262,13 @@ impl Ledger {
             self.credit(fee_collector, commission);
             self.validator_earned = self.validator_earned.saturating_add(commission);
             self.pool_earned = self.pool_earned.saturating_add(pool_share);
+            self.note_validator_commission(fee_collector, commission);
         } else {
             // No delegators yet: the validator keeps the whole non-burned
             // share (its commission is effectively 100% of it).
             self.credit(fee_collector, validator_share);
             self.validator_earned = self.validator_earned.saturating_add(validator_share);
+            self.note_validator_commission(fee_collector, validator_share);
         }
         Ok(())
     }
@@ -353,6 +428,65 @@ impl Ledger {
             } else {
                 None
             };
+
+        // Capture staking activity (Delegate/Undelegate/ClaimReward) the same
+        // way transfers are captured: read the pre-state now (before the
+        // instruction runs), and only record it at the end if the whole
+        // transaction commits. Scoped to single-instruction staking txs - the
+        // exact shape the CLI/wallet build. See `receipt::StakingEvent`.
+        let pre_staking: Option<StakingEvent> = if tx.message.instructions.len() == 1
+            && tx.message.instructions[0].program_id == STAKING_PROGRAM_ID
+        {
+            let ix = &tx.message.instructions[0];
+            let tx_hash = tx.hash();
+            let sys = Pubkey::system_program_id();
+            match crate::staking::StakingInstruction::try_from_slice(&ix.data) {
+                Ok(crate::staking::StakingInstruction::Delegate { validator, amount }) => Some(StakingEvent {
+                    tx_hash,
+                    kind: StakingEventKind::Delegate,
+                    staker: ix.accounts.first().copied().unwrap_or(sys),
+                    validator,
+                    stake_account: ix.accounts.get(1).copied().unwrap_or(sys),
+                    amount,
+                    round: current_round,
+                }),
+                Ok(crate::staking::StakingInstruction::Undelegate) => {
+                    let stake_account = ix.accounts.first().copied().unwrap_or(sys);
+                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::try_from_slice(&a.data).ok());
+                    sad.map(|s| StakingEvent {
+                        tx_hash,
+                        kind: StakingEventKind::Undelegate,
+                        staker: s.owner,
+                        validator: s.validator,
+                        stake_account,
+                        amount: s.amount,
+                        round: current_round,
+                    })
+                }
+                Ok(crate::staking::StakingInstruction::ClaimReward) => {
+                    let stake_account = ix.accounts.first().copied().unwrap_or(sys);
+                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::try_from_slice(&a.data).ok());
+                    let acc_per_share = self
+                        .store
+                        .get(&STAKING_REWARDS_POOL_ID)
+                        .and_then(|p| crate::staking::RewardPoolData::try_from_slice(&p.data).ok())
+                        .map(|p| p.acc_reward_per_share)
+                        .unwrap_or(0);
+                    sad.map(|s| StakingEvent {
+                        tx_hash,
+                        kind: StakingEventKind::ClaimReward,
+                        staker: s.owner,
+                        validator: s.validator,
+                        stake_account,
+                        amount: crate::staking::pending_reward(s.amount, s.reward_debt, acc_per_share),
+                        round: current_round,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         payer_account.balance -= byte_fee;
         payer_account.nonce += 1;
@@ -550,7 +684,21 @@ impl Ledger {
             self.write_account(pk, account);
         }
 
+        // Everything committed - now record any captured staking activity
+        // (a staking tx that failed returned early above, so reaching here
+        // means it succeeded).
+        if let Some(ev) = pre_staking {
+            self.staking_events.push(ev);
+        }
+
         Ok(byte_fee + total_gas_fee)
+    }
+
+    /// Accumulate one block-proposer's direct commission for the per-validator
+    /// earnings report. Bounded by validator-set size (keys are proposers).
+    fn note_validator_commission(&mut self, validator: Pubkey, amount: u64) {
+        let e = self.validator_commissions.entry(validator).or_insert(0);
+        *e = e.saturating_add(amount);
     }
 
     /// Bills the payer for fuel actually consumed by a WASM instruction
@@ -727,6 +875,45 @@ mod tests {
         let mut ledger = Ledger::new(Box::new(InMemoryStore::new())).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    #[test]
+    fn economics_snapshot_round_trips_exactly() {
+        // A ledger with some real economic state, then export -> import into a
+        // fresh ledger must reproduce every counter and the per-validator map
+        // exactly - the property that makes restart-persistence correct.
+        let mut a = new_test_ledger();
+        a.total_burned = 700;
+        a.fee_burned = 500;
+        a.dust_burned = 200;
+        a.validator_earned = 900;
+        a.pool_earned = 100;
+        let v1 = Keypair::generate().unwrap().pubkey();
+        let v2 = Keypair::generate().unwrap().pubkey();
+        a.note_validator_commission(v1, 640);
+        a.note_validator_commission(v2, 260);
+        a.note_validator_commission(v1, 10); // accumulates
+
+        let snap = a.export_economics();
+        let mut b = new_test_ledger();
+        b.import_economics(snap);
+
+        assert_eq!(b.total_burned, 700);
+        assert_eq!(b.fee_burned, 500);
+        assert_eq!(b.dust_burned, 200);
+        assert_eq!(b.validator_earned, 900);
+        assert_eq!(b.pool_earned, 100);
+        assert_eq!(b.commission_of(&v1), 650);
+        assert_eq!(b.commission_of(&v2), 260);
+        assert_eq!(b.commission_of(&Keypair::generate().unwrap().pubkey()), 0, "an unknown validator has zero commission");
+
+        // And it survives a Borsh disk round-trip (how qchain-node persists it).
+        let bytes = borsh::to_vec(&a.export_economics()).unwrap();
+        let decoded = EconomicSnapshot::try_from_slice(&bytes).unwrap();
+        let mut c = new_test_ledger();
+        c.import_economics(decoded);
+        assert_eq!(c.commission_of(&v1), 650);
+        assert_eq!(c.total_burned, 700);
     }
 
     #[test]

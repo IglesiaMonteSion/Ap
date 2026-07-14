@@ -5,45 +5,39 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>qchain — panel del validador</title>
 <style>
+  /* Tema cuántico (navy + violeta), a juego con la wallet. Siempre oscuro. */
   :root {
-    color-scheme: light dark;
-    --bg: #f4f5f7;
-    --panel: #ffffff;
-    --border: #e2e4e9;
-    --text: #16181d;
-    --text-dim: #6b7280;
-    --accent: #4f46e5;
-    --accent-bg: #eef0fe;
-    --good: #16a34a;
-    --good-bg: #e9f9ee;
-    --bad: #dc2626;
-    --bad-bg: #fdecec;
+    color-scheme: dark;
+    --bg: #070912;
+    --panel: rgba(255,255,255,.035);
+    --panel-solid: #0f131f;
+    --border: rgba(255,255,255,.09);
+    --text: #eef1f8;
+    --text-dim: #8b93ab;
+    --accent: #a78bfa;
+    --accent-bg: rgba(124,110,255,.14);
+    --good: #5be3a0;
+    --good-bg: rgba(60,220,150,.10);
+    --bad: #ff7a7a;
+    --bad-bg: rgba(255,90,90,.10);
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0e0f13;
-      --panel: #16181f;
-      --border: #262933;
-      --text: #e8e9ec;
-      --text-dim: #8b8f9a;
-      --accent: #818cf8;
-      --accent-bg: #1c1d3a;
-      --good: #4ade80;
-      --good-bg: #123822;
-      --bad: #f87171;
-      --bad-bg: #3a1515;
-    }
-  }
+  /* Campo cuántico ambiente detrás de todo (canvas) */
+  #qwave { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; opacity: .5; }
   * { box-sizing: border-box; }
   body {
     font-family: var(--sans);
-    background: var(--bg);
+    background:
+      radial-gradient(900px 420px at 50% -8%, rgba(124,92,255,.20), transparent 62%),
+      radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.12), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
     color: var(--text);
     margin: 0;
     padding: 0 0 3rem;
     line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
   }
   a { color: var(--accent); }
   code, .mono { font-family: var(--mono); }
@@ -56,17 +50,16 @@
     gap: 0.75rem;
     padding: 1rem 1.5rem;
     border-bottom: 1px solid var(--border);
-    background: var(--panel);
+    background: rgba(10,13,24,.72);
+    backdrop-filter: blur(12px);
     position: sticky;
     top: 0;
     z-index: 5;
   }
   .brand { display: flex; align-items: center; gap: 0.6rem; }
   .logo {
-    width: 2rem; height: 2rem; border-radius: 8px;
-    background: var(--accent); color: white;
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 1rem; flex-shrink: 0;
+    width: 2rem; height: 2rem; flex-shrink: 0;
+    filter: drop-shadow(0 0 8px rgba(140,120,255,.4));
   }
   .brand h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
   .brand h1 .dim { color: var(--text-dim); font-weight: 400; }
@@ -79,7 +72,7 @@
     100% { box-shadow: 0 0 0 0 transparent; }
   }
 
-  main { max-width: 1080px; margin: 0 auto; padding: 1.5rem; }
+  main { max-width: 1080px; margin: 0 auto; padding: 1.5rem; position: relative; z-index: 1; }
 
   .banner {
     padding: 0.85rem 1rem;
@@ -97,6 +90,11 @@
     gap: 0.75rem;
     margin-bottom: 1.25rem;
   }
+  .op-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.75rem; }
+  .op-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 0.9rem 1rem; }
+  .op-t { font-weight: 600; margin-bottom: 0.3rem; }
+  .op-d { color: var(--text-dim); font-size: 0.82rem; margin-bottom: 0.5rem; }
+  .op-cmd { font-family: var(--mono); font-size: 0.76rem; background: rgba(0,0,0,.28); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.7rem; overflow-x: auto; white-space: pre; margin: 0; color: #cfe0ff; }
   .stat-card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -183,9 +181,10 @@
 </style>
 </head>
 <body>
+  <canvas id="qwave"></canvas>
   <div class="topbar">
     <div class="brand">
-      <div class="logo">Q</div>
+      <svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="qg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#qg)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#qg)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#qg)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
       <h1>qchain <span class="dim">· panel del validador</span></h1>
     </div>
     <div class="topmeta">
@@ -267,9 +266,14 @@
           <div class="stat-value" id="econ-dust-burned" style="color:#ff9a62">–</div>
         </div>
         <div class="stat-card">
+          <div class="stat-label">💰 lo que ganó ESTE validador</div>
+          <div class="stat-value" id="econ-own" style="color:#5be3a0">–</div>
+          <div class="stat-sub">tu comisión acumulada (persiste)</div>
+        </div>
+        <div class="stat-card">
           <div class="stat-label">💸 comisión a validadores (red)</div>
           <div class="stat-value" id="econ-validator-earned" style="color:#5be3a0">–</div>
-          <div class="stat-sub">ganancia directa del proponente</div>
+          <div class="stat-sub">total de toda la red</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">🏦 pool de staking</div>
@@ -295,6 +299,36 @@
 
     <section class="panel">
       <div class="panel-header">
+        <h2>🛠️ herramientas del operador</h2>
+      </div>
+      <div class="panel-sub">Este panel es de solo lectura (el nodo no guarda claves). Las acciones se firman con <code>qchain-cli</code> o la wallet, que sí tienen tu clave.</div>
+      <div class="op-grid">
+        <div class="op-card">
+          <div class="op-t">Cambiar la comisión del validador</div>
+          <div class="op-d">Se hace por gobernanza (tier bajo, mayoría simple, sin time-lock). Proponé un nuevo valor en bps (ej. 2000 = 20%), votá con tu stake y ejecutá:</div>
+          <pre class="op-cmd">qchain propose-set-staking-commission --value &lt;bps&gt; --rpc &lt;url&gt; --keypair tu.json</pre>
+        </div>
+        <div class="op-card">
+          <div class="op-t">Cambiar el fee base / umbral de polvo</div>
+          <div class="op-d">Mismo flujo de gobernanza para los parámetros económicos:</div>
+          <pre class="op-cmd">qchain propose-set-base-fee --value &lt;u/byte&gt; ...
+qchain propose-set-dust-threshold --value &lt;unidades&gt; ...</pre>
+        </div>
+        <div class="op-card">
+          <div class="op-t">Actualizar / reiniciar este nodo</div>
+          <div class="op-d">Sin perder clave, config ni estado:</div>
+          <pre class="op-cmd">cd &lt;repo&gt; &amp;&amp; git pull &amp;&amp; sudo ./deploy/update-node.sh</pre>
+        </div>
+        <div class="op-card">
+          <div class="op-t">Reportar una equivocación</div>
+          <div class="op-d">Permissionless: cualquiera con la evidencia (ver el banner de arriba) quema el self-stake del validador que equivocó.</div>
+          <pre class="op-cmd">qchain report-equivocation --evidence &lt;...&gt; ...</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
         <h2>actividad reciente</h2>
         <button id="refresh-transfers" class="btn-ghost">↻ actualizar</button>
       </div>
@@ -307,6 +341,21 @@
       </div>
       <p id="transfers-empty" class="empty" hidden>todavía no se ejecutó ninguna transferencia en este validador</p>
       <button id="load-more" class="btn btn-block" hidden>cargar más</button>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>🔒 actividad de staking</h2>
+        <button id="refresh-staking" class="btn-ghost">↻ actualizar</button>
+      </div>
+      <div class="panel-sub">Delegaciones, retiros y reclamos de recompensa — no aparecen en la lista de transferencias porque staking no es una transferencia simple.</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>acción</th><th>staker</th><th>validador</th><th>monto (QCH)</th><th>ronda</th></tr></thead>
+          <tbody id="staking-body"></tbody>
+        </table>
+      </div>
+      <p id="staking-empty" class="empty" hidden>todavía no hubo actividad de staking en este validador</p>
     </section>
 
     <section class="panel" id="detail-panel" hidden>
@@ -335,6 +384,31 @@
   <div class="toast" id="toast">copiado</div>
 
 <script>
+// Campo cuántico de fondo (mismo motor que la wallet): ondas violeta + partículas.
+function quantumWaves(canvas, opts){
+  const ctx = canvas.getContext("2d"); if(!ctx) return;
+  const cfg = Object.assign({lines:5, amp:16, speed:.012, alpha:.42, particles:24}, opts||{});
+  let W=0,H=0,dpr=1,t=0,parts=[];
+  function resize(){ dpr=Math.min(window.devicePixelRatio||1,2); W=canvas.clientWidth; H=canvas.clientHeight;
+    canvas.width=Math.max(1,W*dpr); canvas.height=Math.max(1,H*dpr); ctx.setTransform(dpr,0,0,dpr,0,0); }
+  function seed(){ parts=[]; for(let i=0;i<cfg.particles;i++) parts.push({x:Math.random()*W,y:Math.random()*H,r:Math.random()*1.4+.4,s:Math.random()*.35+.06,ph:Math.random()*6.28}); }
+  function frame(){ t+=cfg.speed; ctx.clearRect(0,0,W,H);
+    for(let l=0;l<cfg.lines;l++){
+      const yBase=H*(0.3+0.5*(l/Math.max(1,cfg.lines-1)));
+      const g=ctx.createLinearGradient(0,0,W,0); const a=cfg.alpha*(1-l/(cfg.lines*1.7));
+      g.addColorStop(0,"rgba(124,110,255,0)"); g.addColorStop(.5,"rgba(150,130,255,"+a.toFixed(3)+")"); g.addColorStop(1,"rgba(102,144,255,0)");
+      ctx.strokeStyle=g; ctx.lineWidth=1; ctx.beginPath();
+      for(let x=0;x<=W;x+=8){ const y=yBase+Math.sin(x*0.012+t+l*0.75)*cfg.amp*(1-l/(cfg.lines*1.6))+Math.sin(x*0.031-t*1.35)*4; x===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+      ctx.stroke();
+    }
+    for(const p of parts){ p.y-=p.s; if(p.y<-4){p.y=H+4;p.x=Math.random()*W;} const tw=0.35+0.65*Math.abs(Math.sin(t*2+p.ph));
+      ctx.fillStyle="rgba(180,165,255,"+(0.4*tw).toFixed(3)+")"; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,6.283); ctx.fill(); }
+    requestAnimationFrame(frame);
+  }
+  resize(); seed(); frame(); window.addEventListener("resize",()=>{resize();seed();});
+}
+try { quantumWaves(document.getElementById("qwave")); } catch(e){}
+
 async function getJson(path) {
   const res = await fetch(path);
   if (!res.ok) throw new Error(await res.text());
@@ -630,6 +704,7 @@ async function refreshEconomics() {
     setText("econ-burned", qch(e.total_burned));
     setText("econ-fee-burned", qch(e.fee_burned));
     setText("econ-dust-burned", qch(e.dust_burned));
+    setText("econ-own", qch(e.own_commission));
     setText("econ-validator-earned", qch(e.validator_earned));
     setText("econ-pool", qch(e.reward_pool_balance));
     setText("econ-validator-balance", qch(e.validator_balance));
@@ -642,13 +717,32 @@ async function refreshEconomics() {
   } catch (err) { /* mantener últimos valores si el nodo no responde */ }
 }
 
+// ===== actividad de staking =====
+const STAKE_LABELS = { delegate: "delegó", undelegate: "retiró", claim_reward: "reclamó" };
+async function refreshStaking() {
+  try {
+    const rows = await getJson("/staking_activity?limit=25");
+    const body = document.getElementById("staking-body");
+    const empty = document.getElementById("staking-empty");
+    if (!rows.length) { body.innerHTML = ""; empty.hidden = false; return; }
+    empty.hidden = true;
+    body.innerHTML = rows.map(r => {
+      const label = STAKE_LABELS[r.kind] || r.kind;
+      return `<tr><td>${label}</td><td class="mono">${short(r.staker)}</td><td class="mono">${short(r.validator)}</td><td><b>${qch(r.amount)}</b></td><td>${fmtNum(r.round)}</td></tr>`;
+    }).join("");
+  } catch (e) { /* keep last */ }
+}
+document.getElementById("refresh-staking").addEventListener("click", refreshStaking);
+
 refreshStatus();
 refreshChainId();
 refreshEquivocations();
 refreshEconomics();
+refreshStaking();
 loadTransfers(true);
 setInterval(refreshStatus, 2000);
 setInterval(refreshEconomics, 2000);
+setInterval(refreshStaking, 3000);
 setInterval(refreshEquivocations, 15000);
 // Auto-refresco de "actividad reciente" sin parpadeo: solo redibuja si la
 // lista cambió de verdad (ver autoRefreshTransfers).

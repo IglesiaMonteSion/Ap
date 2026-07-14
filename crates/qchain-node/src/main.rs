@@ -289,6 +289,43 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Same for staking activity (a `sled` tree at `data_dir/staking`) so the
+    // dashboard's and wallet's staking history survives a restart.
+    let staking_log: Option<sled::Db> = match &config.data_dir {
+        Some(dir) => Some(sled::open(dir.join("staking"))?),
+        None => None,
+    };
+    if let Some(db) = &staking_log {
+        let mut loaded = Vec::new();
+        for entry in db.iter() {
+            let (_seq, bytes) = entry?;
+            match serde_json::from_slice::<qchain_execution::StakingEvent>(&bytes) {
+                Ok(e) => loaded.push(e),
+                Err(e) => tracing::warn!("skipping a corrupt staking event in the on-disk log: {e}"),
+            }
+        }
+        if !loaded.is_empty() {
+            tracing::info!("reloaded {} staking events from the on-disk log", loaded.len());
+            ledger.restore_staking_events(loaded);
+        }
+    }
+
+    // Restore the persisted economics snapshot (lifetime burn/earnings counters)
+    // so they don't reset to zero on every restart. A missing/corrupt file just
+    // starts the counters at zero (the pre-persistence behavior).
+    let economics_path: Option<std::path::PathBuf> = config.data_dir.as_ref().map(|dir| dir.join("economics"));
+    if let Some(path) = &economics_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            match borsh::BorshDeserialize::try_from_slice(&bytes) {
+                Ok(snap) => {
+                    ledger.import_economics(snap);
+                    tracing::info!("restored persisted economics counters from {}", path.display());
+                }
+                Err(e) => tracing::warn!("ignoring a corrupt economics snapshot ({e}); starting counters at zero"),
+            }
+        }
+    }
+
     let engine = Arc::new(Engine {
         self_id,
         keypair,
@@ -297,6 +334,8 @@ async fn main() -> anyhow::Result<()> {
         chain_id: config.chain_id(),
         cert_log,
         receipt_log,
+        staking_log,
+        economics_path,
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,

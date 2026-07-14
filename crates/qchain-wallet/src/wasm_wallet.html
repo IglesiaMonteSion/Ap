@@ -705,22 +705,42 @@ async function renderHome(){
 
 async function renderActivity(addr){
   const box=$("activity");
-  let txs;
-  try{ txs=await api("/api/transfers"); }catch(e){ return; }
+  // Fetch both plain transfers AND staking activity, so the activity view shows
+  // EVERYTHING this wallet did (staking never shows up in the transfer list —
+  // it's not a simple transfer). Both are best-effort; if one fails, show the
+  // other.
+  let txs=[], stk=[];
+  try{ txs=await api("/api/transfers"); }catch(e){}
+  try{ stk=await api("/api/staking_activity/"+encodeURIComponent(addr)); }catch(e){}
+  const items=[];
+  // Staking events (rarer, and the whole point of this fix) - show up to 12.
+  for(const s of (stk||[]).slice(0,12)){
+    let title, sub, cls, ic, sign;
+    if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+short(s.validator); cls="out"; ic="🔒"; sign="−"; }
+    else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+short(s.validator); cls="in"; ic="🔓"; sign="+"; }
+    else { title="Recompensa de staking"; sub="reclamada"; cls="in"; ic="★"; sign="+"; }
+    items.push(`<div class="tx">
+      <div class="tx-ic ${cls==='in'?'tx-in':'tx-out'}">${ic}</div>
+      <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ronda ${fmt(String(s.round))}</div></div>
+      <div class="tx-amt ${cls}">${sign}${qchDisp(s.amount)}</div>
+    </div>`);
+  }
+  // Plain transfers to/from this wallet - show up to 15.
   const mine=(txs||[]).filter(t=>t.from===addr||t.to===addr).slice(0,15);
-  const sig=addr+"|"+mine.map(t=>t.tx_hash).join(",");
-  if(sig===lastActivitySig) return;
-  lastActivitySig=sig;
-  if(!mine.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
-  box.innerHTML=mine.map(t=>{
+  for(const t of mine){
     const inc=t.to===addr;
-    return `<div class="tx">
+    items.push(`<div class="tx">
       <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
       <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
         <div class="tx-s">${inc?'de '+short(t.from):'a '+short(t.to)}</div></div>
       <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${qchDisp(t.amount)}</div>
-    </div>`;
-  }).join("");
+    </div>`);
+  }
+  const sig=addr+"|s"+(stk||[]).map(s=>s.tx_hash).join(",")+"|t"+mine.map(t=>t.tx_hash).join(",");
+  if(sig===lastActivitySig) return;
+  lastActivitySig=sig;
+  if(!items.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
+  box.innerHTML=items.join("");
 }
 
 function renderReceive(){

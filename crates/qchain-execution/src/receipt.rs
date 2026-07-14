@@ -39,6 +39,47 @@ use qchain_core::Account;
 use qchain_crypto::Pubkey;
 use qchain_storage::MerkleProof;
 
+/// Which staking action a `StakingEvent` records. Kept as an explicit enum
+/// (not a string) so the wire/JSON is stable and a consumer can switch on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StakingEventKind {
+    /// Funds moved *into* staking (a new/topped-up delegation). This is the
+    /// "transfers to staking" the block explorer's transfer list can't show,
+    /// because staking instructions never produce a `TransferReceipt`.
+    Delegate,
+    /// A withdrawal request/closure of a stake position.
+    Undelegate,
+    /// A claim of accrued staking rewards.
+    ClaimReward,
+}
+
+/// A captured staking action, so the validator dashboard can show staking
+/// activity alongside plain transfers. Captured live in
+/// `Ledger::apply_transaction` (the store has no history to reconstruct from,
+/// same as `TransferReceipt`), only for single-instruction staking
+/// transactions - the exact shape `qchain-cli`/the wallet build. In-memory,
+/// unbounded, reset on restart - the same documented simplification as
+/// `TransferReceipt`. `amount` is exact for `Delegate` (the deposited amount);
+/// for `Undelegate`/`ClaimReward` it reflects the position's state read just
+/// before the call (principal / pending reward), which is what actually moves
+/// for an ordinary delegator.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StakingEvent {
+    pub tx_hash: [u8; 32],
+    pub kind: StakingEventKind,
+    /// The delegator (the transaction payer / the stake account's owner).
+    pub staker: Pubkey,
+    /// The validator the stake is bonded to.
+    pub validator: Pubkey,
+    /// The (deterministic, seed-derived in the wallet) stake account address.
+    pub stake_account: Pubkey,
+    /// Amount that moved: deposited (Delegate) / principal (Undelegate) /
+    /// reward (ClaimReward).
+    pub amount: u64,
+    /// The consensus round this executed in.
+    pub round: u64,
+}
+
 /// Real before/after state for one `SystemProgram::Transfer`, captured
 /// live as it executed - see module docs for exactly what's captured and
 /// why. Directly convertible to `qchain_stark::TransferStep`/

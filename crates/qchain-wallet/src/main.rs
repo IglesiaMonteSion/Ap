@@ -161,7 +161,8 @@ async fn main() -> anyhow::Result<()> {
         // dashboard del nodo. La wallet no-custodial (/) los usa para recibir
         // y mostrar actividad sin necesitar login.
         .route("/api/qr/:address", get(qr_code))
-        .route("/api/transfers", get(recent_transfers));
+        .route("/api/transfers", get(recent_transfers))
+        .route("/api/staking_activity/:address", get(staking_activity));
 
     // Protected routes: the custodial wallet (keys held on the server), now at
     // `/custodial`. These DO need the password gate - whoever reaches them could
@@ -545,6 +546,18 @@ async fn qr_code(Path(address): Path<String>) -> Result<Response, ApiError> {
 /// per-wallet activity by filtering this list by address client-side.
 async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let resp = st.http.get(format!("{}/transfers?limit=100", st.rpc)).send().await.map_err(ApiError::internal)?;
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+/// The node's recent staking activity for a specific address, proxied so the
+/// wallet's activity view can show staking (delegate/undelegate/claim) - which
+/// never appears in the transfer list. Parses the address before interpolation
+/// (no path injection).
+async fn staking_activity(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección inválida: {e}")))?;
+    let url = format!("{}/staking_activity?limit=100&staker={}", st.rpc, pk);
+    let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(body))
 }
