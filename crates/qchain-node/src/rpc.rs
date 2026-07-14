@@ -199,11 +199,12 @@ struct TransferSummary {
     to: Pubkey,
     amount: u64,
     fee: u64,
+    round: u64,
 }
 
 impl From<&TransferReceipt> for TransferSummary {
     fn from(r: &TransferReceipt) -> Self {
-        TransferSummary { tx_hash: hex::encode(r.tx_hash), from: r.from, to: r.to, amount: r.amount, fee: r.fee }
+        TransferSummary { tx_hash: hex::encode(r.tx_hash), from: r.from, to: r.to, amount: r.amount, fee: r.fee, round: r.round }
     }
 }
 

@@ -712,35 +712,37 @@ async function renderActivity(addr){
   let txs=[], stk=[];
   try{ txs=await api("/api/transfers"); }catch(e){}
   try{ stk=await api("/api/staking_activity/"+encodeURIComponent(addr)); }catch(e){}
-  const items=[];
-  // Staking events (rarer, and the whole point of this fix) - show up to 12.
-  for(const s of (stk||[]).slice(0,12)){
+  // Un solo listado de "movimientos": transferencias Y staking juntos, ordenado
+  // por ronda (como un explorador real - no se separan por tipo).
+  const rows=[];
+  for(const s of (stk||[])){
     let title, sub, cls, ic, sign;
     if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+short(s.validator); cls="out"; ic="🔒"; sign="−"; }
     else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+short(s.validator); cls="in"; ic="🔓"; sign="+"; }
     else { title="Recompensa de staking"; sub="reclamada"; cls="in"; ic="★"; sign="+"; }
-    items.push(`<div class="tx">
+    rows.push({round:s.round||0, key:"s"+s.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${cls==='in'?'tx-in':'tx-out'}">${ic}</div>
       <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ronda ${fmt(String(s.round))}</div></div>
       <div class="tx-amt ${cls}">${sign}${qchDisp(s.amount)}</div>
-    </div>`);
+    </div>`});
   }
-  // Plain transfers to/from this wallet - show up to 15.
-  const mine=(txs||[]).filter(t=>t.from===addr||t.to===addr).slice(0,15);
+  const mine=(txs||[]).filter(t=>t.from===addr||t.to===addr);
   for(const t of mine){
     const inc=t.to===addr;
-    items.push(`<div class="tx">
+    rows.push({round:t.round||0, key:"t"+t.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
       <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
         <div class="tx-s">${inc?'de '+short(t.from):'a '+short(t.to)}</div></div>
       <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${qchDisp(t.amount)}</div>
-    </div>`);
+    </div>`});
   }
-  const sig=addr+"|s"+(stk||[]).map(s=>s.tx_hash).join(",")+"|t"+mine.map(t=>t.tx_hash).join(",");
+  rows.sort((a,b)=>b.round-a.round);
+  const shown=rows.slice(0,20);
+  const sig=addr+"|"+shown.map(r=>r.key).join(",");
   if(sig===lastActivitySig) return;
   lastActivitySig=sig;
-  if(!items.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
-  box.innerHTML=items.join("");
+  if(!shown.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
+  box.innerHTML=shown.map(r=>r.html).join("");
 }
 
 function renderReceive(){

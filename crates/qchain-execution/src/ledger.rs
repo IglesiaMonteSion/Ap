@@ -608,6 +608,7 @@ impl Ledger {
             let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             self.transfer_receipts.push(TransferReceipt {
                 tx_hash: tx.hash(),
+                round: current_round,
                 from,
                 to,
                 amount,

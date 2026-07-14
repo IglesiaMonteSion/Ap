@@ -90,6 +90,11 @@ pub struct StakingEvent {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransferReceipt {
     pub tx_hash: [u8; 32],
+    /// The consensus round this transfer executed in. `#[serde(default)]` so
+    /// receipts persisted before this field existed still deserialize (round 0).
+    /// Lets a merged activity view (transfers + staking) order both by round.
+    #[serde(default)]
+    pub round: u64,
     pub from: Pubkey,
     pub to: Pubkey,
     pub amount: u64,

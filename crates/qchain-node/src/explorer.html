@@ -95,6 +95,8 @@
   .op-t { font-weight: 600; margin-bottom: 0.3rem; }
   .op-d { color: var(--text-dim); font-size: 0.82rem; margin-bottom: 0.5rem; }
   .op-cmd { font-family: var(--mono); font-size: 0.76rem; background: rgba(0,0,0,.28); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.7rem; overflow-x: auto; white-space: pre; margin: 0; color: #cfe0ff; }
+  .amt-in { color: var(--good); }
+  .amt-out { color: var(--text-dim); }
   .stat-card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -304,6 +306,12 @@
       <div class="panel-sub">Este panel es de solo lectura (el nodo no guarda claves). Las acciones se firman con <code>qchain-cli</code> o la wallet, que sí tienen tu clave.</div>
       <div class="op-grid">
         <div class="op-card">
+          <div class="op-t">💸 Retirar / gastar tus comisiones</div>
+          <div class="op-d">Tu comisión <b>no se bloquea ni se acumula aparte</b>: se acredita <b>directo a tu balance</b> cada vez que proponés un bloque (ver "balance de este validador" arriba). Ya es líquida — la gastás/retirás como cualquier saldo, firmando una transferencia normal con la clave del validador:</div>
+          <pre class="op-cmd">qchain transfer --keypair &lt;validador&gt;.json --to &lt;destino&gt; --amount &lt;unidades&gt; --rpc &lt;url&gt;</pre>
+          <div class="op-d" style="margin-top:.5rem">Lo único que sí requiere un <code>claim</code> aparte es la parte del <b>pool</b> que les toca a los <b>delegadores</b> (cada uno con <code>qchain stake-claim</code> o desde la wallet), no tu comisión.</div>
+        </div>
+        <div class="op-card">
           <div class="op-t">Cambiar la comisión del validador</div>
           <div class="op-d">Se hace por gobernanza (tier bajo, mayoría simple, sin time-lock). Proponé un nuevo valor en bps (ej. 2000 = 20%), votá con tu stake y ejecutá:</div>
           <pre class="op-cmd">qchain propose-set-staking-commission --value &lt;bps&gt; --rpc &lt;url&gt; --keypair tu.json</pre>
@@ -329,33 +337,17 @@ qchain propose-set-dust-threshold --value &lt;unidades&gt; ...</pre>
 
     <section class="panel">
       <div class="panel-header">
-        <h2>actividad reciente</h2>
+        <h2>transacciones</h2>
         <button id="refresh-transfers" class="btn-ghost">↻ actualizar</button>
       </div>
-      <div class="panel-sub">Transferencias que este validador ejecutó y confirmó — no un índice de toda la red, cada validador solo ve lo que él mismo procesó.</div>
+      <div class="panel-sub">Todo lo que este validador ejecutó y confirmó — transferencias Y staking en una sola lista, como un explorador real. No es un índice de toda la red: cada validador solo ve lo que él mismo procesó.</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>hash</th><th>desde</th><th>hacia</th><th>monto (QCH)</th><th>fee (QCH)</th></tr></thead>
-          <tbody id="transfers-body"></tbody>
+          <thead><tr><th>tipo</th><th>desde</th><th>hacia / detalle</th><th>monto (QCH)</th><th>ronda</th></tr></thead>
+          <tbody id="tx-body"></tbody>
         </table>
       </div>
-      <p id="transfers-empty" class="empty" hidden>todavía no se ejecutó ninguna transferencia en este validador</p>
-      <button id="load-more" class="btn btn-block" hidden>cargar más</button>
-    </section>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h2>🔒 actividad de staking</h2>
-        <button id="refresh-staking" class="btn-ghost">↻ actualizar</button>
-      </div>
-      <div class="panel-sub">Delegaciones, retiros y reclamos de recompensa — no aparecen en la lista de transferencias porque staking no es una transferencia simple.</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>acción</th><th>staker</th><th>validador</th><th>monto (QCH)</th><th>ronda</th></tr></thead>
-          <tbody id="staking-body"></tbody>
-        </table>
-      </div>
-      <p id="staking-empty" class="empty" hidden>todavía no hubo actividad de staking en este validador</p>
+      <p id="tx-empty" class="empty" hidden>todavía no se ejecutó ninguna transacción en este validador</p>
     </section>
 
     <section class="panel" id="detail-panel" hidden>
@@ -575,56 +567,50 @@ async function refreshEquivocations() {
   } catch (e) { /* optional */ }
 }
 
-let transfersOffset = 0;
-const TRANSFERS_PAGE = 20;
-let lastTransfersSig = "";
+// Unified transaction list: transfers AND staking in one table, ordered by
+// round (like a real explorer - ETH/SOL don't split by tx type; they split
+// "transactions" vs "blocks"). Only rebuilds the DOM when the list actually
+// changed (signature check), so it doesn't flicker every refresh.
+const ACTIVITY_LIMIT = 40;
+let lastActivitySig = "";
+const STAKE_TYPE = {
+  delegate:     { label: "Staking · delegación", cls: "amt-out" },
+  undelegate:   { label: "Staking · retiro",     cls: "amt-in" },
+  claim_reward: { label: "Staking · recompensa", cls: "amt-in" },
+};
 
-async function loadTransfers(reset = false) {
-  if (reset) {
-    transfersOffset = 0;
-    document.getElementById("transfers-body").innerHTML = "";
+async function loadActivity(force = false) {
+  const body = document.getElementById("tx-body");
+  const emptyNote = document.getElementById("tx-empty");
+  let txs = [], stk = [];
+  try { txs = await getJson(`/transfers?limit=${ACTIVITY_LIMIT}`); } catch (e) {}
+  try { stk = await getJson(`/staking_activity?limit=${ACTIVITY_LIMIT}`); } catch (e) {}
+  const items = [];
+  for (const t of (txs || [])) {
+    items.push({ round: t.round || 0, hash: t.tx_hash, click: true,
+      type: "Transferencia", from: t.from, to: t.to, amount: t.amount, cls: "" });
   }
-  const body = document.getElementById("transfers-body");
-  const emptyNote = document.getElementById("transfers-empty");
-  const loadMore = document.getElementById("load-more");
-  try {
-    const rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=${transfersOffset}`);
-    // Keep the auto-refresh signature in sync when we (re)load the first page,
-    // so it doesn't immediately re-trigger a rebuild right after a manual load.
-    if (transfersOffset === 0) lastTransfersSig = rows.map(r => r.tx_hash).join(",");
-    if (transfersOffset === 0 && rows.length === 0) {
-      emptyNote.hidden = false;
-      loadMore.hidden = true;
-      return;
-    }
-    emptyNote.hidden = true;
-    for (const r of rows) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td class="mono">${short(r.tx_hash)}</td><td class="mono">${short(r.from)}</td><td class="mono">${short(r.to)}</td><td class="amount">${qch(r.amount)}</td><td>${qch(r.fee)}</td>`;
-      tr.addEventListener("click", () => showTransfer(r.tx_hash));
-      body.appendChild(tr);
-    }
-    transfersOffset += rows.length;
-    loadMore.hidden = rows.length < TRANSFERS_PAGE;
-  } catch (e) {
-    emptyNote.textContent = `error cargando transferencias: ${e.message}`;
-    emptyNote.hidden = false;
+  for (const s of (stk || [])) {
+    const meta = STAKE_TYPE[s.kind] || { label: s.kind, cls: "" };
+    // "hacia / detalle" = the counterparty most useful per action.
+    const to = s.kind === "delegate" ? s.validator : s.staker;
+    items.push({ round: s.round || 0, hash: s.tx_hash, click: false,
+      type: meta.label, from: s.staker, to, amount: s.amount, cls: meta.cls });
   }
-}
-
-// Smooth auto-refresh of the recent-activity list: fetch the first page and
-// only rebuild the table when it actually changed. Rebuilding unconditionally
-// every few seconds cleared the tbody first, causing a visible flicker/
-// "blackout" even when nothing was new. Skips entirely while the user has
-// paged down (so "cargar más" isn't clobbered).
-async function autoRefreshTransfers() {
-  if (transfersOffset > TRANSFERS_PAGE) return;
-  let rows;
-  try { rows = await getJson(`/transfers?limit=${TRANSFERS_PAGE}&offset=0`); }
-  catch (e) { return; }
-  const sig = rows.map(r => r.tx_hash).join(",");
-  if (sig === lastTransfersSig) return; // sin cambios -> no tocar el DOM, sin parpadeo
-  loadTransfers(true);
+  items.sort((a, b) => b.round - a.round);
+  const shown = items.slice(0, ACTIVITY_LIMIT);
+  const sig = shown.map(i => i.hash + i.type).join(",");
+  if (!force && sig === lastActivitySig) return; // sin cambios -> sin parpadeo
+  lastActivitySig = sig;
+  if (!shown.length) { body.innerHTML = ""; emptyNote.hidden = false; return; }
+  emptyNote.hidden = true;
+  body.innerHTML = "";
+  for (const i of shown) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${i.type}</td><td class="mono">${short(i.from)}</td><td class="mono">${short(i.to)}</td><td class="amount ${i.cls}">${qch(i.amount)}</td><td>${fmtNum(i.round)}</td>`;
+    if (i.click) { tr.style.cursor = "pointer"; tr.addEventListener("click", () => showTransfer(i.hash)); }
+    body.appendChild(tr);
+  }
 }
 
 function accountCard(title, address, before, after) {
@@ -671,8 +657,7 @@ async function showTransfer(hash) {
 document.getElementById("close-detail").addEventListener("click", () => {
   document.getElementById("detail-panel").hidden = true;
 });
-document.getElementById("load-more").addEventListener("click", () => loadTransfers(false));
-document.getElementById("refresh-transfers").addEventListener("click", () => loadTransfers(true));
+document.getElementById("refresh-transfers").addEventListener("click", () => loadActivity(true));
 
 document.getElementById("lookup").addEventListener("click", async () => {
   const addr = document.getElementById("addr").value.trim();
@@ -718,35 +703,17 @@ async function refreshEconomics() {
 }
 
 // ===== actividad de staking =====
-const STAKE_LABELS = { delegate: "delegó", undelegate: "retiró", claim_reward: "reclamó" };
-async function refreshStaking() {
-  try {
-    const rows = await getJson("/staking_activity?limit=25");
-    const body = document.getElementById("staking-body");
-    const empty = document.getElementById("staking-empty");
-    if (!rows.length) { body.innerHTML = ""; empty.hidden = false; return; }
-    empty.hidden = true;
-    body.innerHTML = rows.map(r => {
-      const label = STAKE_LABELS[r.kind] || r.kind;
-      return `<tr><td>${label}</td><td class="mono">${short(r.staker)}</td><td class="mono">${short(r.validator)}</td><td><b>${qch(r.amount)}</b></td><td>${fmtNum(r.round)}</td></tr>`;
-    }).join("");
-  } catch (e) { /* keep last */ }
-}
-document.getElementById("refresh-staking").addEventListener("click", refreshStaking);
-
 refreshStatus();
 refreshChainId();
 refreshEquivocations();
 refreshEconomics();
-refreshStaking();
-loadTransfers(true);
+loadActivity(true);
 setInterval(refreshStatus, 2000);
 setInterval(refreshEconomics, 2000);
-setInterval(refreshStaking, 3000);
 setInterval(refreshEquivocations, 15000);
-// Auto-refresco de "actividad reciente" sin parpadeo: solo redibuja si la
-// lista cambió de verdad (ver autoRefreshTransfers).
-setInterval(autoRefreshTransfers, 3000);
+// Auto-refresco de la lista de transacciones (transferencias + staking) sin
+// parpadeo: solo redibuja si la lista cambió de verdad (ver loadActivity).
+setInterval(() => loadActivity(false), 3000);
 </script>
 </body>
 </html>
