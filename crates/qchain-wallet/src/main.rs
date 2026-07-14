@@ -132,7 +132,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/:address", get(account_ep))
         .route("/api/relay-tx", post(relay_tx))
         .route("/api/config", get(config))
-        .route("/api/node", get(node_status));
+        .route("/api/node", get(node_status))
+        // Info pública (no expone claves): el QR es solo la dirección
+        // codificada, y el historial de transferencias ya es visible en el
+        // dashboard del nodo. La wallet no-custodial (/) los usa para recibir
+        // y mostrar actividad sin necesitar login.
+        .route("/api/qr/:address", get(qr_code))
+        .route("/api/transfers", get(recent_transfers));
 
     // Protected routes: the custodial wallet (keys held on the server), now at
     // `/custodial`. These DO need the password gate - whoever reaches them could
@@ -143,8 +149,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/balance/:address", get(balance))
         .route("/api/max/:name", get(max_amount))
         .route("/api/transfer", post(transfer))
-        .route("/api/qr/:address", get(qr_code))
-        .route("/api/transfers", get(recent_transfers))
         .route("/api/import", post(import_wallet))
         .route("/api/export/:name", get(export_wallet))
         .route("/api/export-encrypted", post(export_encrypted))
