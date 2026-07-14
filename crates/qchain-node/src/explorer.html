@@ -82,6 +82,8 @@
     border: 1px solid transparent;
   }
   .banner-danger { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .banner-warn { background: rgba(255,154,98,.10); color: #ff9a62; border-color: rgba(255,154,98,.35); }
+  .banner-info { background: var(--accent-bg); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 32%, transparent); }
   .banner a { color: inherit; font-weight: 600; text-decoration: underline; }
 
   .stat-grid {
@@ -205,6 +207,17 @@
     <section id="update-banner" class="banner" hidden>
       ⬆️ <span id="update-banner-text"></span> — actualizá con
       <code>sudo ./deploy/update-node.sh</code>
+    </section>
+
+    <!-- Alertas proactivas del operador (consenso estancado, sin pares, sin conexión) -->
+    <section id="alert-stalled" class="banner banner-warn" hidden>
+      🟠 <span id="alert-stalled-text"></span>
+    </section>
+    <section id="alert-peers" class="banner banner-info" hidden>
+      🔌 <span id="alert-peers-text"></span>
+    </section>
+    <section id="alert-offline" class="banner banner-danger" hidden>
+      🔴 No se puede contactar el RPC de este validador. ¿El proceso está caído o el puerto cerrado?
     </section>
 
     <section class="stat-grid">
@@ -461,11 +474,41 @@ function makeCopyable(el, getValue) {
 let lastRoundSample = null; // { round, t }
 let lastTxSample = null; // { count, t } - for live TPS
 let liveOk = true;
+// Proactive-alert state: when did the consensus round last actually advance?
+let lastRoundValue = null;
+let lastRoundChangeT = Date.now();
+const STALL_MS = 12000; // rounds not advancing this long -> "consenso estancado"
 
 function setLive(ok) {
   liveOk = ok;
   document.getElementById("live-dot").classList.toggle("down", !ok);
   document.getElementById("live-text").textContent = ok ? "en vivo" : "sin conexión";
+  // Offline alert (RPC unreachable). When offline we can't judge the round, so
+  // clear the stall banner to avoid piling two alerts for the same cause.
+  const off = document.getElementById("alert-offline");
+  if (off) off.hidden = ok;
+  if (!ok) { const st = document.getElementById("alert-stalled"); if (st) st.hidden = true; }
+}
+
+// Show/hide the "consensus stalled" warning based on how long the round has
+// been frozen. A single healthy validator advances rounds continuously, so a
+// long freeze is a real problem (stuck peer, quorum lost, wedged consensus).
+function updateStallAlert(round) {
+  const now = Date.now();
+  if (lastRoundValue === null || round > lastRoundValue) {
+    lastRoundValue = round;
+    lastRoundChangeT = now;
+  }
+  const frozenMs = now - lastRoundChangeT;
+  const banner = document.getElementById("alert-stalled");
+  if (frozenMs >= STALL_MS) {
+    document.getElementById("alert-stalled-text").textContent =
+      `El consenso no avanza desde hace ${Math.round(frozenMs / 1000)} s (ronda fija en ${fmtNum(round)}). ` +
+      `Revisá conectividad con los pares, que haya quórum, y los logs del validador.`;
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
 }
 
 function setUpdatedNow() {
@@ -479,6 +522,7 @@ async function refreshStatus() {
   try {
     const status = await getJson("/status");
     setLive(true);
+    updateStallAlert(status.next_round);
     document.getElementById("stat-certs").textContent = fmtNum(status.dag_certificates);
     document.getElementById("stat-executed").textContent = fmtNum(status.executed_transactions);
     document.getElementById("stat-round").textContent = fmtNum(status.next_round);
@@ -699,6 +743,18 @@ async function refreshEconomics() {
     setText("econ-burn-pct", e.burn_pct + " %");
     setText("econ-stake", fmtNum(e.validator_stake));
     setText("econ-peers", fmtNum(e.peer_count));
+    // Connectivity alert: 0 peers means this validator is isolated. For a
+    // single-validator testnet that's expected (info); for a real network it
+    // means it can't reach anyone and consensus will stall.
+    const peersBanner = document.getElementById("alert-peers");
+    if (e.peer_count === 0) {
+      setText("alert-peers-text",
+        "Este validador no tiene pares conectados (está corriendo en solitario). " +
+        "Si esperabas una red multi-validador, revisá las direcciones de peers y el firewall.");
+      peersBanner.hidden = false;
+    } else {
+      peersBanner.hidden = true;
+    }
   } catch (err) { /* mantener últimos valores si el nodo no responde */ }
 }
 

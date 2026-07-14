@@ -73,7 +73,11 @@
   .balance-card .acct{margin-top:14px;display:flex;align-items:center;gap:8px;font-size:13px;color:#c3c9e0}
   .balance-card .acct .mono{font-family:ui-monospace,Menlo,monospace}
 
-  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;backdrop-filter:blur(10px)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;backdrop-filter:blur(10px);
+    position:relative;overflow:hidden}
+  /* Línea de luz cuántica sutil en el borde superior de cada tarjeta */
+  .card::before{content:"";position:absolute;top:0;left:12%;right:12%;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(150,130,255,.55),transparent);pointer-events:none}
   .card.accent{border-color:rgba(140,130,255,.32);box-shadow:0 0 30px rgba(124,110,255,.12)}
   .section-title{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
     margin:24px 4px 10px;font-weight:700}
@@ -109,7 +113,11 @@
   input:focus,textarea:focus,select:focus{outline:none;border-color:var(--brand1);box-shadow:0 0 0 3px rgba(140,130,255,.18)}
   .row{display:flex;gap:8px}
 
-  h2.view-title{font-size:23px;margin:2px 0 2px;letter-spacing:-.02em;font-weight:800}
+  h2.view-title{font-size:23px;margin:2px 0 2px;letter-spacing:-.02em;font-weight:800;
+    display:flex;align-items:center;gap:11px}
+  /* Barra de acento cuántica (gradiente + glow) antes de cada título de pantalla */
+  h2.view-title::before{content:"";width:4px;height:22px;border-radius:3px;flex:0 0 auto;
+    background:linear-gradient(180deg,var(--brand1),var(--brand2));box-shadow:0 0 12px rgba(140,120,255,.55)}
   .view-sub{color:var(--muted);font-size:14px;margin:0 0 6px}
   .hint{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.5}
   .hint a{color:#9aa2bd}
