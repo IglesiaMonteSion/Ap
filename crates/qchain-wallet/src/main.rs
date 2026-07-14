@@ -162,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
         // y mostrar actividad sin necesitar login.
         .route("/api/qr/:address", get(qr_code))
         .route("/api/transfers", get(recent_transfers))
-        .route("/api/staking_activity/:address", get(staking_activity));
+        .route("/api/staking_activity/:address", get(staking_activity))
+        .route("/api/validators", get(validators));
 
     // Protected routes: the custodial wallet (keys held on the server), now at
     // `/custodial`. These DO need the password gate - whoever reaches them could
@@ -546,6 +547,15 @@ async fn qr_code(Path(address): Path<String>) -> Result<Response, ApiError> {
 /// per-wallet activity by filtering this list by address client-side.
 async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let resp = st.http.get(format!("{}/transfers?limit=100", st.rpc)).send().await.map_err(ApiError::internal)?;
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+/// The validator directory (address, name, stake), proxied so the staking UI
+/// can show a named list to pick a delegation target instead of asking the user
+/// to paste a raw address.
+async fn validators(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let resp = st.http.get(format!("{}/validators", st.rpc)).send().await.map_err(ApiError::internal)?;
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(body))
 }

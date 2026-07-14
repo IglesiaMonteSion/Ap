@@ -55,6 +55,8 @@ Opciones:
                          también configurable con la variable QCHAIN_HOME).
   --listen-port <puerto> Puerto P2P a usar en modo "solo" (por defecto 9000).
   --rpc-port <puerto>    Puerto RPC a usar en modo "solo" (por defecto 8080).
+  --nombre <texto>       (modo "solo") nombre visible del validador, para que
+                         las wallets lo muestren al elegir dónde hacer staking.
   --yes, -y              No pedir confirmaciones (para instalación automatizada).
   --no-build             No construir la imagen desde el código aunque falte;
                          solo intentar 'docker pull' / cargar un tar. Útil si
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
+    --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
     --no-build) NO_BUILD=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -268,10 +271,25 @@ if [ "$SALTAR_CONFIGURACION" -eq 0 ]; then
 
       BUNDLE_JSON="$(qrun qchain bundle --keypair keypair.json)"
 
+      # Nombre (moniker) opcional del validador, para que las wallets lo
+      # muestren en una lista al elegir dónde hacer staking, en vez de una
+      # dirección cruda. Interactivo si no se pasó --nombre y no es --yes.
+      if [ -z "${NOMBRE_VALIDADOR:-}" ] && [ "${ASUMIR_SI:-0}" -ne 1 ]; then
+        read -rp "Nombre para tu validador (opcional, Enter para omitir): " NOMBRE_VALIDADOR || true
+      fi
+
       mkdir -p "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out"
-      cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
+      if [ -n "${NOMBRE_VALIDADOR:-}" ]; then
+        # Escapar comillas/backslashes para un JSON válido.
+        NOMBRE_JSON="$(printf '%s' "$NOMBRE_VALIDADOR" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
+{"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE, "name": "$NOMBRE_JSON"}
+EOF
+      else
+        cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
 {"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE}
 EOF
+      fi
       cat > "$QCHAIN_HOME/genesis.json" <<EOF
 [{"address": "$WALLET_DIRECCION", "balance": $FONDO_WALLET_PRUEBA}]
 EOF

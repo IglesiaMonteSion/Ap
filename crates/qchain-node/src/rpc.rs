@@ -27,6 +27,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers", get(list_transfers))
         .route("/transfers/:hash", get(get_transfer))
         .route("/staking_activity", get(staking_activity))
+        .route("/validators", get(validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
         .route("/version", get(version))
@@ -292,6 +293,14 @@ async fn staking_activity(State(engine): State<Arc<Engine>>, Query(query): Query
     };
     let events = engine.list_staking_events(query.limit, query.offset, staker).await;
     Ok(Json(events.iter().map(StakingSummary::from).collect()))
+}
+
+/// The validator directory: address, optional name, and BFT stake for every
+/// validator in this network's set. Lets a wallet render a named list to pick a
+/// delegation target instead of asking the user to paste a raw address. Static
+/// config data (from the shared genesis), read-only.
+async fn validators(State(engine): State<Arc<Engine>>) -> Json<Vec<crate::engine::ValidatorDirEntry>> {
+    Json(engine.validator_directory.clone())
 }
 
 /// Every equivocation this validator has independently witnessed and

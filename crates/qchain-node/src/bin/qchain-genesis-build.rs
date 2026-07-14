@@ -13,8 +13,11 @@
 //! { "pubkey_bundle": { ... from `qchain bundle` ... },
 //!   "listen_addr": "203.0.113.10:9000",
 //!   "rpc_addr": "203.0.113.10:8080",
-//!   "stake": 1000000 }
+//!   "stake": 1000000,
+//!   "name": "Validador Buenos Aires" }
 //! ```
+//! `name` is optional (a human-readable moniker wallets show when picking a
+//! delegation target); omit it for a nameless validator.
 
 use clap::Parser;
 use qchain_node::config::{GenesisAllocation, NodeConfig, ValidatorConfig};
@@ -62,6 +65,10 @@ struct ValidatorManifest {
     listen_addr: SocketAddr,
     rpc_addr: SocketAddr,
     stake: u64,
+    /// Optional human-readable moniker for this validator, carried into the
+    /// shared config so wallets can show a named list. Absent = no name.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -106,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let validators: Vec<ValidatorConfig> =
-        manifests.iter().map(|m| ValidatorConfig { pubkey_bundle: m.pubkey_bundle.clone(), addr: m.listen_addr, stake: m.stake }).collect();
+        manifests.iter().map(|m| ValidatorConfig { pubkey_bundle: m.pubkey_bundle.clone(), addr: m.listen_addr, stake: m.stake, name: m.name.clone() }).collect();
 
     let genesis: Vec<GenesisAllocation> = match &cli.genesis {
         Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,

@@ -443,9 +443,12 @@
 
     <div class="card accent" style="margin-top:4px">
       <div class="section-title" style="margin:0 0 8px">Delegar</div>
-      <label for="st-validator">Validador</label>
+      <label for="st-valselect">Elegí un validador</label>
+      <select id="st-valselect"><option value="">— cargando validadores… —</option></select>
+      <div class="hint">Elegí de la lista, o pegá una dirección manualmente abajo.</div>
+      <label for="st-validator">Dirección del validador</label>
       <input id="st-validator" placeholder="dirección del validador" autocomplete="off">
-      <div class="hint" id="st-valhint">Se rellena con el validador del nodo conectado.</div>
+      <div class="hint" id="st-valhint">Se rellena con el validador que elijas arriba.</div>
       <label for="st-amount">Monto (QCH)</label>
       <input id="st-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
       <button class="btn-block" id="st-delegate" style="margin-top:16px">Delegar</button>
@@ -1013,10 +1016,44 @@ async function relaySigned(txJson){
   return body;
 }
 
+// Puebla el selector de validadores desde /api/validators (nombre + stake +
+// dirección) para que el usuario elija de una lista en vez de pegar la
+// dirección. Al elegir uno, se rellena el campo de dirección real.
+let validatorListLoaded=false;
+async function loadValidatorList(){
+  const sel=$("st-valselect");
+  try{
+    const vals=await api("/api/validators");
+    if(!Array.isArray(vals)||!vals.length){ sel.innerHTML='<option value="">— sin validadores —</option>'; return; }
+    // Ordenar: con nombre primero (alfabético), luego el resto por stake desc.
+    vals.sort((a,b)=>{
+      const an=a.name||"", bn=b.name||"";
+      if(an&&!bn) return -1; if(!an&&bn) return 1;
+      if(an&&bn) return an.localeCompare(bn);
+      return (b.stake||0)-(a.stake||0);
+    });
+    const opts=['<option value="">— elegí un validador —</option>'];
+    for(const v of vals){
+      const label=(v.name?v.name:short(v.address))+" · "+qchDisp(v.stake)+" stake";
+      opts.push(`<option value="${v.address}">${label}</option>`);
+    }
+    sel.innerHTML=opts.join("");
+    validatorListLoaded=true;
+    // Si ya hay una dirección puesta y coincide con una opción, seleccionarla.
+    const cur=$("st-validator").value.trim();
+    if(cur) sel.value=cur;
+  }catch(e){ sel.innerHTML='<option value="">— no se pudo cargar la lista —</option>'; }
+}
+$("st-valselect").addEventListener("change",e=>{
+  const v=e.target.value;
+  if(v){ $("st-validator").value=v; $("st-valhint").textContent="Validador elegido de la lista (podés editar la dirección)."; }
+});
+
 async function renderStaking(){
   const addr=myAddress(); if(!addr) return;
   $("st-msg").className="msg"; $("st-msg").textContent="";
   $("st-amount").value="";
+  await loadValidatorList();
   // sugerir el validador del nodo conectado
   if(!$("st-validator").value){
     try{ const st=await api("/api/node"); if(st.validator){ $("st-validator").value=st.validator; $("st-valhint").textContent="Validador del nodo conectado (podés cambiarlo)."; } }catch(e){}

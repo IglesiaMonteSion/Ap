@@ -15,6 +15,18 @@ pub struct ValidatorConfig {
     pub pubkey_bundle: PublicKeyBundle,
     pub addr: SocketAddr,
     pub stake: u64,
+    /// Optional human-readable moniker so wallets can show a named list of
+    /// validators to delegate to, instead of asking the user to paste a raw
+    /// address. Set in the shared genesis config (every node with the same
+    /// genesis sees the same name). `skip_serializing_if` keeps the field OUT
+    /// of the JSON entirely when absent, so a config written before names
+    /// existed serializes byte-for-byte identically - which means `chain_id`
+    /// (a hash over `validators`+`genesis`) is UNCHANGED for existing
+    /// networks. A network that does set names folds them into its chain_id,
+    /// which is fine: setting names is a genesis-level decision for that
+    /// network, made once up front.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -127,7 +139,7 @@ mod tests {
     #[test]
     fn chain_id_is_identical_across_validators_of_the_same_network_despite_differing_per_validator_fields() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000 }];
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
         let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
 
         let mut a = config_with(validators.clone(), genesis.clone());
@@ -147,11 +159,31 @@ mod tests {
     #[test]
     fn chain_id_differs_across_genuinely_different_networks() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000 }];
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
 
         let network_a = config_with(validators.clone(), vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 1 }]);
         let network_b = config_with(validators, vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 2 }]);
 
         assert_ne!(network_a.chain_id(), network_b.chain_id(), "genuinely different genesis data must produce different chain_ids");
+    }
+
+    /// The whole point of `skip_serializing_if` on `name`: an existing network
+    /// (validators with no name) must compute the EXACT same chain_id it did
+    /// before the field existed, so adding this feature never breaks a live
+    /// deployment. We prove it by checking the serialized bytes carry no
+    /// `name` key when name is `None` (byte-identical to the old struct), and
+    /// that setting a name does change the bytes (so it folds into chain_id).
+    #[test]
+    fn name_none_is_omitted_from_serialization_so_chain_id_is_unchanged() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let nameless = ValidatorConfig { pubkey_bundle: bundle.clone(), addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None };
+        let named = ValidatorConfig { name: Some("Alice".into()), ..nameless.clone() };
+
+        let nameless_json = serde_json::to_string(&nameless).unwrap();
+        assert!(!nameless_json.contains("name"), "a nameless validator must serialize with no `name` key (byte-identical to pre-name configs, preserving chain_id)");
+
+        let c_nameless = config_with(vec![nameless], vec![]);
+        let c_named = config_with(vec![named], vec![]);
+        assert_ne!(c_nameless.chain_id(), c_named.chain_id(), "setting a name folds it into the network's own chain_id");
     }
 }

@@ -332,10 +332,25 @@ pub struct EngineState {
     pub update_available: Option<String>,
 }
 
+/// One row of the validator directory served by `GET /validators`: the
+/// consensus address (derived from the key bundle), the optional human-readable
+/// name from the shared genesis config, and the BFT stake weight. Static config
+/// data, computed once at startup - lets a wallet show a named list to pick a
+/// delegation target instead of asking for a raw address.
+#[derive(Clone, serde::Serialize)]
+pub struct ValidatorDirEntry {
+    pub address: ValidatorId,
+    pub name: Option<String>,
+    pub stake: u64,
+}
+
 pub struct Engine {
     pub self_id: ValidatorId,
     pub keypair: Keypair,
     pub validators: ValidatorSet,
+    /// The validator set as a wallet-facing directory (address, name, stake),
+    /// built from the node config at startup and served via `GET /validators`.
+    pub validator_directory: Vec<ValidatorDirEntry>,
     pub network: Arc<Network>,
     pub state: Mutex<EngineState>,
     /// This network's own genesis-derived identity - see

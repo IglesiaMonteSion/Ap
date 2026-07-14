@@ -48,9 +48,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut validator_infos = Vec::new();
     let mut peers = Vec::new();
+    let mut validator_directory = Vec::new();
     for v in &config.validators {
         let id = v.pubkey_bundle.to_address();
         validator_infos.push(ValidatorInfo { id, pubkey_bundle: v.pubkey_bundle.clone(), stake: v.stake });
+        validator_directory.push(qchain_node::engine::ValidatorDirEntry { address: id, name: v.name.clone(), stake: v.stake });
         if id != self_id {
             peers.push(PeerInfo { id, addr: v.addr });
         }
@@ -330,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         self_id,
         keypair,
         validators,
+        validator_directory,
         network,
         chain_id: config.chain_id(),
         cert_log,
