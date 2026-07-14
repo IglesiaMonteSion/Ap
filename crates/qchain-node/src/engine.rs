@@ -330,6 +330,23 @@ pub struct EngineState {
     /// operator knows to upgrade. `None` means this node is at least as new
     /// as everything it has heard. Never drives any protocol behavior.
     pub update_available: Option<String>,
+    /// Certificates whose Bullshark total order is already settled but whose
+    /// worker batches are not all locally available yet, held in committed
+    /// order awaiting execution. This is the fix for a real, permanent fork:
+    /// `consensus.advance` emits a certificate's digest exactly once (its
+    /// `seen` set never re-emits it), so a certificate ordered before its
+    /// batch arrived MUST NOT be skipped - skipping drops those transactions
+    /// on this node forever while other nodes execute them, diverging both
+    /// balances AND (since dynamic fees) the on-chain `FeeState`/base-fee
+    /// curve, compounding on every subsequent transaction. Instead the
+    /// certificate is buffered here (a full clone, so DAG pruning can't lose
+    /// it) and execution blocks on it - never reordering past it - until its
+    /// batches are re-synced (`request_missing_batches`), at which point the
+    /// queue drains in order. Empty in steady state (batches almost always
+    /// arrive before or with the certificate); a stall here is the correct,
+    /// safe BFT behavior (no fork) for a node lagging far enough that a peer
+    /// already pruned the batch - snapshot-sync territory (see task #109).
+    pub pending_execution: std::collections::VecDeque<Certificate>,
 }
 
 /// One row of the validator directory served by `GET /validators`: the
@@ -342,6 +359,44 @@ pub struct ValidatorDirEntry {
     pub address: ValidatorId,
     pub name: Option<String>,
     pub stake: u64,
+}
+
+/// A batch-re-sync request the executor is blocked on: the missing
+/// `(worker, digest)` pairs plus the validator to fetch them from. `None` when
+/// execution is not blocked (the steady-state case).
+type BlockedResync = Option<(Vec<(WorkerId, Digest)>, ValidatorId)>;
+
+/// Split off the executable prefix of the pending-execution queue: certificates
+/// whose worker batches are ALL locally cached, in committed order, stopping at
+/// (and leaving buffered) the first certificate with a missing batch and every
+/// certificate after it. This is the core of the permanent-fork fix documented
+/// on `EngineState::pending_execution`: never skip a certificate for a missing
+/// batch (its digest is already consumed from consensus's `seen` set, so it
+/// would be lost forever and fork this node), and never reorder execution past
+/// it. Returns the ready certificates (removed from the front) and, if the
+/// queue is now blocked, the missing `(worker, digest)` pairs plus the author
+/// to re-sync them from.
+fn take_executable_prefix(
+    pending: &mut std::collections::VecDeque<Certificate>,
+    batches: &HashMap<Digest, Batch>,
+) -> (Vec<Certificate>, BlockedResync) {
+    let mut ready = Vec::new();
+    let mut blocked = None;
+    while let Some(cert) = pending.front() {
+        let missing: Vec<(WorkerId, Digest)> = cert
+            .vertex
+            .batch_digests
+            .iter()
+            .copied()
+            .filter(|(_, d)| !batches.contains_key(d))
+            .collect();
+        if !missing.is_empty() {
+            blocked = Some((missing, cert.vertex.author));
+            break;
+        }
+        ready.push(pending.pop_front().expect("front() was just Some"));
+    }
+    (ready, blocked)
 }
 
 pub struct Engine {
@@ -395,6 +450,11 @@ pub struct Engine {
     /// Borsh blob overwritten after each committing round so lifetime
     /// burn/earnings totals survive a restart. `None` for an in-memory node.
     pub economics_path: Option<std::path::PathBuf>,
+    /// This node's configured consensus round interval (`config.round_interval_ms`).
+    /// Surfaced on `/status` so the dashboard's "consensus stalled" threshold can
+    /// scale with the real cadence instead of a hardcoded guess - a node run with
+    /// a deliberately slow interval otherwise false-positives the stall alert.
+    pub round_interval_ms: u64,
 }
 
 impl Engine {
@@ -507,15 +567,25 @@ pub struct StatusResponse {
     /// hardcoded guess. The fee of a standard transfer is this times the
     /// transaction's byte size (~5.5 KB for the default hybrid signature).
     pub base_fee_per_byte: u64,
+    /// This node's configured round interval in ms - lets the dashboard scale
+    /// its stall-detection threshold to the real cadence (see `Engine::round_interval_ms`).
+    pub round_interval_ms: u64,
 }
 
 /// Real validator economics, served at `GET /economics` and rendered on the
 /// node dashboard's validator panel. Answers the operator's real questions:
 /// how do validators earn, how much is being burned right now (and how much
 /// of that is dust - the "excess left in accounts"), and what are the live
-/// network parameters. All the running totals are in-memory since node start
-/// (reset on restart - same limitation as `total_burned`/receipts) and
-/// deterministic across nodes, so every honest node reports the same figures.
+/// network parameters. The running totals are persisted (`EconomicSnapshot`,
+/// `data_dir/economics`) so they survive a clean restart. They are REPORT-ONLY
+/// (never consensus state, never in the Merkle root) and best-effort: the
+/// snapshot is written just after the state lock is released each committing
+/// round, so an *unclean* crash in that narrow window loses the last round's
+/// burn/earn delta permanently (balances are already durable and correct;
+/// only these dashboard counters under-count). In the steady no-crash path
+/// every honest node accrues the identical figures (same deterministic
+/// `fee_collector`/round stream); after crashes at different points two nodes
+/// can differ slightly - expected for a monitoring counter, not a fork.
 #[derive(serde::Serialize, Clone)]
 pub struct EconomicsResponse {
     /// This validator's own address (the `fee_collector` when it proposes).
@@ -917,16 +987,31 @@ impl Engine {
     ) -> Vec<qchain_execution::StakingEvent> {
         let state = self.state.lock().await;
         let all = state.ledger.staking_events();
-        let filtered: Vec<qchain_execution::StakingEvent> = match staker {
-            Some(s) => all.iter().filter(|e| e.staker == s).cloned().collect(),
-            None => all.to_vec(),
-        };
-        if offset >= filtered.len() {
-            return Vec::new();
+        match staker {
+            // Unfiltered (the common dashboard poll): slice the tail directly,
+            // exactly like `list_transfers` - never clone the whole unbounded,
+            // ever-growing history under the global consensus lock just to
+            // return `limit` rows.
+            None => {
+                if offset >= all.len() {
+                    return Vec::new();
+                }
+                let end = all.len() - offset;
+                let start = end.saturating_sub(limit);
+                all[start..end].iter().rev().cloned().collect()
+            }
+            // Filtered to one staker: walk newest-first and stop once enough
+            // rows are collected, so the work is bounded by `offset + limit`
+            // matches, not by the full history length.
+            Some(s) => all
+                .iter()
+                .rev()
+                .filter(|e| e.staker == s)
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect(),
         }
-        let end = filtered.len() - offset;
-        let start = end.saturating_sub(limit);
-        filtered[start..end].iter().rev().cloned().collect()
     }
 
     /// A single captured receipt by its transaction hash, full detail
@@ -1043,6 +1128,7 @@ impl Engine {
             version: NODE_VERSION.to_string(),
             update_available: state.update_available.clone(),
             base_fee_per_byte: state.ledger.current_params().base_fee_per_byte,
+            round_interval_ms: self.round_interval_ms,
         }
     }
 
@@ -1114,8 +1200,14 @@ impl Engine {
                 // broadcast already reached every peer in one hop.
             }
             NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
-                let mut state = self.state.lock().await;
-                cache_batch(&mut state, batch);
+                {
+                    let mut state = self.state.lock().await;
+                    cache_batch(&mut state, batch);
+                }
+                // A newly-arrived batch may be exactly the one blocking the
+                // head of `pending_execution` - drain the queue now instead of
+                // waiting for the next tick (no-op if nothing was blocked).
+                self.try_commit().await;
             }
             NetMessage::VertexProposal { vertex, author_signature } => {
                 if vertex.author != from {
@@ -1726,43 +1818,46 @@ impl Engine {
         let mut to_persist: Vec<TransferReceipt> = Vec::new();
         let mut staking_to_persist: Vec<qchain_execution::StakingEvent> = Vec::new();
         let mut economics_changed = false;
+        // Set inside the lock if execution blocked on a missing batch; the
+        // actual re-sync send happens after the lock is released (below).
+        let missing_to_request: BlockedResync;
         {
         let mut state = self.state.lock().await;
         let state = &mut *state;
         let newly_ordered = state.consensus.advance(&state.dag, &self.validators);
+        // Append every newly-ordered certificate to the execution queue in
+        // committed order. `advance` emits a digest exactly once, so a full
+        // clone is buffered (not just the digest) - DAG pruning can then never
+        // lose a certificate that is still waiting for its batch. Applied in
+        // the vertex's own `batch_digests` order (worker-lane order at
+        // proposal time), the identical certified list every validator sees.
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
-            // Applied in the vertex's own `batch_digests` order (worker lane
-            // order at proposal time) - every validator sees the identical
-            // certified list, so this order is already agreed, not re-derived
-            // locally. Each consumed batch is then evicted from the cache: a
-            // batch is content-addressed and included by exactly one vertex,
-            // and once its transactions are committed they are applied for
-            // good (any later re-reference of the same digest would re-run
-            // no-ops rejected on the already-advanced nonce), so keeping it
-            // cached serves no purpose and would grow `batches` unboundedly.
-            // This is what keeps the cache scoped to in-flight (not-yet-
-            // committed) batches in steady state; `MAX_CACHED_BATCHES` is the
-            // backstop for gossiped-but-never-committed flood, not the
-            // primary bound.
-            for (worker_id, batch_digest) in &cert.vertex.batch_digests {
-                // NOT removed on use: a validator that has fallen behind
-                // re-syncs by fetching old certificates AND their batches
-                // (`WorkerBatchRequest`) from peers - evicting a batch the
-                // moment it commits here would leave a lagging peer unable to
-                // ever fetch it, permanently unable to execute those
-                // transactions (a real resync/state-divergence regression, so
-                // not done). The cache is keyed by content digest so a batch
-                // referenced by more than one certificate is stored once.
-                // Bounding this cache correctly needs round-windowed
-                // retention (keep recent, drop only batches older than any
-                // peer could still be resyncing across) - tracked as
-                // follow-up; until then it stays unbounded, the same
-                // documented phase-1 simplification as before this audit.
-                let Some(batch) = state.batches.get(batch_digest).cloned() else {
-                    tracing::warn!("committed certificate references an unseen batch from worker {worker_id} - skipping its transactions");
-                    continue;
-                };
+            state.pending_execution.push_back(cert);
+        }
+        // Drain the queue in committed order. Execution BLOCKS at the first
+        // certificate whose worker batches aren't all locally available yet -
+        // it is never skipped or reordered past. Skipping would drop those
+        // transactions on this node forever (the digest is already consumed
+        // from `advance`'s `seen` set), forking both balances AND the on-chain
+        // dynamic-fee curve versus every node that did have the batch. Instead
+        // the missing batches are re-synced (below) and the queue resumes
+        // draining, in order, on a later `try_commit`. Batches are NOT evicted
+        // on use here (that is round-windowed in `prune_stale_round_state`) so
+        // a lagging peer can still fetch them.
+        // Split off the executable prefix (all batches present), in order,
+        // leaving the first batch-blocked certificate and everything after it
+        // buffered. `blocked` names the missing batches + who to ask; the send
+        // happens after the lock is released.
+        let (ready, blocked) = take_executable_prefix(&mut state.pending_execution, &state.batches);
+        missing_to_request = blocked;
+        for cert in ready {
+            for (_worker_id, batch_digest) in &cert.vertex.batch_digests {
+                let batch = state
+                    .batches
+                    .get(batch_digest)
+                    .cloned()
+                    .expect("take_executable_prefix guarantees every batch of a ready certificate is cached");
                 for tx in &batch.transactions {
                     let receipts_before = state.ledger.transfer_receipts().len();
                     let staking_before = state.ledger.staking_events().len();
@@ -1789,6 +1884,12 @@ impl Engine {
             }
         }
         } // state lock released here
+        // Re-sync any batch that blocked execution, now off the state lock
+        // (`request_missing_batches` re-acquires it and then sends). No-op in
+        // steady state (`missing_to_request` is `None`).
+        if let Some((missing, author)) = missing_to_request {
+            self.request_missing_batches(&missing, author).await;
+        }
         // Blocking disk writes, now off the state lock (see the note at the top).
         for r in &to_persist {
             self.persist_receipt(r);
@@ -1989,6 +2090,7 @@ mod tests {
             first_seen_vertex: HashMap::new(),
             equivocation_evidence: HashMap::new(),
             update_available: None,
+            pending_execution: std::collections::VecDeque::new(),
         }
     }
 
@@ -2005,6 +2107,48 @@ mod tests {
 
     fn tx(payer: &Keypair, nonce: u64) -> Transaction {
         Transaction::new_signed(payer, nonce, [0u8; 32], 1, vec![]).unwrap()
+    }
+
+    /// The permanent-fork fix (see `EngineState::pending_execution`): a
+    /// certificate whose batch hasn't arrived must NOT be skipped, and
+    /// execution must not run any later-ordered certificate ahead of it -
+    /// otherwise this node drops transactions the rest of the network applied,
+    /// forking both balances and the dynamic-fee curve forever.
+    #[test]
+    fn take_executable_prefix_never_skips_or_reorders_past_a_missing_batch() {
+        use qchain_core::{Batch, Certificate, Vertex};
+        let author = Keypair::generate().unwrap().pubkey();
+        let d = |n: u8| -> Digest { [n; 32] };
+        let cert = |round, bds: Vec<(WorkerId, Digest)>| Certificate {
+            vertex: Vertex { round, author, batch_digests: bds, parents: vec![] },
+            signatures: vec![],
+        };
+
+        // Three certificates in committed order; the middle one's batch is
+        // missing (even though the LAST one's batch is already present).
+        let mut pending: std::collections::VecDeque<Certificate> = std::collections::VecDeque::new();
+        pending.push_back(cert(0, vec![(0, d(1))]));
+        pending.push_back(cert(1, vec![(0, d(2))])); // d(2) not yet cached
+        pending.push_back(cert(2, vec![(0, d(3))]));
+
+        let mut batches: HashMap<Digest, Batch> = HashMap::new();
+        batches.insert(d(1), Batch { transactions: vec![] });
+        batches.insert(d(3), Batch { transactions: vec![] }); // present but blocked behind d(2)
+
+        let (ready, blocked) = take_executable_prefix(&mut pending, &batches);
+        assert_eq!(ready.len(), 1, "only the first certificate is executable");
+        assert_eq!(ready[0].vertex.round, 0);
+        assert_eq!(pending.len(), 2, "the blocked cert and everything after it stay buffered - never skipped");
+        assert_eq!(pending.front().unwrap().vertex.round, 1, "the blocked cert stays at the front (no reorder)");
+        let (missing, who) = blocked.expect("the queue is blocked on a missing batch");
+        assert_eq!(missing, vec![(0u8, d(2))], "the missing batch is surfaced for re-sync");
+        assert_eq!(who, author);
+
+        // The missing batch arrives: the remaining certs drain in order, none lost.
+        batches.insert(d(2), Batch { transactions: vec![] });
+        let (ready2, blocked2) = take_executable_prefix(&mut pending, &batches);
+        assert_eq!(ready2.iter().map(|c| c.vertex.round).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(pending.is_empty() && blocked2.is_none(), "queue fully drains once the gap is filled");
     }
 
     /// The exact bug this replaces: two transactions from the same account

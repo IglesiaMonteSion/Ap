@@ -552,6 +552,11 @@ let nodeTimer = null, balTimer = null;
 // ---- helpers ----
 function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); setTimeout(()=>e.classList.remove("show"),1300); }
 function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s||""); }
+// Escapa texto que va a innerHTML. CRÍTICO para cualquier campo de texto libre
+// que venga del nodo (ej. el NOMBRE de un validador): sin esto, un validador con
+// un nombre como `</option><img src=x onerror=...>` inyectaría JS en el origen de
+// la wallet y podría robar la semilla (que está en memoria al estar desbloqueada).
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function copy(t){ navigator.clipboard.writeText(t).then(()=>toast("copiado")); }
 function b64(b){ return btoa(String.fromCharCode(...b)); }
 function ub64(s){ return Uint8Array.from(atob(s), c=>c.charCodeAt(0)); }
@@ -636,19 +641,26 @@ function qchDisp(u){ const q=unitsToQch(u); const [i,f]=q.split("."); return fmt
 async function api(path, opts){ const r=await fetch(path,opts); const b=await r.json().catch(()=>({})); if(!r.ok) throw new Error(b.error||("error "+r.status)); return b; }
 
 // ---- WebCrypto: cifrar/descifrar la semilla con la contraseña ----
-async function deriveKey(password, salt){
+// PBKDF2-HMAC-SHA256 iteration count. Raised to OWASP's 2023 recommendation
+// (600k) from the original 250k - a brute-forcer now pays ~2.4x more per guess.
+// The count is stored IN each blob (`iter`) so blobs written at the old 250k
+// still decrypt (fallback below), and a future raise stays backward-compatible.
+const PBKDF2_ITERS = 600000;
+async function deriveKey(password, salt, iters){
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:250000, hash:'SHA-256'}, base,
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:iters, hash:'SHA-256'}, base,
     {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
 }
 async function encryptSeed(seed, password){
   const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
-  const key=await deriveKey(password, salt);
+  const key=await deriveKey(password, salt, PBKDF2_ITERS);
   const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, seed));
-  return { v:1, salt:b64(salt), iv:b64(iv), ct:b64(ct) };
+  return { v:1, iter:PBKDF2_ITERS, salt:b64(salt), iv:b64(iv), ct:b64(ct) };
 }
 async function decryptSeed(store, password){
-  const key=await deriveKey(password, ub64(store.salt));
+  // Old blobs (v1, pre-hardening) carry no `iter`: they were derived at 250k.
+  const iters=Number(store.iter)||250000;
+  const key=await deriveKey(password, ub64(store.salt), iters);
   const pt=await crypto.subtle.decrypt({name:'AES-GCM', iv:ub64(store.iv)}, key, ub64(store.ct));
   return new Uint8Array(pt);
 }
@@ -794,23 +806,29 @@ async function renderActivity(addr){
   const rows=[];
   for(const s of (stk||[])){
     let title, sub, cls, ic, sign;
-    if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+short(s.validator); cls="out"; ic="🔒"; sign="−"; }
-    else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+short(s.validator); cls="in"; ic="🔓"; sign="+"; }
+    if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+esc(short(s.validator)); cls="out"; ic="🔒"; sign="−"; }
+    else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+esc(short(s.validator)); cls="in"; ic="🔓"; sign="+"; }
     else { title="Recompensa de staking"; sub="reclamada"; cls="in"; ic="★"; sign="+"; }
-    rows.push({round:s.round||0, key:"s"+s.tx_hash, html:`<div class="tx">
+    const rnd=Number(s.round)||0, amt=esc(qchDisp(s.amount));   // coerción numérica + escape: nada de markup del nodo
+    rows.push({round:rnd, key:"s"+s.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${cls==='in'?'tx-in':'tx-out'}">${ic}</div>
-      <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ronda ${fmt(String(s.round))}</div></div>
-      <div class="tx-amt ${cls}">${sign}${qchDisp(s.amount)}</div>
+      <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ronda ${esc(fmt(String(rnd)))}</div></div>
+      <div class="tx-amt ${cls}">${sign}${amt}</div>
     </div>`});
   }
   const mine=(txs||[]).filter(t=>t.from===addr||t.to===addr);
   for(const t of mine){
     const inc=t.to===addr;
-    rows.push({round:t.round||0, key:"t"+t.tx_hash, html:`<div class="tx">
+    // Escape every node-supplied value folded into innerHTML: addresses are
+    // base58 (no markup chars) and amounts numeric, but defense-in-depth is
+    // consistent with the staking loop above - a compromised/hostile node RPC
+    // must never be able to inject markup into the wallet origin.
+    const peer=esc(short(inc?t.from:t.to)), amt=esc(qchDisp(t.amount));
+    rows.push({round:Number(t.round)||0, key:"t"+t.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
       <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
-        <div class="tx-s">${inc?'de '+short(t.from):'a '+short(t.to)}</div></div>
-      <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${qchDisp(t.amount)}</div>
+        <div class="tx-s">${inc?'de ':'a '}${peer}</div></div>
+      <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${amt}</div>
     </div>`});
   }
   rows.sort((a,b)=>b.round-a.round);
@@ -1135,8 +1153,8 @@ async function loadValidatorList(){
     });
     const opts=['<option value="">— elegí un validador —</option>'];
     for(const v of vals){
-      const label=(v.name?v.name:short(v.address))+" · "+qchDisp(v.stake)+" stake";
-      opts.push(`<option value="${v.address}">${label}</option>`);
+      const label=(v.name?esc(v.name):esc(short(v.address)))+" · "+esc(qchDisp(v.stake))+" stake";
+      opts.push(`<option value="${esc(v.address)}">${label}</option>`);
     }
     sel.innerHTML=opts.join("");
     validatorListLoaded=true;
@@ -1363,7 +1381,12 @@ function runBoot(){
   try{ quantumWaves($("qwave"),{bright:false,lines:5,amp:16,particles:22,alpha:.42}); }catch(e){}  // fondo ambiente persistente
   showView("loading");
   if(!(window.isSecureContext && window.crypto && crypto.subtle)){
-    const httpsUrl=location.href.replace(/^http:/, 'https:');
+    // `location.href` is attacker-influenceable (path/query), so escape it
+    // before folding into innerHTML - both the attribute and the text - or a
+    // crafted `http://host/">…` URL would be reflected DOM-XSS. Scheme is
+    // always http:->https: here, so no `javascript:` risk; esc() handles the
+    // quotes/brackets that would break out of the attribute or inject markup.
+    const httpsUrl=esc(location.href.replace(/^http:/, 'https:'));
     $("loading-text").innerHTML = '⚠️ Esta wallet cifra tu clave <b>en tu navegador</b>, lo que requiere <b>HTTPS</b> '+
       '(o acceso local). Estás entrando por HTTP plano.<br><br>Probá <a href="'+httpsUrl+'" style="color:#a78bfa">'+httpsUrl+'</a>.';
     return;

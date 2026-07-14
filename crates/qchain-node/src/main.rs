@@ -339,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
         receipt_log,
         staking_log,
         economics_path,
+        round_interval_ms: config.round_interval_ms,
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
@@ -360,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
             first_seen_vertex: HashMap::new(),
             equivocation_evidence: HashMap::new(),
             update_available: None,
+            pending_execution: std::collections::VecDeque::new(),
         }),
     });
 

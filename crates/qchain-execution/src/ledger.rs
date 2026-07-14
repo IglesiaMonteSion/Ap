@@ -566,7 +566,7 @@ impl Ledger {
         // is to reward the validator that included a congested transaction.
         let burn_share = byte_fee / 2;
         let validator_share = byte_fee - burn_share;
-        self.total_burned += burn_share;
+        self.total_burned = self.total_burned.saturating_add(burn_share);
         self.fee_burned = self.fee_burned.saturating_add(burn_share);
         self.credit_validator_share(*fee_collector, validator_share, &params)?;
         if priority_fee > 0 {
@@ -609,7 +609,7 @@ impl Ledger {
                     let module_bytes = module_bytes.clone();
                     let entry_point = entry_point.clone();
                     match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel) {
-                        Ok(fee) => total_gas_fee += fee,
+                        Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
                     }
                 }
@@ -638,7 +638,7 @@ impl Ledger {
                         &mut working,
                         params.gas_price_per_fuel,
                     ) {
-                        Ok(fee) => total_gas_fee += fee,
+                        Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
                     }
                 }
@@ -723,8 +723,16 @@ impl Ledger {
         // fee, see the security-review entry in `project-lessons-learned`),
         // so declaring too-low a `fee_limit` for a WASM call still costs
         // the byte fee, same as any other rejected transaction.
-        if upfront_fee + total_gas_fee > tx.message.fee_limit {
-            return Err(ExecError::FeeExceedsLimit { actual: upfront_fee + total_gas_fee, limit: tx.message.fee_limit });
+        // `saturating_add`, not `+`: `total_gas_fee` is itself a
+        // `saturating_mul` of a governance-set `gas_price_per_fuel` with no
+        // upper bound, so it can reach `u64::MAX`; with `overflow-checks =
+        // true` (release, see root `Cargo.toml`) a plain `+` here would panic
+        // on the whole network at once (deterministic tx stream) instead of
+        // rejecting this one transaction. Saturating keeps the intended
+        // outcome: the fee exceeds any real `fee_limit`, so the tx is rejected.
+        let combined_fee = upfront_fee.saturating_add(total_gas_fee);
+        if combined_fee > tx.message.fee_limit {
+            return Err(ExecError::FeeExceedsLimit { actual: combined_fee, limit: tx.message.fee_limit });
         }
 
         if total_gas_fee > 0 {
@@ -733,7 +741,7 @@ impl Ledger {
                 return Err(ExecError::InsufficientFunds);
             }
             payer_after.balance -= total_gas_fee;
-            self.total_burned += total_gas_fee / 2;
+            self.total_burned = self.total_burned.saturating_add(total_gas_fee / 2);
             self.fee_burned = self.fee_burned.saturating_add(total_gas_fee / 2);
             let gas_validator_share = total_gas_fee - total_gas_fee / 2;
             // Seed the fee collector's working-set entry from its REAL
@@ -764,7 +772,7 @@ impl Ledger {
 
         for (pk, mut account) in working {
             if account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold {
-                self.total_burned += account.balance;
+                self.total_burned = self.total_burned.saturating_add(account.balance);
                 self.dust_burned = self.dust_burned.saturating_add(account.balance);
                 account.balance = 0;
             }
@@ -778,7 +786,10 @@ impl Ledger {
             self.staking_events.push(ev);
         }
 
-        Ok(upfront_fee + total_gas_fee)
+        // `combined_fee` (already `saturating_add`) equals `upfront_fee +
+        // total_gas_fee` and was proven `<= fee_limit` above; reuse it rather
+        // than a fresh `+` that could panic under `overflow-checks`.
+        Ok(combined_fee)
     }
 
     /// Accumulate one block-proposer's direct commission for the per-validator
@@ -809,7 +820,7 @@ impl Ledger {
                     self.write_account(*payer, payer_account);
                     let burn_share = charge / 2;
                     let validator_share = charge - burn_share;
-                    self.total_burned += burn_share;
+                    self.total_burned = self.total_burned.saturating_add(burn_share);
                     self.fee_burned = self.fee_burned.saturating_add(burn_share);
                     // Same "attempted-execution byte fee already stuck, so
                     // fold this trap fee's own credit failure into the

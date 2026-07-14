@@ -477,7 +477,16 @@ let liveOk = true;
 // Proactive-alert state: when did the consensus round last actually advance?
 let lastRoundValue = null;
 let lastRoundChangeT = Date.now();
-const STALL_MS = 12000; // rounds not advancing this long -> "consenso estancado"
+// Minimum "consensus stalled" threshold; the real threshold scales with the
+// node's configured round interval (`/status.round_interval_ms`) so a
+// deliberately slow node doesn't false-positive. See `stallThresholdMs`.
+const STALL_MS_MIN = 12000;
+function stallThresholdMs(roundIntervalMs) {
+  const iv = Number(roundIntervalMs) || 0;
+  // 24 missed intervals, floored at 12 s - generous enough to never fire on a
+  // healthy node yet still catch a genuine wedge within a reasonable window.
+  return Math.max(STALL_MS_MIN, iv * 24);
+}
 
 function setLive(ok) {
   liveOk = ok;
@@ -493,7 +502,7 @@ function setLive(ok) {
 // Show/hide the "consensus stalled" warning based on how long the round has
 // been frozen. A single healthy validator advances rounds continuously, so a
 // long freeze is a real problem (stuck peer, quorum lost, wedged consensus).
-function updateStallAlert(round) {
+function updateStallAlert(round, roundIntervalMs) {
   const now = Date.now();
   if (lastRoundValue === null || round > lastRoundValue) {
     lastRoundValue = round;
@@ -501,7 +510,7 @@ function updateStallAlert(round) {
   }
   const frozenMs = now - lastRoundChangeT;
   const banner = document.getElementById("alert-stalled");
-  if (frozenMs >= STALL_MS) {
+  if (frozenMs >= stallThresholdMs(roundIntervalMs)) {
     document.getElementById("alert-stalled-text").textContent =
       `El consenso no avanza desde hace ${Math.round(frozenMs / 1000)} s (ronda fija en ${fmtNum(round)}). ` +
       `Revisá conectividad con los pares, que haya quórum, y los logs del validador.`;
@@ -522,7 +531,7 @@ async function refreshStatus() {
   try {
     const status = await getJson("/status");
     setLive(true);
-    updateStallAlert(status.next_round);
+    updateStallAlert(status.next_round, status.round_interval_ms);
     document.getElementById("stat-certs").textContent = fmtNum(status.dag_certificates);
     document.getElementById("stat-executed").textContent = fmtNum(status.executed_transactions);
     document.getElementById("stat-round").textContent = fmtNum(status.next_round);
@@ -743,14 +752,18 @@ async function refreshEconomics() {
     setText("econ-burn-pct", e.burn_pct + " %");
     setText("econ-stake", fmtNum(e.validator_stake));
     setText("econ-peers", fmtNum(e.peer_count));
-    // Connectivity alert: 0 peers means this validator is isolated. For a
-    // single-validator testnet that's expected (info); for a real network it
-    // means it can't reach anyone and consensus will stall.
+    // `peer_count` is the CONFIGURED validator-set size minus one, not a count
+    // of live TCP connections - so it flags a genuinely solo config (network
+    // size 1), which is useful info, but it deliberately does NOT try to detect
+    // a multi-validator node that has lost connectivity: that would need real
+    // live-connection tracking, and a wrong signal is worse than none. Real
+    // loss of connectivity on a multi-validator node surfaces as the "consensus
+    // stalled" alert above (which IS live - rounds stop advancing).
     const peersBanner = document.getElementById("alert-peers");
     if (e.peer_count === 0) {
       setText("alert-peers-text",
-        "Este validador no tiene pares conectados (está corriendo en solitario). " +
-        "Si esperabas una red multi-validador, revisá las direcciones de peers y el firewall.");
+        "Este validador está configurado en solitario (un solo validador en el set). " +
+        "Si esperabas una red multi-validador, revisá el config: las direcciones de peers y el firewall.");
       peersBanner.hidden = false;
     } else {
       peersBanner.hidden = true;
