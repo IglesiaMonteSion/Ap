@@ -3,6 +3,7 @@
 //! real liboqs node without a browser. Not shipped - a verification tool.
 //!
 //!   qchain-wasm-signer address <seed_hex>
+//!   qchain-wasm-signer stake-addr <seed_hex> <index>
 //!   qchain-wasm-signer sign <seed_hex> <to_addr> <amount> <nonce> <chain_id_hex> <fee_limit>
 
 use std::env;
@@ -19,6 +20,11 @@ fn main() -> anyhow::Result<()> {
         Some("address") => {
             let s = seed(&args[2])?;
             println!("{}", qchain_wasm::address_from_seed(&s)?);
+        }
+        Some("stake-addr") => {
+            let s = seed(&args[2])?;
+            let index: u32 = args[3].parse()?;
+            println!("{}", qchain_wasm::stake_address_from_seed(&s, index));
         }
         Some("sign") => {
             let s = seed(&args[2])?;

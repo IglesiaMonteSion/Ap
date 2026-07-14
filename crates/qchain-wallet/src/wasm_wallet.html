@@ -340,9 +340,12 @@
       <div class="msg" id="st-msg"></div>
     </div>
 
-    <div class="section-title">Mis delegaciones</div>
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Mis delegaciones</span>
+      <button class="btn-sec" id="st-recover" style="padding:6px 10px;font-size:12px">↻ Recuperar</button>
+    </div>
     <div class="card" id="st-list"><div class="empty">todavía no delegaste nada</div></div>
-    <div class="hint" style="margin-top:8px">🔐 Todo se firma en tu navegador. La cuenta de stake se guarda en este dispositivo para poder reclamar/retirar.</div>
+    <div class="hint" style="margin-top:8px">🔐 Todo se firma en tu navegador. La cuenta de stake se DERIVA de tu semilla, así que tus delegaciones se recuperan al restaurar la wallet en otro dispositivo — tocá <b>Recuperar</b> si no aparecen.</div>
   </section>
 
   <!-- ===== CONFIGURACIÓN ===== -->
@@ -420,7 +423,7 @@
 <div class="toast" id="toast">copiado</div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, stakeAddressFromSeed } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -827,14 +830,47 @@ $("s-btn").onclick=async()=>{
 };
 
 // ---- staking ----
-// Las delegaciones se guardan por-dirección en localStorage: la cuenta de
-// stake es una dirección random que nadie firma, pero hay que recordarla para
-// poder reclamar/retirar después.
+// Las delegaciones se guardan por-dirección en localStorage como caché, PERO la
+// cuenta de stake ya NO es una dirección random: se DERIVA de la semilla
+// (`stakeAddressFromSeed(SEED, index)`), así una posición de staking es
+// RECUPERABLE con solo la semilla (Shamir incluido) — re-derivás index 0,1,2…
+// y preguntás a la cadena, sin depender del localStorage del navegador. Las
+// posiciones viejas (dirección random, sin campo `index`) siguen funcionando
+// para reclamar/retirar; simplemente no son recuperables desde la semilla (eso
+// era el estado anterior, no se puede retrofittear una dirección random).
 const STAKES_KEY="qchain_stakes_v1";
 function allStakes(){ try{ return JSON.parse(localStorage.getItem(STAKES_KEY)||"{}"); }catch(e){ return {}; } }
 function myStakes(){ const a=myAddress(); return (allStakes()[a]||[]); }
 function saveStake(pos){ const a=myAddress(), all=allStakes(); (all[a]=all[a]||[]).push(pos); localStorage.setItem(STAKES_KEY, JSON.stringify(all)); }
 function dropStake(stakeAccount){ const a=myAddress(), all=allStakes(); all[a]=(all[a]||[]).filter(p=>p.stakeAccount!==stakeAccount); localStorage.setItem(STAKES_KEY, JSON.stringify(all)); }
+// El próximo índice determinista libre = 1 + el mayor índice ya usado. Nunca se
+// reutiliza un índice (una cuenta de stake ya creada — aunque esté en 0 tras un
+// retiro — haría fallar un Delegate nuevo, que rechaza sobrescribir).
+function nextStakeIndex(){ let mx=-1; for(const p of myStakes()){ if(typeof p.index==="number" && p.index>mx) mx=p.index; } return mx+1; }
+function stakeKnown(sa){ return myStakes().some(p=>p.stakeAccount===sa); }
+
+// Recuperar posiciones desde la semilla: re-deriva index 0,1,2… y pregunta a la
+// cadena por cada dirección. Reconstruye la lista sin ningún estado local — el
+// caso exacto de restaurar la wallet en otro navegador/dispositivo. Corta tras
+// varias direcciones vacías consecutivas (las posiciones son contiguas porque
+// los índices siempre incrementan). Solo suma una posición si la cadena
+// confirma que su `owner` es esta wallet.
+async function recoverStakes(){
+  const addr=myAddress(); if(!addr) return 0;
+  const all=allStakes(); const list=all[addr]||[];
+  let idx=0, misses=0, found=0; const MAX_IDX=256, MAX_MISS=10;
+  while(idx<MAX_IDX && misses<MAX_MISS){
+    const sa=stakeAddressFromSeed(SEED, idx);
+    const d=await api("/api/stake/"+encodeURIComponent(sa)).catch(()=>null);
+    if(d && d.exists && d.owner===addr && Number(d.amount)>0){
+      if(!list.some(p=>p.stakeAccount===sa)){ list.push({ stakeAccount:sa, index:idx, validator:d.validator, amount:String(d.amount) }); found++; }
+      misses=0;
+    }else{ misses++; }
+    idx++;
+  }
+  all[addr]=list; localStorage.setItem(STAKES_KEY, JSON.stringify(all));
+  return found;
+}
 
 async function relaySigned(txJson){
   const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
@@ -851,7 +887,15 @@ async function renderStaking(){
   if(!$("st-validator").value){
     try{ const st=await api("/api/node"); if(st.validator){ $("st-validator").value=st.validator; $("st-valhint").textContent="Validador del nodo conectado (podés cambiarlo)."; } }catch(e){}
   }
-  const list=$("st-list"), stakes=myStakes();
+  let stakes=myStakes();
+  const list=$("st-list");
+  // Sin posiciones locales (típico tras restaurar en otro dispositivo): intentar
+  // recuperarlas desde la semilla antes de mostrar "no delegaste nada".
+  if(!stakes.length){
+    list.innerHTML='<div class="empty">buscando delegaciones…</div>';
+    try{ await recoverStakes(); }catch(e){}
+    stakes=myStakes();
+  }
   if(!stakes.length){ list.innerHTML='<div class="empty">todavía no delegaste nada</div>'; return; }
   // Estado en vivo por posición (recompensa pendiente + si ya se puede retirar).
   const live=await Promise.all(stakes.map(s=>api("/api/stake/"+encodeURIComponent(s.stakeAccount)).catch(()=>null)));
@@ -887,19 +931,36 @@ async function stakeCtx(){
   return { nonce:BigInt(acct.nonce), chainId:fromHex(cid.chain_id) };
 }
 
+$("st-recover").onclick=async()=>{
+  const msg=$("st-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="buscando posiciones desde tu semilla…";
+  try{
+    const n=await recoverStakes();
+    msg.className="msg ok"; msg.textContent = n>0 ? `✓ Recuperé ${n} delegación${n>1?"es":""}` : "no se encontraron delegaciones nuevas para esta semilla";
+    await renderStaking();
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+};
+
 $("st-delegate").onclick=async()=>{
   const validator=$("st-validator").value.trim(), amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
   if(!validator){ msg.className="msg err"; msg.textContent="poné la dirección del validador"; return; }
   let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
   $("st-delegate").disabled=true; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
   try{
-    const raw=crypto.getRandomValues(new Uint8Array(32));   // dirección fresca de la cuenta de stake
-    const stakeAccount=addressFromBytes(raw);
+    // Dirección de la cuenta de stake DERIVADA de la semilla (recuperable),
+    // no random. Se salta cualquier índice cuya dirección ya exista on-chain
+    // (una posición previa aún abierta), para que Delegate nunca choque con
+    // una cuenta ya creada.
+    let index=nextStakeIndex(), stakeAccount=stakeAddressFromSeed(SEED, index), guard=0;
+    while(guard++<300){
+      const d=await api("/api/stake/"+encodeURIComponent(stakeAccount)).catch(()=>null);
+      if(!(d && d.exists)) break;             // libre → usar este índice
+      index++; stakeAccount=stakeAddressFromSeed(SEED, index);
+    }
     const {nonce,chainId}=await stakeCtx();
     const txJson=signDelegate(SEED, validator, amount, stakeAccount, nonce, chainId, 10000000n);
     msg.textContent="enviando al nodo…";
     await relaySigned(txJson);
-    saveStake({ stakeAccount, validator, amount:amount.toString() });
+    saveStake({ stakeAccount, index, validator, amount:amount.toString() });
     msg.className="msg ok"; msg.innerHTML=`✓ Delegaste ${amt} QCH`;
     $("st-amount").value="";
     setTimeout(renderStaking, 1500);

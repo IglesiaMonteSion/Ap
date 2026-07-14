@@ -65,6 +65,32 @@ pub fn address_from_bytes(bytes: &[u8; 32]) -> String {
     Pubkey::new(*bytes).to_string()
 }
 
+/// Deterministically derive the address of the `index`-th stake account for a
+/// given master seed.
+///
+/// A stake account is program-owned - nobody ever signs *as* it (see the CLI's
+/// `StakeDelegate`), and only its stored `owner` (the delegator's wallet) can
+/// undelegate or claim against it - so its address only needs to be unique and
+/// reproducible, not a real keypair. Deriving it from the seed (instead of
+/// fresh randomness the browser saves only in `localStorage`) is what makes a
+/// staked position RECOVERABLE from the seed alone: after a restore, re-derive
+/// index 0, 1, 2, ... and query each against the chain to rebuild the list.
+///
+/// Domain-separated (`"qchain-stake-account-v1"`) so it can never collide with
+/// the wallet address itself (a completely different derivation), and
+/// preimage-resistant (SHA3-256) so publishing the derived address never leaks
+/// the seed. Nobody can pre-create or grief the account either: computing the
+/// address at all requires the seed.
+pub fn stake_address_from_seed(seed: &[u8; 32], index: u32) -> String {
+    use sha3::{Digest, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"qchain-stake-account-v1");
+    hasher.update(seed);
+    hasher.update(index.to_le_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    Pubkey::new(digest).to_string()
+}
+
 /// Sign a `Delegate` (stake `amount` to `validator`). `stake_account` is the
 /// fresh address the browser generated for this position. accounts order matches
 /// the CLI: [payer, stake_account, stats, reward_pool].
@@ -151,6 +177,26 @@ pub fn sign_transfer_json(
     Ok(serde_json::to_string(&tx)?)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stake_address_is_deterministic_and_index_separated() {
+        let seed = [7u8; 32];
+        // Same (seed, index) always yields the same address - the property a
+        // restore depends on.
+        assert_eq!(stake_address_from_seed(&seed, 0), stake_address_from_seed(&seed, 0));
+        // Different indices give different accounts (so a second delegation
+        // never lands on the first account, which Delegate would reject).
+        assert_ne!(stake_address_from_seed(&seed, 0), stake_address_from_seed(&seed, 1));
+        // A different seed gives different addresses (positions are per-wallet).
+        assert_ne!(stake_address_from_seed(&seed, 0), stake_address_from_seed(&[8u8; 32], 0));
+        // And it must never equal the wallet address itself (distinct domains).
+        assert_ne!(stake_address_from_seed(&seed, 0), address_from_seed(&seed).unwrap());
+    }
+}
+
 // -------------------------------------------------------------------------
 // JavaScript bindings (wasm target only)
 // -------------------------------------------------------------------------
@@ -191,6 +237,15 @@ mod wasm {
     #[wasm_bindgen(js_name = addressFromBytes)]
     pub fn address_from_bytes(bytes: &[u8]) -> Result<String, JsValue> {
         Ok(super::address_from_bytes(&as32(bytes, "bytes")?))
+    }
+
+    /// `stakeAddressFromSeed(seed: Uint8Array, index: number) -> string`
+    /// Deterministic, seed-derived stake-account address for `index` - lets a
+    /// restored wallet re-derive and recover its staking positions without any
+    /// browser-local state.
+    #[wasm_bindgen(js_name = stakeAddressFromSeed)]
+    pub fn stake_address_from_seed(seed: &[u8], index: u32) -> Result<String, JsValue> {
+        Ok(super::stake_address_from_seed(&as32(seed, "seed")?, index))
     }
 
     /// `signDelegate(seed, validator, amount, stakeAccount, nonce, chainId, feeLimit) -> string`
