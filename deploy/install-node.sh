@@ -33,6 +33,8 @@ CONFIG_ORIGEN=""
 LISTEN_PORT_ARG=""
 RPC_PORT_ARG=""
 FONDO_WALLET_PRUEBA="1000000000000"
+CON_WALLET=0
+CON_TUNEL=0
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -57,6 +59,12 @@ Opciones:
   --rpc-port <puerto>    Puerto RPC a usar en modo "solo" (por defecto 8080).
   --nombre <texto>       (modo "solo") nombre visible del validador, para que
                          las wallets lo muestren al elegir dónde hacer staking.
+  --con-wallet           Instalar también la wallet web sin preguntar (con --yes
+                         te genera y muestra una contraseña fuerte).
+  --con-tunel            Instalar también el túnel de Cloudflare (HTTPS público)
+                         sin preguntar. Implica --con-wallet (el túnel expone la
+                         wallet). Deja un nodo público (validador + wallet +
+                         HTTPS) en UN solo comando.
   --yes, -y              No pedir confirmaciones (para instalación automatizada).
   --no-build             No construir la imagen desde el código aunque falte;
                          solo intentar 'docker pull' / cargar un tar. Útil si
@@ -76,6 +84,8 @@ while [ $# -gt 0 ]; do
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
+    --con-wallet) CON_WALLET=1; shift ;;
+    --con-tunel) CON_TUNEL=1; shift ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
     --no-build) NO_BUILD=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -83,6 +93,9 @@ while [ $# -gt 0 ]; do
     *) error "opción desconocida: $1 (ver --help)" ;;
   esac
 done
+
+# El túnel expone la wallet, así que pedirlo implica instalar la wallet.
+[ "$CON_TUNEL" -eq 1 ] && CON_WALLET=1
 
 if [ "$(id -u)" -ne 0 ]; then
   error "corre este script como root (sudo ./install-node.sh)"
@@ -432,8 +445,8 @@ echo "y saturarlo). Esto sigue siendo un testnet - no pongas valor real detrás.
 # navegador, con botones en vez de la CLI). Es opcional y reutiliza la misma
 # imagen que acabamos de preparar - por eso lo ofrecemos acá, ya con todo listo.
 # ---------------------------------------------------------------------------
-INSTALAR_WALLET=0
-if [ "$ASUMIR_SI" -ne 1 ]; then
+INSTALAR_WALLET="$CON_WALLET"
+if [ "$INSTALAR_WALLET" -ne 1 ] && [ "$ASUMIR_SI" -ne 1 ]; then
   decir "¿Querés abrir también la wallet web?"
   echo "Es una página para crear wallets, ver balances y transferir desde el"
   echo "navegador (sin usar comandos). Queda protegida con una contraseña."
@@ -441,11 +454,40 @@ if [ "$ASUMIR_SI" -ne 1 ]; then
   case "$resp" in s|S|si|Si|SI) INSTALAR_WALLET=1 ;; esac
 fi
 if [ "$INSTALAR_WALLET" -eq 1 ]; then
-  QCHAIN_HOME="$QCHAIN_HOME" "$SCRIPT_DIR/install-wallet.sh" --rpc-port "$RPC_PORT" --home "$QCHAIN_HOME" \
+  WALLET_ARGS=(--rpc-port "$RPC_PORT" --home "$QCHAIN_HOME")
+  # Sin interacción (--yes): que la wallet genere y muestre una contraseña
+  # fuerte, en vez de quedarse esperando que la tipeen.
+  [ "$ASUMIR_SI" -eq 1 ] && WALLET_ARGS+=(--generar-password --yes)
+  QCHAIN_HOME="$QCHAIN_HOME" "$SCRIPT_DIR/install-wallet.sh" "${WALLET_ARGS[@]}" \
     || echo "La wallet no se pudo instalar ahora, pero tu nodo sigue funcionando. Podés instalarla después con: sudo ./install-wallet.sh"
 else
   echo
   echo "Tip: para manejar tus fondos desde el navegador (crear wallets y"
   echo "transferir con botones), instalá la wallet web cuando quieras:"
   echo "  sudo ./install-wallet.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# Oferta: exponer la wallet por HTTPS con un túnel de Cloudflare. Solo tiene
+# sentido si la wallet quedó instalada (el túnel apunta al puerto de la wallet).
+# Deja todo el despliegue de un nodo público en UN solo comando.
+# ---------------------------------------------------------------------------
+if [ "$INSTALAR_WALLET" -eq 1 ]; then
+  INSTALAR_TUNEL="$CON_TUNEL"
+  if [ "$INSTALAR_TUNEL" -ne 1 ] && [ "$ASUMIR_SI" -ne 1 ]; then
+    decir "¿Querés abrir la wallet por HTTPS desde internet (túnel de Cloudflare)?"
+    echo "Te da una URL https://...trycloudflare.com para entrar desde el celular,"
+    echo "SIN abrir puertos en el firewall de la nube. (La URL cambia si el túnel"
+    echo "reinicia; para una fija hace falta un dominio propio - ver install-tunnel.sh.)"
+    read -rp "Instalar el túnel HTTPS ahora? [s/N] " resp
+    case "$resp" in s|S|si|Si|SI) INSTALAR_TUNEL=1 ;; esac
+  fi
+  if [ "$INSTALAR_TUNEL" -eq 1 ]; then
+    "$SCRIPT_DIR/install-tunnel.sh" \
+      || echo "El túnel no se pudo instalar ahora, pero la wallet sigue funcionando en la red local. Podés instalarlo después con: sudo ./install-tunnel.sh"
+  fi
+elif [ "$CON_TUNEL" -eq 1 ]; then
+  echo
+  echo "Nota: pediste --con-tunel pero la wallet no se instaló (el túnel expone la"
+  echo "wallet). Instalá la wallet y el túnel con: sudo ./install-wallet.sh && sudo ./install-tunnel.sh"
 fi

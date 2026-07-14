@@ -49,6 +49,21 @@ un `qchain-image.tar` que dejes junto al repo). En todos los casos el
 script verifica que la imagen realmente tenga los binarios de qchain antes
 de avanzar.
 
+Al final, si elegís instalar la **wallet web**, también te ofrece exponerla
+por **HTTPS con un túnel de Cloudflare** (sin abrir puertos en el firewall de
+la nube) — así un nodo público completo (validador + wallet + HTTPS) queda en
+**un solo comando**. Un nodo público en solitario, de punta a punta, sin
+interacción (`--con-tunel` implica la wallet, y `--yes` le genera una
+contraseña fuerte y te la muestra):
+
+```
+sudo ./deploy/install-node.sh --modo solo --nombre "Mi validador" \
+    --con-tunel --yes
+```
+
+O de forma interactiva (te pregunta la contraseña de la wallet y si querés el
+túnel): `sudo ./deploy/install-node.sh --modo solo`.
+
 Es seguro volver a correrlo: si ya generó tu clave o tu `config.json`,
 nunca los pisa (ni siquiera si un paso anterior falló a mitad de camino)
 — solo te pregunta si querés reinstalar el servicio. Para bajar el nodo
