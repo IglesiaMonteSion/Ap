@@ -3,8 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>qchain · Wallet</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%23a78bfa'/%3E%3Cstop%20offset='1'%20stop-color='%236690ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='64'%20height='64'%20rx='16'%20fill='%230b0f1a'/%3E%3Cellipse%20cx='32'%20cy='32'%20rx='20'%20ry='8'%20fill='none'%20stroke='url(%23g)'%20stroke-width='2.5'%20transform='rotate(30%2032%2032)'/%3E%3Cellipse%20cx='32'%20cy='32'%20rx='20'%20ry='8'%20fill='none'%20stroke='url(%23g)'%20stroke-width='2.5'%20transform='rotate(-30%2032%2032)'/%3E%3Cpath%20d='M32%2022%20L40%2027%20L40%2037%20L32%2042%20L24%2037%20L24%2027%20Z'%20fill='url(%23g)'/%3E%3C/svg%3E">
+<title>QCHAIN Wallet</title>
+<meta name="theme-color" content="#0a0e18">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<!-- Al añadir a la pantalla de inicio se abre como app (sin barra del navegador) y con nombre/ícono propios -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="QCHAIN">
 <style>
   :root{
     --bg:#070912; --ink:#eef1f8; --muted:#8b93ab; --line:rgba(255,255,255,.09);
@@ -240,7 +248,7 @@
       <div class="boot-rings"><i></i><i></i><i></i></div>
       <div class="boot-sweep"></div>
       <div class="boot-logo">
-        <svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="bgl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><g fill="none" stroke="url(#bgl)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#bgl)"/><path d="M32 20.5 L42 26.3 L32 32 Z" fill="#fff" opacity=".22"/></svg>
+        <svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="bgl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#bgl)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#bgl)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#bgl)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
       </div>
     </div>
     <div class="boot-word">QCHAIN <span class="grad">WALLET</span></div>
@@ -259,7 +267,7 @@
   <!-- ===== CARGANDO / AVISO ===== -->
   <section class="view center" id="v-loading">
     <div class="hero" style="display:flex;flex-direction:column;align-items:center;gap:14px">
-      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="agl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><g fill="none" stroke="url(#agl)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#agl)"/></svg>
+      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="agl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#agl)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#agl)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#agl)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
       <div id="loading-text" class="view-sub">cargando…</div>
     </div>
   </section>
@@ -267,7 +275,7 @@
   <!-- ===== BIENVENIDA ===== -->
   <section class="view welcome" id="v-welcome">
     <div class="hero">
-      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="ag1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl1" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl1)"><g fill="none" stroke="url(#ag1)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag1)"/><path d="M32 20.5 L42 26.3 L32 32 Z" fill="#fff" opacity=".22"/></g></svg>
+      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="ag1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl1" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl1)"><path fill="url(#ag1)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag1)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag1)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></g></svg>
       <span class="qbadge">
         <svg viewBox="0 0 24 24" fill="none" stroke="#c9c2ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l7 3v6c0 4.5-3 8-7 9-4-1-7-4.5-7-9V5z"/><path d="M9 12l2 2 4-4"/></svg>
         QUANTUM RESISTANT
@@ -347,7 +355,7 @@
   <!-- ===== DESBLOQUEAR ===== -->
   <section class="view center" id="v-unlock">
     <div class="hero" style="display:flex;flex-direction:column;align-items:center;gap:14px;margin:auto 0 20px">
-      <svg class="logo logo-lg" style="width:88px;height:88px" viewBox="0 0 64 64"><defs><linearGradient id="ag4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><g fill="none" stroke="url(#ag4)" stroke-width="1.6" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag4)"/></svg>
+      <svg class="logo logo-lg" style="width:88px;height:88px" viewBox="0 0 64 64"><defs><linearGradient id="ag4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag4)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag4)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag4)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
       <h2 class="view-title">Bienvenido de vuelta</h2>
       <p class="view-sub center">Ingresá tu contraseña para desbloquear la wallet en este dispositivo.</p>
     </div>
@@ -363,7 +371,7 @@
   <section class="view" id="v-home">
     <div class="topbar">
       <div class="brand-row">
-        <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><g fill="none" stroke="url(#ag2)" stroke-width="1.8" opacity=".9"><ellipse cx="32" cy="32" rx="25" ry="10"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(60 32 32)"/><ellipse cx="32" cy="32" rx="25" ry="10" transform="rotate(120 32 32)"/></g><path d="M32 20.5 L42 26.3 L42 37.7 L32 43.5 L22 37.7 L22 26.3 Z" fill="url(#ag2)"/></g></svg>
+        <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag2)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag2)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag2)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
         <span class="brand-name">qchain <span class="grad">Wallet</span></span>
       </div>
       <div style="display:flex;align-items:center;gap:8px">

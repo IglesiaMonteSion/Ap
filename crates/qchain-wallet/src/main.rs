@@ -141,6 +141,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/wasm", get(wasm_page))
         .route("/wasm/qchain_wasm.js", get(wasm_js))
         .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
+        // brand / PWA assets (favicon, home-screen icons, manifest)
+        .route("/icon.svg", get(icon_svg))
+        .route("/favicon.ico", get(icon_svg))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
+        // iOS also requests these precomposed variants by convention
+        .route("/apple-touch-icon-precomposed.png", get(apple_touch_icon))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
+        .route("/manifest.webmanifest", get(manifest))
         .route("/api/chain_id", get(chain_id_ep))
         .route("/api/account/:address", get(account_ep))
         .route("/api/stake/:address", get(stake_ep))
@@ -283,6 +292,37 @@ async fn wasm_bg() -> Response {
         .header(header::CONTENT_TYPE, "application/wasm")
         .body(Body::from(&include_bytes!("wasm_assets/qchain_wasm_bg.wasm")[..]))
         .expect("static wasm response always builds")
+}
+
+// ---- brand / PWA assets (favicon, home-screen app icons, manifest) --------
+// So the wallet looks like a real app: a proper favicon in the tab and, when
+// added to the phone's home screen ("Añadir a inicio"), a native-looking app
+// icon + name instead of a screenshot. iOS reads `apple-touch-icon` (PNG only);
+// Android reads the web manifest's PNG icons. All embedded in the binary.
+
+fn static_asset(content_type: &str, body: Body) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        // Icons/manifest are versioned with the binary; let clients cache them.
+        .header(header::CACHE_CONTROL, "public, max-age=604800")
+        .body(body)
+        .expect("static asset response always builds")
+}
+
+async fn icon_svg() -> Response {
+    static_asset("image/svg+xml", Body::from(include_str!("wasm_assets/icon.svg")))
+}
+async fn apple_touch_icon() -> Response {
+    static_asset("image/png", Body::from(&include_bytes!("wasm_assets/apple-touch-icon.png")[..]))
+}
+async fn icon_192() -> Response {
+    static_asset("image/png", Body::from(&include_bytes!("wasm_assets/icon-192.png")[..]))
+}
+async fn icon_512() -> Response {
+    static_asset("image/png", Body::from(&include_bytes!("wasm_assets/icon-512.png")[..]))
+}
+async fn manifest() -> Response {
+    static_asset("application/manifest+json", Body::from(include_str!("wasm_assets/manifest.webmanifest")))
 }
 
 /// The network's chain id (hex), so the browser can sign a chain-bound tx.
