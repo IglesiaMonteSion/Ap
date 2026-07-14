@@ -28,6 +28,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers/:hash", get(get_transfer))
         .route("/staking_activity", get(staking_activity))
         .route("/validators", get(validators))
+        .route("/validator_registry", get(validator_registry))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
         .route("/version", get(version))
@@ -301,6 +302,32 @@ async fn staking_activity(State(engine): State<Arc<Engine>>, Query(query): Query
 /// config data (from the shared genesis), read-only.
 async fn validators(State(engine): State<Arc<Engine>>) -> Json<Vec<crate::engine::ValidatorDirEntry>> {
     Json(engine.validator_directory.clone())
+}
+
+/// `/validator_registry` - the live, on-chain validator registry (phase 3):
+/// every identity that has registered itself by locking self-stake
+/// (`StakingInstruction::RegisterValidator`), with its address, consensus
+/// key bundle, and self-stake. Read straight from
+/// `VALIDATOR_REGISTRY_ACCOUNT_ID`'s on-chain `data`, so it reflects real
+/// state, not static config (unlike `/validators`, which is the config's
+/// fixed set). Inert this increment - nothing consumes it for consensus yet,
+/// but it's the discovery surface a future joining node/wallet reads. Each
+/// entry's `stake` is a snapshot from registration time.
+async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use qchain_execution::validator_registry::ValidatorRegistryData;
+    use qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID;
+    let Some(acct) = engine.get_account(&VALIDATOR_REGISTRY_ACCOUNT_ID).await else {
+        // Not seeded (e.g. a pre-phase-3 persisted store) - report empty rather
+        // than error, so callers can treat "no registry" as "no registrations."
+        return Ok(Json(json!({ "validators": [] })));
+    };
+    let registry = ValidatorRegistryData::try_read(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("validator registry decode: {e}")))?;
+    let validators: Vec<serde_json::Value> = registry
+        .validators
+        .iter()
+        .map(|v| json!({ "validator": v.validator.to_string(), "address": v.address, "stake": v.stake }))
+        .collect();
+    Ok(Json(json!({ "validators": validators })))
 }
 
 /// Every equivocation this validator has independently witnessed and

@@ -11,7 +11,7 @@ use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{AlgorithmId, AlgorithmStatus, Keypair, Pubkey, RegistryEntry};
 use qchain_execution::{
     EconomicParams, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
-    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
+    REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
@@ -155,6 +155,43 @@ enum Command {
         /// witnessed more than one - omit when there's exactly one.
         #[arg(long)]
         author: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// Register (or update) yourself as a validator in the on-chain validator
+    /// registry (phase 3). Requires a genuine self-stake account (owner ==
+    /// validator == you, amount >= the minimum validator stake) - delegate to
+    /// yourself first with `stake-delegate --validator <your own address>`.
+    /// Publishes your consensus key bundle and P2P address so peers can
+    /// discover and consense with you. Inert this increment: the registry is
+    /// populated and queryable, but consensus doesn't read it for membership
+    /// yet.
+    RegisterValidator {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Your own self-stake account (from `stake-delegate` where the
+        /// validator target was your own address).
+        #[arg(long)]
+        stake_account: String,
+        /// Your P2P address other nodes dial, e.g. `203.0.113.7:9000`.
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// Remove your own entry from the on-chain validator registry. Does not
+    /// touch your self-stake (unbond it separately with `stake-undelegate`).
+    UnregisterValidator {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -661,6 +698,39 @@ fn main() -> anyhow::Result<()> {
             // global `total_staked` counter (keeps reward-per-share and
             // governance turnout accounting correct after a slash).
             let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+        }
+        Command::RegisterValidator { rpc, keypair, stake_account, address, nonce, fee_limit } => {
+            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+            let stake_pk: Pubkey = stake_account.parse()?;
+            let data = borsh::to_vec(&StakingInstruction::RegisterValidator {
+                pubkey_bundle: validator.public_key_bundle(),
+                address: address.clone(),
+            })?;
+            let body = submit_instruction(
+                &rpc,
+                &validator,
+                STAKING_PROGRAM_ID,
+                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, stake_pk],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("registered validator {} at {address}", validator.pubkey());
+        }
+        Command::UnregisterValidator { rpc, keypair, nonce, fee_limit } => {
+            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&StakingInstruction::UnregisterValidator)?;
+            let body = submit_instruction(
+                &rpc,
+                &validator,
+                STAKING_PROGRAM_ID,
+                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
             println!("submitted: {body}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {

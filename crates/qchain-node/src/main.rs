@@ -8,7 +8,7 @@ use clap::Parser;
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
 use qchain_execution::{
     genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, RewardPoolData, StakingProgram, SystemProgram,
-    GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
+    GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
 use qchain_network::{Network, PeerInfo};
 use qchain_node::config::NodeConfig;
@@ -173,6 +173,19 @@ async fn main() -> anyhow::Result<()> {
         ledger.seed_account(
             STAKING_REWARDS_POOL_ID,
             qchain_core::Account { data: borsh::to_vec(&RewardPoolData::default())?, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        // On-chain validator registry (phase 3 - `qchain-execution::
+        // validator_registry`): starts empty and is populated live by
+        // `RegisterValidator`. Inert this increment (nothing reads it for
+        // consensus yet), but seeded at genesis the same way every other
+        // program singleton is so the account exists for the first
+        // registration to mutate.
+        ledger.seed_account(
+            VALIDATOR_REGISTRY_ACCOUNT_ID,
+            qchain_core::Account {
+                data: qchain_execution::validator_registry::genesis_validator_registry_account_data(),
+                ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
+            },
         );
     } else {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");

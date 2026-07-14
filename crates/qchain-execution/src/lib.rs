@@ -6,11 +6,12 @@ pub mod native;
 pub mod params;
 pub mod receipt;
 pub mod staking;
+pub mod validator_registry;
 pub mod wasm;
 
 pub use error::ExecError;
 pub use governance::{genesis_params_account_data, genesis_registry_account_data, GovernanceInstruction, GovernanceProgram};
-pub use ids::{GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+pub use ids::{GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID};
 pub use ledger::{Ledger, Program, DEFAULT_FUEL_LIMIT};
 pub use native::{NativeProgram, SystemInstruction, SystemProgram};
 pub use params::EconomicParams;

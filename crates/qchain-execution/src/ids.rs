@@ -48,3 +48,14 @@ pub const LOADER_PROGRAM_ID: Pubkey = Pubkey::new([7u8; 32]);
 /// `base_fee_per_byte` itself stays in `EconomicParams`; only the accumulator
 /// lives here. See `Ledger::advance_dynamic_fee`.
 pub const FEE_STATE_ACCOUNT_ID: Pubkey = Pubkey::new([8u8; 32]);
+
+/// Well-known singleton holding the on-chain validator registry - the directory
+/// of validators that have registered themselves by locking self-stake
+/// (`StakingInstruction::RegisterValidator`): their consensus key bundle, their
+/// P2P network address (for peer discovery), and the self-stake backing them.
+/// This is the foundation of dynamic, permissionless validator membership
+/// (phase 3): a newcomer stakes and registers here instead of a coordinator
+/// hand-editing a genesis file. Inert on its own - nothing reads it for
+/// consensus yet; the active-set-by-stake selection and epoch rotation that
+/// wire it into `qchain-consensus` are the following increments.
+pub const VALIDATOR_REGISTRY_ACCOUNT_ID: Pubkey = Pubkey::new([9u8; 32]);

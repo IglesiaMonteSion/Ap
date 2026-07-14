@@ -206,6 +206,25 @@ pub enum StakingInstruction {
     /// what makes it independently verifiable. See module docs below for
     /// why this burns the whole position rather than a partial fraction.
     ReportEquivocation { evidence: Box<EquivocationEvidence> },
+    /// Register (or update) the caller as a validator in the on-chain
+    /// validator registry (`VALIDATOR_REGISTRY_ACCOUNT_ID` - see
+    /// `validator_registry.rs`). accounts[0] = the validator wallet (must
+    /// equal the transaction payer), accounts[1] = the validator registry
+    /// singleton, accounts[2] = the caller's *self-stake* account (a
+    /// `StakeAccountData` whose `owner` and `validator` both equal the
+    /// payer, with `amount >= MIN_VALIDATOR_STAKE`). The `pubkey_bundle`
+    /// must genuinely be the payer's own (its `to_address()` must equal the
+    /// payer), and `address` is the P2P `"ip:port"` peers dial. Re-calling
+    /// updates the existing entry (address/bundle/stake refresh) rather than
+    /// duplicating it. **Inert this increment**: nothing reads the registry
+    /// for consensus yet - see `validator_registry.rs`'s module docs.
+    RegisterValidator { pubkey_bundle: qchain_crypto::PublicKeyBundle, address: String },
+    /// Remove the caller's own entry from the on-chain validator registry.
+    /// accounts[0] = the validator wallet (must equal the transaction
+    /// payer), accounts[1] = the validator registry singleton. Only removes
+    /// the payer's own entry; the self-stake itself is untouched (unbond it
+    /// separately via `Undelegate`).
+    UnregisterValidator,
 }
 
 fn read_stats(account: &Account) -> Result<u64, ExecError> {
@@ -494,6 +513,83 @@ impl NativeProgram for StakingProgram {
                     let total = read_stats(stats)?.saturating_sub(slashed);
                     stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 }
+            }
+            StakingInstruction::RegisterValidator { pubkey_bundle, address } => {
+                let validator = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[0]".into()))?;
+                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[1]".into()))?;
+                let stake_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[2]".into()))?;
+
+                if validator != *payer {
+                    return Err(ExecError::Unauthorized("RegisterValidator's validator account must be the transaction payer".into()));
+                }
+                // The published consensus bundle must genuinely be the
+                // payer's own - otherwise a registrant could advertise
+                // someone else's keys (or a bundle that hashes to an address
+                // they don't control), poisoning peer discovery.
+                if pubkey_bundle.to_address() != validator {
+                    return Err(ExecError::ProgramError("pubkey_bundle does not match the validator's address".into()));
+                }
+                if address.is_empty() || address.len() > crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN {
+                    return Err(ExecError::ProgramError(format!("validator address must be 1..={} bytes", crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN)));
+                }
+                // Gate on a real, slashable self-stake - the Sybil-resistance
+                // barrier. The named account must be a genuine self-stake
+                // (owner == validator == payer) with at least the minimum,
+                // reusing the exact `StakeAccountData` the rest of this module
+                // already produces and slashes.
+                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let stake_data = StakeAccountData::try_from_slice(&stake_account.data)
+                    .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
+                if stake_data.owner != validator || stake_data.validator != validator {
+                    return Err(ExecError::Unauthorized(
+                        "RegisterValidator's accounts[2] must be the validator's own self-stake (owner == validator == payer)".into(),
+                    ));
+                }
+                if stake_data.amount < crate::validator_registry::MIN_VALIDATOR_STAKE {
+                    return Err(ExecError::ProgramError(format!(
+                        "self-stake {} is below the minimum validator stake {}",
+                        stake_data.amount,
+                        crate::validator_registry::MIN_VALIDATOR_STAKE
+                    )));
+                }
+
+                let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
+                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(&registry_account.data)?;
+                let entry = crate::validator_registry::RegisteredValidator {
+                    validator,
+                    pubkey_bundle,
+                    address,
+                    stake: stake_data.amount,
+                };
+                match registry.position_of(&validator) {
+                    Some(idx) => registry.validators[idx] = entry, // re-register: refresh in place
+                    None => {
+                        if registry.validators.len() >= crate::validator_registry::MAX_REGISTERED_VALIDATORS {
+                            return Err(ExecError::ProgramError("validator registry is full".into()));
+                        }
+                        registry.validators.push(entry);
+                    }
+                }
+                let bytes = registry.to_bytes()?;
+                accounts.get_mut(&registry_pk).unwrap().data = bytes;
+            }
+            StakingInstruction::UnregisterValidator => {
+                let validator = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("UnregisterValidator requires accounts[0]".into()))?;
+                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("UnregisterValidator requires accounts[1]".into()))?;
+
+                if validator != *payer {
+                    return Err(ExecError::Unauthorized("UnregisterValidator's validator account must be the transaction payer".into()));
+                }
+                let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
+                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(&registry_account.data)?;
+                match registry.position_of(&validator) {
+                    Some(idx) => {
+                        registry.validators.remove(idx);
+                    }
+                    None => return Err(ExecError::ProgramError("caller is not registered as a validator".into())),
+                }
+                let bytes = registry.to_bytes()?;
+                accounts.get_mut(&registry_pk).unwrap().data = bytes;
             }
         }
         Ok(())
@@ -1116,5 +1212,201 @@ mod tests {
 
         assert!(matches!(result, Err(ExecError::ProgramError(_))));
         assert_eq!(accounts[&stake_pk].balance, 5_000_000, "two different validators' or rounds' vertices prove nothing about either one equivocating");
+    }
+
+    // ---- validator registry (phase 3.1) ----
+
+    use crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID;
+    use crate::validator_registry::{ValidatorRegistryData, MAX_VALIDATOR_ADDRESS_LEN, MIN_VALIDATOR_STAKE};
+
+    fn registry_account() -> Account {
+        Account { data: crate::validator_registry::genesis_validator_registry_account_data(), ..Account::new_wallet(STAKING_PROGRAM_ID) }
+    }
+
+    /// A genuine self-stake account for `validator` with `amount` bonded
+    /// (owner == validator == the account's controller), the exact shape
+    /// `RegisterValidator` gates on.
+    fn self_stake_account(validator: Pubkey, amount: u64) -> Account {
+        Account {
+            data: borsh::to_vec(&StakeAccountData {
+                owner: validator,
+                validator,
+                amount,
+                reward_debt: 0,
+                locked_until_round: 0,
+                bonding_until_round: 0,
+                unbonding_requested_at_round: None,
+            })
+            .unwrap(),
+            balance: amount,
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        }
+    }
+
+    fn register_ix(validator: Pubkey, stake_pk: Pubkey, bundle: qchain_crypto::PublicKeyBundle, address: &str) -> Instruction {
+        Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![validator, VALIDATOR_REGISTRY_ACCOUNT_ID, stake_pk],
+            data: borsh::to_vec(&StakingInstruction::RegisterValidator { pubkey_bundle: bundle, address: address.to_string() }).unwrap(),
+        }
+    }
+
+    #[test]
+    fn register_validator_adds_an_entry_with_sufficient_self_stake() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let stake_pk = Pubkey::new([50u8; 32]);
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
+        StakingProgram.process(&mut accounts, &ix, &validator, 0).unwrap();
+
+        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert_eq!(registry.validators.len(), 1);
+        assert_eq!(registry.validators[0].validator, validator);
+        assert_eq!(registry.validators[0].address, "203.0.113.7:9000");
+        assert_eq!(registry.validators[0].stake, MIN_VALIDATOR_STAKE);
+        assert_eq!(registry.validators[0].pubkey_bundle, kp.public_key_bundle());
+    }
+
+    #[test]
+    fn register_validator_is_rejected_with_insufficient_self_stake() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let stake_pk = Pubkey::new([51u8; 32]);
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE - 1)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
+        let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
+        assert!(result.is_err(), "below-minimum self-stake must be rejected");
+        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert!(registry.validators.is_empty(), "nothing must be registered when the stake gate fails");
+    }
+
+    #[test]
+    fn register_validator_rejects_a_bundle_that_is_not_the_payers_own() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let other_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let stake_pk = Pubkey::new([52u8; 32]);
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        // Advertise someone else's bundle (hashes to a different address).
+        let ix = register_ix(validator, stake_pk, other_kp.public_key_bundle(), "203.0.113.7:9000");
+        let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
+        assert!(matches!(result, Err(ExecError::ProgramError(_))));
+    }
+
+    #[test]
+    fn register_validator_rejects_another_accounts_self_stake() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let someone_else = Pubkey::new([99u8; 32]);
+        let stake_pk = Pubkey::new([53u8; 32]);
+        // A self-stake account belonging to a *different* validator - must not
+        // satisfy the payer's registration gate.
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(someone_else, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
+        let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
+        assert!(matches!(result, Err(ExecError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn register_validator_rejects_an_empty_or_oversized_address() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let stake_pk = Pubkey::new([54u8; 32]);
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        let empty = register_ix(validator, stake_pk, kp.public_key_bundle(), "");
+        assert!(StakingProgram.process(&mut accounts, &empty, &validator, 0).is_err(), "empty address must be rejected");
+
+        let oversized = register_ix(validator, stake_pk, kp.public_key_bundle(), &"a".repeat(MAX_VALIDATOR_ADDRESS_LEN + 1));
+        assert!(StakingProgram.process(&mut accounts, &oversized, &validator, 0).is_err(), "oversized address must be rejected");
+    }
+
+    #[test]
+    fn re_registering_updates_the_existing_entry_in_place() {
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = kp.pubkey();
+        let stake_pk = Pubkey::new([55u8; 32]);
+        let mut accounts = HashMap::from([
+            (validator, wallet_with(0)),
+            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+
+        StakingProgram.process(&mut accounts, &register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000"), &validator, 0).unwrap();
+        // Second registration with a new address + a larger self-stake.
+        accounts.insert(stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE * 3));
+        StakingProgram.process(&mut accounts, &register_ix(validator, stake_pk, kp.public_key_bundle(), "198.51.100.9:9001"), &validator, 0).unwrap();
+
+        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert_eq!(registry.validators.len(), 1, "re-registering must update in place, not duplicate");
+        assert_eq!(registry.validators[0].address, "198.51.100.9:9001");
+        assert_eq!(registry.validators[0].stake, MIN_VALIDATOR_STAKE * 3);
+    }
+
+    #[test]
+    fn unregister_removes_only_the_callers_own_entry() {
+        let kp_a = qchain_crypto::Keypair::generate().unwrap();
+        let kp_b = qchain_crypto::Keypair::generate().unwrap();
+        let a = kp_a.pubkey();
+        let b = kp_b.pubkey();
+        let stake_a = Pubkey::new([56u8; 32]);
+        let stake_b = Pubkey::new([57u8; 32]);
+        let mut accounts = HashMap::from([
+            (a, wallet_with(0)),
+            (b, wallet_with(0)),
+            (stake_a, self_stake_account(a, MIN_VALIDATOR_STAKE)),
+            (stake_b, self_stake_account(b, MIN_VALIDATOR_STAKE)),
+            (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
+        ]);
+        StakingProgram.process(&mut accounts, &register_ix(a, stake_a, kp_a.public_key_bundle(), "203.0.113.7:9000"), &a, 0).unwrap();
+        StakingProgram.process(&mut accounts, &register_ix(b, stake_b, kp_b.public_key_bundle(), "203.0.113.8:9000"), &b, 0).unwrap();
+
+        let unregister_a = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![a, VALIDATOR_REGISTRY_ACCOUNT_ID],
+            data: borsh::to_vec(&StakingInstruction::UnregisterValidator).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &unregister_a, &a, 0).unwrap();
+
+        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert_eq!(registry.validators.len(), 1, "only the caller's entry must be removed");
+        assert_eq!(registry.validators[0].validator, b, "the other validator's entry must survive");
+    }
+
+    #[test]
+    fn register_and_unregister_encodings_are_appended_after_report_equivocation() {
+        // Guards the borsh discriminants: the two new variants must be
+        // appended (4, 5) so the existing Delegate/Undelegate/ClaimReward/
+        // ReportEquivocation encodings the wallet and prior data depend on
+        // never shift.
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let register = borsh::to_vec(&StakingInstruction::RegisterValidator { pubkey_bundle: kp.public_key_bundle(), address: "x".into() }).unwrap();
+        assert_eq!(register[0], 4, "RegisterValidator must be discriminant 4");
+        assert_eq!(borsh::to_vec(&StakingInstruction::UnregisterValidator).unwrap(), vec![5u8], "UnregisterValidator must be discriminant 5");
     }
 }
