@@ -64,6 +64,41 @@ sudo ./deploy/install-node.sh --modo unirse --config /ruta/a/config.json --yes
 Ver todas las opciones (puertos custom, imagen custom, carpeta de
 instalación custom) con `sudo ./deploy/install-node.sh --help`.
 
+## Red de 2 validadores (principal + secundario) en un paso: `deploy/setup-2validators.sh`
+
+Para armar una red NUEVA de dos VPS sin hacer el ida y vuelta de bundles/configs
+a mano, hay un solo script que corre en la **VPS principal** (la que lleva la
+mayoría del stake, así puede avanzar sola si la secundaria se cae):
+
+```
+# 1) En la VPS SECUNDARIA (Oracle): sacá su bundle (un comando)
+sudo docker run --rm -v /opt/qchain:/qchain -w /qchain qchain:latest \
+    qchain bundle --keypair keypair.json > bundle-secundario.json
+#    → copiá el contenido a la VPS principal (scp, o pegalo en un archivo)
+
+# 2) En la VPS PRINCIPAL (nueva), dentro del repo:
+sudo ./deploy/setup-2validators.sh \
+    --ip-principal  <IP_PUBLICA_DE_ESTA_VPS> \
+    --ip-secundario <IP_PUBLICA_DE_LA_ORACLE> \
+    --bundle-secundario bundle-secundario.json
+#    → instala el principal (Docker + imagen + firewall + systemd) y te imprime
+#      UN comando listo para pegar en la secundaria.
+
+# 3) En la SECUNDARIA: pegá el comando que imprimió el paso 2 (escribe su config,
+#    borra el estado viejo y la reinicia en la red nueva).
+
+# 4) Abrí el puerto P2P (9000 por defecto) en el FIREWALL DE LA NUBE de AMBAS
+#    VPS (Security List / NSG en Oracle Cloud, grupo de seguridad en la otra).
+```
+
+Reparto de stake por defecto: principal 3.000.000 / secundario 1.000.000 (75/25 →
+el principal tiene >2/3 y avanza solo si la secundaria se cae). Cambialo con
+`--stake-principal`/`--stake-secundario`. **Aclaración honesta:** con >2/3 en un
+solo nodo ganás redundancia, no tolerancia bizantina — para tolerar la caída de
+cualquiera de las dos sin depender de cuál, el salto real es a 4 validadores con
+stake parejo. `--dry-run` genera los configs sin instalar nada; `--help` lista
+todas las opciones.
+
 El resto de esta guía documenta el camino manual, paso a paso, para
 quien quiera más control (multi-validador coordinado, ajustar
 `round_interval_ms`, etc.) o entender qué hace el instalador por dentro.
