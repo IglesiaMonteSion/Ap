@@ -18,13 +18,16 @@
   body{margin:0;color:var(--ink);background:#070912;
     font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5;
     -webkit-font-smoothing:antialiased}
-  .app{max-width:460px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;position:relative;
+  .app{max-width:460px;margin:0 auto;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;position:relative;
     background:
       radial-gradient(900px 420px at 50% -8%, rgba(124,92,255,.20), transparent 62%),
       radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.12), transparent 60%),
       radial-gradient(600px 500px at 0% 100%, rgba(90,80,220,.10), transparent 60%),
       #070912;}
-  .view{display:none;flex-direction:column;flex:1;padding:18px 18px 34px}
+  /* dvh = alto REAL del viewport en móvil (descuenta la barra del navegador),
+     así el contenido no queda "empujado" abajo del área visible como con vh. */
+  .view{display:none;flex-direction:column;flex:1;min-height:0;
+    padding:calc(16px + env(safe-area-inset-top)) 18px calc(28px + env(safe-area-inset-bottom))}
   .view.active{display:flex;animation:fade .2s ease}
   @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
@@ -41,11 +44,14 @@
   .dot{width:8px;height:8px;border-radius:50%;background:#8792a8}
   .dot.ok{background:#34e39b;box-shadow:0 0 0 3px rgba(52,227,155,.18),0 0 8px rgba(52,227,155,.7)} .dot.bad{background:var(--bad)}
 
-  .welcome{align-items:center;justify-content:center;text-align:center;gap:0}
-  .welcome .hero{margin:auto 0 24px;display:flex;flex-direction:column;align-items:center;gap:14px}
-  .welcome h1{font-size:30px;margin:8px 0 0;letter-spacing:-.02em;font-weight:800}
+  /* Bienvenida: contenido alineado ARRIBA (logo+título siempre visibles sin
+     scroll), botones empujados al fondo con margin-top:auto. */
+  .welcome{align-items:center;text-align:center;gap:0;justify-content:flex-start}
+  .welcome .hero{margin:clamp(16px,6vh,52px) 0 22px;display:flex;flex-direction:column;align-items:center;gap:13px}
+  .welcome h1{font-size:clamp(24px,7vw,30px);margin:8px 0 0;letter-spacing:-.02em;font-weight:800}
   .welcome p{color:var(--muted);margin:0;max-width:320px;font-size:15px}
-  .welcome .cta{width:100%;display:flex;flex-direction:column;gap:12px}
+  .welcome .cta{width:100%;display:flex;flex-direction:column;gap:12px;margin-top:auto}
+  .welcome .logo-lg{width:clamp(80px,22vw,110px);height:clamp(80px,22vw,110px)}
   .badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#c9c2ff;font-weight:600;
     background:var(--brand-soft);border:1px solid rgba(140,130,255,.28);padding:6px 13px;border-radius:999px}
 
