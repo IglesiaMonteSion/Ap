@@ -196,17 +196,35 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Instalar el PRINCIPAL reusando install-node.sh (firewall + systemd + reusa la clave)
+# 6. Instalar/actualizar el PRINCIPAL
+#    - Si NO había nodo: install-node.sh hace todo (firewall + systemd + reusa clave).
+#    - Si YA había un nodo (p.ej. modo solo): pasar a la red de 2 validadores es
+#      OTRA red (chain_id nuevo), así que install-node.sh no pisaría el config por
+#      seguridad. Acá lo hacemos a mano: reemplazar config, borrar el estado viejo
+#      (es otra cadena) y reiniciar el servicio ya instalado.
 # ---------------------------------------------------------------------------
-log "==> Instalando el validador principal (servicio systemd)..."
-"$SCRIPT_DIR/install-node.sh" --modo unirse --config "$QCHAIN_HOME/out/node1.json" \
-  --home "$QCHAIN_HOME" --image "$IMAGE" --yes
+NODE1="$QCHAIN_HOME/out/node1.json"
+if [ -f /etc/systemd/system/qchain-validator.service ]; then
+  log "==> Ya había un nodo instalado; migrándolo a la red de 2 validadores (chain_id nuevo, estado desde cero)..."
+  cp "$NODE1" "$QCHAIN_HOME/config.json"
+  chmod 600 "$QCHAIN_HOME/config.json" 2>/dev/null || true
+  rm -rf "$QCHAIN_HOME/data"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${P2P_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw allow "${RPC_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+  systemctl restart qchain-validator || error "no pude reiniciar qchain-validator; revisá 'journalctl -u qchain-validator -e'."
+  log "==> Principal migrado y reiniciado en la red nueva. La wallet/túnel siguen igual (apuntan al mismo RPC)."
+else
+  log "==> Instalando el validador principal (servicio systemd)..."
+  "$SCRIPT_DIR/install-node.sh" --modo unirse --config "$NODE1" \
+    --home "$QCHAIN_HOME" --image "$IMAGE" --yes
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Imprimir el comando LISTO para pegar en la secundaria (Oracle)
 # ---------------------------------------------------------------------------
 NODE2_B64="$(base64 -w0 "$QCHAIN_HOME/out/node2.json")"
-ORACLE_CMD="echo '$NODE2_B64' | base64 -d | sudo tee $HOME_SECUNDARIO/config.json >/dev/null && sudo rm -rf $HOME_SECUNDARIO/data && sudo systemctl restart qchain-validator && echo LISTO"
 
 cat <<EOF
 
@@ -220,10 +238,12 @@ Wallet de prueba fondeada en el génesis:
 
 FALTAN 2 COSAS:
 
-1) En la VPS SECUNDARIA (Oracle), pegá EXACTAMENTE este comando
-   (escribe su config, borra el estado viejo y la reinicia en la red nueva):
+1) En la VPS SECUNDARIA (Oracle) — que ya generó su clave al sacar el bundle,
+   y con el repo clonado (git clone ... qchain) — pegá estos DOS comandos.
+   Instala el validador secundario SIN wallet ni túnel y reusa su clave:
 
-$ORACLE_CMD
+   echo '$NODE2_B64' | base64 -d | sudo tee /tmp/node2.json >/dev/null
+   cd ~/qchain && sudo ./deploy/install-node.sh --modo unirse --config /tmp/node2.json --yes
 
 2) Abrí el puerto P2P $P2P_PORT en el FIREWALL DE LA NUBE de AMBAS VPS
    (Security List / NSG en Oracle Cloud; grupo de seguridad en la otra).
