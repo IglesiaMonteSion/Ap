@@ -586,6 +586,12 @@ impl Ledger {
             }
         }
 
+        // Snapshot what the post-execution security check needs, BEFORE
+        // `accounts`/`is_signer` are moved into `call`.
+        let before_balances: Vec<u64> = accounts.iter().map(|a| a.balance).collect();
+        let before_owners: Vec<Pubkey> = accounts.iter().map(|a| a.owner).collect();
+        let signer_flags = is_signer.clone();
+
         // Setup-level failures (bad module, missing entry point) never
         // spend fuel - real execution hasn't started yet.
         let result = self
@@ -609,6 +615,49 @@ impl Ledger {
         // discarded (same as any other failed instruction).
         if let Some(trap_message) = result.trap {
             return Err(ExecError::Wasm { message: trap_message, fuel_consumed: result.fuel_consumed });
+        }
+
+        // SECURITY — enforced by the LEDGER, not the contract. `host_set_balance`
+        // lets bytecode write any balance to any declared account, and
+        // `host_is_signer` is only *advisory* (a cooperative contract may consult
+        // it, but nothing forces malicious bytecode to). So a deployed contract
+        // could otherwise mint (`set_balance(self, MAX)`) or steal (drain a
+        // victim named in `accounts` without checking the signer). We validate
+        // the balance delta here, before committing, so the guarantee holds for
+        // ALL bytecode - not just the reference contract that voluntarily checks
+        // `host_is_signer`. Two invariants (Solana-style):
+        //   (1) an account may only be DEBITED if the caller is authorized over
+        //       it - it is the transaction signer, or the contract program owns
+        //       it (`owner == program_id`);
+        //   (2) the total balance across the declared accounts may not increase
+        //       (minting from nothing is impossible).
+        // Only `balance` is reachable from the host API (no set for owner/data),
+        // so this fully covers what bytecode can change. Fees are billed
+        // separately by `apply_transaction`; a rejected instruction still pays
+        // its byte/gas fee, so this is not a free retry for an attacker.
+        let program_id = ix.program_id;
+        let mut total_before: u128 = 0;
+        let mut total_after: u128 = 0;
+        for (i, account_after) in result.accounts.iter().enumerate() {
+            let before = before_balances.get(i).copied().unwrap_or(0);
+            let after = account_after.balance;
+            total_before += before as u128;
+            total_after += after as u128;
+            if after < before {
+                let authorized = signer_flags.get(i).copied().unwrap_or(false)
+                    || before_owners.get(i).map(|o| *o == program_id).unwrap_or(false);
+                if !authorized {
+                    let who = ix.accounts.get(i).copied().unwrap_or_else(Pubkey::system_program_id);
+                    return Err(ExecError::Unauthorized(format!(
+                        "contract debited account {who} it is not authorized over (not the signer, not program-owned)"
+                    )));
+                }
+            }
+        }
+        if total_after > total_before {
+            return Err(ExecError::ProgramError(
+                "contract increased the total balance across its accounts - minting is not allowed".into(),
+            ));
         }
 
         for (pk, account) in ix.accounts.iter().zip(result.accounts.into_iter()) {
@@ -1311,6 +1360,119 @@ mod tests {
         let result = ledger.apply_transaction(&call_tx, &validator, 0);
         assert!(result.is_err(), "a contract call naming a non-signer as the funds source must be rejected, not silently drain the victim");
         assert_eq!(ledger.get_balance(&victim.pubkey()), 2_000_000, "the victim's balance must be untouched");
+    }
+
+    /// A *malicious* contract that steals exactly like `I64_TRANSFER_WAT`
+    /// but deliberately OMITS the `host_is_signer` guard - the whole point
+    /// of the ledger-boundary enforcement is that this is rejected anyway.
+    /// `host_is_signer` is advisory (a cooperative contract may consult it,
+    /// but nothing forces bytecode to), so the previous test only proves
+    /// the *reference* contract behaves; this proves the LEDGER refuses the
+    /// debit even when the bytecode itself never checks. Value-conserving
+    /// (from-=amount, to+=amount), so it slips past the minting invariant
+    /// and is caught solely by the debit-authorization invariant.
+    const STEAL_NO_SIGNER_CHECK_WAT: &str = r#"
+        (module
+            (import "env" "host_get_balance" (func $get_balance (param i32) (result i64)))
+            (import "env" "host_set_balance" (func $set_balance (param i32 i64)))
+            (memory (export "memory") 1)
+            (func (export "steal") (param $from i64) (param $to i64) (param $amount i64)
+                (local $from_balance i64)
+                (local $to_balance i64)
+                (local.set $from_balance (call $get_balance (i32.wrap_i64 (local.get $from))))
+                (local.set $to_balance (call $get_balance (i32.wrap_i64 (local.get $to))))
+                (call $set_balance (i32.wrap_i64 (local.get $from)) (i64.sub (local.get $from_balance) (local.get $amount)))
+                (call $set_balance (i32.wrap_i64 (local.get $to)) (i64.add (local.get $to_balance) (local.get $amount)))
+            )
+        )
+    "#;
+
+    /// A *malicious* contract that mints: it sets an account's balance to a
+    /// huge value out of nothing, increasing the total across the declared
+    /// accounts. Caught by the minting invariant regardless of whether the
+    /// target is the signer.
+    const MINT_WAT: &str = r#"
+        (module
+            (import "env" "host_set_balance" (func $set_balance (param i32 i64)))
+            (memory (export "memory") 1)
+            (func (export "mint") (param $target i64)
+                (call $set_balance (i32.wrap_i64 (local.get $target)) (i64.const 1000000000000))
+            )
+        )
+    "#;
+
+    fn deploy_wat(ledger: &mut Ledger, wat: &str, entry_point: &str, deployer: &Keypair, validator: &Pubkey) -> Pubkey {
+        let program_pk = Keypair::generate().unwrap().pubkey();
+        let module_bytes = wat::parse_str(wat).unwrap();
+        let deploy_ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![program_pk],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: entry_point.into() }).unwrap(),
+        };
+        let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
+        ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
+        program_pk
+    }
+
+    /// The ledger-boundary security guarantee, proven against bytecode that
+    /// makes NO voluntary check: a malicious contract debiting a non-signer
+    /// victim is rejected by the ledger itself, and the victim keeps every
+    /// unit. This is the real closure of the finding - the reference
+    /// contract's own `host_is_signer` check is a courtesy; the ledger is
+    /// the enforcement.
+    #[test]
+    fn a_malicious_contract_that_skips_the_signer_check_still_cannot_drain_a_non_signer() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+
+        let program_pk = deploy_wat(&mut ledger, STEAL_NO_SIGNER_CHECK_WAT, "steal", &deployer, &validator);
+
+        let victim = Keypair::generate().unwrap();
+        let attacker = Keypair::generate().unwrap();
+        ledger.credit(victim.pubkey(), 2_000_000);
+        ledger.credit(attacker.pubkey(), 5_000_000);
+
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes()); // index 0 = victim, never signed
+        call_data.extend_from_slice(&1i64.to_le_bytes()); // index 1 = attacker
+        call_data.extend_from_slice(&2_000_000i64.to_le_bytes());
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![victim.pubkey(), attacker.pubkey()], data: call_data };
+        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+
+        let result = ledger.apply_transaction(&call_tx, &validator, 0);
+        assert!(result.is_err(), "the ledger must reject a debit of a non-signer even when the bytecode never checks host_is_signer");
+        assert_eq!(ledger.get_balance(&victim.pubkey()), 2_000_000, "victim's balance untouched");
+    }
+
+    /// A contract cannot conjure balance from nothing: even setting its own
+    /// (signer's) account to a huge value is rejected by the minting
+    /// invariant, because the total across declared accounts would grow.
+    #[test]
+    fn a_malicious_contract_cannot_mint_balance_from_nothing() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+
+        let program_pk = deploy_wat(&mut ledger, MINT_WAT, "mint", &deployer, &validator);
+
+        let attacker = Keypair::generate().unwrap();
+        ledger.credit(attacker.pubkey(), 5_000_000);
+
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes()); // index 0 = attacker (the signer!) - still can't mint
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![attacker.pubkey()], data: call_data };
+        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+
+        let balance_before = ledger.get_balance(&attacker.pubkey());
+        let result = ledger.apply_transaction(&call_tx, &validator, 0);
+        assert!(result.is_err(), "minting balance out of nothing must be rejected even for the signer's own account");
+        // The instruction is rejected; only the byte fee for the attempt is
+        // charged (no mint applied), so the balance never balloons.
+        assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive a rejected mint");
+        assert!(ledger.get_balance(&attacker.pubkey()) < 1_000_000_000_000, "the minted value must not have been committed");
     }
 
     #[test]

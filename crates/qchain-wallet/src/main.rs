@@ -77,6 +77,17 @@ struct AppState {
     /// at `/`), we just serve a 403 on the custodial routes and keep the
     /// key-less browser wallet available to everyone.
     custodial_enabled: bool,
+    /// True when the server is bound to a loopback address (127.0.0.1 /
+    /// localhost). Only in that case do we enforce a Host-header allowlist on
+    /// custodial routes: DNS-rebinding attacks specifically target a
+    /// loopback-only server (a malicious page rebinds its own domain to
+    /// 127.0.0.1 to reach a server the victim can reach but the attacker's
+    /// origin normally can't). When the wallet is deliberately exposed (a
+    /// public bind, or fronted by a Cloudflare tunnel), the Host header is a
+    /// legitimately arbitrary domain and the password is the real defense, so
+    /// we do NOT gate on it there - enforcing an allowlist would break the
+    /// user's real tunnel deployment.
+    loopback_bound: bool,
 }
 
 #[tokio::main]
@@ -88,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // land in shell history). Empty = none.
     let password = cli.password.or_else(|| std::env::var("QCHAIN_WALLET_PASSWORD").ok()).filter(|s| !s.is_empty());
     let exposed = cli.bind != "127.0.0.1" && cli.bind != "localhost";
+    let loopback_bound = cli.bind == "127.0.0.1" || cli.bind == "localhost" || cli.bind == "::1";
 
     // The custodial wallet (server holds the keys) is only reachable when it's
     // safe: either we're localhost-only, or a password is set. Exposed with no
@@ -111,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::new(),
         password: password.clone(),
         custodial_enabled,
+        loopback_bound,
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -194,6 +207,34 @@ async fn require_auth(State(st): State<Arc<AppState>>, req: Request, next: Next)
             ))
             .expect("static 403 response always builds");
     }
+    // DNS-rebinding defense, but ONLY when bound to loopback (see
+    // `loopback_bound` doc). A malicious web page can rebind its own hostname
+    // to 127.0.0.1 and drive the victim's browser to POST at these custodial
+    // routes; the browser will send the *attacker's* domain in the Host
+    // header. Since a legitimate loopback client always addresses the server
+    // as localhost/127.0.0.1, rejecting any other Host closes the rebinding
+    // path without a password ever being involved. Skipped entirely when
+    // exposed, where an arbitrary Host (a tunnel domain) is legitimate.
+    if st.loopback_bound {
+        let host_ok = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|h| {
+                let host = h.rsplit_once(':').map(|(hp, _)| hp).unwrap_or(h);
+                host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
+            })
+            .unwrap_or(false);
+        if !host_ok {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(
+                    "Host no permitido para la wallet custodial local (defensa anti DNS-rebinding). \
+                     Accedé por http://127.0.0.1 o localhost.",
+                ))
+                .expect("static 403 response always builds");
+        }
+    }
     let Some(expected) = &st.password else {
         return next.run(req).await;
     };
@@ -266,7 +307,13 @@ async fn account_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>
 /// (pending reward + bonding/lock rounds). Read-only, no keys - lets the
 /// non-custodial wallet show real rewards and pre-check an Undelegate.
 async fn stake_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
-    let url = format!("{}/stake/{}", st.rpc, address.trim());
+    // Parse to a real Pubkey before interpolating into the node URL: this
+    // rejects anything that isn't a canonical address (no slashes, no query
+    // fragments, no path traversal) so a caller can't smuggle a different
+    // node path through this proxy. Re-encode from the parsed value, not the
+    // raw string, so only a well-formed address ever reaches the node.
+    let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección inválida: {e}")))?;
+    let url = format!("{}/stake/{}", st.rpc, pk);
     let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
     let val: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(val))
@@ -276,6 +323,18 @@ async fn stake_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) 
 /// node's `/tx`. The server never signs anything - it just forwards, so the
 /// key stays in the browser. Same-origin relay avoids the node needing CORS.
 async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+    // A signed Transaction (hybrid Ed25519+ML-DSA-65, ~5.5KB) is small; the
+    // node itself already caps `/tx` bodies. Cap here too so this open relay
+    // can't be used to shovel arbitrarily large payloads at the node in a
+    // single request. 256KB is generous headroom over a real signed tx.
+    const MAX_RELAY_BODY: usize = 256 * 1024;
+    if body.len() > MAX_RELAY_BODY {
+        return Err(ApiError::bad(format!(
+            "transacción demasiado grande ({} bytes, máximo {})",
+            body.len(),
+            MAX_RELAY_BODY
+        )));
+    }
     let resp = st
         .http
         .post(format!("{}/tx", st.rpc))

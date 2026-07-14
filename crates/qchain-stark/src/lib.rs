@@ -315,6 +315,20 @@ impl<'de> serde::Deserialize<'de> for PublicInputs {
         if raw.len() != TRACE_WIDTH {
             return Err(serde::de::Error::custom(format!("expected {TRACE_WIDTH} PublicInputs columns, got {}", raw.len())));
         }
+        // Defense-in-depth: every column must be the same length. A real
+        // trace has one cell per row in every column, so ragged columns are
+        // never legitimate - and `verify_batch_bound_to_state` treats
+        // `columns[COL_FROM_BEFORE].len()` as the row count and indexes the
+        // other columns at `[row]`, so a shorter column from a malicious node
+        // would panic (an out-of-bounds index) and DoS the light client.
+        // Reject it here, at the wire boundary, before any indexing.
+        let expected_rows = raw[0].len();
+        if let Some(bad) = raw.iter().position(|c| c.len() != expected_rows) {
+            return Err(serde::de::Error::custom(format!(
+                "PublicInputs columns must all have the same length ({expected_rows}); column {bad} has {}",
+                raw[bad].len()
+            )));
+        }
         let mut columns: [Vec<BaseElement>; TRACE_WIDTH] = Default::default();
         for (col, raw_col) in columns.iter_mut().zip(raw) {
             *col = raw_col.into_iter().map(BaseElement::new).collect();
@@ -669,6 +683,21 @@ mod tests {
     /// about the real Merkle tie-in - fills every byte with `n`.
     fn addr(n: u8) -> [u8; 32] {
         [n; 32]
+    }
+
+    /// A malicious node could send `PublicInputs` with columns of unequal
+    /// length; `verify_batch_bound_to_state` uses one column's length as the
+    /// row count and indexes the rest at `[row]`, so a shorter column would
+    /// panic (out-of-bounds) and DoS a light client. Deserialization must
+    /// reject ragged columns at the wire boundary instead.
+    #[test]
+    fn deserializing_public_inputs_with_ragged_columns_is_rejected() {
+        // TRACE_WIDTH columns, but the second one is one element short.
+        let mut cols: Vec<Vec<u128>> = vec![vec![1u128, 2u128]; TRACE_WIDTH];
+        cols[1] = vec![1u128]; // ragged
+        let json = serde_json::to_string(&cols).unwrap();
+        let parsed: Result<PublicInputs, _> = serde_json::from_str(&json);
+        assert!(parsed.is_err(), "ragged PublicInputs columns must be rejected, not silently accepted");
     }
 
     #[test]

@@ -440,7 +440,12 @@ function fromHex(s){ const a=new Uint8Array(s.length/2); for(let i=0;i<a.length;
 
 // dinero exacto (BigInt), 1 QCH = 1e9 unidades
 function qchToUnits(s){ s=(s||"").trim().replace(",","."); if(!/^\d+(\.\d+)?$/.test(s)) throw new Error("monto inválido");
-  let [i,f=""]=s.split("."); f=(f+"000000000").slice(0,9); return BigInt(i)*1000000000n+BigInt(f); }
+  let [i,f=""]=s.split(".");
+  // Reject more than 9 decimals instead of silently truncating: 1 QCH = 1e9
+  // units, so a 10th decimal is a sub-unit the chain can't represent.
+  // Truncating would quietly send a different amount than the user typed.
+  if(f.length>9) throw new Error("máximo 9 decimales (1 QCH = 1e9 unidades)");
+  f=(f+"000000000").slice(0,9); return BigInt(i)*1000000000n+BigInt(f); }
 function unitsToQch(u){ u=BigInt(u); const i=u/1000000000n; let f=(u%1000000000n).toString().padStart(9,"0").replace(/0+$/,""); return f?`${i}.${f}`:i.toString(); }
 function fmt(s){ return s.replace(/\B(?=(\d{3})+(?!\d))/g,"."); }
 function qchDisp(u){ const q=unitsToQch(u); const [i,f]=q.split("."); return fmt(i)+(f?","+f:"")+" QCH"; }

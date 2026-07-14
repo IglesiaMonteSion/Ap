@@ -118,6 +118,19 @@ impl NativeProgram for GovernanceProgram {
                 let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[0]".into()))?;
                 let stats_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[1]".into()))?;
 
+                // The quorum a proposal is judged against is a fraction of
+                // `total_staked`, read from this account's data. It MUST be
+                // the canonical staking-stats singleton - otherwise a caller
+                // could name a different account they control whose bytes
+                // deserialize to a tiny `total_staked`, shrinking the quorum
+                // and passing a proposal with far less than real support. The
+                // legitimate CLI always passes `STAKING_STATS_ID` here.
+                if stats_pk != crate::ids::STAKING_STATS_ID {
+                    return Err(ExecError::ProgramError(
+                        "Finalize accounts[1] must be the canonical staking-stats account".into(),
+                    ));
+                }
+
                 let total_staked = u64::try_from_slice(&accounts.get(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?.data)
                     .map_err(borsh_err)?;
 
@@ -158,8 +171,21 @@ impl NativeProgram for GovernanceProgram {
                     return Err(ExecError::ProgramError("the mandatory review time-lock has not elapsed yet".into()));
                 }
 
+                // Pin the mutated account to the canonical singleton for the
+                // action's tier. Without this, a caller could name a
+                // different account they control and have `Execute` overwrite
+                // it with registry/params bytes, or (with a look-alike data
+                // layout) desync what the rest of the ledger reads as the
+                // real registry/params. The legitimate CLI always passes
+                // `REGISTRY_ACCOUNT_ID` (Registry tier) or `PARAMS_ACCOUNT_ID`
+                // (Low tier) as accounts[1].
                 match &proposal.action {
                     ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+                        if target_pk != crate::ids::REGISTRY_ACCOUNT_ID {
+                            return Err(ExecError::ProgramError(
+                                "Execute accounts[1] must be the canonical registry account for a registry action".into(),
+                            ));
+                        }
                         let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
                         let mut registry: Vec<RegistryEntry> = Vec::try_from_slice(&target_account.data).map_err(borsh_err)?;
                         apply_registry_action(&mut registry, &proposal.action, current_round)?;
@@ -169,6 +195,11 @@ impl NativeProgram for GovernanceProgram {
                     | ProposalAction::SetDustThreshold(_)
                     | ProposalAction::SetGasPricePerFuel(_)
                     | ProposalAction::SetStakingCommissionBps(_) => {
+                        if target_pk != crate::ids::PARAMS_ACCOUNT_ID {
+                            return Err(ExecError::ProgramError(
+                                "Execute accounts[1] must be the canonical economic-params account for a Low-tier action".into(),
+                            ));
+                        }
                         let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
                         let mut params = crate::params::EconomicParams::try_from_slice(&target_account.data).map_err(borsh_err)?;
                         apply_economic_action(&mut params, &proposal.action)?;

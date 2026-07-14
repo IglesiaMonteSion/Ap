@@ -33,9 +33,18 @@ pub const KEY_BITS: usize = 256;
 pub fn hash_leaf(account: &Account) -> [u8; 32] {
     let mut hasher = Sha3_256::new();
     hasher.update([0x00]); // domain separator: leaf
-    if let Ok(bytes) = borsh::to_vec(account) {
-        hasher.update(bytes);
-    }
+    // Fail-loud, deliberately (same philosophy as `SledStore` refusing to
+    // run on corrupt data): a silent `if let Ok(...)` would, on a
+    // serialization failure, hash *only* the domain separator - producing
+    // exactly `Sha3(0x00)`, which is `empty_hashes()[0]`, the hash of an
+    // *absent* leaf. That would make a real account collide with "no
+    // account here", letting an exclusion proof validate against a
+    // populated slot (mint/erase value). Borsh encoding of an in-memory
+    // `Account` (fixed-size + `Vec<u8>` fields) has no realistic failure
+    // mode, so this `expect` is a theoretical-collision backstop, not a
+    // hot path that ever fires.
+    let bytes = borsh::to_vec(account).expect("borsh encoding of an Account cannot fail");
+    hasher.update(bytes);
     hasher.finalize().into()
 }
 
