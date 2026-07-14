@@ -2,7 +2,7 @@
 //! wallet/client traffic - what `qchain-cli` talks to. Deliberately small:
 //! submit a transaction, read an account, read node status.
 
-use crate::engine::{Engine, SnapshotMeta, SnapshotPage, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
+use crate::engine::{Engine, EconomicsResponse, SnapshotMeta, SnapshotPage, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -21,6 +21,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/account/:address", get(get_account))
         .route("/stake/:address", get(get_stake))
         .route("/status", get(status))
+        .route("/economics", get(economics))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
         .route("/transfers", get(list_transfers))
@@ -151,6 +152,13 @@ async fn get_stake(State(engine): State<Arc<Engine>>, Path(address): Path<String
 
 async fn status(State(engine): State<Arc<Engine>>) -> Json<StatusResponse> {
     Json(engine.status().await)
+}
+
+/// `/economics` - real validator economics for the dashboard's validator
+/// panel: live burn (fees + dust), validator earnings, staking pool, and the
+/// current governance parameters. See `EconomicsResponse`.
+async fn economics(State(engine): State<Arc<Engine>>) -> Json<EconomicsResponse> {
+    Json(engine.economics().await)
 }
 
 async fn root(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {

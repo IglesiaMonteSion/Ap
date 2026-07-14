@@ -240,6 +240,59 @@
       </div>
     </section>
 
+    <!-- ===== ECONOMÍA DEL VALIDADOR (en vivo) ===== -->
+    <section class="panel" id="econ-panel">
+      <div class="panel-header">
+        <h2>💰 economía del validador · en vivo</h2>
+      </div>
+      <div class="panel-sub">
+        Los validadores <b>ganan con los fees</b>: de cada fee cobrado, <b>la mitad se quema</b>
+        (sale de circulación para siempre) y la otra mitad va a los validadores — repartida entre la
+        <b>comisión</b> del que propone el bloque y el <b>pool de staking</b> que reclaman los delegadores.
+        El <b>“polvo”</b> (los excesos por debajo del umbral que quedan en las cuentas) también se quema.
+        Los totales son desde que arrancó este nodo.
+      </div>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-label">🔥 quemado total</div>
+          <div class="stat-value" id="econ-burned" style="color:#ff9a62">–</div>
+          <div class="stat-sub">fuera de circulación para siempre</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">quemado · de fees</div>
+          <div class="stat-value" id="econ-fee-burned" style="color:#ff9a62">–</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">quemado · de polvo (excesos de cuentas)</div>
+          <div class="stat-value" id="econ-dust-burned" style="color:#ff9a62">–</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">💸 comisión a validadores (red)</div>
+          <div class="stat-value" id="econ-validator-earned" style="color:#5be3a0">–</div>
+          <div class="stat-sub">ganancia directa del proponente</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">🏦 pool de staking</div>
+          <div class="stat-value" id="econ-pool" style="color:#5be3a0">–</div>
+          <div class="stat-sub">reclamable por delegadores</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">💼 balance de ESTE validador</div>
+          <div class="stat-value" id="econ-validator-balance" style="color:#5be3a0">–</div>
+          <div class="stat-sub">lo que llevás ganado + génesis</div>
+        </div>
+      </div>
+      <div class="panel-sub" style="margin-top:16px">parámetros económicos actuales (ajustables por gobernanza)</div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">fee por byte</div><div class="stat-value" id="econ-base-fee">–</div></div>
+        <div class="stat-card"><div class="stat-label">umbral de polvo</div><div class="stat-value" id="econ-dust-thr">–</div></div>
+        <div class="stat-card"><div class="stat-label">comisión del validador</div><div class="stat-value" id="econ-commission">–</div></div>
+        <div class="stat-card"><div class="stat-label">se quema de cada fee</div><div class="stat-value" id="econ-burn-pct">–</div></div>
+        <div class="stat-card"><div class="stat-label">peso en el quórum (BFT)</div><div class="stat-value" id="econ-stake">–</div></div>
+        <div class="stat-card"><div class="stat-label">pares (otros validadores)</div><div class="stat-value" id="econ-peers">–</div></div>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-header">
         <h2>actividad reciente</h2>
@@ -569,11 +622,33 @@ document.getElementById("addr").addEventListener("keydown", (e) => {
 makeCopyable(document.getElementById("stat-validator"), () => validatorAddr);
 makeCopyable(document.getElementById("stat-root"), () => rootHex);
 
+// ===== economía del validador (en vivo) =====
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+async function refreshEconomics() {
+  try {
+    const e = await getJson("/economics");
+    setText("econ-burned", qch(e.total_burned));
+    setText("econ-fee-burned", qch(e.fee_burned));
+    setText("econ-dust-burned", qch(e.dust_burned));
+    setText("econ-validator-earned", qch(e.validator_earned));
+    setText("econ-pool", qch(e.reward_pool_balance));
+    setText("econ-validator-balance", qch(e.validator_balance));
+    setText("econ-base-fee", fmtNum(e.base_fee_per_byte) + " u/byte");
+    setText("econ-dust-thr", qch(e.dust_threshold));
+    setText("econ-commission", (e.staking_commission_bps / 100) + " %");
+    setText("econ-burn-pct", e.burn_pct + " %");
+    setText("econ-stake", fmtNum(e.validator_stake));
+    setText("econ-peers", fmtNum(e.peer_count));
+  } catch (err) { /* mantener últimos valores si el nodo no responde */ }
+}
+
 refreshStatus();
 refreshChainId();
 refreshEquivocations();
+refreshEconomics();
 loadTransfers(true);
 setInterval(refreshStatus, 2000);
+setInterval(refreshEconomics, 2000);
 setInterval(refreshEquivocations, 15000);
 // Auto-refresco de "actividad reciente" sin parpadeo: solo redibuja si la
 // lista cambió de verdad (ver autoRefreshTransfers).

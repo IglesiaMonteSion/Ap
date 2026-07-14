@@ -30,6 +30,26 @@ pub struct Ledger {
     programs: HashMap<Pubkey, Program>,
     wasm: WasmExecutor,
     pub total_burned: u64,
+    /// Live breakdown of where value flows, so a validator operator can see
+    /// the real economics (not just a single "burned" number). All are running
+    /// totals since this `Ledger` was constructed (in-memory, reset on restart,
+    /// the same deliberate limitation as `total_burned`/`transfer_receipts`),
+    /// and all are deterministic across nodes (every node applies the same
+    /// transactions with the same `fee_collector`), so they agree network-wide.
+    /// `fee_burned + dust_burned == total_burned` by construction.
+    pub fee_burned: u64,
+    /// Burned specifically by the dust sweep - the "excess left in accounts"
+    /// below `dust_threshold` that gets zeroed and destroyed. The user asked
+    /// to see this separately from the fee burn.
+    pub dust_burned: u64,
+    /// Total paid out to validators as direct commission (the `fee_collector`
+    /// of each block, i.e. the proposer, keeps this share immediately). This is
+    /// literally how a validator earns: half of every fee is not burned, and
+    /// `staking_commission_bps` of that half is the validator's cut.
+    pub validator_earned: u64,
+    /// Total routed into the shared staking rewards pool (the rest of the
+    /// non-burned fee half), later claimable by delegators pro-rata.
+    pub pool_earned: u64,
     /// Real, live-maintained incremental sparse Merkle tree - see
     /// `qchain-storage::tree`'s `IncrementalStateTree` doc comment for
     /// the measured performance problem this closes (a single validator
@@ -63,7 +83,18 @@ impl Ledger {
         for (pk, account) in store.iter() {
             tree.note_set(&pk, &account);
         }
-        Ok(Ledger { store, programs: HashMap::new(), wasm: WasmExecutor::new()?, total_burned: 0, tree, transfer_receipts: Vec::new() })
+        Ok(Ledger {
+            store,
+            programs: HashMap::new(),
+            wasm: WasmExecutor::new()?,
+            total_burned: 0,
+            fee_burned: 0,
+            dust_burned: 0,
+            validator_earned: 0,
+            pool_earned: 0,
+            tree,
+            transfer_receipts: Vec::new(),
+        })
     }
 
     pub fn register_program(&mut self, id: Pubkey, program: Program) {
@@ -156,8 +187,13 @@ impl Ledger {
                 self.write_account(STAKING_REWARDS_POOL_ID, pool);
             }
             self.credit(fee_collector, commission);
+            self.validator_earned = self.validator_earned.saturating_add(commission);
+            self.pool_earned = self.pool_earned.saturating_add(pool_share);
         } else {
+            // No delegators yet: the validator keeps the whole non-burned
+            // share (its commission is effectively 100% of it).
             self.credit(fee_collector, validator_share);
+            self.validator_earned = self.validator_earned.saturating_add(validator_share);
         }
         Ok(())
     }
@@ -325,6 +361,7 @@ impl Ledger {
         let burn_share = byte_fee / 2;
         let validator_share = byte_fee - burn_share;
         self.total_burned += burn_share;
+        self.fee_burned = self.fee_burned.saturating_add(burn_share);
         self.credit_validator_share(*fee_collector, validator_share, &params)?;
 
         // Working set: the payer is always included (implicit participant,
@@ -476,6 +513,7 @@ impl Ledger {
             }
             payer_after.balance -= total_gas_fee;
             self.total_burned += total_gas_fee / 2;
+            self.fee_burned = self.fee_burned.saturating_add(total_gas_fee / 2);
             let gas_validator_share = total_gas_fee - total_gas_fee / 2;
             // Seed the fee collector's working-set entry from its REAL
             // stored balance, exactly like the payer is seeded at the top of
@@ -506,6 +544,7 @@ impl Ledger {
         for (pk, mut account) in working {
             if account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold {
                 self.total_burned += account.balance;
+                self.dust_burned = self.dust_burned.saturating_add(account.balance);
                 account.balance = 0;
             }
             self.write_account(pk, account);
@@ -536,6 +575,7 @@ impl Ledger {
                     let burn_share = charge / 2;
                     let validator_share = charge - burn_share;
                     self.total_burned += burn_share;
+                    self.fee_burned = self.fee_burned.saturating_add(burn_share);
                     // Same "attempted-execution byte fee already stuck, so
                     // fold this trap fee's own credit failure into the
                     // returned error rather than swallowing it" posture as
@@ -714,6 +754,14 @@ mod tests {
         assert_eq!(ledger.get_balance(&alice.pubkey()), 10_000_000 - 2_000_000 - fee);
         assert_eq!(ledger.get_balance(&validator), fee - fee / 2, "validator gets its half of the burned/split fee");
         assert_eq!(ledger.total_burned, fee / 2);
+        // The new economics breakdown must reconcile exactly: the burned half
+        // is all fee-burn (no dust here), and the non-burned half was all
+        // earned by the validator (no delegators, so commission == full share).
+        assert_eq!(ledger.fee_burned, fee / 2, "the burned half is fee-burn");
+        assert_eq!(ledger.dust_burned, 0, "no dust sweep in this transfer");
+        assert_eq!(ledger.fee_burned + ledger.dust_burned, ledger.total_burned, "breakdown must sum to total_burned");
+        assert_eq!(ledger.validator_earned, fee - fee / 2, "with no delegators the validator earns the whole non-burned share");
+        assert_eq!(ledger.pool_earned, 0, "nothing delegated, so nothing routed to the pool");
     }
 
     /// A real, live-confirmed gap this closes (see `project-lessons-learned`):

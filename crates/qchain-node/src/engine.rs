@@ -440,6 +440,51 @@ pub struct StatusResponse {
     pub base_fee_per_byte: u64,
 }
 
+/// Real validator economics, served at `GET /economics` and rendered on the
+/// node dashboard's validator panel. Answers the operator's real questions:
+/// how do validators earn, how much is being burned right now (and how much
+/// of that is dust - the "excess left in accounts"), and what are the live
+/// network parameters. All the running totals are in-memory since node start
+/// (reset on restart - same limitation as `total_burned`/receipts) and
+/// deterministic across nodes, so every honest node reports the same figures.
+#[derive(serde::Serialize, Clone)]
+pub struct EconomicsResponse {
+    /// This validator's own address (the `fee_collector` when it proposes).
+    pub validator: String,
+    /// This validator's on-chain balance - where its collected commission
+    /// accumulates (it earns by being the block proposer / `fee_collector`).
+    pub validator_balance: u64,
+    /// This validator's stake weight in the BFT quorum (from the genesis
+    /// validator set) - not the same as on-chain delegated staking.
+    pub validator_stake: u64,
+    /// Total value destroyed since node start = `fee_burned + dust_burned`.
+    pub total_burned: u64,
+    /// Burned from the fee split (half of every fee is burned).
+    pub fee_burned: u64,
+    /// Burned by the dust sweep - the sub-threshold "excess" left in accounts.
+    pub dust_burned: u64,
+    /// Total paid to validators as direct commission (network-wide).
+    pub validator_earned: u64,
+    /// Total routed into the shared staking rewards pool (network-wide).
+    pub pool_earned: u64,
+    /// Current balance sitting in the staking rewards pool, claimable by
+    /// delegators.
+    pub reward_pool_balance: u64,
+    /// Live governance-set economic parameters.
+    pub base_fee_per_byte: u64,
+    pub dust_threshold: u64,
+    pub staking_commission_bps: u16,
+    pub gas_price_per_fuel: u64,
+    /// The fraction of every fee that is burned (currently a fixed 50%).
+    pub burn_pct: u64,
+    /// Consensus liveness figures, so the panel is one-stop for an operator.
+    pub next_round: Round,
+    pub executed_transactions: u64,
+    pub dag_certificates: usize,
+    /// Number of *other* validators in the set (peers this node talks to).
+    pub peer_count: usize,
+}
+
 /// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
 /// far-behind peer or a fresh joining validator reads first to learn a
 /// server's current round, account-state Merkle root, and size before
@@ -883,6 +928,38 @@ impl Engine {
             version: NODE_VERSION.to_string(),
             update_available: state.update_available.clone(),
             base_fee_per_byte: state.ledger.current_params().base_fee_per_byte,
+        }
+    }
+
+    /// Real validator economics for the dashboard's validator panel (see
+    /// `EconomicsResponse`). Reads the ledger's live fee/burn/earn totals plus
+    /// the current governance params, this validator's own balance, and the
+    /// staking pool balance - all under one state lock.
+    pub async fn economics(&self) -> EconomicsResponse {
+        use qchain_execution::ids::STAKING_REWARDS_POOL_ID;
+        let state = self.state.lock().await;
+        let params = state.ledger.current_params();
+        let validator_balance = state.ledger.store().get(&self.self_id).map(|a| a.balance).unwrap_or(0);
+        let reward_pool_balance = state.ledger.store().get(&STAKING_REWARDS_POOL_ID).map(|a| a.balance).unwrap_or(0);
+        EconomicsResponse {
+            validator: self.self_id.to_string(),
+            validator_balance,
+            validator_stake: self.validators.stake_of(&self.self_id),
+            total_burned: state.ledger.total_burned,
+            fee_burned: state.ledger.fee_burned,
+            dust_burned: state.ledger.dust_burned,
+            validator_earned: state.ledger.validator_earned,
+            pool_earned: state.ledger.pool_earned,
+            reward_pool_balance,
+            base_fee_per_byte: params.base_fee_per_byte,
+            dust_threshold: params.dust_threshold,
+            staking_commission_bps: params.staking_commission_bps,
+            gas_price_per_fuel: params.gas_price_per_fuel,
+            burn_pct: 50,
+            next_round: state.next_round,
+            executed_transactions: state.executed,
+            dag_certificates: state.dag.len(),
+            peer_count: self.validators.len().saturating_sub(1),
         }
     }
 
