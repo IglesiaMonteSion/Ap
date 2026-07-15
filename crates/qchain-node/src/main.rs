@@ -5,7 +5,7 @@
 //! the `blockchain-core-rust` skill.
 
 use clap::Parser;
-use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSet};
+use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSchedule, ValidatorSet};
 use qchain_execution::{
     genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, RewardPoolData, StakingProgram, SystemProgram,
     GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
@@ -341,10 +341,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Phase-3.3 stage-1: a single-committee schedule (all rounds → the same
+    // set), built before `validators` is moved into the engine. Identical
+    // membership, so consensus behaves exactly as before.
+    let validator_schedule = ValidatorSchedule::single(validators.clone());
     let engine = Arc::new(Engine {
         self_id,
         keypair,
         validators,
+        validator_schedule,
         validator_directory,
         network,
         chain_id: config.chain_id(),

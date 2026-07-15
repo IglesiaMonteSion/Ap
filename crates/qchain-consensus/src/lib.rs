@@ -16,10 +16,12 @@
 pub mod bullshark;
 pub mod dag_store;
 pub mod quorum;
+pub mod schedule;
 
 pub use bullshark::Bullshark;
 pub use dag_store::DagStore;
 pub use quorum::{ValidatorInfo, ValidatorSet};
+pub use schedule::ValidatorSchedule;
 
 use qchain_core::{Certificate, Digest, Round};
 use std::collections::HashSet;
@@ -200,8 +202,8 @@ impl ConsensusState {
     /// phase-1/testnet scale - see the `dag-consensus-design` skill for the
     /// tradeoff) and returns any certificate digests newly finalized into
     /// the total order since the last call.
-    pub fn advance(&mut self, dag: &DagStore, validators: &ValidatorSet) -> Vec<Digest> {
-        let bullshark = Bullshark::with_gc_floor(dag, validators, self.gc_floor);
+    pub fn advance(&mut self, dag: &DagStore, schedule: &ValidatorSchedule) -> Vec<Digest> {
+        let bullshark = Bullshark::with_gc_floor(dag, schedule, self.gc_floor);
         let (ordered, stopped_at) = bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen, &mut self.committed_cache);
         // Record how far consensus has permanently finalized (the first
         // still-unresolved round), monotonically. This drives DAG garbage
@@ -225,7 +227,10 @@ impl ConsensusState {
 /// holds 2f+1 certificates from round `r` (Narwhal's synchronization rule).
 /// Pure predicate - no state - so callers can check it against whatever DAG
 /// view they currently have.
-pub fn can_advance_round(dag: &DagStore, validators: &ValidatorSet, round: Round) -> bool {
+pub fn can_advance_round(dag: &DagStore, schedule: &ValidatorSchedule, round: Round) -> bool {
+    // Resolve the committee in effect for `round` (stage 1: always the base
+    // set). Round advancement needs 2f+1 of *that round's* stake.
+    let validators = schedule.for_round(round);
     let stake: u64 = dag.certificates_in_round(round).map(|c| validators.stake_of(&c.vertex.author)).sum();
     stake >= validators.quorum_threshold()
 }
@@ -241,7 +246,11 @@ mod tests {
         id: qchain_core::ValidatorId,
     }
 
-    fn make_validators(n: usize) -> (Vec<TestValidator>, ValidatorSet) {
+    // Returns the validators wrapped in a single-committee `ValidatorSchedule`
+    // (stage 1: one set for all rounds), the shape `advance`/`can_advance_round`
+    // now take. `verify_certificate` still wants the bare set — reach it via
+    // `.base()`.
+    fn make_validators(n: usize) -> (Vec<TestValidator>, ValidatorSchedule) {
         let mut tvs = Vec::new();
         let mut infos = Vec::new();
         for _ in 0..n {
@@ -250,7 +259,7 @@ mod tests {
             infos.push(ValidatorInfo { id, pubkey_bundle: kp.public_key_bundle(), stake: 1 });
             tvs.push(TestValidator { keypair: kp, id });
         }
-        (tvs, ValidatorSet::new(infos))
+        (tvs, ValidatorSchedule::single(ValidatorSet::new(infos)))
     }
 
     fn certify(vertex: Vertex, signers: &[TestValidator]) -> Certificate {
@@ -290,7 +299,7 @@ mod tests {
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         // Only one signer - below the quorum threshold of 3.
         let cert = certify(vertex, &tvs[..1]);
-        assert!(!verify_certificate(&cert, &validators));
+        assert!(!verify_certificate(&cert, validators.base()));
     }
 
     #[test]
@@ -298,7 +307,7 @@ mod tests {
         let (tvs, validators) = make_validators(4);
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let cert = certify(vertex, &tvs[..3]);
-        assert!(verify_certificate(&cert, &validators));
+        assert!(verify_certificate(&cert, validators.base()));
     }
 
     #[test]
@@ -307,7 +316,7 @@ mod tests {
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let mut cert = certify(vertex, &tvs[..3]);
         cert.signatures[0].1.components[0].bytes[0] ^= 0xFF;
-        assert!(!verify_certificate(&cert, &validators), "a quorum count that includes a forged signature must not pass");
+        assert!(!verify_certificate(&cert, validators.base()), "a quorum count that includes a forged signature must not pass");
     }
 
     #[test]

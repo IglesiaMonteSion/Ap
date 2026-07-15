@@ -10,7 +10,7 @@
 //! validators, or `(0, [1u8; 32])` for an `Equivocator`'s second,
 //! conflicting vertex, purely so the two vertices hash differently.
 
-use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
+use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule, ValidatorSet};
 use qchain_core::{Certificate, Digest, EquivocationEvidence, Round, ValidatorId, Vertex};
 use qchain_crypto::{Keypair, MultiSignature};
 use std::collections::HashMap;
@@ -309,7 +309,13 @@ impl SimValidator {
     /// Mirrors `engine.rs`'s `try_commit`: re-run Bullshark ordering and
     /// record any newly-finalized digests.
     pub fn try_commit(&mut self, validators: &ValidatorSet) {
-        let newly = self.consensus.advance(&self.dag, validators);
+        // Phase-3.3 stage-1: `advance` now takes a `ValidatorSchedule`. The DST
+        // is a single static committee, so wrap the set in a single-committee
+        // schedule (cheap clone at this test-harness scale). Behavior is
+        // identical to passing the bare set — the reason the DST must still pass
+        // 9/9 unchanged.
+        let schedule = ValidatorSchedule::single(validators.clone());
+        let newly = self.consensus.advance(&self.dag, &schedule);
         self.committed_order.extend(newly);
     }
 }

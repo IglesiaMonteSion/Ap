@@ -54,7 +54,7 @@
 //! already accounted for, and anything with a gap ahead of it just stays
 //! queued for a later round instead of being drained blindly.
 
-use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSet};
+use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule, ValidatorSet};
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
@@ -403,6 +403,15 @@ pub struct Engine {
     pub self_id: ValidatorId,
     pub keypair: Keypair,
     pub validators: ValidatorSet,
+    /// Phase-3.3 stage-1 plumbing: the per-round committee resolver Bullshark
+    /// ordering reads (`ConsensusState::advance`). Currently a single-committee
+    /// schedule built from `validators` at startup — identical membership, so
+    /// consensus behaves exactly as before (proven by the DST). A later stage
+    /// makes this authoritative and lets the committee vary by epoch (derived
+    /// from the on-chain validator registry); it is kept *alongside*
+    /// `validators` rather than replacing the 14 direct reads, to keep this
+    /// no-op refactor minimal and reviewable.
+    pub validator_schedule: ValidatorSchedule,
     /// The validator set as a wallet-facing directory (address, name, stake),
     /// built from the node config at startup and served via `GET /validators`.
     pub validator_directory: Vec<ValidatorDirEntry>,
@@ -1868,7 +1877,7 @@ impl Engine {
         {
         let mut state = self.state.lock().await;
         let state = &mut *state;
-        let newly_ordered = state.consensus.advance(&state.dag, &self.validators);
+        let newly_ordered = state.consensus.advance(&state.dag, &self.validator_schedule);
         // Append every newly-ordered certificate to the execution queue in
         // committed order. `advance` emits a digest exactly once, so a full
         // clone is buffered (not just the digest) - DAG pruning can then never

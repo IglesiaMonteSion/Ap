@@ -38,14 +38,19 @@
 //! forces throughout.
 
 use crate::dag_store::DagStore;
-use crate::quorum::ValidatorSet;
+use crate::schedule::ValidatorSchedule;
 use qchain_core::{Certificate, Digest, Round, ValidatorId};
 use sha3::{Digest as _, Sha3_256};
 use std::collections::{HashMap, HashSet};
 
 pub struct Bullshark<'a> {
     dag: &'a DagStore,
-    validators: &'a ValidatorSet,
+    /// Resolves the committee in effect for a given round (stage 1: a single
+    /// set for all rounds — see `ValidatorSchedule`). Leader election and every
+    /// quorum check below ask this per round rather than assuming one global
+    /// set, so a later stage can vary the committee by epoch without touching
+    /// the ordering logic here.
+    schedule: &'a ValidatorSchedule,
     /// GC barrier: any certificate whose round is strictly below this is
     /// treated as already-committed permanent history and its slot in a
     /// causal walk is satisfied without requiring the certificate to be
@@ -67,12 +72,12 @@ pub struct Bullshark<'a> {
 }
 
 impl<'a> Bullshark<'a> {
-    pub fn new(dag: &'a DagStore, validators: &'a ValidatorSet) -> Self {
-        Bullshark { dag, validators, gc_floor: 0 }
+    pub fn new(dag: &'a DagStore, schedule: &'a ValidatorSchedule) -> Self {
+        Bullshark { dag, schedule, gc_floor: 0 }
     }
 
-    pub fn with_gc_floor(dag: &'a DagStore, validators: &'a ValidatorSet, gc_floor: Round) -> Self {
-        Bullshark { dag, validators, gc_floor }
+    pub fn with_gc_floor(dag: &'a DagStore, schedule: &'a ValidatorSchedule, gc_floor: Round) -> Self {
+        Bullshark { dag, schedule, gc_floor }
     }
 
     /// Deterministic, stake-agnostic leader selection: every honest
@@ -80,7 +85,7 @@ impl<'a> Bullshark<'a> {
     /// the round number alone, so agreeing on "who proposes this round's
     /// block" costs no extra consensus round.
     pub fn leader_for_round(&self, round: Round) -> Option<ValidatorId> {
-        let ids = self.validators.ids_sorted();
+        let ids = self.schedule.for_round(round).ids_sorted();
         if ids.is_empty() {
             return None;
         }
@@ -101,19 +106,21 @@ impl<'a> Bullshark<'a> {
         let Some(leader) = self.leader_for_round(round) else {
             return RoundOutcome::Skipped;
         };
-        let quorum = self.validators.quorum_threshold();
+        // Committee in effect for this round (stage 1: the single base set).
+        let validators = self.schedule.for_round(round);
+        let quorum = validators.quorum_threshold();
         let next_round_certs: Vec<&Certificate> = self.dag.certificates_in_round(round + 1).collect();
-        let known_stake: u64 = next_round_certs.iter().map(|c| self.validators.stake_of(&c.vertex.author)).sum();
+        let known_stake: u64 = next_round_certs.iter().map(|c| validators.stake_of(&c.vertex.author)).sum();
         // However much round+1 stake this validator simply hasn't seen a
         // certificate for yet - the upper bound on how much MORE support
         // could still show up, no matter what it turns out to reference.
-        let unknown_stake = self.validators.total_stake().saturating_sub(known_stake);
+        let unknown_stake = validators.total_stake().saturating_sub(known_stake);
 
         match self.dag.certificate_by_author(round, &leader) {
             Some(leader_cert) => {
                 let leader_digest = leader_cert.digest();
                 let supporting_stake: u64 =
-                    next_round_certs.iter().filter(|c| c.vertex.parents.contains(&leader_digest)).map(|c| self.validators.stake_of(&c.vertex.author)).sum();
+                    next_round_certs.iter().filter(|c| c.vertex.parents.contains(&leader_digest)).map(|c| validators.stake_of(&c.vertex.author)).sum();
                 if supporting_stake >= quorum {
                     RoundOutcome::Committed(leader_digest)
                 } else if supporting_stake + unknown_stake < quorum {
@@ -502,6 +509,7 @@ enum RoundOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quorum::ValidatorSet;
     use qchain_crypto::Keypair;
 
     fn validators(n: usize) -> ValidatorSet {
@@ -516,9 +524,9 @@ mod tests {
 
     #[test]
     fn leader_election_is_deterministic_and_spans_the_validator_set() {
-        let validators = validators(4);
+        let schedule = ValidatorSchedule::single(validators(4));
         let dag = DagStore::new();
-        let bullshark = Bullshark::new(&dag, &validators);
+        let bullshark = Bullshark::new(&dag, &schedule);
 
         assert_eq!(bullshark.leader_for_round(5), bullshark.leader_for_round(5));
 
@@ -528,9 +536,9 @@ mod tests {
 
     #[test]
     fn empty_validator_set_has_no_leader() {
-        let validators = ValidatorSet::new(vec![]);
+        let schedule = ValidatorSchedule::single(ValidatorSet::new(vec![]));
         let dag = DagStore::new();
-        let bullshark = Bullshark::new(&dag, &validators);
+        let bullshark = Bullshark::new(&dag, &schedule);
         assert!(bullshark.leader_for_round(0).is_none());
     }
 
@@ -547,13 +555,14 @@ mod tests {
     #[test]
     fn a_missing_leader_referenced_by_a_known_child_is_undecided_not_skipped() {
         let validators = validators(4);
+        let schedule = ValidatorSchedule::single(validators.clone());
         let ids = validators.ids_sorted();
         let r = 1;
         // The four round-r certificates (one per validator). The leader's is
         // the one we'll withhold from the "behind" validator's DAG.
         let leader = {
             let dag = DagStore::new();
-            Bullshark::new(&dag, &validators).leader_for_round(r).unwrap()
+            Bullshark::new(&dag, &schedule).leader_for_round(r).unwrap()
         };
         let round_r: Vec<Certificate> = ids.iter().map(|id| cert(r, *id, vec![])).collect();
         let leader_digest = round_r.iter().find(|c| c.vertex.author == leader).unwrap().digest();
@@ -576,7 +585,7 @@ mod tests {
         for c in round_r.iter().filter(|c| c.vertex.author != leader) {
             behind.insert(c.clone());
         }
-        let b = Bullshark::new(&behind, &validators);
+        let b = Bullshark::new(&behind, &schedule);
         assert_eq!(
             b.direct_status(r),
             RoundOutcome::Undecided,
@@ -590,7 +599,7 @@ mod tests {
         for c in round_r.iter().chain(round_r1.iter()) {
             synced.insert(c.clone());
         }
-        let s = Bullshark::new(&synced, &validators);
+        let s = Bullshark::new(&synced, &schedule);
         assert_eq!(s.direct_status(r), RoundOutcome::Committed(leader_digest), "with the leader present and 3-of-4 support, it commits directly");
     }
 
@@ -603,6 +612,7 @@ mod tests {
     fn walk_causal_history_handles_a_chain_far_deeper_than_the_recursion_limit() {
         let validators = validators(1);
         let author = validators.ids_sorted()[0];
+        let schedule = ValidatorSchedule::single(validators);
         let mut dag = DagStore::new();
         let depth: u64 = 200_000;
         let mut prev: Vec<Digest> = vec![];
@@ -612,7 +622,7 @@ mod tests {
             digests.push(d);
             prev = vec![d];
         }
-        let bull = Bullshark::new(&dag, &validators);
+        let bull = Bullshark::new(&dag, &schedule);
         let mut seen = HashSet::new();
         let mut ordered = Vec::new();
         let mut memo = HashMap::new();
@@ -628,11 +638,12 @@ mod tests {
     #[test]
     fn a_genuinely_absent_leader_is_still_skipped_so_the_chain_stays_live() {
         let validators = validators(4);
+        let schedule = ValidatorSchedule::single(validators.clone());
         let ids = validators.ids_sorted();
         let r = 1;
         let leader = {
             let dag = DagStore::new();
-            Bullshark::new(&dag, &validators).leader_for_round(r).unwrap()
+            Bullshark::new(&dag, &schedule).leader_for_round(r).unwrap()
         };
         // Round-r certs from the THREE non-leader validators only - the
         // leader crashed and never certified round r.
@@ -647,7 +658,7 @@ mod tests {
         for c in round_r.iter().chain(round_r1.iter()) {
             dag.insert(c.clone());
         }
-        let b = Bullshark::new(&dag, &validators);
+        let b = Bullshark::new(&dag, &schedule);
         // known_stake = 3 (all round+1 certs present), unknown = 1 < quorum 3,
         // and every child's parents are present (none is the absent leader),
         // so known support is provably zero => sound permanent Skip.
