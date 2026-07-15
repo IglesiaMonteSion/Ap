@@ -957,7 +957,22 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
                 .map(|p| p.base_fee_per_byte)
                 .unwrap_or(180);
-            let fund_amount = base_fee_per_byte.saturating_mul(6000).max(1_000_000);
+            // Headroom for the DYNAMIC (EIP-1559) fee. A hybrid-signed transfer
+            // is ~5,571 bytes, so the fee at the current floor is ~5,571 x
+            // base_fee_per_byte. But the load-test's own burst is above the
+            // per-round fee target, so the base fee RISES while the timed
+            // transfers are in flight (up to +12.5%/round, compounding over the
+            // few rounds a 300-tx burst spans). Funding at only ~1.08x the floor
+            // fee (the old 6000 multiplier vs the 5,571-byte size) left the test
+            // accounts stranded the moment the fee ticked up ~8% - every measured
+            // transfer then failed with "payer cannot afford this transaction's
+            // byte fee", so the tool measured the funding round instead of the
+            // real transfers. Fund with ~5x the floor fee (30_000 vs 5,571
+            // bytes): enough for the base fee to rise several-fold under the load
+            // and still admit the transfer. This is untimed setup, so the extra
+            // funding costs nothing measured. The transfer's fee_limit is set to
+            // this same amount below, so it never caps a legitimately-risen fee.
+            let fund_amount = base_fee_per_byte.saturating_mul(30_000).max(5_000_000);
             let client = reqwest::blocking::Client::new();
             for (i, sender) in senders.iter().enumerate() {
                 let ix = Instruction {
