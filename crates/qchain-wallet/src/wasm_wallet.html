@@ -239,9 +239,30 @@
     box-shadow:0 0 0 0 rgba(140,120,255,.45);animation:btnPulse 2.6s ease-out infinite}
   @keyframes btnPulse{0%{box-shadow:0 0 0 0 rgba(140,120,255,.42)}70%{box-shadow:0 0 0 12px rgba(140,120,255,0)}100%{box-shadow:0 0 0 0 rgba(140,120,255,0)}}
 
+  /* promo de staking en el home */
+  .stake-promo{display:flex;align-items:center;gap:12px;margin:14px 0 4px;padding:13px 15px;cursor:pointer;
+    border-radius:16px;border:1px solid rgba(140,120,255,.35);
+    background:linear-gradient(120deg,rgba(140,120,255,.16),rgba(90,140,255,.09));
+    box-shadow:0 0 0 0 rgba(140,120,255,.4);animation:btnPulse 3.2s ease-out infinite;transition:transform .12s}
+  .stake-promo:active{transform:scale(.99)}
+  .stake-promo .sp-ic{width:34px;height:34px;flex:0 0 auto;display:grid;place-items:center;border-radius:10px;
+    font-size:17px;color:#fff;background:linear-gradient(135deg,#b6a2ff,#6690ff)}
+  .stake-promo .sp-txt{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25}
+  .stake-promo .sp-txt b{font-size:15px}
+  .stake-promo .sp-txt span{font-size:12px;color:var(--muted)}
+  .stake-promo .sp-arrow{font-size:18px;color:var(--accent,#8c78ff);flex:0 0 auto}
+  /* banner de APY en la vista de staking */
+  .apy-banner{margin:4px 0 12px;padding:18px;border-radius:18px;text-align:center;
+    border:1px solid rgba(140,120,255,.35);
+    background:radial-gradient(120% 140% at 50% 0,rgba(140,120,255,.22),rgba(90,140,255,.06) 60%,transparent)}
+  .apy-banner .apy-big{font-size:30px;font-weight:800;letter-spacing:-.02em}
+  .apy-banner .apy-big b{background:linear-gradient(135deg,#c3b3ff,#7aa0ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .apy-banner .apy-big span{font-size:16px;font-weight:700;opacity:.75;margin-left:2px}
+  .apy-banner .apy-sub{font-size:13px;color:var(--muted);margin-top:4px}
+
   @media (prefers-reduced-motion: reduce){
     .boot-logo,.boot-word,.boot-tag,.boot-badge,.boot-status,.boot-sweep,.boot-halo,.boot-rings i,
-    .welcome .cta .btn-block,.btn-glow::after{animation:none !important;opacity:1 !important;transform:none !important}
+    .welcome .cta .btn-block,.btn-glow::after,.stake-promo{animation:none !important;opacity:1 !important;transform:none !important}
   }
 </style>
 </head>
@@ -288,7 +309,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="#c9c2ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l7 3v6c0 4.5-3 8-7 9-4-1-7-4.5-7-9V5z"/><path d="M9 12l2 2 4-4"/></svg>
         QUANTUM RESISTANT
       </span>
-      <h1>qchain <span class="grad">Wallet</span></h1>
+      <h1>QCHAIN <span class="grad">Wallet</span></h1>
       <p>Tu billetera cuántica. La clave se genera y vive <b>en tu dispositivo</b> — nadie más la tiene, ni siquiera nosotros.</p>
     </div>
     <div class="cta">
@@ -377,7 +398,7 @@
     <div class="topbar">
       <div class="brand-row">
         <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag2)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag2)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag2)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
-        <span class="brand-name">qchain <span class="grad">Wallet</span></span>
+        <span class="brand-name">QCHAIN <span class="grad">Wallet</span></span>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
         <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
@@ -398,6 +419,12 @@
       <div class="act nav" data-to="send"><div class="ic">↑</div>Enviar</div>
       <div class="act nav" data-to="receive"><div class="ic">↓</div>Recibir</div>
       <div class="act nav" data-to="staking"><div class="ic">◆</div>Staking</div>
+    </div>
+
+    <div class="stake-promo nav" data-to="staking">
+      <div class="sp-ic">◆</div>
+      <div class="sp-txt"><b>Ganá hasta 12% APY</b><span>Delegá tu QCH y hacelo crecer asegurando la red</span></div>
+      <div class="sp-arrow">→</div>
     </div>
 
     <div class="section-title">Actividad</div>
@@ -456,6 +483,11 @@
     <button class="backlink nav" data-to="home">← volver</button>
     <h2 class="view-title">Staking</h2>
     <p class="view-sub">Delegá QCH a un validador para ayudar a asegurar la red y ganar recompensas. Podés reclamar las recompensas o retirar cuando quieras.</p>
+
+    <div class="apy-banner">
+      <div class="apy-big">hasta <b>12%</b> <span>APY</span></div>
+      <div class="apy-sub">Ganá recompensas por asegurar la red. Delegá tu QCH y hacelo crecer.</div>
+    </div>
 
     <div class="card accent" style="margin-top:4px">
       <div class="section-title" style="margin:0 0 8px">Delegar</div>
@@ -526,7 +558,7 @@
     <div style="margin-top:12px"><button class="btn-block danger" id="set-remove">Quitar wallet de este navegador</button></div>
     <div class="hint center" style="margin-top:8px">Solo la vas a poder recuperar con tu semilla. No afecta tus fondos en la red.</div>
 
-    <div class="hint center" style="margin-top:22px;opacity:.7">qchain Wallet · <span id="set-appver">—</span></div>
+    <div class="hint center" style="margin-top:22px;opacity:.7">QCHAIN Wallet · <span id="set-appver">—</span></div>
   </section>
 
   <!-- ===== RESPALDO SHAMIR ===== -->
@@ -573,6 +605,7 @@ let ACCT = 0;           // índice de la cuenta activa
 let SEED = null;        // Uint8Array(32) de la cuenta activa = deriveAccountSeed(MASTER, ACCT)
 let PW = null;          // contraseña en memoria (solo para cifrar el respaldo sin re-preguntar); nunca se persiste ni se muestra
 let lastActivitySig = "";
+let activityExpanded = false;   // el historial muestra 5 filas; "Ver más" lo expande
 let nodeTimer = null, balTimer = null;
 
 // ---- helpers ----
@@ -819,11 +852,18 @@ function accountsStore(){ try{ return JSON.parse(localStorage.getItem(ACCOUNTS_K
 function myAccounts(){ const s=accountsStore()[master0Addr()]; return s&&s.count>=1 ? s : {count:1, names:{}, active:0}; }
 function saveAccounts(o){ const all=accountsStore(); all[master0Addr()]=o; localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(all)); }
 function accountName(i, o){ o=o||myAccounts(); return (o.names&&o.names[i]) || (i===0?"Cuenta principal":"Cuenta "+(i+1)); }
+// Borrar una cuenta = ocultarla de la lista (las cuentas se DERIVAN de la semilla,
+// así que "borrar" no destruye la clave: oculta el índice y quema el saldo residual
+// antes, para que no quede QCH accesible en una cuenta que ya no querés ver). El
+// índice sigue existiendo en la derivación; `hidden` es la lista de índices ocultos.
+function acctHidden(o){ o=o||myAccounts(); return Array.isArray(o.hidden)?o.hidden:[]; }
+function isHidden(i,o){ return acctHidden(o).includes(i); }
+function visibleAccounts(o){ o=o||myAccounts(); const h=acctHidden(o); const v=[]; for(let i=0;i<o.count;i++) if(!h.includes(i)) v.push(i); return v; }
 // Cambia la cuenta activa: re-deriva SEED, persiste la elección y refresca la vista.
 function setAccount(i){
   ACCT=i; SEED=acctSeed(i);
   const o=myAccounts(); o.active=i; if(i+1>o.count) o.count=i+1; saveAccounts(o);
-  lastActivitySig="";  // forzá el re-render de la actividad para la cuenta nueva
+  lastActivitySig=""; activityExpanded=false;  // re-render de la actividad (colapsada) para la cuenta nueva
 }
 // Al desbloquear/crear/restaurar: fijá MASTER y activá la última cuenta usada.
 let acctDiscoveryRan=false;   // el auto-descubrimiento corre una vez por sesión desbloqueada
@@ -847,7 +887,7 @@ async function recoverAccounts(){
     const a=await api("/api/account/"+encodeURIComponent(acctAddr(i))).catch(()=>null);
     let used=false;
     try{ used = a && ((BigInt(a.balance||0) > 0n) || (Number(a.nonce||0) > 0)); }catch(e){}
-    if(used){ highestUsed=i; gap=0; } else { gap++; }
+    if(used){ highestUsed=i; gap=0; if(isHidden(i)){ const o=myAccounts(); o.hidden=acctHidden(o).filter(x=>x!==i); saveAccounts(o); } } else { gap++; }
     i++;
   }
   if(highestUsed>0){
@@ -882,22 +922,26 @@ async function renderAccounts(){
     try{ await recoverAccounts(); }catch(e){}
     o=myAccounts();
   }
+  const vis=visibleAccounts(o);
   const rows=[];
-  for(let i=0;i<o.count;i++){
+  for(const i of vis){
     const addr=acctAddr(i), name=accountName(i,o), activo=(i===ACCT);
-    rows.push(`<div class="acct-row" data-i="${i}" style="display:flex;align-items:center;gap:10px;padding:12px 4px;cursor:pointer;border-bottom:1px solid var(--line)">
+    // La cuenta principal (0) no se puede borrar: es la identidad de la wallet.
+    const delBtn = i===0 ? '' : `<button class="btn-ghost acct-del" data-i="${i}" title="borrar" style="padding:2px 6px;color:var(--bad)">🗑</button>`;
+    rows.push(`<div class="acct-row" data-i="${i}" style="display:flex;align-items:center;gap:8px;padding:12px 4px;cursor:pointer;border-bottom:1px solid var(--line)">
       <div style="flex:1;min-width:0">
         <div style="font-weight:700;display:flex;align-items:center;gap:8px">${esc(name)} ${activo?'<span style="font-size:11px;color:var(--good);border:1px solid var(--good);border-radius:6px;padding:0 6px">activa</span>':''}</div>
         <div class="mono" style="font-size:12px;opacity:.7">${esc(short(addr))}</div>
       </div>
       <div class="acct-bal" data-addr="${esc(addr)}" style="font-weight:700;white-space:nowrap">…</div>
       <button class="btn-ghost acct-rename" data-i="${i}" title="renombrar" style="padding:2px 6px">✎</button>
+      ${delBtn}
     </div>`);
   }
   box.innerHTML=rows.join("");
   // switch al tocar una fila
   box.querySelectorAll(".acct-row").forEach(r=>r.addEventListener("click",e=>{
-    if(e.target.closest(".acct-rename")) return;   // el lápiz no cambia de cuenta
+    if(e.target.closest(".acct-rename")||e.target.closest(".acct-del")) return;   // lápiz/papelera no cambian de cuenta
     setAccount(+r.dataset.i); toast("cuenta "+accountName(+r.dataset.i)); showView("home");
   }));
   // renombrar
@@ -906,6 +950,8 @@ async function renderAccounts(){
     const i=+b.dataset.i, cur=accountName(i), nn=(prompt("Nombre de la cuenta:", cur)||"").trim();
     if(nn){ const oo=myAccounts(); oo.names=oo.names||{}; oo.names[i]=nn.slice(0,40); saveAccounts(oo); renderAccounts(); }
   }));
+  // borrar (quema el saldo residual y oculta la cuenta)
+  box.querySelectorAll(".acct-del").forEach(b=>b.addEventListener("click",e=>{ e.stopPropagation(); deleteAccount(+b.dataset.i); }));
   // saldos (best-effort, en paralelo) + saldo total sumado de todas las cuentas
   let total=0n;
   const totalEl=$("acct-total"); if(totalEl) totalEl.textContent="…";
@@ -916,6 +962,63 @@ async function renderAccounts(){
   });
 }
 $("acct-new").onclick=()=>{ const i=createAccount(); toast("cuenta creada"); renderAccounts(); };
+
+// Saldo por encima del cual borrar una cuenta pide confirmación (0,1 QCH); por
+// debajo se quema en silencio, como pidió el usuario. 1 QCH = 1e9 unidades.
+const BURN_WARN_UNITS = 100000000n;
+
+// Borra una cuenta: quema su saldo residual (transferencia a la dirección de quema
+// inquemable) y la oculta de la lista. La clave se DERIVA de la semilla, así que no
+// se destruye nada irrecuperable salvo el saldo, que es justamente lo que se quema.
+async function deleteAccount(i){
+  if(i===0){ toast("la cuenta principal no se puede borrar"); return; }
+  if(visibleAccounts().length<=1){ toast("no podés borrar tu única cuenta"); return; }
+  const seed=acctSeed(i), addr=addressFromSeed(seed), name=accountName(i);
+  let bal=0n;
+  try{ const a=await api("/api/account/"+encodeURIComponent(addr)); bal=BigInt(a.balance||0); }catch(e){ bal=0n; }
+  // Con saldo, hay que quemarlo. Aviso solo si supera 0,1 QCH.
+  if(bal>0n){
+    let fee=0n, burnAddr=null, dustThr=1000000n;
+    try{ const node=await api("/api/node"); fee=BigInt(node.base_fee_per_byte||180)*TX_BYTES; dustThr=BigInt(node.dust_threshold||1000000); }catch(e){ fee=BigInt(180)*TX_BYTES; }
+    try{ const cfg=await api("/api/config"); burnAddr=cfg.burn_address; }catch(e){}
+    // Se manda TODO menos el fee y un margen de "polvo" (medio umbral). El margen
+    // cumple dos cosas: (1) absorbe cualquier diferencia entre el fee estimado y
+    // el real (si no, un fee real un pelo mayor haría fallar la transferencia por
+    // fondos insuficientes, dejando el saldo intacto), y (2) el remanente que
+    // queda en la cuenta es sub-umbral, así que la red lo BARRE y QUEMA en la
+    // misma tx — no queda nada accesible.
+    const margin=fee+dustThr/2n;
+    if(bal<=margin || !burnAddr){
+      // Saldo demasiado chico para quemarlo a la dirección (o no hay dirección):
+      // se oculta; el residuo (sub-polvo) queda inaccesible/insignificante.
+      hideAccount(i); toast("cuenta borrada"); return;
+    }
+    if(bal>BURN_WARN_UNITS){
+      if(!confirm(`«${name}» tiene ${qchDisp(bal)}.\n\nBorrarla QUEMARÁ ese saldo de forma permanente e irrecuperable (contribuye a la deflación de la red).\n\n¿Borrar y quemar?`)) return;
+    }
+    try{
+      toast("quemando saldo…");
+      const a=await api("/api/account/"+encodeURIComponent(addr));
+      const cid=await api("/api/chain_id"); const chainId=fromHex(cid.chain_id);
+      const amount=bal-margin;   // el grueso se quema en la dirección; el resto lo barre la red
+      const txJson=signTransfer(seed, burnAddr, amount, BigInt(a.nonce), chainId, 10000000n);
+      const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
+      const body=await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(body.error||("error "+r.status));
+      toast("✓ saldo quemado · cuenta borrada");
+    }catch(e){ toast("no se pudo quemar: "+e.message); return; }
+  } else {
+    toast("cuenta borrada");
+  }
+  hideAccount(i);
+}
+// Oculta el índice y, si era la cuenta activa, vuelve a la principal.
+function hideAccount(i){
+  const o=myAccounts(); o.hidden=acctHidden(o).slice(); if(!o.hidden.includes(i)) o.hidden.push(i);
+  saveAccounts(o);
+  if(ACCT===i){ setAccount(0); }
+  renderAccounts();
+}
 $("acct-recover").onclick=async()=>{
   const box=$("acct-list"); box.innerHTML='<div class="empty">buscando cuentas desde tu semilla…</div>';
   try{ const n=await recoverAccounts(); toast(n>0 ? `✓ Cuentas encontradas hasta la #${n+1}` : "no se encontraron cuentas nuevas con saldo"); }catch(e){}
@@ -962,12 +1065,22 @@ async function renderActivity(addr){
     </div>`});
   }
   rows.sort((a,b)=>b.round-a.round);
-  const shown=rows.slice(0,20);
-  const sig=addr+"|"+shown.map(r=>r.key).join(",");
+  // Historial: 5 filas por defecto (se ve más limpio), con "Ver más" para expandir.
+  const LIMIT=5;
+  const shown = activityExpanded ? rows : rows.slice(0,LIMIT);
+  const sig=addr+"|"+(activityExpanded?"x":"c")+"|"+shown.map(r=>r.key).join(",");
   if(sig===lastActivitySig) return;
   lastActivitySig=sig;
-  if(!shown.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
-  box.innerHTML=shown.map(r=>r.html).join("");
+  if(!rows.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
+  let html=shown.map(r=>r.html).join("");
+  if(rows.length>LIMIT){
+    html += activityExpanded
+      ? '<button class="btn-block btn-sec act-toggle" style="margin-top:10px">Ver menos</button>'
+      : `<button class="btn-block btn-sec act-toggle" style="margin-top:10px">Ver más (${rows.length-LIMIT})</button>`;
+  }
+  box.innerHTML=html;
+  const tb=box.querySelector(".act-toggle");
+  if(tb) tb.onclick=()=>{ activityExpanded=!activityExpanded; lastActivitySig=""; renderActivity(addr); };
 }
 
 function renderReceive(){
@@ -988,13 +1101,14 @@ function renderSend(){
   // Poblá el selector de origen con todas las cuentas (default = la activa).
   // textContent (no innerHTML) → sin riesgo de inyección por el nombre.
   sel.innerHTML="";
-  for(let i=0;i<o.count;i++){
+  const vis=visibleAccounts(o);
+  for(const i of vis){
     const op=document.createElement("option");
     op.value=i; op.textContent=accountName(i,o)+" · "+short(acctAddr(i));
     sel.appendChild(op);
   }
   sel.value=String(ACCT);
-  sel.style.display = o.count>1 ? "block" : "none";   // el selector solo aparece si hay >1 cuenta
+  sel.style.display = vis.length>1 ? "block" : "none";   // el selector solo aparece si hay >1 cuenta visible
   const upd=()=>{ $("s-from-addr").textContent=sendFromAddr(); };
   sel.onchange=upd; upd();
   $("s-amount").value=""; $("s-to").value="";
@@ -1025,7 +1139,7 @@ async function downloadEncryptedBackup(){
   const store=await encryptSeed(MASTER, pw);   // { v, salt, iv, ct } — respalda la MAESTRA (todas las cuentas)
   const data=JSON.stringify({ type:"qchain-wallet-encrypted-backup", version:2, address:addr,
     kdf:"PBKDF2-SHA256", cipher:"AES-256-GCM", ...store,
-    note:"Respaldo CIFRADO de una wallet qchain no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
+    note:"Respaldo CIFRADO de una wallet QCHAIN no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
   const blob=new Blob([data],{type:"application/json"}), url=URL.createObjectURL(blob), a=document.createElement("a");
   a.href=url; a.download="qchain-wallet-backup.json"; a.click(); URL.revokeObjectURL(url);
   toast("respaldo cifrado descargado");
@@ -1150,7 +1264,7 @@ $("shamir-gen").onclick=async()=>{
 };
 $("shamir-dl").onclick=()=>{
   const addr=myAddress();
-  const txt=`qchain Wallet — respaldo Shamir (${shamirK} de ${shamirN})\n`+
+  const txt=`QCHAIN Wallet — respaldo Shamir (${shamirK} de ${shamirN})\n`+
     `dirección: ${addr}\n`+
     `Necesitás juntar ${shamirK} de estos ${shamirN} fragmentos para recuperar la wallet.\n`+
     `Restaurar: wallet -> Restaurar -> Fragmentos -> pegá ${shamirK} de ellos.\n\n`+
@@ -1204,9 +1318,25 @@ $("s-max").onclick=async()=>{
     const acct=await api("/api/account/"+encodeURIComponent(addr));
     const node=await api("/api/node");
     const fee=BigInt(node.base_fee_per_byte||180)*TX_BYTES;
-    const max=BigInt(acct.balance)-fee;
-    if(max<=0n){ $("s-fee").textContent="saldo insuficiente incluso para el fee"; }
-    else{ $("s-amount").value=unitsToQch(max); $("s-fee").textContent=`máximo: ${qchDisp(max)} · fee aprox: ${qchDisp(fee)}`; }
+    const bal=BigInt(acct.balance);
+    // Enviar máximo deja a propósito un "polvo" por DEBAJO del umbral de polvo:
+    // la red barre y QUEMA cualquier saldo sub-umbral que quede en la cuenta al
+    // participar en una tx (esta misma), así que ese remanente se destruye y
+    // contribuye a la deflación en vez de quedar en cero. Se deja la mitad del
+    // umbral (holgura ante variaciones del fee dinámico, para que siga siendo
+    // sub-umbral y se queme seguro).
+    const dustThr=BigInt(node.dust_threshold||1000000);
+    const dustLeave=dustThr/2n;
+    let max=bal-fee-dustLeave;
+    if(max<=0n){
+      // Saldo demasiado chico para dejar polvo: mandá todo lo que se pueda.
+      max=bal-fee;
+      if(max<=0n){ $("s-fee").textContent="saldo insuficiente incluso para el fee"; }
+      else{ $("s-amount").value=unitsToQch(max); $("s-fee").textContent=`máximo: ${qchDisp(max)} · fee aprox: ${qchDisp(fee)}`; }
+    } else {
+      $("s-amount").value=unitsToQch(max);
+      $("s-fee").textContent=`máximo: ${qchDisp(max)} · fee aprox: ${qchDisp(fee)} · deja ${qchDisp(dustLeave)} de polvo que la red quema 🔥`;
+    }
   }catch(e){ $("s-fee").textContent="no pude calcular el máximo"; }
   $("s-max").disabled=false;
 };

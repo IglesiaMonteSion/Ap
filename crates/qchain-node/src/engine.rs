@@ -828,6 +828,12 @@ pub struct StatusResponse {
     /// hardcoded guess. The fee of a standard transfer is this times the
     /// transaction's byte size (~5.5 KB for the default hybrid signature).
     pub base_fee_per_byte: u64,
+    /// Live on-chain `dust_threshold` (governance-settable): a system-owned
+    /// account left holding less than this after a transaction is swept to zero
+    /// and BURNED. The wallet reads it so "send max" can deliberately leave a
+    /// sub-threshold remainder that the sweep burns (a small deflationary
+    /// contribution) instead of leaving the account at exactly zero.
+    pub dust_threshold: u64,
     /// This node's configured round interval in ms - lets the dashboard scale
     /// its stall-detection threshold to the real cadence (see `Engine::round_interval_ms`).
     pub round_interval_ms: u64,
@@ -1460,6 +1466,7 @@ impl Engine {
             version: NODE_VERSION.to_string(),
             update_available: state.update_available.clone(),
             base_fee_per_byte: state.ledger.current_params().base_fee_per_byte,
+            dust_threshold: state.ledger.current_params().dust_threshold,
             round_interval_ms: self.round_interval_ms,
         }
     }

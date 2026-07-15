@@ -273,7 +273,13 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({ "rpc": st.rpc }))
+    // The canonical burn address: the all-`0xFF` public key. No keypair can
+    // derive to it (finding a preimage is infeasible), so any funds sent here
+    // are permanently unspendable - a real, if untracked-by-`total_burned`,
+    // removal from circulation. Computed with the node's exact base58 encoding
+    // (`Pubkey`'s `Display`) so the string the wallet sends matches byte-for-byte
+    // what the node parses. Used by "delete wallet" to burn any residual balance.
+    Json(json!({ "rpc": st.rpc, "burn_address": Pubkey([0xFFu8; 32]).to_string() }))
 }
 
 // ---- non-custodial WASM wallet (keys live in the browser) ----------------
