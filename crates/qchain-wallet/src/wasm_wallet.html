@@ -72,6 +72,10 @@
   .balance-card .amt{font-size:34px;font-weight:800;margin-top:5px;letter-spacing:-.02em}
   .balance-card .acct{margin-top:14px;display:flex;align-items:center;gap:8px;font-size:13px;color:#c3c9e0}
   .balance-card .acct .mono{font-family:ui-monospace,Menlo,monospace}
+  /* Marca de agua Q grande y tenue en la tarjeta de saldo (como el mockup) */
+  .balance-card .bc-watermark{position:absolute;right:-14px;top:8px;width:150px;height:150px;color:#fff;
+    opacity:.06;pointer-events:none;z-index:0}
+  .balance-card>*:not(.bc-watermark){position:relative;z-index:1}
 
   .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;backdrop-filter:blur(10px);
     position:relative;overflow:hidden}
@@ -498,7 +502,8 @@
     </div>
 
     <div class="balance-card">
-      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:8px">
+      <svg class="bc-watermark" viewBox="0 0 64 64" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="currentColor" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="currentColor" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
+      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:8px;position:relative;z-index:1">
         <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.8">▾</span>
       </button>
       <div class="lbl" style="display:flex;align-items:center;gap:7px">Saldo
