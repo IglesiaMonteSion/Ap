@@ -563,12 +563,36 @@ impl NativeProgram for StakingProgram {
                 if address.is_empty() || address.len() > crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN {
                     return Err(ExecError::ProgramError(format!("validator address must be 1..={} bytes", crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN)));
                 }
+                // AUDIT FIX (v4.1.4, defense-in-depth): pin the registry account
+                // to its canonical singleton, exactly as every sibling singleton
+                // writer already does (`Delegate`/`Undelegate` pin STAKING_STATS_ID,
+                // governance pins REGISTRY/PARAMS). A caller can only ever add its
+                // OWN entry (identity checks below), so this doesn't gate a real
+                // attack today, but it keeps a bogus `accounts[1]` from ever being
+                // written and matches the codebase-wide singleton discipline.
+                if registry_pk != crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID {
+                    return Err(ExecError::Unauthorized(
+                        "RegisterValidator's accounts[1] must be the canonical validator registry".into(),
+                    ));
+                }
                 // Gate on a real, slashable self-stake - the Sybil-resistance
                 // barrier. The named account must be a genuine self-stake
                 // (owner == validator == payer) with at least the minimum,
                 // reusing the exact `StakeAccountData` the rest of this module
                 // already produces and slashes.
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                // AUDIT FIX (v4.1.4, defense-in-depth): pin the ACCOUNT owner to
+                // the staking program, as `Vote` already does before reading a
+                // stake's weight. Not exploitable today (the only source of a
+                // parseable `StakeAccountData` with amount>=MIN is `Delegate`,
+                // which sets owner==STAKING_PROGRAM_ID and locks real funds), but
+                // it hardens the Sybil gate against any future arbitrary-data
+                // write primitive.
+                if stake_account.owner != STAKING_PROGRAM_ID {
+                    return Err(ExecError::Unauthorized(
+                        "RegisterValidator's accounts[2] must be a staking-program-owned self-stake".into(),
+                    ));
+                }
                 let stake_data = StakeAccountData::try_from_slice(&stake_account.data)
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if stake_data.owner != validator || stake_data.validator != validator {
@@ -610,6 +634,13 @@ impl NativeProgram for StakingProgram {
 
                 if validator != *payer {
                     return Err(ExecError::Unauthorized("UnregisterValidator's validator account must be the transaction payer".into()));
+                }
+                // AUDIT FIX (v4.1.4, defense-in-depth): pin the registry singleton,
+                // same as RegisterValidator above and every sibling singleton writer.
+                if registry_pk != crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID {
+                    return Err(ExecError::Unauthorized(
+                        "UnregisterValidator's accounts[1] must be the canonical validator registry".into(),
+                    ));
                 }
                 let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
                 let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(&registry_account.data)?;

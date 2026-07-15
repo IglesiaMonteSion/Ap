@@ -2001,11 +2001,11 @@ async function renderStaking(){
     // ¿se puede retirar ya? (bonding y lock cumplidos). Si no hay datos, se permite intentar.
     let ready=true, until=0;
     if(d&&d.exists){ until=Math.max(d.bonding_until_round||0, d.locked_until_round||0); ready = (d.current_round||0) >= until; }
-    const rewardLine = reward!==null ? `<div class="hint" style="margin:2px 0 0">recompensa: <b style="color:var(--good)">${qchDisp(reward)}</b></div>` : '';
-    const lockLine = (!ready) ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">se puede retirar en la ronda ${until}</div>` : '';
+    const rewardLine = reward!==null ? `<div class="hint" style="margin:2px 0 0">recompensa: <b style="color:var(--good)">${esc(qchDisp(reward))}</b></div>` : '';
+    const lockLine = (!ready) ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">se puede retirar en la ronda ${esc(fmt(String(until)))}</div>` : '';
     return `<div class="row-item" style="align-items:flex-start">
       <div style="min-width:0;flex:1">
-        <div style="font-weight:700">${qchDisp(amount)}</div>
+        <div style="font-weight:700">${esc(qchDisp(amount))}</div>
         <div class="wi-addr mono" style="font-size:11px">a ${esc(short(s.validator))}</div>
         ${rewardLine}${lockLine}
       </div>
@@ -2056,7 +2056,7 @@ $("st-delegate").onclick=async()=>{
     msg.textContent="enviando al nodo…";
     await relaySigned(txJson);
     saveStake({ stakeAccount, index, validator, amount:amount.toString() });
-    msg.className="msg ok"; msg.innerHTML=`✓ Delegaste ${amt} QCH`;
+    msg.className="msg ok"; msg.innerHTML=`✓ Delegaste ${esc(amt)} QCH`;
     $("st-amount").value="";
     setTimeout(renderStaking, 1500);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }

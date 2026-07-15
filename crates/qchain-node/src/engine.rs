@@ -2342,7 +2342,29 @@ impl Engine {
             if frontier != u64::MAX {
                 let epoch_rounds = sched.epoch_rounds();
                 let finalized_floor = state.consensus.finalized_floor();
-                if finalized_floor >= (frontier + 1).saturating_mul(epoch_rounds) {
+                let boundary = (frontier + 1).saturating_mul(epoch_rounds);
+                // AUDIT FIX (v4.1.4): the committee for the next epoch is derived
+                // from the EXECUTED ledger's on-chain registry, but `finalized_floor`
+                // only tracks ORDERING. If execution lags ordering — a worker-batch
+                // of some round `< boundary` hasn't arrived yet, so the "block, never
+                // skip" `take_executable_prefix` (v3.0.3) is still buffering that
+                // round's transactions in `pending_execution` — then the registry is
+                // STALE (a `RegisterValidator`/`UnregisterValidator` in that round is
+                // not yet applied). Two honest nodes at different execution progress
+                // would then derive DIFFERENT committees for the same epoch and fork
+                // permanently (the committee is installed once and persisted). The
+                // ordering-only trigger is unsafe here; also require that EXECUTION
+                // has crossed the boundary: no un-executed certificate may remain
+                // below `boundary`. Deterministic and self-healing — the missing
+                // batch re-syncs, `pending_execution` drains, and a later tick
+                // ratchets from the now-identical fully-executed registry. NO-OP for
+                // a `single` (fixed-membership) schedule: this whole block is
+                // `frontier == u64::MAX`-gated, so a non-rotating node is unchanged.
+                let execution_crossed = state
+                    .pending_execution
+                    .iter()
+                    .all(|c| c.vertex.round >= boundary);
+                if finalized_floor >= boundary && execution_crossed {
                     let next_epoch = frontier + 1;
                     let registry = state
                         .ledger
