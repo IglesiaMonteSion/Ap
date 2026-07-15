@@ -615,6 +615,10 @@ impl NativeProgram for StakingProgram {
                     pubkey_bundle,
                     address,
                     stake: stake_data.amount,
+                    // Record the self-stake account so committee derivation can
+                    // re-read the LIVE bond and drop this validator if it later
+                    // undelegates below the minimum (v4.1.4 audit MEDIUM fix).
+                    self_stake_account: Some(stake_pk),
                 };
                 match registry.position_of(&validator) {
                     Some(idx) => registry.validators[idx] = entry, // re-register: refresh in place

@@ -66,9 +66,35 @@ use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorIn
 /// deterministic**: every honest node computing this from the identical
 /// committed registry state gets the byte-identical committee, which is what
 /// keeps a live rotation fork-free.
-pub fn active_committee_from_registry(registry: &qchain_execution::validator_registry::ValidatorRegistryData) -> Option<ValidatorSet> {
-    use qchain_execution::validator_registry::{select_active_set, MAX_ACTIVE_VALIDATORS};
-    let active = select_active_set(registry, MAX_ACTIVE_VALIDATORS);
+/// `live_stake_of` returns the EFFECTIVE stake of a registered validator: for a
+/// genesis-seeded entry (`self_stake_account == None`) it's the snapshot; for a
+/// self-registered validator it's the LIVE self-stake read from the store, so a
+/// validator that undelegated its bond is dropped (falls below the minimum in
+/// `select_active_set`). This closes the v4.1.4 audit's MEDIUM: a registered
+/// validator can no longer withdraw its self-stake and keep sitting in the
+/// active committee with a stale snapshot, non-slashable. The caller (the epoch
+/// ratchet) supplies the closure over committed store state, keeping this
+/// deterministic and byte-identical across honest nodes.
+pub fn active_committee_from_registry(
+    registry: &qchain_execution::validator_registry::ValidatorRegistryData,
+    live_stake_of: impl Fn(&qchain_execution::validator_registry::RegisteredValidator) -> u64,
+) -> Option<ValidatorSet> {
+    use qchain_execution::validator_registry::{select_active_set, MAX_ACTIVE_VALIDATORS, ValidatorRegistryData};
+    // Rebuild the registry with each entry's effective (live) stake, then run
+    // the same deterministic top-N selection. A withdrawn self-stake becomes 0
+    // and `select_active_set`'s min-stake filter removes it.
+    let live = ValidatorRegistryData {
+        validators: registry
+            .validators
+            .iter()
+            .map(|rv| {
+                let mut r = rv.clone();
+                r.stake = live_stake_of(rv);
+                r
+            })
+            .collect(),
+    };
+    let active = select_active_set(&live, MAX_ACTIVE_VALIDATORS);
     if active.is_empty() {
         return None;
     }
@@ -1600,10 +1626,33 @@ impl Engine {
                 // to `old_n` parents from the last round of the previous epoch;
                 // bounding by the new (smaller) `n` would reject those honest
                 // proposals and freeze the network (a real liveness bug found in a
-                // live rotation test). Using the parent round's committee keeps the
-                // DoS bound tight (still a real committee size, never unbounded)
-                // while allowing the boundary case.
-                let max_parents = sched.for_round(vertex.round.saturating_sub(1)).len();
+                // live rotation test).
+                //
+                // Not sufficient on its own, though: the FIRST round of a shrunk
+                // epoch is itself over-produced. The epoch ratchet installs the new
+                // committee only after finalization crosses the boundary, which lags
+                // the frontier — so the boundary round (an epoch start) is proposed
+                // and certified while every node still has the OLD committee
+                // installed, giving it up to `old_n` certificates even though
+                // `for_round(boundary)` now returns the NEW, smaller committee. A
+                // vertex at `boundary + 1` legitimately references all of them, so
+                // bounding by `for_round(boundary)` alone re-froze a live 3 -> 2
+                // shrink (found in a real rotation test: the withdrawal-driven drop
+                // that closes the v4.1.4 audit MEDIUM now makes such shrinks happen
+                // for a new reason). The sound, tight bound: a round's certificate
+                // count can never exceed the LARGER of the two committees that could
+                // have produced it — its own epoch's, and the previous epoch's
+                // (install lag is bounded to the boundary). That is still a real,
+                // finite committee size (never unbounded), so the DoS guard holds.
+                let parent_round = vertex.round.saturating_sub(1);
+                let prev_epoch_last_round = sched
+                    .epoch_of(parent_round)
+                    .saturating_mul(sched.epoch_rounds())
+                    .saturating_sub(1);
+                let max_parents = sched
+                    .for_round(parent_round)
+                    .len()
+                    .max(sched.for_round(prev_epoch_last_round).len());
                 if vertex.parents.len() > max_parents {
                     tracing::warn!("dropping vertex proposal from {from}: {} parents exceeds round-{} validator count {max_parents}", vertex.parents.len(), vertex.round.saturating_sub(1));
                     return;
@@ -2372,11 +2421,31 @@ impl Engine {
                         .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
                         .and_then(|a| qchain_execution::validator_registry::ValidatorRegistryData::try_read(&a.data).ok())
                         .unwrap_or_default();
+                    // Re-read each self-registered validator's LIVE self-stake
+                    // from committed state (v4.1.4 audit MEDIUM fix): a validator
+                    // that undelegated its bond is dropped from the derived set
+                    // instead of coasting on its registration-time snapshot.
+                    // Genesis-seeded entries (`self_stake_account == None`) keep
+                    // their snapshot. Reads committed state, so every honest node
+                    // computes the identical committee — fork-free.
+                    let store = state.ledger.store();
+                    let live_stake_of = |rv: &qchain_execution::validator_registry::RegisteredValidator| -> u64 {
+                        match rv.self_stake_account {
+                            None => rv.stake, // genesis bootstrap: trust snapshot
+                            Some(addr) => store
+                                .get(&addr)
+                                .and_then(|a| <qchain_execution::staking::StakeAccountData as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
+                                // A genuine self-stake: owner == validator == the entry's validator.
+                                .filter(|d| d.owner == rv.validator && d.validator == rv.validator)
+                                .map(|d| d.amount)
+                                .unwrap_or(0), // withdrawn / missing / not a self-stake -> dropped by the min filter
+                        }
+                    };
                     // Fall back to the committee this epoch would otherwise
                     // inherit (the frontier epoch's) when the registry has no
                     // viable active set — so a rotation network keeps running on
                     // its genesis validators until real registrations exist.
-                    let derived = active_committee_from_registry(&registry);
+                    let derived = active_committee_from_registry(&registry, live_stake_of);
                     // The committee this epoch inherits (the frontier epoch's) —
                     // used only as the fallback when the registry yields no set.
                     let inherited = sched.for_round(frontier.saturating_mul(epoch_rounds));
@@ -2651,17 +2720,17 @@ mod tests {
     fn active_committee_from_registry_maps_stakes_and_rejects_an_empty_registry() {
         use qchain_execution::validator_registry::{RegisteredValidator, ValidatorRegistryData, MIN_VALIDATOR_STAKE};
         // Empty registry → no viable committee (caller keeps the current one).
-        assert!(active_committee_from_registry(&ValidatorRegistryData::default()).is_none());
+        assert!(active_committee_from_registry(&ValidatorRegistryData::default(), |rv| rv.stake).is_none());
         // Two registered validators → a committee carrying their exact stakes.
         let kp1 = Keypair::generate().unwrap();
         let kp2 = Keypair::generate().unwrap();
         let reg = ValidatorRegistryData {
             validators: vec![
-                RegisteredValidator { validator: kp1.pubkey(), pubkey_bundle: kp1.public_key_bundle(), address: "10.0.0.1:9000".into(), stake: MIN_VALIDATOR_STAKE * 2 },
-                RegisteredValidator { validator: kp2.pubkey(), pubkey_bundle: kp2.public_key_bundle(), address: "10.0.0.2:9000".into(), stake: MIN_VALIDATOR_STAKE },
+                RegisteredValidator { validator: kp1.pubkey(), pubkey_bundle: kp1.public_key_bundle(), address: "10.0.0.1:9000".into(), stake: MIN_VALIDATOR_STAKE * 2, self_stake_account: None },
+                RegisteredValidator { validator: kp2.pubkey(), pubkey_bundle: kp2.public_key_bundle(), address: "10.0.0.2:9000".into(), stake: MIN_VALIDATOR_STAKE, self_stake_account: None },
             ],
         };
-        let committee = active_committee_from_registry(&reg).expect("a non-empty registry yields a committee");
+        let committee = active_committee_from_registry(&reg, |rv| rv.stake).expect("a non-empty registry yields a committee");
         assert_eq!(committee.len(), 2);
         assert_eq!(committee.total_stake(), MIN_VALIDATOR_STAKE * 3);
         assert_eq!(committee.stake_of(&kp1.pubkey()), MIN_VALIDATOR_STAKE * 2);
@@ -2685,7 +2754,7 @@ mod tests {
         let v_new = Keypair::generate().unwrap().pubkey(); // a genuinely new registrant
         let bundle = qchain_crypto::Keypair::generate().unwrap().public_key_bundle();
         let config_peers = vec![PeerInfo { id: v_config, addr: "10.0.0.2:9000".parse().unwrap() }];
-        let reg = |id, addr: &str| RegisteredValidator { validator: id, pubkey_bundle: bundle.clone(), address: addr.to_string(), stake: 10_000_000 };
+        let reg = |id, addr: &str| RegisteredValidator { validator: id, pubkey_bundle: bundle.clone(), address: addr.to_string(), stake: 10_000_000, self_stake_account: None };
         let active = vec![
             reg(self_id, "10.0.0.1:9000"), // self — must be excluded
             reg(v_config, "10.0.0.2:9000"), // already a peer — no duplicate
@@ -2738,18 +2807,66 @@ mod tests {
             pubkey_bundle: kp.public_key_bundle(),
             address: "127.0.0.1:9000".to_string(),
             stake,
+            self_stake_account: None,
         };
         // Three registered validators, all above the minimum self-stake.
         let full = ValidatorRegistryData { validators: vec![reg(&kps[0], 30_000_000), reg(&kps[1], 20_000_000), reg(&kps[2], 10_000_000)] };
-        let committee_before = active_committee_from_registry(&full).expect("three registered validators form a committee");
+        let committee_before = active_committee_from_registry(&full, |rv| rv.stake).expect("three registered validators form a committee");
         assert_eq!(committee_before.len(), 3);
 
         // The lowest-staked validator unregisters (removed from the registry).
         let shrunk = ValidatorRegistryData { validators: vec![reg(&kps[0], 30_000_000), reg(&kps[1], 20_000_000)] };
-        let committee_after = active_committee_from_registry(&shrunk).expect("two registered validators still form a committee");
+        let committee_after = active_committee_from_registry(&shrunk, |rv| rv.stake).expect("two registered validators still form a committee");
         assert_eq!(committee_after.len(), 2, "the derived committee SHRINKS to drop the unregistered validator");
         assert!(committee_after.get(&kps[2].pubkey()).is_none(), "the departed validator is removed");
         assert!(committee_after.get(&kps[0].pubkey()).is_some() && committee_after.get(&kps[1].pubkey()).is_some(), "the survivors remain");
+    }
+
+    /// v4.1.4 audit MEDIUM fix: a self-registered validator that withdrew its
+    /// self-stake (or whose bond fell below the minimum) is DROPPED from the
+    /// derived committee even though its registration snapshot still records a
+    /// large stake — because the committee is derived from the LIVE self-stake
+    /// (`live_stake_of`), not the stale snapshot. A genesis-seeded entry
+    /// (`self_stake_account == None`) keeps its snapshot (the bootstrap set).
+    #[test]
+    fn a_registered_validator_whose_self_stake_is_withdrawn_is_dropped_from_the_committee() {
+        use qchain_execution::validator_registry::{RegisteredValidator, ValidatorRegistryData, MIN_VALIDATOR_STAKE};
+        let kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        // Distinct self-stake account markers so the closure can tell them apart.
+        let sacc = |i: u8| { let mut b = [0u8; 32]; b[0] = 0xAA; b[1] = i; Pubkey::new(b) };
+        let reg = |kp: &Keypair, stake, ssa| RegisteredValidator {
+            validator: kp.pubkey(),
+            pubkey_bundle: kp.public_key_bundle(),
+            address: "127.0.0.1:9000".to_string(),
+            stake,
+            self_stake_account: ssa,
+        };
+        // v0: self-registered, snapshot huge; v1: self-registered, snapshot huge;
+        // v2: genesis-seeded (None) with a real snapshot.
+        let registry = ValidatorRegistryData {
+            validators: vec![
+                reg(&kps[0], MIN_VALIDATOR_STAKE * 3, Some(sacc(0))),
+                reg(&kps[1], MIN_VALIDATOR_STAKE * 2, Some(sacc(1))),
+                reg(&kps[2], MIN_VALIDATOR_STAKE * 2, None),
+            ],
+        };
+        // All snapshots honored → committee of 3.
+        let full = active_committee_from_registry(&registry, |rv| rv.stake).expect("committee");
+        assert_eq!(full.len(), 3);
+
+        // Now v0 withdrew its self-stake (live = 0) — the live-stake closure
+        // returns 0 for its account, below the minimum, so it's dropped; v1's
+        // live self-stake is still healthy; v2 (genesis, None) keeps its snapshot.
+        let derived = active_committee_from_registry(&registry, |rv| match rv.self_stake_account {
+            None => rv.stake,                              // genesis bootstrap keeps snapshot
+            Some(a) if a == sacc(0) => 0,                  // v0 withdrew its bond
+            Some(_) => MIN_VALIDATOR_STAKE * 2,            // v1 live stake healthy
+        })
+        .expect("two validators still form a committee");
+        assert_eq!(derived.len(), 2, "the validator whose live self-stake was withdrawn is dropped");
+        assert!(derived.get(&kps[0].pubkey()).is_none(), "withdrawn self-stake -> not in the active committee");
+        assert!(derived.get(&kps[1].pubkey()).is_some(), "healthy live self-stake stays");
+        assert!(derived.get(&kps[2].pubkey()).is_some(), "genesis-seeded entry keeps its snapshot");
     }
 
     fn new_state() -> EngineState {

@@ -74,8 +74,20 @@ pub struct RegisteredValidator {
     /// validator - real peer discovery, replacing the hand-edited peer list.
     pub address: String,
     /// Self-stake backing this validator at registration time (>=
-    /// `MIN_VALIDATOR_STAKE`).
+    /// `MIN_VALIDATOR_STAKE`). NOTE: this is a SNAPSHOT taken at
+    /// registration; the authoritative, up-to-date stake for committee
+    /// selection is re-read live from `self_stake_account` (see below).
     pub stake: u64,
+    /// The self-stake account address backing this validator. `Some(addr)`
+    /// for a validator that self-registered via `RegisterValidator` — the
+    /// committee derivation re-reads this account's LIVE balance and DROPS
+    /// the validator if the self-stake was withdrawn (or fell below the
+    /// minimum), so a registered validator cannot undelegate its bond and
+    /// keep sitting in the active set with a stale snapshot (the v4.1.4
+    /// audit's MEDIUM finding). `None` for a genesis-seeded bootstrap entry:
+    /// genesis validators are trusted by the genesis config and keep their
+    /// snapshot stake (they have no separate self-stake account to re-read).
+    pub self_stake_account: Option<Pubkey>,
 }
 
 /// The registry account's (`VALIDATOR_REGISTRY_ACCOUNT_ID`) borsh-encoded
@@ -137,6 +149,9 @@ pub fn genesis_validator_registry_with(
             pubkey_bundle,
             address,
             stake,
+            // Genesis bootstrap entry: no separate self-stake account to
+            // re-read, so it keeps its snapshot stake (trusted by genesis).
+            self_stake_account: None,
         })
         .collect();
     borsh::to_vec(&ValidatorRegistryData { validators: entries }).expect("genesis validator registry always serializes")
@@ -233,6 +248,7 @@ mod tests {
             pubkey_bundle: PublicKeyBundle { components: vec![KeyComponent { scheme: qchain_crypto::AlgorithmId(1), bytes: vec![addr_byte] }] },
             address: format!("10.0.0.{addr_byte}:9000"),
             stake,
+            self_stake_account: None,
         }
     }
 
