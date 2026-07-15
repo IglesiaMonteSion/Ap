@@ -485,6 +485,13 @@ enum Command {
         /// strand the load generator before the node itself is the limit.
         #[arg(long, default_value_t = true)]
         refund: bool,
+        /// Continuous mode only. If > 0, OFFER this many transactions per second
+        /// (paced across workers), bypassing the in-flight throttle — a real
+        /// flood that can exceed what the node validates, so you can push the
+        /// dynamic fee to its peak and measure the worst-case fee per transfer.
+        /// 0 (default) uses the sustainable in-flight throttle instead.
+        #[arg(long, default_value_t = 0)]
+        offer_rate: u64,
     },
     /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
     /// see `qchain-execution::native`). Prints the fresh address the
@@ -1266,6 +1273,7 @@ fn main() -> anyhow::Result<()> {
             validator,
             sustained_secs,
             refund,
+            offer_rate,
         } => {
             let bank = qchain_crypto::read_keypair_file(&keypair)?;
             let chain_id = fetch_chain_id(&rpc)?;
@@ -1372,7 +1380,8 @@ fn main() -> anyhow::Result<()> {
                 // whole window, no per-step settle. An optional refunder thread
                 // tops workers up so the rising fee can't strand the generator
                 // before the node itself is the bottleneck.
-                println!("continuous mode: {workers} workers submitting for {sustained_secs}s (refund={refund})...");
+                let mode = if offer_rate > 0 { format!("FLOOD offering ~{offer_rate} tx/s") } else { "sustainable (in-flight throttled)".to_string() };
+                println!("continuous mode: {workers} workers for {sustained_secs}s, {mode} (refund={refund})...");
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(sustained_secs);
                 let bank_ref = &bank;
                 let workers_ref = &workers_kp;
@@ -1381,7 +1390,29 @@ fn main() -> anyhow::Result<()> {
                 let validator_ref = validator_pk;
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 let stop_ref = &stop;
+                // Peak dynamic base_fee observed during the run - the input to the
+                // worst-case fee-per-transfer report below.
+                let peak_base_fee = std::sync::atomic::AtomicU64::new(0);
+                let peak_ref = &peak_base_fee;
+                // Per-worker send interval to hit the offered rate (0 = unpaced).
+                let send_interval = if offer_rate > 0 {
+                    std::time::Duration::from_secs_f64((workers as f64 / offer_rate as f64).max(0.0))
+                } else {
+                    std::time::Duration::ZERO
+                };
                 let results: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
+                    // Sampler: record the peak base_fee every ~250ms.
+                    scope.spawn(move || {
+                        while !stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            if let Some(bf) = fetch_account(rpc_ref, &PARAMS_ACCOUNT_ID).ok().flatten()
+                                .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
+                                .map(|p| p.base_fee_per_byte)
+                            {
+                                peak_ref.fetch_max(bf, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                    });
                     // Refunder: single writer of the bank account (no nonce race),
                     // tops up any worker below a per-tx fee estimate every ~1.5s.
                     if refund {
@@ -1439,10 +1470,16 @@ fn main() -> anyhow::Result<()> {
                                 let mut since_sync = 0u64;
                                 let mut counter = wi as u64;
                                 while std::time::Instant::now() < deadline {
-                                    // Throttle: if too far ahead of confirmed, refresh
-                                    // the on-chain nonce and wait for execution to
-                                    // catch up rather than adding to the backlog.
-                                    if nonce.saturating_sub(confirmed) >= MAX_INFLIGHT {
+                                    // FLOOD mode (offer_rate > 0): pace to the offered
+                                    // rate and BYPASS the in-flight throttle, so the
+                                    // offered load can exceed what the node validates
+                                    // and drive the dynamic fee to its peak. Otherwise
+                                    // use the throttle for a sustainable measurement.
+                                    if offer_rate > 0 {
+                                        if !send_interval.is_zero() {
+                                            std::thread::sleep(send_interval);
+                                        }
+                                    } else if nonce.saturating_sub(confirmed) >= MAX_INFLIGHT {
                                         confirmed = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(confirmed);
                                         if nonce.saturating_sub(confirmed) >= MAX_INFLIGHT {
                                             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1499,6 +1536,31 @@ fn main() -> anyhow::Result<()> {
                     "  submitted {total_attempted} ({total_accepted} accepted, {total_failed} rejected at admission); base_fee now {}",
                     s.map(|s| s.base_fee).unwrap_or(0)
                 );
+
+                // ---- PEAK FEE-PER-TRANSFER report. fee = base_fee_per_byte ×
+                // tx.byte_size() (see qchain-execution::Ledger). Measure the exact
+                // byte size of a real signed transfer, then price it at the peak
+                // base_fee observed and at the floor for comparison. 1 QCH = 1e9
+                // units.
+                let floor_bf = qchain_execution::params::FEE_MIN_BASE_FEE_PER_BYTE;
+                let max_bf = qchain_execution::params::MAX_BASE_FEE_PER_BYTE;
+                let peak = peak_base_fee.load(std::sync::atomic::Ordering::Relaxed).max(floor_bf);
+                let sample_tx = {
+                    let to = Keypair::generate()?.pubkey();
+                    let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![bank.pubkey(), to], data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 })? };
+                    Transaction::new_signed(&bank, 0, chain_id, 1_000_000_000, vec![ix])?
+                };
+                let tx_bytes = sample_tx.byte_size() as u64;
+                let floor_units = floor_bf.saturating_mul(tx_bytes);
+                let peak_units = peak.saturating_mul(tx_bytes);
+                let max_units = max_bf.saturating_mul(tx_bytes);
+                let to_qch = |u: u64| u as f64 / 1e9;
+                println!("\n=== fee por transferencia ===");
+                println!("  tamaño de una transferencia firmada: {tx_bytes} bytes");
+                println!("  base_fee_per_byte en el PICO:        {peak} unidades/byte");
+                println!("  fee por transferencia en el PICO:    {peak_units} unidades = {:.9} QCH", to_qch(peak_units));
+                println!("  (referencia, piso base_fee={floor_bf}: {floor_units} unidades = {:.9} QCH)", to_qch(floor_units));
+                println!("  (tope duro teórico base_fee={max_bf}: {max_units} unidades = {:.3} QCH)", to_qch(max_units));
             } else {
 
             println!("{:<5} {:>8} {:>10} {:>10} {:>9} {:>7} {:>7} {:>6}", "step", "burst", "submit/s", "exec tx/s", "base_fee", "Δround", "fail", "fork");
