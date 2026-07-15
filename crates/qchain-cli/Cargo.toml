@@ -20,3 +20,4 @@ anyhow.workspace = true
 reqwest.workspace = true
 hex.workspace = true
 borsh.workspace = true
+wat.workspace = true

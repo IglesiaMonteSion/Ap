@@ -426,6 +426,54 @@ enum Command {
         #[arg(long = "monitor")]
         monitor: Vec<String>,
     },
+    /// Mixed, ramping stress test: fans out a growing burst of REAL signed
+    /// transactions each step (transfers + optional staking + optional WASM
+    /// contract calls) until the network degrades, reporting real end-to-end
+    /// throughput, base-fee response, round liveness, and cross-node fork
+    /// detection per step. Unlike `load-test` (transfers only, one fixed
+    /// count), this ramps the load geometrically to FIND the breaking point
+    /// and mixes op types to stress the staking program and the WASM VM too.
+    /// Non-destructive (never touches keys or deletes state) but it DOES
+    /// congest the target network while running.
+    Stress {
+        /// Node to submit transactions to.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// A well-funded keypair (a genesis "bank" wallet or the faucet's) used
+        /// to fund the ephemeral worker accounts. Never spent beyond funding.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Nodes to sample each step for round liveness + Merkle-root fork
+        /// detection (defaults to just `--rpc`). Pass multiple to catch a fork.
+        #[arg(long = "monitor")]
+        monitor: Vec<String>,
+        /// Number of ephemeral worker accounts = the real submission
+        /// concurrency (each worker keeps strict per-account nonce order).
+        #[arg(long, default_value_t = 32)]
+        workers: usize,
+        /// Transactions submitted in the FIRST step; each later step multiplies
+        /// this by `growth` (geometric ramp toward the breaking point).
+        #[arg(long, default_value_t = 100)]
+        base_burst: u64,
+        /// Per-step growth factor of the burst size (2 = double each step).
+        #[arg(long, default_value_t = 2)]
+        growth: u64,
+        /// Number of ramp steps.
+        #[arg(long, default_value_t = 6)]
+        steps: u64,
+        /// Percent of each burst that is a staking Delegate op (0 disables;
+        /// skipped anyway if no validator is available). The rest split between
+        /// transfers and contract calls.
+        #[arg(long, default_value_t = 15)]
+        stake_pct: u64,
+        /// Percent of each burst that is a WASM contract call (0 disables).
+        #[arg(long, default_value_t = 15)]
+        contract_pct: u64,
+        /// Validator address to delegate to for the staking mix. If omitted,
+        /// the tool tries `GET /validators` and uses the first one.
+        #[arg(long)]
+        validator: Option<String>,
+    },
     /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
     /// see `qchain-execution::native`). Prints the fresh address the
     /// program now lives at - save it, later `call-program` invocations
@@ -580,6 +628,83 @@ fn fetch_and_verify_stark_proof(rpc: &str, limit: Option<usize>) -> anyhow::Resu
 fn fetch_executed_count(rpc: &str) -> anyhow::Result<u64> {
     let status: NodeStatus = reqwest::blocking::get(format!("{rpc}/status"))?.error_for_status()?.json()?;
     Ok(status.executed_transactions)
+}
+
+/// One point-in-time health sample of a node for the `stress` ramp: how many
+/// transactions it has executed (throughput), the round consensus is on
+/// (liveness), the live dynamic base fee (congestion response), and its Merkle
+/// root (cross-node fork detection).
+#[derive(Clone)]
+struct StressSample {
+    executed: u64,
+    round: u64,
+    base_fee: u64,
+    root: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StressStatusWire {
+    next_round: u64,
+    executed_transactions: u64,
+    base_fee_per_byte: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RootWire {
+    root: String,
+}
+
+fn fetch_stress_sample(rpc: &str) -> anyhow::Result<StressSample> {
+    let s: StressStatusWire = reqwest::blocking::get(format!("{rpc}/status"))?.error_for_status()?.json()?;
+    let r: RootWire = reqwest::blocking::get(format!("{rpc}/root"))?.error_for_status()?.json()?;
+    Ok(StressSample { executed: s.executed_transactions, round: s.next_round, base_fee: s.base_fee_per_byte, root: r.root })
+}
+
+#[derive(serde::Deserialize)]
+struct ValidatorDirWire {
+    address: String,
+}
+
+/// First validator address from `GET /validators` - used to pick a delegation
+/// target for the `stress` staking mix when `--validator` isn't given.
+fn fetch_first_validator(rpc: &str) -> anyhow::Result<Option<Pubkey>> {
+    let list: Vec<ValidatorDirWire> = reqwest::blocking::get(format!("{rpc}/validators"))?.error_for_status()?.json()?;
+    match list.first() {
+        Some(v) => Ok(Some(v.address.parse()?)),
+        None => Ok(None),
+    }
+}
+
+/// A minimal no-op WASM contract for the `stress` contract-call mix: takes one
+/// i64 (the single little-endian arg the dispatch packs from `ix.data`) and
+/// returns 0, touching no balances. It exercises the real deploy + dispatch +
+/// module-compile + fuel-metering path per call (the point of the stress) while
+/// never tripping the ledger's balance-conservation guard, so every call is a
+/// clean success rather than a trap.
+const STRESS_NOOP_WAT: &str = r#"(module (func (export "run") (param i64) (result i64) i64.const 0))"#;
+
+/// Deploys `STRESS_NOOP_WAT` from `bank` and waits until the program account
+/// exists on-chain, returning its address.
+fn deploy_noop_contract(rpc: &str, bank: &Keypair, chain_id: [u8; 32]) -> anyhow::Result<Pubkey> {
+    let module_bytes = wat::parse_str(STRESS_NOOP_WAT).map_err(|e| anyhow::anyhow!("compiling stress contract: {e}"))?;
+    let program_pk = Keypair::generate()?.pubkey();
+    let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "run".to_string() })?;
+    let nonce = fetch_account(rpc, &bank.pubkey())?.map(|a| a.nonce).unwrap_or(0);
+    let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![program_pk], data };
+    let tx = Transaction::new_signed(bank, nonce, chain_id, 100_000_000, vec![ix])?;
+    let client = reqwest::blocking::Client::new();
+    let resp = client.post(format!("{rpc}/tx")).json(&tx).send()?;
+    if !resp.status().is_success() {
+        anyhow::bail!("deploy rejected: {}", resp.text()?);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while fetch_account(rpc, &program_pk)?.is_none() {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("timed out waiting for the stress contract to deploy");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Ok(program_pk)
 }
 
 fn submit_instruction(
@@ -1079,6 +1204,239 @@ fn main() -> anyhow::Result<()> {
                     count as f64 / total_elapsed.as_secs_f64()
                 );
             }
+        }
+        Command::Stress {
+            rpc,
+            keypair,
+            monitor,
+            workers,
+            base_burst,
+            growth,
+            steps,
+            stake_pct,
+            contract_pct,
+            validator,
+        } => {
+            let bank = qchain_crypto::read_keypair_file(&keypair)?;
+            let chain_id = fetch_chain_id(&rpc)?;
+            let monitors = if monitor.is_empty() { vec![rpc.clone()] } else { monitor.clone() };
+            let workers = workers.max(1);
+
+            // Resolve a delegation target for the staking mix.
+            let validator_pk: Option<Pubkey> = match &validator {
+                Some(v) => Some(v.parse()?),
+                None => fetch_first_validator(&rpc).unwrap_or(None),
+            };
+            let stake_pct = if validator_pk.is_some() { stake_pct } else { 0 };
+
+            // Deploy the no-op contract used by the contract-call mix.
+            let program_pk: Option<Pubkey> = if contract_pct > 0 {
+                match deploy_noop_contract(&rpc, &bank, chain_id) {
+                    Ok(pk) => {
+                        println!("deployed stress contract at {pk}");
+                        Some(pk)
+                    }
+                    Err(e) => {
+                        eprintln!("contract deploy failed ({e}); disabling the contract mix");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let contract_pct = if program_pk.is_some() { contract_pct } else { 0 };
+            let transfer_pct = 100u64.saturating_sub(stake_pct).saturating_sub(contract_pct);
+            println!(
+                "op mix: {transfer_pct}% transfers, {stake_pct}% staking{}, {contract_pct}% contract calls{}",
+                validator_pk.map(|v| format!(" (validator {v})")).unwrap_or_default(),
+                program_pk.map(|p| format!(" (program {p})")).unwrap_or_default(),
+            );
+
+            let base_fee = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?
+                .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
+                .map(|p| p.base_fee_per_byte)
+                .unwrap_or(180);
+
+            // Fund ephemeral worker accounts (sequential, untimed). Each worker
+            // is funded as richly as the bank allows (capped), so the dynamic
+            // fee rising under the ramp doesn't strand them prematurely - a
+            // worker running out of funds is a real breaking signal we WANT to
+            // observe at the top of the ramp, not an artifact of stingy funding.
+            let workers_kp: Vec<Keypair> = (0..workers).map(|_| Keypair::generate().unwrap()).collect();
+            let bank_balance = fetch_account(&rpc, &bank.pubkey())?.map(|a| a.balance).unwrap_or(0);
+            let per_worker = (bank_balance / (workers as u64 + 2))
+                .min(2_000_000_000)
+                .max(base_fee.saturating_mul(100_000));
+            if bank_balance < per_worker.saturating_mul(workers as u64) {
+                anyhow::bail!(
+                    "bank balance {bank_balance} too low to fund {workers} workers at {per_worker} each - fund the bank or lower --workers"
+                );
+            }
+            println!("funding {workers} workers with {per_worker} units each (untimed setup)...");
+            let bank_nonce = fetch_account(&rpc, &bank.pubkey())?.map(|a| a.nonce).unwrap_or(0);
+            let client = reqwest::blocking::Client::new();
+            for (i, w) in workers_kp.iter().enumerate() {
+                let ix = Instruction {
+                    program_id: Pubkey::system_program_id(),
+                    accounts: vec![bank.pubkey(), w.pubkey()],
+                    data: borsh::to_vec(&SystemInstruction::Transfer { amount: per_worker })?,
+                };
+                let tx = Transaction::new_signed(&bank, bank_nonce + i as u64, chain_id, 200_000_000, vec![ix])?;
+                let resp = client.post(format!("{rpc}/tx")).json(&tx).send()?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("worker funding rejected: {}", resp.text()?);
+                }
+            }
+            print!("  waiting for funding to land...");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let fund_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let last = workers_kp.last().unwrap().pubkey();
+                if fetch_account(&rpc, &last)?.map(|a| a.balance).unwrap_or(0) > 0 {
+                    break;
+                }
+                if std::time::Instant::now() > fund_deadline {
+                    anyhow::bail!("timed out waiting for worker funding to land");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            println!(" done\n");
+
+            println!("{:<5} {:>8} {:>10} {:>10} {:>9} {:>7} {:>7} {:>6}", "step", "burst", "submit/s", "exec tx/s", "base_fee", "Δround", "fail", "fork");
+            println!("{}", "-".repeat(72));
+
+            let mut broke = false;
+            for step in 1..=steps {
+                let burst = base_burst.saturating_mul(growth.saturating_pow((step - 1) as u32)).max(1);
+                let per_worker_txs = (burst as usize).div_ceil(workers).max(1);
+
+                // Fresh on-chain nonce per worker (a rejected tx never consumes
+                // its nonce, so re-reading avoids a self-inflicted gap between
+                // steps).
+                let worker_nonces: Vec<u64> = workers_kp
+                    .iter()
+                    .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
+                    .collect();
+
+                // Pre-sign every tx for this step (untimed), choosing the op type
+                // by a cheap deterministic mix so the ratios are stable.
+                let mut per_worker_txs_vec: Vec<Vec<Transaction>> = Vec::with_capacity(workers);
+                let mut global_ix = 0u64;
+                for (wi, w) in workers_kp.iter().enumerate() {
+                    let mut txs = Vec::with_capacity(per_worker_txs);
+                    for j in 0..per_worker_txs {
+                        let nonce = worker_nonces[wi] + j as u64;
+                        let bucket = (global_ix.wrapping_mul(2654435761) >> 8) % 100;
+                        global_ix += 1;
+                        let ix = if bucket < contract_pct {
+                            // contract call: one i64 arg, no accounts touched
+                            Instruction { program_id: program_pk.unwrap(), accounts: vec![w.pubkey()], data: 0i64.to_le_bytes().to_vec() }
+                        } else if bucket < contract_pct + stake_pct {
+                            let stake_pk = Keypair::generate().unwrap().pubkey();
+                            Instruction {
+                                program_id: STAKING_PROGRAM_ID,
+                                accounts: vec![w.pubkey(), stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+                                data: borsh::to_vec(&StakingInstruction::Delegate { validator: validator_pk.unwrap(), amount: 1_000_000 }).unwrap(),
+                            }
+                        } else {
+                            let to = workers_kp[(wi + 1) % workers].pubkey();
+                            Instruction {
+                                program_id: Pubkey::system_program_id(),
+                                accounts: vec![w.pubkey(), to],
+                                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+                            }
+                        };
+                        // Generous fee_limit: only balance/nonce should ever be
+                        // the limiting factor, so a failure is a real breaking
+                        // signal, never a self-imposed cap on a risen fee.
+                        txs.push(Transaction::new_signed(w, nonce, chain_id, 1_000_000_000, vec![ix]).unwrap());
+                    }
+                    per_worker_txs_vec.push(txs);
+                }
+                let submitted: u64 = per_worker_txs_vec.iter().map(|v| v.len() as u64).sum();
+
+                let before: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: 0, round: 0, base_fee, root: String::new() })).collect();
+                let submit_start = std::time::Instant::now();
+                let handles: Vec<_> = per_worker_txs_vec
+                    .into_iter()
+                    .map(|txs| {
+                        let rpc = rpc.clone();
+                        std::thread::spawn(move || {
+                            let client = reqwest::blocking::Client::new();
+                            let mut fail = 0u64;
+                            for tx in &txs {
+                                match client.post(format!("{rpc}/tx")).json(tx).send() {
+                                    Ok(r) if r.status().is_success() => {}
+                                    _ => fail += 1,
+                                }
+                            }
+                            fail
+                        })
+                    })
+                    .collect();
+                let failures: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                let submit_elapsed = submit_start.elapsed();
+                let submit_rate = submitted as f64 / submit_elapsed.as_secs_f64().max(1e-9);
+
+                // Let execution settle: poll the primary until its executed count
+                // stops climbing (converged / stalled) or a timeout.
+                let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let mut last_exec = before[0].executed;
+                let mut stable = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let now_exec = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(last_exec);
+                    if now_exec == last_exec {
+                        stable += 1;
+                    } else {
+                        stable = 0;
+                    }
+                    last_exec = now_exec;
+                    if stable >= 4 || std::time::Instant::now() > settle_deadline {
+                        break;
+                    }
+                }
+                let after: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: last_exec, round: 0, base_fee, root: String::new() })).collect();
+
+                let exec_delta = after[0].executed.saturating_sub(before[0].executed);
+                let total_elapsed = submit_start.elapsed().as_secs_f64().max(1e-9);
+                let exec_tps = exec_delta as f64 / total_elapsed;
+                let round_delta = after[0].round.saturating_sub(before[0].round);
+                // Fork check: only meaningful once nodes agree on how much they
+                // executed (else roots differ merely because one is behind).
+                let converged = after.iter().all(|s| s.executed == after[0].executed);
+                let roots_agree = after.iter().all(|s| s.root == after[0].root);
+                let fork = converged && !roots_agree;
+                let fork_str = if monitors.len() < 2 { "n/a" } else if !converged { "..." } else if fork { "FORK" } else { "ok" };
+
+                println!(
+                    "{:<5} {:>8} {:>10.0} {:>10.0} {:>9} {:>7} {:>7} {:>6}",
+                    step, submitted, submit_rate, exec_tps, after[0].base_fee, round_delta, failures, fork_str
+                );
+
+                // Breaking-point detection.
+                if round_delta == 0 {
+                    println!("\n⚠  BREAKING POINT: consensus stopped advancing at step {step} (round frozen at {}). The node is not committing new rounds under this load.", after[0].round);
+                    broke = true;
+                    break;
+                }
+                if fork {
+                    println!("\n⚠  BREAKING POINT: nodes CONVERGED on executed count but DISAGREE on the Merkle root at step {step} — a real fork. Roots: {:?}", after.iter().map(|s| &s.root[..s.root.len().min(16)]).collect::<Vec<_>>());
+                    broke = true;
+                    break;
+                }
+                if failures * 2 > submitted {
+                    println!("\n⚠  DEGRADED: over half the burst failed to submit at step {step} ({failures}/{submitted}) — the RPC/mempool is saturated or workers ran out of funds. Stopping the ramp.");
+                    broke = true;
+                    break;
+                }
+            }
+
+            if !broke {
+                println!("\n✓ Completed all {steps} steps without a freeze, fork, or mass-failure. The network absorbed the ramp.");
+            }
+            println!("\nNote: end-to-end tx/s counts REAL executed transactions (submit → gossip → consensus → execution), converged across the monitored node(s). A rising base_fee is the EIP-1559 mechanism responding to congestion, not a failure.");
         }
         Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
