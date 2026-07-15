@@ -82,13 +82,41 @@
   .section-title{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
     margin:24px 4px 10px;font-weight:700}
 
-  .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}
-  .act{display:flex;flex-direction:column;align-items:center;gap:8px;background:var(--card);
-    border:1px solid var(--line);border-radius:16px;padding:16px 8px;cursor:pointer;font-weight:600;
-    color:var(--ink);transition:transform .08s,border-color .15s;backdrop-filter:blur(10px)}
-  .act:hover{border-color:rgba(140,130,255,.4)} .act:active{transform:scale(.97)}
-  .act .ic{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#fff;font-size:20px;font-weight:700;
-    background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 6px 18px rgba(102,120,255,.35)}
+  /* Fila de acciones estilo app: círculos azules + etiqueta debajo (como el mockup) */
+  .actions{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:20px}
+  .act{display:flex;flex-direction:column;align-items:center;gap:9px;background:none;border:0;padding:2px;
+    cursor:pointer;font-weight:600;font-size:13px;color:var(--ink);transition:transform .08s}
+  .act:active{transform:scale(.94)}
+  .act .ic{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:23px;font-weight:700;
+    background:linear-gradient(150deg,var(--brand1),var(--brand2));box-shadow:0 8px 22px rgba(70,110,255,.42)}
+  .act .ic svg{width:24px;height:24px;stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+
+  /* Tarjeta de activos (home) */
+  .asset-row{display:flex;align-items:center;gap:12px}
+  .asset-ic{width:44px;height:44px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
+    background:linear-gradient(150deg,var(--brand1),var(--brand2));box-shadow:0 6px 16px rgba(70,110,255,.35)}
+  .asset-ic svg{width:26px;height:26px}
+  .asset-name{font-weight:700;font-size:16px}
+  .asset-sub{color:var(--muted);font-size:12px}
+  .asset-usd{color:var(--muted);font-size:12px;margin-top:2px}
+  .asset-stake{border-left:1px solid var(--line);padding-left:14px;text-align:right}
+  .asset-stake .k{color:var(--muted);font-size:11px;display:flex;align-items:center;gap:4px;justify-content:flex-end}
+  .link-row{display:flex;align-items:center;justify-content:space-between;color:var(--brand2);font-weight:600;
+    font-size:14px;cursor:pointer;padding:4px 2px}
+  .row-sep{border-top:1px solid var(--line);margin:14px 0}
+
+  /* Barra de navegación inferior (tabs) */
+  .tabbar{position:sticky;bottom:0;left:0;right:0;z-index:40;display:grid;grid-template-columns:repeat(5,1fr);
+    gap:2px;margin:8px -4px 0;padding:8px 4px calc(6px + env(safe-area-inset-bottom));
+    background:linear-gradient(0deg,var(--bg) 72%,transparent);backdrop-filter:blur(10px)}
+  .tab{display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:0;box-shadow:none;
+    color:var(--muted);font-size:11px;font-weight:600;padding:5px 2px;cursor:pointer}
+  .tab svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .tab.on{color:var(--brand2)}
+  .eye-btn{background:none;border:0;box-shadow:none;padding:0 2px;color:#c3c9e0;font-size:14px;cursor:pointer;line-height:1}
+  .copy-ic{background:none;border:0;box-shadow:none;padding:2px;color:#c3c9e0;cursor:pointer;display:inline-grid;place-items:center}
+  .copy-ic svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2}
+  .balance-card .divider{border-top:1px solid rgba(255,255,255,.12);margin:16px 0 12px}
 
   button,.btn{cursor:pointer;border:0;border-radius:15px;padding:15px 16px;font-size:16px;font-weight:700;
     font-family:inherit;background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
@@ -174,6 +202,36 @@
   .danger{background:var(--bad-bg);color:var(--bad);border:1px solid rgba(255,90,90,.28);box-shadow:none}
   .danger:hover{filter:none}
   .center{align-items:center;justify-content:center;text-align:center}
+
+  /* ===== Modal de confirmación (overlay) ===== */
+  .modal-bg{position:fixed;inset:0;z-index:120;display:none;align-items:flex-end;justify-content:center;
+    background:rgba(4,6,14,.62);backdrop-filter:blur(4px);padding:0}
+  .modal-bg.show{display:flex;animation:mfade .18s ease}
+  @keyframes mfade{from{opacity:0}to{opacity:1}}
+  .modal{width:100%;max-width:520px;background:var(--card-solid);border:1px solid var(--line);
+    border-radius:22px 22px 0 0;padding:20px 18px calc(20px + env(safe-area-inset-bottom));box-shadow:0 -12px 40px rgba(0,0,0,.4);
+    animation:mslide .22s cubic-bezier(.2,.9,.3,1)}
+  @keyframes mslide{from{transform:translateY(24px)}to{transform:translateY(0)}}
+  .modal h3{margin:0 0 4px;font-size:19px}
+  .modal .msub{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .cf-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 0;border-top:1px solid var(--line)}
+  .cf-row:first-of-type{border-top:0}
+  .cf-k{color:var(--muted);font-size:14px}
+  .cf-v{font-weight:700;text-align:right;word-break:break-all}
+  .cf-v small{display:block;font-weight:500;color:var(--muted);font-size:12px;margin-top:2px}
+  .cf-total .cf-k,.cf-total .cf-v{font-size:17px}
+  @media(prefers-reduced-motion:reduce){.modal,.modal-bg.show{animation:none}}
+
+  /* ===== Libreta de contactos ===== */
+  .contact{display:flex;align-items:center;gap:12px;padding:13px 4px;border-top:1px solid var(--line)}
+  .contact:first-child{border-top:0}
+  .contact .cav{width:38px;height:38px;flex:0 0 auto;border-radius:12px;display:grid;place-items:center;font-weight:700;
+    color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand2))}
+  .contact .cmain{flex:1;min-width:0}
+  .contact .cn{font-weight:600}
+  .contact .ca{color:var(--muted);font-size:12px;word-break:break-all}
+  .contact .cbtns{display:flex;gap:6px;flex:0 0 auto}
+  .contact .cbtns button{padding:8px 10px;font-size:13px;border-radius:10px}
 
   /* ===== Campo cuántico ambiente (canvas detrás de todo) ===== */
   #qwave{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.6}
@@ -400,25 +458,65 @@
         <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag2)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag2)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag2)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
         <span class="brand-name">QCHAIN <span class="grad">Wallet</span></span>
       </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <div class="node-pill"><span class="dot" id="dot"></span><span id="node-text">…</span></div>
+      <div style="display:flex;align-items:center;gap:4px">
+        <button class="icon-btn nav" data-to="receive" title="recibir / mostrar QR" aria-label="recibir">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/></svg>
+        </button>
+        <button class="icon-btn" id="h-bell" title="notificaciones" aria-label="notificaciones" style="position:relative">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          <span id="bell-dot" style="display:none;position:absolute;top:6px;right:7px;width:8px;height:8px;border-radius:50%;background:var(--bad)"></span>
+        </button>
         <button class="icon-btn nav" data-to="settings" title="configuración" aria-label="configuración">⚙</button>
       </div>
     </div>
 
     <div class="balance-card">
-      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:6px">
+      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:8px">
         <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.8">▾</span>
       </button>
-      <div class="lbl">Saldo</div>
+      <div class="lbl" style="display:flex;align-items:center;gap:7px">Saldo
+        <button class="eye-btn" id="h-eye" title="ocultar/mostrar saldo" aria-label="ocultar saldo">👁</button>
+      </div>
       <div class="amt" id="h-balance">—</div>
-      <div class="acct"><span class="mono" id="h-addr">—</span><button class="btn-ghost" id="h-copy" style="color:#fff;padding:0 4px">copiar</button></div>
+      <div class="asset-usd" id="h-usd" style="color:#c3c9e0;font-size:14px;margin-top:2px">—</div>
+      <div class="divider"></div>
+      <div class="lbl" style="margin-bottom:5px">Dirección</div>
+      <div class="acct"><span class="mono" id="h-addr">—</span>
+        <button class="copy-ic" id="h-copy" title="copiar dirección" aria-label="copiar">
+          <svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+        </button>
+      </div>
     </div>
 
-    <div class="actions" style="grid-template-columns:1fr 1fr 1fr">
-      <div class="act nav" data-to="send"><div class="ic">↑</div>Enviar</div>
-      <div class="act nav" data-to="receive"><div class="ic">↓</div>Recibir</div>
-      <div class="act nav" data-to="staking"><div class="ic">◆</div>Staking</div>
+    <div class="actions">
+      <button class="act nav" data-to="send"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span>Enviar</button>
+      <button class="act nav" data-to="receive"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></span>Recibir</button>
+      <button class="act nav" data-to="buy"><span class="ic"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg></span>Comprar</button>
+      <button class="act nav" data-to="staking"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg></span>Staking</button>
+    </div>
+
+    <div class="section-title">Activos</div>
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <div class="asset-row">
+          <div class="asset-ic"><svg viewBox="0 0 64 64" width="26" height="26"><path fill="#fff" fill-rule="evenodd" d="M32 8 L52 19.6 L52 42.8 L32 54.4 L12 42.8 L12 19.6 Z M32 17 L44 24 L44 38 L32 45 L20 38 L20 24 Z"/><path fill="#fff" d="M39 37 L49 47"/><path stroke="#fff" stroke-width="5.5" stroke-linecap="round" fill="none" d="M39 37 L49 47"/></svg></div>
+          <div>
+            <div class="asset-name">QCH</div>
+            <div class="asset-sub">QCHAIN</div>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-weight:700" id="as-bal">—</div>
+          <div class="asset-usd" id="as-usd">—</div>
+        </div>
+        <div class="asset-stake nav" data-to="staking" style="cursor:pointer">
+          <div class="k">En staking 🔒</div>
+          <div style="font-weight:700" id="as-stake">—</div>
+          <div class="asset-usd" id="as-stake-usd">—</div>
+        </div>
+      </div>
+      <div class="row-sep"></div>
+      <div class="link-row nav" data-to="accounts"><span>Ver todas tus cuentas</span><span>›</span></div>
     </div>
 
     <div class="stake-promo nav" data-to="staking">
@@ -427,8 +525,45 @@
       <div class="sp-arrow">→</div>
     </div>
 
-    <div class="section-title">Actividad</div>
+    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Actividad</span>
+      <span class="nav" data-to="activity-all" style="color:var(--brand2);cursor:pointer;text-transform:none;letter-spacing:0;font-size:13px">Ver todo</span>
+    </div>
     <div class="card" id="activity"><div class="empty">sin movimientos todavía</div></div>
+  </section>
+
+  <!-- ===== COMPRAR ===== -->
+  <section class="view" id="v-buy">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Comprar <span class="grad">QCH</span></h2>
+    <p class="view-sub">QCHAIN es una red nueva. Todavía no hay una pasarela de compra con tarjeta integrada — cuando un exchange o un on-ramp liste QCH, vas a poder comprar directo desde acá.</p>
+    <div class="card">
+      <div class="section-title" style="margin-top:0">Mientras tanto, podés obtener QCH así:</div>
+      <div class="row-item"><div><b>💧 Faucet de prueba</b><div class="asset-sub">Pedí QCH de prueba gratis (si el operador de la red tiene un faucet activo).</div></div></div>
+      <div class="row-item"><div><b>↔ Transferencia de otra wallet</b><div class="asset-sub">Que alguien te envíe QCH a tu dirección — tocá <b>Recibir</b> para mostrar tu QR.</div></div></div>
+      <div class="row-item"><div><b>◆ Recompensas de staking</b><div class="asset-sub">Delegá y ganá QCH nuevo por asegurar la red (hasta ~12% anual).</div></div></div>
+    </div>
+    <button class="btn-block btn-sec nav" data-to="receive" style="margin-top:14px">Mostrar mi dirección para recibir</button>
+  </section>
+
+  <!-- ===== SWAP ===== -->
+  <section class="view" id="v-swap">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title"><span class="grad">Swap</span></h2>
+    <p class="view-sub">Intercambiar QCH por otros activos requiere un mercado (DEX o puente) con liquidez — todavía no existe en esta red. Esta función se activará cuando haya un puente o un DEX real.</p>
+    <div class="card center" style="padding:34px 18px">
+      <div style="font-size:40px;margin-bottom:10px">↔</div>
+      <div style="font-weight:700;font-size:17px;margin-bottom:6px">Próximamente</div>
+      <div class="asset-sub" style="max-width:300px">Por ahora, la red es de un solo activo (QCH). Cuando haya un puente EVM/Solana o un DEX nativo, vas a poder swapear desde acá sin salir de la wallet.</div>
+    </div>
+  </section>
+
+  <!-- ===== ACTIVIDAD COMPLETA ===== -->
+  <section class="view" id="v-activity-all">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Toda tu <span class="grad">actividad</span></h2>
+    <p class="view-sub">Todos los movimientos de esta cuenta: transferencias y staking, más reciente primero.</p>
+    <div class="card" id="activity-full"><div class="empty">cargando…</div></div>
   </section>
 
   <!-- ===== CUENTAS ===== -->
@@ -466,7 +601,11 @@
       <div class="wi-addr mono" id="s-from-addr" style="font-size:12px;color:var(--muted);word-break:break-all">—</div>
     </div>
     <label for="s-to">Dirección de destino</label>
+    <select id="s-contact" style="display:none;margin-bottom:8px"></select>
     <input id="s-to" placeholder="pegá la dirección de quien recibe" autocomplete="off">
+    <div id="s-save-contact" style="display:none;margin-top:8px" class="hint">
+      Guardar como contacto: <input id="s-cname" placeholder="nombre" autocomplete="off" style="margin:6px 0 0;padding:10px 12px">
+    </div>
     <label for="s-amount">Monto (QCH)</label>
     <div class="row">
       <input id="s-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
@@ -476,6 +615,23 @@
     <div style="margin-top:18px"><button class="btn-block" id="s-btn">Firmar y enviar</button></div>
     <div class="msg" id="s-msg"></div>
     <div class="hint center" style="margin-top:14px">🔐 La transacción se firma en tu navegador. Tu clave nunca sale de acá.</div>
+  </section>
+
+  <!-- ===== CONTACTOS (libreta) ===== -->
+  <section class="view" id="v-contacts">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Tus <span class="grad">contactos</span></h2>
+    <p class="view-sub">Guardá las direcciones a las que enviás seguido con un nombre fácil de reconocer. Se guardan solo en este dispositivo (nunca salen del navegador) y aparecen al enviar y en tu actividad.</p>
+    <div class="card">
+      <label for="c-name">Nombre</label>
+      <input id="c-name" placeholder="ej: Ahorros, Juan…" autocomplete="off">
+      <label for="c-addr">Dirección</label>
+      <input id="c-addr" placeholder="pegá la dirección" autocomplete="off">
+      <div style="margin-top:14px"><button class="btn-block" id="c-add">+ Guardar contacto</button></div>
+      <div class="msg" id="c-msg"></div>
+    </div>
+    <div class="section-title" style="margin-top:20px">Guardados</div>
+    <div class="card" id="c-list"><div class="empty">todavía no guardaste ninguno</div></div>
   </section>
 
   <!-- ===== STAKING ===== -->
@@ -525,6 +681,14 @@
           <button data-theme-set="dark">Oscuro</button>
           <button data-theme-set="auto">Auto</button>
         </div>
+      </div>
+    </div>
+
+    <div class="section-title">Contactos</div>
+    <div class="card">
+      <div class="row-item nav" data-to="contacts" style="cursor:pointer">
+        <div><div style="font-weight:600">📇 Libreta de direcciones</div><div class="hint" style="margin:0">Guardá destinatarios con un nombre fácil</div></div>
+        <span style="color:var(--brand2);font-size:20px">›</span>
       </div>
     </div>
 
@@ -585,8 +749,33 @@
     </div>
   </section>
 
+  <!-- ===== Barra de navegación inferior ===== -->
+  <nav class="tabbar" id="tabbar" style="display:none">
+    <button class="tab" data-tab="home" data-to="home"><svg viewBox="0 0 24 24"><path d="M3 10.5L12 3l9 7.5M5 9.5V21h14V9.5"/></svg>Inicio</button>
+    <button class="tab" data-tab="accounts" data-to="accounts"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18" opacity="0"/><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z"/></svg>Activos</button>
+    <button class="tab" data-tab="swap" data-to="swap"><svg viewBox="0 0 24 24"><path d="M7 10h11l-3-3M17 14H6l3 3"/></svg>Swap</button>
+    <button class="tab" data-tab="staking" data-to="staking"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg>Staking</button>
+    <button class="tab" data-tab="settings" data-to="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.3 2.6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.4h4l.3-2.6a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg>Ajustes</button>
+  </nav>
+
 </div>
 <div class="toast" id="toast">copiado</div>
+
+<!-- ===== Modal de confirmación de envío ===== -->
+<div class="modal-bg" id="confirm-bg">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cf-title">
+    <h3 id="cf-title">Confirmá el envío</h3>
+    <p class="msub">Revisá los datos. Una transferencia es <b>irreversible</b>.</p>
+    <div class="cf-row"><span class="cf-k">Para</span><span class="cf-v" id="cf-to">—</span></div>
+    <div class="cf-row"><span class="cf-k">Monto</span><span class="cf-v" id="cf-amt">—</span></div>
+    <div class="cf-row"><span class="cf-k">Fee de red (aprox)</span><span class="cf-v" id="cf-fee">—</span></div>
+    <div class="cf-row cf-total"><span class="cf-k">Total aprox</span><span class="cf-v" id="cf-total">—</span></div>
+    <div style="display:flex;gap:10px;margin-top:18px">
+      <button class="btn-sec" id="cf-cancel" style="flex:1">Cancelar</button>
+      <button class="btn-block" id="cf-ok" style="flex:1;margin:0">Confirmar y enviar</button>
+    </div>
+  </div>
+</div>
 
 <script type="module">
 import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, stakeAddressFromSeed, deriveAccountSeed } from '/wasm/qchain_wasm.js';
@@ -804,20 +993,109 @@ async function shamirCombine(mnemonics){
   return seed;
 }
 
+// ---- libreta de contactos ----
+// Direcciones de destino con un nombre amigable. Se guardan SOLO en este
+// dispositivo (localStorage) — nunca salen del navegador ni tocan la cadena;
+// son públicas (direcciones de pago), no un secreto, así que no van en el
+// respaldo de la semilla. Clave global (un contacto es un destinatario, igual
+// desde cualquiera de tus cuentas). Forma: { address: name }.
+const CONTACTS_KEY = "qchain_contacts_v1";
+function contactsStore(){ try{ return JSON.parse(localStorage.getItem(CONTACTS_KEY)||"{}"); }catch(e){ return {}; } }
+function saveContact(addr,name){ const c=contactsStore(); c[addr]=String(name||"").slice(0,40); localStorage.setItem(CONTACTS_KEY, JSON.stringify(c)); }
+function deleteContact(addr){ const c=contactsStore(); delete c[addr]; localStorage.setItem(CONTACTS_KEY, JSON.stringify(c)); }
+function contactName(addr){ const n=contactsStore()[addr]; return (n&&n.trim())?n:null; }
+// Etiqueta amigable para un peer en la actividad/confirmación: nombre de
+// contacto si lo hay, si no la dirección abreviada. Ambos escapados por el
+// caller donde se inyecta a innerHTML.
+function peerLabel(addr){ return contactName(addr) || short(addr); }
+
+function renderContacts(){
+  const box=$("c-list"); const c=contactsStore();
+  const entries=Object.entries(c).filter(([a,n])=>a&&n);
+  if(!entries.length){ box.innerHTML='<div class="empty">todavía no guardaste ninguno</div>'; return; }
+  box.innerHTML=entries.map(([a,n])=>{
+    const ini=esc((n.trim()[0]||"?").toUpperCase());
+    return `<div class="contact">
+      <div class="cav">${ini}</div>
+      <div class="cmain"><div class="cn">${esc(n)}</div><div class="ca mono">${esc(a)}</div></div>
+      <div class="cbtns">
+        <button class="btn-sec c-send" data-a="${esc(a)}">Enviar</button>
+        <button class="danger c-del" data-a="${esc(a)}">🗑</button>
+      </div>
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".c-del").forEach(b=>b.onclick=()=>{
+    const a=b.dataset.a;
+    if(confirm(`¿Borrar el contacto «${contactName(a)||short(a)}»?\n\n(No afecta ningún fondo — solo quita el nombre guardado en este dispositivo.)`)){ deleteContact(a); renderContacts(); }
+  });
+  box.querySelectorAll(".c-send").forEach(b=>b.onclick=()=>{ showView("send"); $("s-to").value=b.dataset.a; onSendToChanged(); });
+}
+
+// ---- valor en USD (precio de REFERENCIA, no un oráculo de mercado) ----
+// QCHAIN no tiene todavía un precio de mercado real; se muestra un estimado con
+// un precio de referencia configurable (default 1 QCH = 1 USD, el mismo ancla
+// documentado para la calibración de fees). NO es asesoría ni un precio real.
+function refUsd(){ const v=parseFloat(localStorage.getItem("qchain_ref_usd")||"1"); return (isFinite(v)&&v>0)?v:1; }
+function usdOf(units){
+  const q=Number(BigInt(units||0))/1e9;      // unidades → QCH
+  const usd=q*refUsd();
+  return "≈ $"+usd.toLocaleString("es",{minimumFractionDigits:2,maximumFractionDigits:2})+" USD";
+}
+// ---- ocultar/mostrar saldo (👁) ----
+function balanceHidden(){ return localStorage.getItem("qchain_hide_bal")==="1"; }
+function setBalanceHidden(v){ localStorage.setItem("qchain_hide_bal", v?"1":"0"); }
+
+// Las vistas que forman parte de la barra inferior (muestran la tabbar).
+const TAB_VIEWS = new Set(["home","accounts","swap","staking","settings"]);
+// Qué pestaña se resalta para una vista dada (sub-vistas mapean a su raíz).
+function tabFor(name){
+  if(name==="home"||name==="send"||name==="receive"||name==="buy"||name==="contacts"||name==="activity-all") return "home";
+  if(name==="accounts") return "accounts";
+  if(name==="swap") return "swap";
+  if(name==="staking") return "staking";
+  if(name==="settings") return "settings";
+  return "";
+}
+
 // ---- navegación entre vistas ----
 function showView(name){
   document.querySelectorAll(".view").forEach(v=>v.classList.remove("active"));
   $("v-"+name).classList.add("active");
   window.scrollTo(0,0);
+  // Barra inferior: visible en las vistas principales (y sub-vistas de home),
+  // oculta en welcome/unlock/create/import/backup/shamir.
+  const rooted = TAB_VIEWS.has(name) || tabFor(name)!=="";
+  const loggedIn = !!MASTER;
+  const tb=$("tabbar");
+  if(tb){
+    tb.style.display = (loggedIn && rooted) ? "grid" : "none";
+    const t=tabFor(name);
+    tb.querySelectorAll(".tab").forEach(b=>b.classList.toggle("on", b.dataset.tab===t));
+  }
   if(name==="home"){ renderHome(); }
   if(name==="accounts") renderAccounts();
   if(name==="receive") renderReceive();
   if(name==="send") renderSend();
+  if(name==="contacts") renderContacts();
   if(name==="staking") renderStaking();
   if(name==="settings") renderSettings();
+  if(name==="activity-all") renderActivityFull();
   if(name==="unlock") refreshBioUnlockBtn();
 }
 document.querySelectorAll(".nav").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
+document.querySelectorAll(".tab").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
+// Campana de notificaciones: resume el estado del nodo / aviso de actualización.
+$("h-bell").onclick=async()=>{
+  let txt="Todo en orden. Tu wallet está conectada al nodo.";
+  try{ const st=await api("/api/node");
+    if(st.online===false) txt="⚠️ Sin conexión con el nodo. Revisá que esté corriendo.";
+    else if(st.update_available) txt="⬆️ Hay una actualización disponible del nodo (v"+st.update_available+"). Pedile al operador que actualice.";
+    else txt="✓ Nodo en vivo · v"+st.version+". No hay novedades.";
+  }catch(e){ txt="⚠️ No pude contactar el nodo."; }
+  toast(txt);
+};
+// Ojo: alternar ocultar/mostrar el saldo.
+$("h-eye").onclick=()=>{ setBalanceHidden(!balanceHidden()); renderHome(); };
 
 // ---- tema claro / oscuro / auto ----
 function resolveTheme(s){ return s==="auto" ? (window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark") : s; }
@@ -833,11 +1111,13 @@ document.querySelectorAll("#theme-seg button").forEach(b=>b.addEventListener("cl
 
 // ---- estado del nodo ----
 async function loadNode(){
+  // El punto rojo de la campana avisa: nodo caído o actualización disponible.
+  const dot=$("bell-dot"); const show=(v)=>{ if(dot) dot.style.display = v ? "block" : "none"; };
   try{
     const st=await api("/api/node");
-    if(st.online===false) throw 0;
-    $("dot").className="dot ok"; $("node-text").textContent=`en vivo · v${st.version}`;
-  }catch(e){ $("dot").className="dot bad"; $("node-text").textContent="sin conexión"; }
+    if(st.online===false){ show(true); return; }
+    show(!!st.update_available);
+  }catch(e){ show(true); }
 }
 
 // ---- cuentas HD (múltiples direcciones desde una semilla) ----
@@ -900,13 +1180,44 @@ async function recoverAccounts(){
 // ---- home / saldo / actividad ----
 function myAddress(){ return SEED ? addressFromSeed(SEED) : null; }
 
+// Suma best-effort del stake vivo de la cuenta activa (sobre las posiciones
+// conocidas en localStorage). No bloquea el home si el nodo no responde.
+async function walletStakedTotal(addr){
+  const list=(allStakes()[addr]||[]);
+  if(!list.length) return 0n;
+  const live=await Promise.all(list.map(s=>api("/api/stake/"+encodeURIComponent(s.stakeAccount)).catch(()=>null)));
+  let t=0n; for(const d of live){ if(d&&d.amount) t+=BigInt(d.amount); }
+  return t;
+}
+
 async function renderHome(){
   const addr = myAddress(); if(!addr){ showView("unlock"); return; }
   const nm=$("h-acct-name"); if(nm) nm.textContent=accountName(ACCT);
   $("h-addr").textContent = short(addr);
   $("h-copy").onclick = ()=>copy(addr);
-  try{ const acct = await api("/api/account/"+encodeURIComponent(addr)); $("h-balance").textContent = qchDisp(acct.balance); }
+  const hidden=balanceHidden();
+  $("h-eye").textContent = hidden ? "🙈" : "👁";
+  if(hidden){
+    $("h-balance").textContent="••••••"; $("h-usd").textContent="≈ $•••• USD";
+    $("as-bal").textContent="••••"; $("as-usd").textContent="≈ $•••• USD";
+    $("as-stake").textContent="••••"; $("as-stake-usd").textContent="≈ $•••• USD";
+  }
+  try{
+    const acct = await api("/api/account/"+encodeURIComponent(addr));
+    if(!balanceHidden()){
+      $("h-balance").textContent = qchDisp(acct.balance);
+      $("h-usd").textContent = usdOf(acct.balance);
+      $("as-bal").textContent = qchDisp(acct.balance);
+      $("as-usd").textContent = usdOf(acct.balance);
+    }
+  }
   catch(e){ /* no borramos lo que ya se ve ante un error de red */ }
+  // Total en staking (best-effort, no bloquea).
+  walletStakedTotal(addr).then(st=>{
+    if(balanceHidden()) return;
+    $("as-stake").textContent = unitsToQch(st)+" QCH";
+    $("as-stake-usd").textContent = usdOf(st);
+  }).catch(()=>{});
   renderActivity(addr);
 }
 
@@ -1025,62 +1336,79 @@ $("acct-recover").onclick=async()=>{
   renderAccounts();
 };
 
-async function renderActivity(addr){
-  const box=$("activity");
-  // Fetch both plain transfers AND staking activity, so the activity view shows
-  // EVERYTHING this wallet did (staking never shows up in the transfer list —
-  // it's not a simple transfer). Both are best-effort; if one fails, show the
-  // other.
-  let txs=[], stk=[];
+// Tiempo relativo aproximado desde el número de ronda (no hay timestamp real
+// por-tx; se estima con `(ronda_actual − ronda_tx) × intervalo_de_ronda`). Es un
+// aproximado honesto — si no hay datos de ronda, cae a "ronda N".
+function relTime(round, cur, intervalMs){
+  if(!cur||!intervalMs||round<=0||round>cur) return null;
+  let s=Math.round((cur-round)*intervalMs/1000);
+  if(s<45) return "hace un momento";
+  if(s<3600) return "hace "+Math.max(1,Math.round(s/60))+" min";
+  if(s<86400) return "hace "+Math.round(s/3600)+" h";
+  return "hace "+Math.round(s/86400)+" d";
+}
+
+// Construye las filas de movimientos (transferencias + staking) para una cuenta,
+// ordenadas por ronda desc. Comparte lógica entre el home y la vista completa.
+async function buildActivityRows(addr){
+  let txs=[], stk=[], cur=0, iv=0;
   try{ txs=await api("/api/transfers"); }catch(e){}
   try{ stk=await api("/api/staking_activity/"+encodeURIComponent(addr)); }catch(e){}
-  // Un solo listado de "movimientos": transferencias Y staking juntos, ordenado
-  // por ronda (como un explorador real - no se separan por tipo).
+  try{ const n=await api("/api/node"); if(n.online!==false){ cur=Number(n.next_round)||0; iv=Number(n.round_interval_ms)||0; } }catch(e){}
   const rows=[];
+  const when=(rnd)=>{ const r=relTime(rnd,cur,iv); return r?esc(r):("ronda "+esc(fmt(String(rnd)))); };
   for(const s of (stk||[])){
     let title, sub, cls, ic, sign;
-    if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+esc(short(s.validator)); cls="out"; ic="🔒"; sign="−"; }
-    else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+esc(short(s.validator)); cls="in"; ic="🔓"; sign="+"; }
+    if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+esc(peerLabel(s.validator)); cls="out"; ic="🔒"; sign="−"; }
+    else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+esc(peerLabel(s.validator)); cls="in"; ic="🔓"; sign="+"; }
     else { title="Recompensa de staking"; sub="reclamada"; cls="in"; ic="★"; sign="+"; }
-    const rnd=Number(s.round)||0, amt=esc(qchDisp(s.amount));   // coerción numérica + escape: nada de markup del nodo
+    const rnd=Number(s.round)||0, amt=esc(qchDisp(s.amount));
     rows.push({round:rnd, key:"s"+s.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${cls==='in'?'tx-in':'tx-out'}">${ic}</div>
-      <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ronda ${esc(fmt(String(rnd)))}</div></div>
+      <div class="tx-main"><div class="tx-t">${title}</div><div class="tx-s">${sub} · ${when(rnd)}</div></div>
       <div class="tx-amt ${cls}">${sign}${amt}</div>
     </div>`});
   }
   const mine=(txs||[]).filter(t=>t.from===addr||t.to===addr);
   for(const t of mine){
     const inc=t.to===addr;
-    // Escape every node-supplied value folded into innerHTML: addresses are
-    // base58 (no markup chars) and amounts numeric, but defense-in-depth is
-    // consistent with the staking loop above - a compromised/hostile node RPC
-    // must never be able to inject markup into the wallet origin.
-    const peer=esc(short(inc?t.from:t.to)), amt=esc(qchDisp(t.amount));
-    rows.push({round:Number(t.round)||0, key:"t"+t.tx_hash, html:`<div class="tx">
+    // Escape every node-supplied value folded into innerHTML (defense-in-depth).
+    const peer=esc(peerLabel(inc?t.from:t.to)), amt=esc(qchDisp(t.amount)), rnd=Number(t.round)||0;
+    rows.push({round:rnd, key:"t"+t.tx_hash, html:`<div class="tx">
       <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
       <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
-        <div class="tx-s">${inc?'de ':'a '}${peer}</div></div>
+        <div class="tx-s">${inc?'de ':'a '}${peer} · ${when(rnd)}</div></div>
       <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${amt}</div>
     </div>`});
   }
   rows.sort((a,b)=>b.round-a.round);
-  // Historial: 5 filas por defecto (se ve más limpio), con "Ver más" para expandir.
+  return rows;
+}
+
+async function renderActivity(addr){
+  const box=$("activity");
+  const rows=await buildActivityRows(addr);
+  // Historial: 5 filas por defecto (se ve más limpio), "Ver todo" abre la lista completa.
   const LIMIT=5;
-  const shown = activityExpanded ? rows : rows.slice(0,LIMIT);
-  const sig=addr+"|"+(activityExpanded?"x":"c")+"|"+shown.map(r=>r.key).join(",");
+  const shown = rows.slice(0,LIMIT);
+  const sig=addr+"|c|"+shown.map(r=>r.key).join(",");
   if(sig===lastActivitySig) return;
   lastActivitySig=sig;
   if(!rows.length){ box.innerHTML='<div class="empty">sin movimientos todavía</div>'; return; }
   let html=shown.map(r=>r.html).join("");
   if(rows.length>LIMIT){
-    html += activityExpanded
-      ? '<button class="btn-block btn-sec act-toggle" style="margin-top:10px">Ver menos</button>'
-      : `<button class="btn-block btn-sec act-toggle" style="margin-top:10px">Ver más (${rows.length-LIMIT})</button>`;
+    html += `<button class="btn-block btn-sec nav" data-to="activity-all" style="margin-top:10px">Ver todo (${rows.length})</button>`;
   }
   box.innerHTML=html;
-  const tb=box.querySelector(".act-toggle");
-  if(tb) tb.onclick=()=>{ activityExpanded=!activityExpanded; lastActivitySig=""; renderActivity(addr); };
+  const mb=box.querySelector('[data-to="activity-all"]');
+  if(mb) mb.onclick=()=>showView("activity-all");
+}
+
+async function renderActivityFull(){
+  const addr=myAddress(); if(!addr) return;
+  const box=$("activity-full");
+  const rows=await buildActivityRows(addr);
+  box.innerHTML = rows.length ? rows.map(r=>r.html).join("") : '<div class="empty">sin movimientos todavía</div>';
 }
 
 function renderReceive(){
@@ -1111,9 +1439,29 @@ function renderSend(){
   sel.style.display = vis.length>1 ? "block" : "none";   // el selector solo aparece si hay >1 cuenta visible
   const upd=()=>{ $("s-from-addr").textContent=sendFromAddr(); };
   sel.onchange=upd; upd();
+  // Selector de contactos: elegir uno rellena la dirección de destino.
+  const cs=$("s-contact"), cts=Object.entries(contactsStore()).filter(([a,n])=>a&&n);
+  cs.innerHTML="";
+  if(cts.length){
+    const ph=document.createElement("option"); ph.value=""; ph.textContent="📇 Elegir un contacto…"; cs.appendChild(ph);
+    for(const [a,n] of cts){ const op=document.createElement("option"); op.value=a; op.textContent=n+" · "+short(a); cs.appendChild(op); }
+    cs.style.display="block";
+    cs.onchange=()=>{ if(cs.value){ $("s-to").value=cs.value; onSendToChanged(); } };
+  } else { cs.style.display="none"; }
   $("s-amount").value=""; $("s-to").value="";
+  $("s-save-contact").style.display="none";
   $("s-fee").textContent="El fee de red se calcula solo al enviar.";
   const msg=$("s-msg"); msg.className="msg"; msg.textContent="";
+}
+
+// Cuando cambia la dirección de destino: si es una dirección nueva (no guardada
+// como contacto y con pinta de dirección real) ofrecé guardarla con un nombre.
+function onSendToChanged(){
+  const to=$("s-to").value.trim();
+  const known=!!contactName(to);
+  const looksAddr=to.length>=32 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(to); // base58, sin 0OIl
+  $("s-save-contact").style.display = (looksAddr && !known) ? "block" : "none";
+  if(!looksAddr||known) $("s-cname").value="";
 }
 
 async function renderSettings(){
@@ -1342,11 +1690,39 @@ $("s-max").onclick=async()=>{
 };
 
 // enviar (firma en el navegador)
+// Estado del envío pendiente de confirmación (llenado por s-btn, usado por cf-ok).
+let pendingSend=null;
+function closeConfirm(){ $("confirm-bg").classList.remove("show"); }
+
+// Paso 1: validar y mostrar la pantalla de confirmación con el fee estimado.
+// Enviar es IRREVERSIBLE — una confirmación explícita evita errores caros.
 $("s-btn").onclick=async()=>{
   const to=$("s-to").value.trim(), amt=$("s-amount").value.trim(), msg=$("s-msg"); msg.className="msg"; msg.textContent="";
-  if(!to){ msg.className="msg err"; msg.textContent="poné la dirección de destino"; return; }
-  let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
-  $("s-btn").disabled=true; msg.className="msg"; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
+  if(!to){ msg.className="msg err"; msg.style.display="block"; msg.textContent="poné la dirección de destino"; return; }
+  let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.style.display="block"; msg.textContent="monto inválido (ej: 1,5)"; return; }
+  if(amount<=0n){ msg.className="msg err"; msg.style.display="block"; msg.textContent="el monto debe ser mayor a 0"; return; }
+  // Fee estimado: base_fee_per_byte (vivo) × tamaño real de una transferencia
+  // firmada — la misma cuenta que usa el botón "máx".
+  let fee;
+  try{ const node=await api("/api/node"); fee=BigInt(node.base_fee_per_byte||180)*TX_BYTES; }catch(e){ fee=BigInt(180)*TX_BYTES; }
+  const nm=contactName(to);
+  $("cf-to").innerHTML = nm ? `${esc(nm)}<small class="mono">${esc(short(to))}</small>` : `<span class="mono">${esc(short(to))}</span>`;
+  $("cf-amt").textContent=qchDisp(amount);
+  $("cf-fee").textContent="≈ "+qchDisp(fee);
+  $("cf-total").textContent="≈ "+qchDisp(amount+fee);
+  pendingSend={to, amount, amt};
+  $("confirm-bg").classList.add("show");
+};
+$("cf-cancel").onclick=closeConfirm;
+$("confirm-bg").onclick=(e)=>{ if(e.target===$("confirm-bg")) closeConfirm(); };
+
+// Paso 2: firmar en el navegador y difundir al nodo (tras confirmar).
+$("cf-ok").onclick=async()=>{
+  if(!pendingSend) return closeConfirm();
+  const {to, amount, amt}=pendingSend; const msg=$("s-msg");
+  closeConfirm();
+  $("s-btn").disabled=true; $("cf-ok").disabled=true;
+  msg.className="msg"; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
   try{
     const seed=sendFromSeed();          // cuenta origen elegida (default = activa)
     const addr=addressFromSeed(seed);
@@ -1358,11 +1734,30 @@ $("s-btn").onclick=async()=>{
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
     const body=await r.json().catch(()=>({}));
     if(!r.ok) throw new Error(body.error||("error "+r.status));
-    msg.className="msg ok"; msg.innerHTML=`✓ Enviaste ${amt} QCH`;
-    $("s-amount").value=""; $("s-to").value="";
+    // Guardar como contacto si el usuario tipeó un nombre para una dirección nueva.
+    const cname=$("s-cname").value.trim();
+    if(cname && !contactName(to)){ saveContact(to,cname); }
+    msg.className="msg ok"; msg.innerHTML=`✓ Enviaste ${esc(amt)} QCH`;
+    $("s-amount").value=""; $("s-to").value=""; $("s-cname").value=""; $("s-save-contact").style.display="none";
     setTimeout(()=>showView("home"), 1600);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
-  $("s-btn").disabled=false;
+  $("s-btn").disabled=false; $("cf-ok").disabled=false; pendingSend=null;
+};
+
+// Detectar dirección nueva mientras se escribe/pega → ofrecer guardarla.
+$("s-to").addEventListener("input", onSendToChanged);
+
+// Guardar un contacto desde la libreta.
+$("c-add").onclick=()=>{
+  const name=$("c-name").value.trim(), addr=$("c-addr").value.trim(), m=$("c-msg");
+  m.className="msg"; m.style.display="block";
+  if(!name){ m.className="msg err"; m.textContent="poné un nombre"; return; }
+  if(!(addr.length>=32 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(addr))){ m.className="msg err"; m.textContent="dirección inválida"; return; }
+  saveContact(addr,name);
+  $("c-name").value=""; $("c-addr").value="";
+  m.className="msg ok"; m.textContent="✓ contacto guardado";
+  renderContacts();
+  setTimeout(()=>{ m.style.display="none"; }, 1400);
 };
 
 // ---- staking ----
