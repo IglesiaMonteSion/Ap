@@ -411,6 +411,8 @@
     <p class="view-sub">Todas tus direcciones se derivan de la <b>misma</b> semilla, así que tu único respaldo las recupera a todas. Tocá una para usarla, o creá una nueva.</p>
     <div class="card" id="acct-list"><div class="empty">cargando…</div></div>
     <button class="btn-block" id="acct-new" style="margin-top:14px">+ Crear nueva cuenta</button>
+    <button class="btn-block btn-sec" id="acct-recover" style="margin-top:10px">↻ Recuperar cuentas desde mi semilla</button>
+    <div class="hint" style="margin-top:8px">🔐 Todas tus cuentas se derivan de tu semilla, así que se recuperan al restaurar la wallet en otro dispositivo. Tocá <b>Recuperar</b> si alguna con saldo no aparece.</div>
   </section>
 
   <!-- ===== RECIBIR ===== -->
@@ -819,9 +821,36 @@ function setAccount(i){
   lastActivitySig="";  // forzá el re-render de la actividad para la cuenta nueva
 }
 // Al desbloquear/crear/restaurar: fijá MASTER y activá la última cuenta usada.
-function bootAccounts(){ const o=myAccounts(); setAccount(Math.min(o.active||0, o.count-1)); }
+let acctDiscoveryRan=false;   // el auto-descubrimiento corre una vez por sesión desbloqueada
+function bootAccounts(){ acctDiscoveryRan=false; const o=myAccounts(); setAccount(Math.min(o.active||0, o.count-1)); }
 // Crea la siguiente cuenta (índice determinista libre) y la activa.
 function createAccount(){ const o=myAccounts(); const i=o.count; o.count=i+1; o.active=i; saveAccounts(o); setAccount(i); return i; }
+
+// Descubrir cuentas HD financiadas/usadas al restaurar en otro dispositivo: la
+// lista de cuentas (cuántas hay) vive SOLO en localStorage, no en el respaldo,
+// así que en un equipo nuevo `myAccounts()` cae a `{count:1}` y solo se vería la
+// cuenta 0. Como cada cuenta es determinista por índice (deriveAccountSeed), se
+// re-deriva 1,2,3… y se le pregunta a la cadena por cada dirección: una cuenta
+// "existe" si tiene saldo > 0 o ya firmó algo (nonce > 0). Se extiende el
+// contador para incluir la de índice más alto en uso. Corta tras GAP índices
+// seguidos sin uso (gap limit, como toda HD wallet). Mismo patrón que
+// recoverStakes. No toca la cuenta 0 (siempre existe = la maestra).
+async function recoverAccounts(){
+  acctDiscoveryRan=true;
+  const GAP=10; let highestUsed=0, gap=0, i=1;
+  while(gap<GAP){
+    const a=await api("/api/account/"+encodeURIComponent(acctAddr(i))).catch(()=>null);
+    let used=false;
+    try{ used = a && ((BigInt(a.balance||0) > 0n) || (Number(a.nonce||0) > 0)); }catch(e){}
+    if(used){ highestUsed=i; gap=0; } else { gap++; }
+    i++;
+  }
+  if(highestUsed>0){
+    const o=myAccounts();
+    if(highestUsed+1 > o.count){ o.count=highestUsed+1; saveAccounts(o); }
+  }
+  return highestUsed;
+}
 
 // ---- home / saldo / actividad ----
 function myAddress(){ return SEED ? addressFromSeed(SEED) : null; }
@@ -839,7 +868,15 @@ async function renderHome(){
 // ---- vista de cuentas (múltiples direcciones desde una semilla) ----
 async function renderAccounts(){
   if(!MASTER){ showView("unlock"); return; }
-  const box=$("acct-list"), o=myAccounts();
+  const box=$("acct-list");
+  let o=myAccounts();
+  // En un equipo recién restaurado la lista local está vacía (solo la cuenta 0).
+  // Descubrí las cuentas usadas desde la semilla la primera vez, una sola vez.
+  if(o.count<=1 && !acctDiscoveryRan){
+    box.innerHTML='<div class="empty">buscando tus cuentas…</div>';
+    try{ await recoverAccounts(); }catch(e){}
+    o=myAccounts();
+  }
   const rows=[];
   for(let i=0;i<o.count;i++){
     const addr=acctAddr(i), name=accountName(i,o), activo=(i===ACCT);
@@ -871,6 +908,11 @@ async function renderAccounts(){
   });
 }
 $("acct-new").onclick=()=>{ const i=createAccount(); toast("cuenta creada"); renderAccounts(); };
+$("acct-recover").onclick=async()=>{
+  const box=$("acct-list"); box.innerHTML='<div class="empty">buscando cuentas desde tu semilla…</div>';
+  try{ const n=await recoverAccounts(); toast(n>0 ? `✓ Cuentas encontradas hasta la #${n+1}` : "no se encontraron cuentas nuevas con saldo"); }catch(e){}
+  renderAccounts();
+};
 
 async function renderActivity(addr){
   const box=$("activity");
