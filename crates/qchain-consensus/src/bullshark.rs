@@ -668,4 +668,86 @@ mod tests {
             "a genuinely-absent leader (no cert, no child references it, all child parents present) is soundly skipped to keep the chain live"
         );
     }
+
+    /// **Phase-3.3 stage-2 core proof: a committee change at an epoch boundary
+    /// does not fork honest validators and the chain stays live across it.**
+    /// Epoch length 2, committee A = {v0,v1,v2,v3} for epoch 0 (rounds 0-1),
+    /// committee B = {v1,v2,v3,v4} for epoch 1 (rounds 2-3) — a real rotation
+    /// (v0 leaves, v4 joins, three overlap). Each round `r` is decided entirely
+    /// under `for_round(r)` (see `direct_status`), so the boundary round 1
+    /// (committee A) counts its round-2 support weighted by A: v4 (in B, not A)
+    /// contributes zero, v1/v2/v3 contribute their A stake. Verifies: (1) the
+    /// committed order is independent of delivery order (full-at-once vs
+    /// incremental) — the safety property; (2) a peer missing a certificate
+    /// commits a prefix of the full order, never a divergent one; (3) the order
+    /// actually crosses the boundary and commits a committee-B round — liveness
+    /// under rotation.
+    #[test]
+    fn a_committee_change_at_an_epoch_boundary_keeps_honest_validators_consistent_and_live() {
+        use crate::ConsensusState;
+        let kps: Vec<Keypair> = (0..5).map(|_| Keypair::generate().unwrap()).collect();
+        let info = |i: usize| crate::quorum::ValidatorInfo { id: kps[i].pubkey(), pubkey_bundle: kps[i].public_key_bundle(), stake: 1 };
+        let committee_a = ValidatorSet::new((0..4).map(info).collect());
+        let committee_b = ValidatorSet::new((1..5).map(info).collect());
+        let a_ids: Vec<ValidatorId> = (0..4).map(|i| kps[i].pubkey()).collect();
+        let b_ids: Vec<ValidatorId> = (1..5).map(|i| kps[i].pubkey()).collect();
+        let mut schedule = ValidatorSchedule::new(2, committee_a);
+        schedule.install_epoch(1, committee_b);
+
+        // Build a full cross-epoch DAG: rounds 0,1 authored by A; rounds 2,3 by
+        // B; every round references all of the previous round's certificates.
+        let r0: Vec<Certificate> = a_ids.iter().map(|id| cert(0, *id, vec![])).collect();
+        let r0d: Vec<Digest> = r0.iter().map(|c| c.digest()).collect();
+        let r1: Vec<Certificate> = a_ids.iter().map(|id| cert(1, *id, r0d.clone())).collect();
+        let r1d: Vec<Digest> = r1.iter().map(|c| c.digest()).collect();
+        let r2: Vec<Certificate> = b_ids.iter().map(|id| cert(2, *id, r1d.clone())).collect();
+        let r2d: Vec<Digest> = r2.iter().map(|c| c.digest()).collect();
+        let r3: Vec<Certificate> = b_ids.iter().map(|id| cert(3, *id, r2d.clone())).collect();
+
+        let insert_all = |dag: &mut DagStore, certs: &[&[Certificate]]| {
+            for group in certs {
+                for c in group.iter() {
+                    dag.insert(c.clone());
+                }
+            }
+        };
+
+        // Validator X: receives everything, commits in one shot.
+        let mut dag_full = DagStore::new();
+        insert_all(&mut dag_full, &[&r0, &r1, &r2, &r3]);
+        let order_full = ConsensusState::new().advance(&dag_full, &schedule);
+
+        // Validator Y: same certificates, delivered incrementally across the
+        // boundary. The committed order MUST be identical — delivery order can
+        // never change what commits or in what order (the safety property).
+        let mut dag_inc = DagStore::new();
+        let mut state_y = ConsensusState::new();
+        let mut order_inc = Vec::new();
+        insert_all(&mut dag_inc, &[&r0, &r1, &r2]);
+        order_inc.extend(state_y.advance(&dag_inc, &schedule));
+        insert_all(&mut dag_inc, &[&r3]);
+        order_inc.extend(state_y.advance(&dag_inc, &schedule));
+        assert_eq!(order_full, order_inc, "committee change must not make the committed order depend on delivery order");
+
+        // Validator Z: missing one committee-B round-2 certificate (v1's). Its
+        // committed order must be a PREFIX of the full order — behind, never
+        // divergent.
+        let mut dag_partial = DagStore::new();
+        insert_all(&mut dag_partial, &[&r0, &r1]);
+        for c in r2.iter().filter(|c| c.vertex.author != b_ids[0]) {
+            dag_partial.insert(c.clone());
+        }
+        insert_all(&mut dag_partial, &[&r3]);
+        let order_partial = ConsensusState::new().advance(&dag_partial, &schedule);
+        let n = order_partial.len().min(order_full.len());
+        assert_eq!(order_partial[..n], order_full[..n], "a peer with a missing certificate must commit a prefix of the full order, never a fork");
+
+        // Liveness across the boundary: the full order must include a committed
+        // committee-B (epoch-1) round. Round 2's leader is chosen from committee
+        // B; its certificate being in the committed order proves consensus
+        // crossed the rotation and kept committing.
+        let leader_2 = Bullshark::new(&dag_full, &schedule).leader_for_round(2).expect("epoch-1 committee elects a leader");
+        let leader_2_digest = r2.iter().find(|c| c.vertex.author == leader_2).unwrap().digest();
+        assert!(order_full.contains(&leader_2_digest), "consensus must cross the epoch boundary and commit a committee-B round (liveness under rotation)");
+    }
 }
