@@ -91,9 +91,33 @@
   .act{display:flex;flex-direction:column;align-items:center;gap:9px;background:none;border:0;padding:2px;
     cursor:pointer;font-weight:600;font-size:13px;color:var(--ink);transition:transform .08s}
   .act:active{transform:scale(.94)}
-  .act .ic{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:23px;font-weight:700;
-    background:linear-gradient(150deg,var(--brand1),var(--brand2));box-shadow:0 8px 22px rgba(70,110,255,.42)}
-  .act .ic svg{width:24px;height:24px;stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+  /* Círculo de acción estilo Trust Wallet: fondo oscuro sutil, ícono violeta */
+  .act .ic{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-size:23px;font-weight:700;
+    background:rgba(255,255,255,.05);border:1px solid var(--line)}
+  .act .ic svg{width:23px;height:23px;stroke:var(--brand1);fill:none;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+  .act:hover .ic{background:rgba(140,120,255,.12);border-color:rgba(140,120,255,.35)}
+
+  /* ===== Zona de saldo estilo Trust Wallet (sobre fondo plano) ===== */
+  .bal-zone{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-top:6px}
+  .bal-main{min-width:0;flex:1}
+  .acct-pill{display:inline-flex;align-items:center;gap:6px;background:var(--brand-soft);
+    border:1px solid rgba(140,120,255,.28);color:var(--ink);border-radius:999px;padding:7px 14px;
+    font-size:14px;font-weight:600;cursor:pointer;box-shadow:none}
+  .acct-pill:hover{filter:none;border-color:rgba(140,120,255,.5)}
+  .bal-amt-row{display:flex;align-items:center;gap:10px;margin-top:16px}
+  .bal-amt-row .amt{font-size:clamp(26px,7.4vw,34px);font-weight:800;letter-spacing:-.02em;line-height:1.05;word-break:break-word}
+  .bal-usd{color:var(--brand1);font-size:15px;font-weight:600;margin-top:6px}
+  .addr-pill{display:inline-flex;align-items:center;gap:8px;margin-top:14px;background:rgba(255,255,255,.045);
+    border:1px solid var(--line);border-radius:999px;padding:9px 14px;color:var(--muted);font-size:13px;
+    cursor:pointer;box-shadow:none;max-width:100%}
+  .addr-pill .mono{font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .addr-pill svg{width:15px;height:15px;flex:0 0 auto;stroke:currentColor;fill:none;stroke-width:2}
+  .addr-pill:hover{filter:none;border-color:rgba(140,120,255,.35);color:var(--ink)}
+  .bal-badge{width:78px;height:78px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;margin-top:6px;
+    background:radial-gradient(circle at 50% 42%,rgba(124,110,255,.20),rgba(18,16,38,.35));
+    box-shadow:inset 0 0 0 2px rgba(140,120,255,.4),0 0 34px rgba(124,110,255,.35)}
+  .bal-badge svg{width:44px;height:44px}
+  .eye-btn{background:none;border:0;box-shadow:none;padding:0 2px;color:var(--muted);font-size:15px;cursor:pointer;line-height:1}
 
   /* Tarjeta de activos (home) */
   .asset-row{display:flex;align-items:center;gap:12px}
@@ -117,10 +141,6 @@
     color:var(--muted);font-size:11px;font-weight:600;padding:5px 2px;cursor:pointer}
   .tab svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
   .tab.on{color:var(--brand2)}
-  .eye-btn{background:none;border:0;box-shadow:none;padding:0 2px;color:#c3c9e0;font-size:14px;cursor:pointer;line-height:1}
-  .copy-ic{background:none;border:0;box-shadow:none;padding:2px;color:#c3c9e0;cursor:pointer;display:inline-grid;place-items:center}
-  .copy-ic svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2}
-  .balance-card .divider{border-top:1px solid rgba(255,255,255,.12);margin:16px 0 12px}
 
   button,.btn{cursor:pointer;border:0;border-radius:15px;padding:15px 16px;font-size:16px;font-weight:700;
     font-family:inherit;background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;
@@ -198,6 +218,8 @@
   .icon-btn{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;padding:0;font-size:18px;
     background:var(--card);border:1px solid var(--line);color:var(--ink);box-shadow:none;backdrop-filter:blur(8px)}
   .icon-btn:hover{filter:none;border-color:rgba(140,130,255,.4)}
+  .icon-btn.box{width:42px;height:42px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--muted)}
+  .icon-btn.box:hover{color:var(--ink);border-color:rgba(140,120,255,.4)}
   .row-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 4px;border-top:1px solid var(--line)}
   .row-item:first-child{border-top:0}
   .seg{display:inline-flex;background:var(--field);border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
@@ -366,7 +388,7 @@
       <div class="boot-rings"><i></i><i></i><i></i></div>
       <div class="boot-sweep"></div>
       <div class="boot-logo">
-        <svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="bgl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#bgl)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#bgl)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#bgl)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
+        <svg viewBox="0 0 64 64" aria-hidden="true"><use href="#qlogo"/></svg>
       </div>
     </div>
     <div class="boot-word">QCHAIN <span class="grad">WALLET</span></div>
@@ -379,13 +401,35 @@
   </div>
 </div>
 
+<!-- Logo Q hexagonal biselado 3D (nuevo, estilo Trust Wallet) — definido una
+     vez y referenciado con <use href="#qlogo"> en todos lados. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="qlite" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#cbb8ff"/><stop offset="1" stop-color="#8fa8ff"/></linearGradient>
+  <linearGradient id="qdark" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#4f74ff"/></linearGradient>
+  <symbol id="qlogo" viewBox="0 0 64 64">
+    <polygon points="32,5 55,18.5 45,24.5 32,17" fill="url(#qlite)"/>
+    <polygon points="55,18.5 55,45.5 45,39.5 45,24.5" fill="url(#qdark)"/>
+    <polygon points="55,45.5 32,59 32,47 45,39.5" fill="url(#qdark)"/>
+    <polygon points="32,59 9,45.5 19,39.5 32,47" fill="url(#qdark)"/>
+    <polygon points="9,45.5 9,18.5 19,24.5 19,39.5" fill="url(#qlite)"/>
+    <polygon points="9,18.5 32,5 32,17 19,24.5" fill="url(#qlite)"/>
+    <polygon points="32,22 41,27 41,37 32,42 23,37 23,27" fill="url(#qdark)"/>
+    <path stroke="url(#qdark)" stroke-width="7" stroke-linecap="round" fill="none" d="M40 39 L52 51"/>
+  </symbol>
+  <symbol id="qlogo-w" viewBox="0 0 64 64">
+    <path fill="#fff" fill-rule="evenodd" d="M32 5 L55 18.5 L55 45.5 L32 59 L9 45.5 L9 18.5 Z M32 17 L45 24.5 L45 39.5 L32 47 L19 39.5 L19 24.5 Z"/>
+    <path fill="#fff" d="M32 22 L41 27 L41 37 L32 42 L23 37 L23 27 Z"/>
+    <path stroke="#fff" stroke-width="6" stroke-linecap="round" fill="none" d="M40 39 L52 51"/>
+  </symbol>
+</defs></svg>
+
 <div class="app">
   <canvas id="qwave"></canvas>
 
   <!-- ===== CARGANDO / AVISO ===== -->
   <section class="view center" id="v-loading">
     <div class="hero" style="display:flex;flex-direction:column;align-items:center;gap:14px">
-      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="agl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#agl)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#agl)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#agl)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
+      <svg class="logo logo-lg" viewBox="0 0 64 64"><use href="#qlogo"/></svg>
       <div id="loading-text" class="view-sub">cargando…</div>
     </div>
   </section>
@@ -393,7 +437,7 @@
   <!-- ===== BIENVENIDA ===== -->
   <section class="view welcome" id="v-welcome">
     <div class="hero">
-      <svg class="logo logo-lg" viewBox="0 0 64 64"><defs><linearGradient id="ag1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient><filter id="gl1" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#gl1)"><path fill="url(#ag1)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag1)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag1)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></g></svg>
+      <svg class="logo logo-lg" viewBox="0 0 64 64"><use href="#qlogo"/></svg>
       <span class="qbadge">
         <svg viewBox="0 0 24 24" fill="none" stroke="#c9c2ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l7 3v6c0 4.5-3 8-7 9-4-1-7-4.5-7-9V5z"/><path d="M9 12l2 2 4-4"/></svg>
         QUANTUM RESISTANT
@@ -469,7 +513,7 @@
   <!-- ===== DESBLOQUEAR ===== -->
   <section class="view center" id="v-unlock">
     <div class="hero" style="display:flex;flex-direction:column;align-items:center;gap:14px;margin:auto 0 20px">
-      <svg class="logo logo-lg" style="width:88px;height:88px" viewBox="0 0 64 64"><defs><linearGradient id="ag4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag4)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag4)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag4)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
+      <svg class="logo logo-lg" style="width:88px;height:88px" viewBox="0 0 64 64"><use href="#qlogo"/></svg>
       <h2 class="view-title">Bienvenido de vuelta</h2>
       <p class="view-sub center">Ingresá tu contraseña para desbloquear la wallet en este dispositivo.</p>
     </div>
@@ -486,38 +530,41 @@
   <section class="view" id="v-home">
     <div class="topbar">
       <div class="brand-row">
-        <svg class="logo" viewBox="0 0 64 64"><defs><linearGradient id="ag2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b6a2ff"/><stop offset="1" stop-color="#6690ff"/></linearGradient></defs><path fill="url(#ag2)" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="url(#ag2)" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="url(#ag2)" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
+        <svg class="logo" viewBox="0 0 64 64"><use href="#qlogo"/></svg>
         <span class="brand-name">QCHAIN <span class="grad">Wallet</span></span>
       </div>
-      <div style="display:flex;align-items:center;gap:4px">
-        <button class="icon-btn" id="h-scan" title="escanear para pagar" aria-label="escanear QR">
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="icon-btn box" id="h-scan" title="escanear para pagar" aria-label="escanear QR">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
         </button>
-        <button class="icon-btn" id="h-bell" title="notificaciones" aria-label="notificaciones" style="position:relative">
+        <button class="icon-btn box" id="h-bell" title="notificaciones" aria-label="notificaciones" style="position:relative">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
           <span id="bell-dot" style="display:none;position:absolute;top:6px;right:7px;width:8px;height:8px;border-radius:50%;background:var(--bad)"></span>
         </button>
-        <button class="icon-btn nav" data-to="settings" title="configuración" aria-label="configuración">⚙</button>
+        <button class="icon-btn box nav" data-to="settings" title="configuración" aria-label="configuración">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H10a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V10a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        </button>
       </div>
     </div>
 
-    <div class="balance-card">
-      <svg class="bc-watermark" viewBox="0 0 64 64" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M32 4 L54.86 17.2 L54.86 43.6 L32 56.8 L9.14 43.6 L9.14 17.2 Z M32 14.4 L45.86 22.4 L45.86 38.4 L32 46.4 L18.14 38.4 L18.14 22.4 Z"/><path fill="currentColor" d="M32 21 L40.5 25.9 L40.5 35.7 L32 40.6 L23.5 35.7 L23.5 25.9 Z"/><path stroke="currentColor" stroke-width="6.5" stroke-linecap="round" fill="none" d="M40 39 L52 51"/></svg>
-      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:8px;position:relative;z-index:1">
-        <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.8">▾</span>
-      </button>
-      <div class="lbl" style="display:flex;align-items:center;gap:7px">Saldo
-        <button class="eye-btn" id="h-eye" title="ocultar/mostrar saldo" aria-label="ocultar saldo">👁</button>
-      </div>
-      <div class="amt" id="h-balance">—</div>
-      <div class="asset-usd" id="h-usd" style="color:#c3c9e0;font-size:14px;margin-top:2px">—</div>
-      <div class="divider"></div>
-      <div class="lbl" style="margin-bottom:5px">Dirección</div>
-      <div class="acct"><span class="mono" id="h-addr">—</span>
-        <button class="copy-ic" id="h-copy" title="copiar dirección" aria-label="copiar">
+    <!-- Zona de saldo estilo Trust Wallet: saldo sobre fondo plano, con el logo
+         brillando en un círculo a la derecha -->
+    <div class="bal-zone">
+      <div class="bal-main">
+        <button id="h-acct" class="acct-pill nav" data-to="accounts">
+          <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.7">▾</span>
+        </button>
+        <div class="bal-amt-row">
+          <span class="amt" id="h-balance">—</span>
+          <button class="eye-btn" id="h-eye" title="ocultar/mostrar saldo" aria-label="ocultar saldo">👁</button>
+        </div>
+        <div class="bal-usd" id="h-usd">—</div>
+        <button class="addr-pill" id="h-copy" title="copiar dirección">
+          <span class="mono" id="h-addr">—</span>
           <svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
         </button>
       </div>
+      <div class="bal-badge"><svg viewBox="0 0 64 64"><use href="#qlogo"/></svg></div>
     </div>
 
     <div class="actions">
@@ -527,11 +574,16 @@
       <button class="act nav" data-to="staking"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg></span>Staking</button>
     </div>
 
-    <div class="section-title">Activos</div>
+    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Activos</span>
+      <span style="display:inline-flex;align-items:center;gap:6px;color:var(--muted);text-transform:none;letter-spacing:0;font-size:13px;font-weight:600">Ordenar
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg>
+      </span>
+    </div>
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
         <div class="asset-row">
-          <div class="asset-ic"><svg viewBox="0 0 64 64" width="26" height="26"><path fill="#fff" fill-rule="evenodd" d="M32 8 L52 19.6 L52 42.8 L32 54.4 L12 42.8 L12 19.6 Z M32 17 L44 24 L44 38 L32 45 L20 38 L20 24 Z"/><path fill="#fff" d="M39 37 L49 47"/><path stroke="#fff" stroke-width="5.5" stroke-linecap="round" fill="none" d="M39 37 L49 47"/></svg></div>
+          <div class="asset-ic"><svg viewBox="0 0 64 64" width="28" height="28"><use href="#qlogo-w"/></svg></div>
           <div>
             <div class="asset-name">QCH</div>
             <div class="asset-sub">QCHAIN</div>
