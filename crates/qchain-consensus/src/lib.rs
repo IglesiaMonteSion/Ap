@@ -204,7 +204,14 @@ impl ConsensusState {
     /// the total order since the last call.
     pub fn advance(&mut self, dag: &DagStore, schedule: &ValidatorSchedule) -> Vec<Digest> {
         let bullshark = Bullshark::with_gc_floor(dag, schedule, self.gc_floor);
-        let (ordered, stopped_at) = bullshark.extend_order(self.from_round, dag.highest_round(), &mut self.seen, &mut self.committed_cache);
+        // Never resolve past the schedule's resolvable frontier: a round whose
+        // epoch's committee is not yet installed must wait, so a single pass
+        // (even a big catch-up) can't commit it under the wrong committee and
+        // fork nodes that install that committee at different points. For a
+        // fixed-membership (`single`) schedule the frontier is unbounded, so
+        // this clamp is a no-op — identical to resolving the whole DAG.
+        let up_to = dag.highest_round().min(schedule.resolvable_frontier_round());
+        let (ordered, stopped_at) = bullshark.extend_order(self.from_round, up_to, &mut self.seen, &mut self.committed_cache);
         // Record how far consensus has permanently finalized (the first
         // still-unresolved round), monotonically. This drives DAG garbage
         // collection only - it is deliberately NOT fed back into `from_round`

@@ -66,6 +66,15 @@ pub struct ValidatorSchedule {
     epoch_rounds: u64,
     /// Committee per epoch. Epoch 0 is always present (the bootstrap committee).
     committees: BTreeMap<u64, ValidatorSet>,
+    /// The highest epoch whose committee is finalized/known — the "resolvable
+    /// frontier". Consensus may resolve rounds up to the last round of this
+    /// epoch, but not beyond, until a later epoch's committee is derived and
+    /// installed. This is what makes the *live* rotation safe: a single
+    /// resolution pass (even a large catch-up) can never commit a round whose
+    /// epoch's committee is not yet known — which could otherwise let two nodes
+    /// that derive that committee at different points diverge. `u64::MAX` means
+    /// "unbounded / fixed membership" (a `single` schedule), i.e. no guard.
+    frontier_epoch: u64,
 }
 
 impl ValidatorSchedule {
@@ -76,7 +85,9 @@ impl ValidatorSchedule {
     pub fn single(set: ValidatorSet) -> Self {
         let mut committees = BTreeMap::new();
         committees.insert(0, set);
-        ValidatorSchedule { epoch_rounds: DEFAULT_EPOCH_ROUNDS, committees }
+        // Unbounded frontier: fixed membership, every round always resolvable —
+        // the guard is a no-op, so behavior is exactly the phase-1/2 consensus.
+        ValidatorSchedule { epoch_rounds: DEFAULT_EPOCH_ROUNDS, committees, frontier_epoch: u64::MAX }
     }
 
     /// A rotating schedule with a given epoch length and a bootstrap (epoch-0)
@@ -86,7 +97,43 @@ impl ValidatorSchedule {
         assert!(epoch_rounds > 0, "epoch_rounds must be positive");
         let mut committees = BTreeMap::new();
         committees.insert(0, bootstrap);
-        ValidatorSchedule { epoch_rounds, committees }
+        // Only epoch 0 is known at genesis; consensus may not resolve later
+        // epochs until the node derives and installs their committees and raises
+        // the frontier (`set_frontier_epoch`).
+        ValidatorSchedule { epoch_rounds, committees, frontier_epoch: 0 }
+    }
+
+    /// The highest epoch whose committee is finalized/known — the resolvable
+    /// frontier. `u64::MAX` for a fixed-membership (`single`) schedule.
+    pub fn frontier_epoch(&self) -> u64 {
+        self.frontier_epoch
+    }
+
+    /// Raise the resolvable frontier to `epoch` (monotonic; a lower value is
+    /// ignored). **Caller obligation:** only raise the frontier to `epoch` after
+    /// installing `epoch`'s committee, which must be a deterministic function of
+    /// committed state at the end of epoch `epoch-1` (so every honest node
+    /// installs the identical committee), or consensus would resolve that
+    /// epoch's rounds under the wrong (inherited) committee and could fork.
+    pub fn set_frontier_epoch(&mut self, epoch: u64) {
+        if epoch > self.frontier_epoch {
+            self.frontier_epoch = epoch;
+        }
+    }
+
+    /// The last round consensus may resolve right now: the final round of the
+    /// frontier epoch (`u64::MAX` — no bound — for a fixed-membership schedule).
+    /// `ConsensusState::advance` clamps `extend_order`'s upper bound to this, so
+    /// even a large catch-up never resolves a round whose epoch's committee is
+    /// not yet known.
+    pub fn resolvable_frontier_round(&self) -> Round {
+        if self.frontier_epoch == u64::MAX {
+            u64::MAX
+        } else {
+            // Last round of `frontier_epoch`. Saturating so a huge frontier can
+            // never overflow (it just means "unbounded" in practice).
+            self.frontier_epoch.saturating_add(1).saturating_mul(self.epoch_rounds).saturating_sub(1)
+        }
     }
 
     /// Rounds per epoch.

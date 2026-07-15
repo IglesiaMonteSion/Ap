@@ -693,6 +693,7 @@ mod tests {
         let b_ids: Vec<ValidatorId> = (1..5).map(|i| kps[i].pubkey()).collect();
         let mut schedule = ValidatorSchedule::new(2, committee_a);
         schedule.install_epoch(1, committee_b);
+        schedule.set_frontier_epoch(1); // the node has derived committee(1); epoch 1 is now resolvable
 
         // Build a full cross-epoch DAG: rounds 0,1 authored by A; rounds 2,3 by
         // B; every round references all of the previous round's certificates.
@@ -749,5 +750,54 @@ mod tests {
         let leader_2 = Bullshark::new(&dag_full, &schedule).leader_for_round(2).expect("epoch-1 committee elects a leader");
         let leader_2_digest = r2.iter().find(|c| c.vertex.author == leader_2).unwrap().digest();
         assert!(order_full.contains(&leader_2_digest), "consensus must cross the epoch boundary and commit a committee-B round (liveness under rotation)");
+    }
+
+    /// **Phase-3.3 stage-2b: the resolvable frontier holds back rounds of an
+    /// epoch whose committee is not yet installed.** With a rotating schedule
+    /// whose frontier is still at epoch 0, `advance` must resolve epoch-0 rounds
+    /// but leave epoch-1 rounds untouched (their committee isn't known yet);
+    /// raising the frontier to epoch 1 then lets them commit. This is what stops
+    /// a single catch-up pass from committing a later epoch under the wrong
+    /// (inherited) committee before the node has derived the real one.
+    #[test]
+    fn the_resolvable_frontier_holds_back_rounds_of_an_uninstalled_epoch() {
+        use crate::ConsensusState;
+        let kps: Vec<Keypair> = (0..4).map(|_| Keypair::generate().unwrap()).collect();
+        let info = |i: usize| crate::quorum::ValidatorInfo { id: kps[i].pubkey(), pubkey_bundle: kps[i].public_key_bundle(), stake: 1 };
+        let committee = ValidatorSet::new((0..4).map(info).collect());
+        let ids: Vec<ValidatorId> = (0..4).map(|i| kps[i].pubkey()).collect();
+        // Same committee both epochs (the guard is about *timing*, not a change);
+        // frontier starts at epoch 0.
+        let mut schedule = ValidatorSchedule::new(2, committee.clone());
+        schedule.install_epoch(1, committee);
+
+        // DAG spanning epochs 0 (rounds 0,1) and 1 (rounds 2,3).
+        let r0: Vec<Certificate> = ids.iter().map(|id| cert(0, *id, vec![])).collect();
+        let r0d: Vec<Digest> = r0.iter().map(|c| c.digest()).collect();
+        let r1: Vec<Certificate> = ids.iter().map(|id| cert(1, *id, r0d.clone())).collect();
+        let r1d: Vec<Digest> = r1.iter().map(|c| c.digest()).collect();
+        let r2: Vec<Certificate> = ids.iter().map(|id| cert(2, *id, r1d.clone())).collect();
+        let r2d: Vec<Digest> = r2.iter().map(|c| c.digest()).collect();
+        let r3: Vec<Certificate> = ids.iter().map(|id| cert(3, *id, r2d.clone())).collect();
+        let mut dag = DagStore::new();
+        for c in r0.iter().chain(&r1).chain(&r2).chain(&r3) {
+            dag.insert(c.clone());
+        }
+
+        // Frontier at epoch 0: advance resolves only epoch-0 rounds. None of the
+        // epoch-1 certificates (rounds 2,3) may be committed yet.
+        let order_capped = ConsensusState::new().advance(&dag, &schedule);
+        let epoch1_digests: HashSet<Digest> = r2.iter().chain(&r3).map(|c| c.digest()).collect();
+        assert!(
+            order_capped.iter().all(|d| !epoch1_digests.contains(d)),
+            "with the frontier at epoch 0, no epoch-1 round may be committed"
+        );
+
+        // Raise the frontier to epoch 1 (committee derived): now epoch-1 rounds
+        // resolve, and the previously-committed prefix is unchanged (monotone).
+        schedule.set_frontier_epoch(1);
+        let order_open = ConsensusState::new().advance(&dag, &schedule);
+        assert!(order_open.len() > order_capped.len(), "raising the frontier must let more rounds commit");
+        assert_eq!(order_open[..order_capped.len()], order_capped[..], "raising the frontier must not change what already committed");
     }
 }
