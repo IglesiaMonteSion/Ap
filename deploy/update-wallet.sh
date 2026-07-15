@@ -45,8 +45,9 @@ command -v docker >/dev/null 2>&1 || error "Docker no está instalado."
 systemctl list-unit-files "$SERVICE.service" >/dev/null 2>&1 && systemctl cat "$SERVICE" >/dev/null 2>&1 \
   || error "no encontré el servicio '$SERVICE'. ¿Instalaste la wallet con deploy/install-wallet.sh?"
 
-# 1. git pull (como el dueño del repo)
-if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ]; then
+# 1. git pull (como el dueño del repo). Tras el pull nos re-ejecutamos con la
+# versión recién traída (el pull puede reemplazar este script y desincronizar bash).
+if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ] && [ -z "${QCHAIN_UPDATE_REEXEC:-}" ]; then
   DUENO="$(stat -c '%U' "$REPO_ROOT/.git")"
   decir "Trayendo el código nuevo (git pull, como '$DUENO')"
   if [ "$DUENO" != "root" ] && command -v sudo >/dev/null 2>&1; then
@@ -55,6 +56,8 @@ if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ]; then
     git -C "$REPO_ROOT" config --global --add safe.directory "$REPO_ROOT" 2>/dev/null || true
     git -C "$REPO_ROOT" pull --ff-only || error "git pull falló. Resolvé el conflicto a mano y reintentá (o corré con --no-pull)."
   fi
+  export QCHAIN_UPDATE_REEXEC=1
+  exec "$0" "$@"
 fi
 
 VERSION_REPO="$(grep -oP '"version"\s*:\s*"\K[^"]+' "$REPO_ROOT/version.json" 2>/dev/null | head -1 || echo 'desconocida')"
@@ -71,8 +74,9 @@ if [ "$FORZAR" -ne 1 ] && [ -n "$COMMIT_ACTUAL" ] && [ -f "$MARCA" ] && [ "$(cat
 fi
 
 if [ "$ASUMIR_SI" -ne 1 ]; then
-  read -rp "Reconstruir la imagen y reiniciar solo la wallet. ¿Continuar? [s/N] " r
-  case "$r" in s|S|si|Si|SI) ;; *) echo "Cancelado."; exit 0 ;; esac
+  read -rp "Reconstruir la imagen y reiniciar solo la wallet. ¿Continuar? [S/n] " r || r=""
+  r="${r//[$'\r\t ']/}"
+  case "$r" in n|N|no|NO|No) echo "Cancelado."; exit 0 ;; esac  # solo 'n' cancela; enter/s/y continúa
 fi
 
 decir "Reconstruyendo la imagen qchain:latest (rápido si Docker ya tiene la cache)"

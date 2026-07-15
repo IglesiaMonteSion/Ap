@@ -54,8 +54,12 @@ RPC_PORT="${RPC_PORT:-8080}"
 version_rpc() { curl -fsSL --max-time 3 "http://127.0.0.1:$RPC_PORT/version" 2>/dev/null | grep -oP '"version"\s*:\s*"\K[^"]+' || echo 'desconocida'; }
 round_rpc()   { curl -fsSL --max-time 3 "http://127.0.0.1:$RPC_PORT/status"  2>/dev/null | grep -oP '"next_round"\s*:\s*\K[0-9]+' || echo ''; }
 
-# 1. git pull (como el dueño del repo, para evitar el error de "dubious ownership" de git corriendo como root)
-if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ]; then
+# 1. git pull (como el dueño del repo, para evitar el error de "dubious ownership" de git corriendo como root).
+# Como el pull puede REEMPLAZAR este mismo script en disco, y bash lee el archivo
+# por offset de bytes mientras corre (un cambio a mitad de camino lo desincroniza),
+# tras el pull nos RE-EJECUTAMOS con la versión recién traída, desde el arranque
+# limpio. El guard QCHAIN_UPDATE_REEXEC evita volver a pullear/loopear.
+if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ] && [ -z "${QCHAIN_UPDATE_REEXEC:-}" ]; then
   DUENO="$(stat -c '%U' "$REPO_ROOT/.git")"
   decir "Trayendo el código nuevo (git pull, como '$DUENO')"
   if [ "$DUENO" != "root" ] && command -v sudo >/dev/null 2>&1; then
@@ -64,6 +68,8 @@ if [ "$HACER_PULL" -eq 1 ] && [ -d "$REPO_ROOT/.git" ]; then
     git -C "$REPO_ROOT" config --global --add safe.directory "$REPO_ROOT" 2>/dev/null || true
     git -C "$REPO_ROOT" pull --ff-only || error "git pull falló. Resolvé el conflicto a mano y reintentá (o corré con --no-pull)."
   fi
+  export QCHAIN_UPDATE_REEXEC=1
+  exec "$0" "$@"   # continuá con el script ya actualizado, sin volver a pullear
 fi
 
 VERSION_ACTUAL="$(version_rpc)"
@@ -82,8 +88,9 @@ if [ "$FORZAR" -ne 1 ] && [ -n "$COMMIT_ACTUAL" ] && [ -f "$MARCA" ] && [ "$(cat
 fi
 
 if [ "$ASUMIR_SI" -ne 1 ]; then
-  read -rp "Esto reconstruye la imagen y reinicia el nodo (tu clave y el estado NO se tocan). ¿Continuar? [s/N] " resp
-  case "$resp" in s|S|si|Si|SI) ;; *) echo "Cancelado."; exit 0 ;; esac
+  read -rp "Esto reconstruye la imagen y reinicia el nodo (tu clave y el estado NO se tocan). ¿Continuar? [S/n] " resp || resp=""
+  resp="${resp//[$'\r\t ']/}"   # sacá CR/tab/espacios por si se colaron (la causa de un 'Cancelado' con la 's' bien tipeada)
+  case "$resp" in n|N|no|NO|No) echo "Cancelado."; exit 0 ;; esac  # solo 'n' cancela; enter/s/y/cualquier cosa continúa
 fi
 
 # 3. Punto de rollback: guardá la imagen actual como qchain:previous
