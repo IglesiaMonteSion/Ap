@@ -76,6 +76,15 @@ pub fn active_committee_from_registry(registry: &qchain_execution::validator_reg
     Some(ValidatorSet::new(infos))
 }
 
+/// SUPERSEDED (v4.1.0): the epoch ratchet no longer calls this — it now adopts
+/// the derived set wholesale (real shrink: `Some(d) => (*d).clone()`), which is
+/// safe because the consensus ordering fixes landed first (v4.0.3 `direct_status`
+/// liveness under a shrinking committee + cert-availability broadcast, v4.0.4
+/// atomic per-leader causal emission that closes the late-cert reorder fork).
+/// Kept `pub` and tested as a documented reference for the grow-only model and
+/// for anyone wiring rotation without those consensus fixes; do not reintroduce
+/// it into the ratchet.
+///
 /// Grow-only (monotonic) committee adoption for automatic rotation. The next
 /// epoch's committee is `current ∪ (derived members not already in current)`,
 /// capped at `MAX_ACTIVE_VALIDATORS` — a current member is **never dropped**
@@ -2347,16 +2356,34 @@ impl Engine {
                     // its genesis validators until real registrations exist.
                     let derived = active_committee_from_registry(&registry);
                     // The committee this epoch inherits (the frontier epoch's) —
-                    // also the base for the grow-only merge below.
+                    // used only as the fallback when the registry yields no set.
                     let inherited = sched.for_round(frontier.saturating_mul(epoch_rounds));
                     let committee = match &derived {
-                        // Grow-only: add newly-registered validators to the current
-                        // committee, never drop a seated one mid-flight. See
-                        // `merge_committee_grow_only` for why a mid-flight shrink
-                        // freezes DAG-BFT consensus (a live-confirmed freeze) and
-                        // why automatic removal is deferred to a real
-                        // reconfiguration protocol.
-                        Some(d) => merge_committee_grow_only(inherited, d),
+                        // Adopt the committee derived from the committed on-chain
+                        // registry WHOLESALE — the real dynamic validator set: a
+                        // newcomer that ranks into the top-N joins, and one that
+                        // unregistered / ranked out / was slashed below the minimum
+                        // is REMOVED. Automatic removal (a committee SHRINK at an
+                        // epoch boundary) is now safe — the three fixes that
+                        // together closed the freeze/fork that forced the earlier
+                        // grow-only-only policy: (1) ordering-layer liveness of a
+                        // shrinking boundary — `Bullshark::direct_status`'s unknown
+                        // stake is measured over the NEXT round's committee, so a
+                        // departed validator no longer holds the boundary round
+                        // `Undecided` forever (v4.0.3); (2) certificate availability
+                        // — `retry_pending_resync_requests` broadcasts a missing
+                        // cert when the peer that referenced it has left the set, so
+                        // a departed author's cert is still fetchable from a
+                        // survivor (v4.0.3); (3) atomic per-leader causal-history
+                        // commit — `walk_causal_history` commits a leader's whole
+                        // history or none, so a late-arriving departed cert can
+                        // never reorder the append-only committed prefix into a fork
+                        // (v4.0.4). The registry is seeded with the genesis
+                        // validators when rotation is on, so a network that never
+                        // touches the registry keeps its genesis committee, and a
+                        // newcomer must out-stake a seated validator (self-stakes
+                        // real and slashable) to displace it — no trivial takeover.
+                        Some(d) => (*d).clone(),
                         None => (*inherited).clone(),
                     };
                     {
@@ -2671,6 +2698,36 @@ mod tests {
         // Never shrinks: for the same current, an empty-derived-overlap still
         // returns at least the current members.
         assert!(merged.len() >= current.len());
+    }
+
+    /// The real-shrink derivation the epoch ratchet now adopts wholesale (once
+    /// the v4.0.3/v4.0.4 shrink-safety fixes landed): the committee derived from
+    /// the on-chain registry SHRINKS when a validator unregisters. Grow-only kept
+    /// the departed member forever; the ratchet now drops it at the epoch boundary
+    /// (safe: ordering liveness + cert availability + atomic commit close the old
+    /// freeze/fork). Determinism (stake-desc, id-asc tie-break) is what keeps
+    /// every honest node deriving the byte-identical shrunk committee.
+    #[test]
+    fn the_derived_committee_shrinks_when_a_validator_unregisters() {
+        use qchain_execution::validator_registry::{RegisteredValidator, ValidatorRegistryData};
+        let kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let reg = |kp: &Keypair, stake| RegisteredValidator {
+            validator: kp.pubkey(),
+            pubkey_bundle: kp.public_key_bundle(),
+            address: "127.0.0.1:9000".to_string(),
+            stake,
+        };
+        // Three registered validators, all above the minimum self-stake.
+        let full = ValidatorRegistryData { validators: vec![reg(&kps[0], 30_000_000), reg(&kps[1], 20_000_000), reg(&kps[2], 10_000_000)] };
+        let committee_before = active_committee_from_registry(&full).expect("three registered validators form a committee");
+        assert_eq!(committee_before.len(), 3);
+
+        // The lowest-staked validator unregisters (removed from the registry).
+        let shrunk = ValidatorRegistryData { validators: vec![reg(&kps[0], 30_000_000), reg(&kps[1], 20_000_000)] };
+        let committee_after = active_committee_from_registry(&shrunk).expect("two registered validators still form a committee");
+        assert_eq!(committee_after.len(), 2, "the derived committee SHRINKS to drop the unregistered validator");
+        assert!(committee_after.get(&kps[2].pubkey()).is_none(), "the departed validator is removed");
+        assert!(committee_after.get(&kps[0].pubkey()).is_some() && committee_after.get(&kps[1].pubkey()).is_some(), "the survivors remain");
     }
 
     fn new_state() -> EngineState {
