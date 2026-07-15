@@ -747,6 +747,34 @@ impl Engine {
         }
     }
 
+    /// Force every on-disk store durable before a graceful exit. `sled` buffers
+    /// writes and flushes on a ~500ms timer, so between flushes recent account /
+    /// certificate / batch writes live only in process memory - while the plain
+    /// `round_checkpoint` file (page-cache-durable across process death) can be
+    /// ahead of them, so a restart could resume from a round whose state was
+    /// never persisted and silently drop committed transactions. Called on
+    /// SIGTERM/SIGINT (the `systemctl restart` / `update-node.sh` path) so that
+    /// flow is fully durable. Takes the state lock so it flushes a consistent
+    /// point-in-time (any in-flight commit finishes first).
+    pub async fn flush_all(&self) {
+        let state = self.state.lock().await;
+        state.ledger.flush();
+        for (name, db) in [
+            ("dag", &self.cert_log),
+            ("batches", &self.batch_log),
+            ("committees", &self.committee_log),
+            ("receipts", &self.receipt_log),
+            ("staking", &self.staking_log),
+        ] {
+            if let Some(db) = db {
+                if let Err(e) = db.flush() {
+                    tracing::warn!("failed to flush the {name} log on shutdown: {e}");
+                }
+            }
+        }
+        tracing::info!("flushed all persistent stores to disk");
+    }
+
     /// Best-effort persist of a worker batch to `batch_log`, keyed by its
     /// content digest (see the `batch_log` field docs for why this is the
     /// necessary companion to `insert_certificate`). Same contract as the DAG

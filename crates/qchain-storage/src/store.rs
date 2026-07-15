@@ -29,6 +29,17 @@ pub trait StateStore: Send + Sync {
     fn set(&mut self, key: Pubkey, account: Account);
     fn remove(&mut self, key: &Pubkey);
     fn iter(&self) -> Box<dyn Iterator<Item = (Pubkey, Account)> + '_>;
+    /// Force any buffered writes durable to disk. `sled` buffers writes and
+    /// flushes on its own timer (~500ms) by default, so between flushes recent
+    /// account writes live only in the process's memory and are lost on an
+    /// unclean exit (SIGTERM without a handler, OOM, kill -9) - while the plain
+    /// `round_checkpoint` file (`std::fs::write`, page-cache-durable across
+    /// process death) can already be ahead of them, so a restart can silently
+    /// drop committed transactions. A node flushes this (and its sibling sled
+    /// logs) on SIGTERM/SIGINT so the documented `systemctl restart` /
+    /// `update-node.sh` flow is fully durable. Default no-op for the in-memory
+    /// store (nothing to flush).
+    fn flush(&self) {}
 }
 
 #[derive(Default)]
@@ -134,6 +145,12 @@ impl StateStore for SledStore {
             let account = borsh::from_slice(&value_bytes).expect("a value written by this same store must decode as an Account");
             (key, account)
         }))
+    }
+
+    fn flush(&self) {
+        if let Err(e) = self.db.flush() {
+            eprintln!("warning: failed to flush the sled state store: {e}");
+        }
     }
 }
 

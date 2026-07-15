@@ -134,6 +134,14 @@ impl Ledger {
         self.store.as_ref()
     }
 
+    /// Force the backing store's buffered writes durable to disk (see
+    /// `StateStore::flush`). Called on a graceful shutdown so a restart never
+    /// resumes from a `round_checkpoint` that is ahead of the persisted account
+    /// state. No-op for the in-memory store.
+    pub fn flush(&self) {
+        self.store.flush();
+    }
+
     /// The only place this `Ledger` is allowed to write to `self.store` -
     /// see `tree`'s doc comment for why every write must go through here
     /// rather than calling `self.store.set` directly.

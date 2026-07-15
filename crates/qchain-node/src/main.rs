@@ -572,8 +572,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("qchain-node {self_id} up: p2p={}, rpc={}", config.listen_addr, config.rpc_addr);
+    let flush_engine = engine.clone();
     let app = rpc::router(engine);
     let listener = tokio::net::TcpListener::bind(config.rpc_addr).await?;
-    axum::serve(listener, app).await?;
+    // Serve until a shutdown signal arrives; on SIGTERM/SIGINT flush every sled
+    // store to disk BEFORE exiting, so the durable `round_checkpoint` is never
+    // ahead of the persisted state (the restart-durability fix - see
+    // `Engine::flush_all`). `flush_all` takes the state lock, so any in-flight
+    // commit finishes first and a consistent point-in-time is flushed.
+    tokio::select! {
+        r = axum::serve(listener, app) => { r?; }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; flushing state to disk before exit");
+            flush_engine.flush_all().await;
+        }
+    }
     Ok(())
+}
+
+/// Resolves on the first SIGTERM (systemd stop/restart) or SIGINT (Ctrl-C).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
