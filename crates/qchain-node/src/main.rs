@@ -191,6 +191,51 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");
     }
 
+    // Phase-3.3: build the committee schedule (rotating when enabled, else a
+    // single fixed committee = the exact phase-1/2 behavior) and — for a
+    // rotation node with a `data_dir` — reload the per-epoch committees prior
+    // runs persisted, so a restart re-resolves the retained DAG window under the
+    // right committees (each was derived from the on-chain registry as of a past
+    // epoch boundary, state the current ledger no longer holds and so cannot
+    // re-derive). `committee_log` is `None` (no persistence, no reload) unless
+    // both rotation is on and a `data_dir` is configured.
+    let committee_log: Option<sled::Db> = match (&config.data_dir, config.validator_rotation) {
+        (Some(dir), true) => Some(sled::open(dir.join("committees"))?),
+        _ => None,
+    };
+    let mut validator_schedule = if config.validator_rotation {
+        tracing::info!("validator rotation ENABLED (epoch_rounds={}) - the active committee is re-derived from the on-chain registry each epoch", config.epoch_rounds());
+        ValidatorSchedule::new(config.epoch_rounds(), validators.clone())
+    } else {
+        ValidatorSchedule::single(validators.clone())
+    };
+    if let Some(db) = &committee_log {
+        let mut loaded = 0u64;
+        let mut max_epoch = 0u64;
+        for kv in db.iter() {
+            let (k, v) = kv?;
+            let epoch = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+            match qchain_node::engine::deserialize_committee(&v) {
+                Some(committee) => {
+                    validator_schedule.install_epoch(epoch, committee);
+                    max_epoch = max_epoch.max(epoch);
+                    loaded += 1;
+                }
+                None => tracing::warn!("skipping corrupt persisted committee for epoch {epoch}"),
+            }
+        }
+        if loaded > 0 {
+            // Everything up to the highest reloaded epoch is known, so the
+            // resolvable frontier resumes there; the ratchet derives further
+            // epochs from here as the chain advances past them.
+            validator_schedule.set_frontier_epoch(max_epoch);
+            tracing::info!("reloaded {loaded} epoch committees from disk; resolvable frontier at epoch {max_epoch}");
+        }
+    }
+    // The committee in effect for the round this node resumes at (under rotation)
+    // or the single fixed set (no rotation) — used for the resume decision below.
+    let current_committee = validator_schedule.for_round(next_round).clone();
+
     // Real bug found live building this exact fix, one layer deeper than
     // the `propose_round` gate it pairs with: `ConsensusState::
     // resuming_from` is only safe to use when this validator's own stake
@@ -220,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     // this fix existed, and that path never even reaches `resuming_from`'s
     // added behavior in the first place.
     let mut consensus =
-        if validators.stake_of(&self_id) >= validators.quorum_threshold() { ConsensusState::resuming_from(next_round) } else { ConsensusState::new() };
+        if current_committee.stake_of(&self_id) >= current_committee.quorum_threshold() { ConsensusState::resuming_from(next_round) } else { ConsensusState::new() };
 
     // Task #107 - DAG persistence. Reload every certificate this validator
     // previously certified from local disk (`data_dir/dag`, a `sled` tree)
@@ -341,29 +386,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Phase-3.3: build the committee schedule. With rotation OFF (the default,
-    // and every existing config) it is a single fixed committee — the exact
-    // phase-1/2 behavior, and `for_round` always returns it. With rotation ON
-    // it is a rotating schedule seeded with epoch 0 = the genesis validators
-    // (the bootstrap committee); the epoch ratchet in `try_commit` then derives
-    // and installs each later epoch's committee from the on-chain registry and
-    // raises the resolvable frontier. Epoch 0 governs until a viable active set
-    // exists on-chain, so a rotation network still starts from its genesis set.
-    let validator_schedule = if config.validator_rotation {
-        tracing::info!("validator rotation ENABLED (epoch_rounds={}) - the active committee will be re-derived from the on-chain registry each epoch", config.epoch_rounds());
-        ValidatorSchedule::new(config.epoch_rounds(), validators.clone())
-    } else {
-        ValidatorSchedule::single(validators.clone())
-    };
+    // The committee schedule was built (and, for a rotation node, reloaded from
+    // disk) above, before the consensus-resume decision. `current_committee` is
+    // the set in effect for the resume round; the schedule carries the full
+    // per-epoch map + resolvable frontier.
     let engine = Arc::new(Engine {
         self_id,
         keypair,
-        validators: std::sync::RwLock::new(std::sync::Arc::new(validators)),
+        validators: std::sync::RwLock::new(std::sync::Arc::new(current_committee)),
         validator_schedule: std::sync::RwLock::new(std::sync::Arc::new(validator_schedule)),
         validator_directory,
         network,
         chain_id: config.chain_id(),
         cert_log,
+        committee_log,
         receipt_log,
         staking_log,
         economics_path,

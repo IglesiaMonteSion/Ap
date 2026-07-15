@@ -75,6 +75,38 @@ pub fn active_committee_from_registry(registry: &qchain_execution::validator_reg
     let infos: Vec<ValidatorInfo> = active.into_iter().map(|rv| ValidatorInfo { id: rv.validator, pubkey_bundle: rv.pubkey_bundle, stake: rv.stake }).collect();
     Some(ValidatorSet::new(infos))
 }
+
+/// One validator's entry in a persisted epoch committee (phase-3.3 rotation).
+/// Borsh-encoded to `data_dir/committees` so a restarted rotation node can
+/// reconstruct the committee for each already-finalized epoch — those committees
+/// were derived from *historical* registry states the current ledger no longer
+/// holds, so without this a restart could not re-resolve the retained DAG
+/// window under the right committees.
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
+struct PersistedValidator {
+    id: qchain_crypto::Pubkey,
+    pubkey_bundle: qchain_crypto::PublicKeyBundle,
+    stake: u64,
+}
+
+/// Borsh-serialize a committee (deterministic order via `ids_sorted`) for the
+/// on-disk committee log.
+pub fn serialize_committee(committee: &ValidatorSet) -> Vec<u8> {
+    let entries: Vec<PersistedValidator> = committee
+        .ids_sorted()
+        .into_iter()
+        .filter_map(|id| committee.get(&id).map(|info| PersistedValidator { id, pubkey_bundle: info.pubkey_bundle.clone(), stake: info.stake }))
+        .collect();
+    borsh::to_vec(&entries).expect("committee always serializes")
+}
+
+/// Reconstruct a committee from the on-disk committee log. `None` on corrupt
+/// bytes (a corrupt entry is skipped at reload, not fatal — that epoch simply
+/// re-derives from peers/registry, same graceful degradation as a corrupt cert).
+pub fn deserialize_committee(bytes: &[u8]) -> Option<ValidatorSet> {
+    let entries: Vec<PersistedValidator> = borsh::from_slice(bytes).ok()?;
+    Some(ValidatorSet::new(entries.into_iter().map(|p| ValidatorInfo { id: p.id, pubkey_bundle: p.pubkey_bundle, stake: p.stake }).collect()))
+}
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
@@ -461,6 +493,14 @@ pub struct Engine {
     /// never double-charges or corrupts balances - the same idempotence the
     /// pre-existing network-refetch restart already relied on.
     pub cert_log: Option<sled::Db>,
+    /// Phase-3.3 rotation: on-disk log of each epoch's committee (a `sled` db at
+    /// `data_dir/committees`, `Some` only when rotation is on and the node
+    /// persists to disk). The epoch ratchet writes each newly-installed
+    /// committee here (keyed by epoch), and `main.rs` reloads them at startup to
+    /// rebuild the schedule — because a committee was derived from the on-chain
+    /// registry as of a *past* epoch boundary, state the current ledger no
+    /// longer reflects, so it cannot be re-derived after a restart.
+    pub committee_log: Option<sled::Db>,
     /// A cached consistent point-in-time snapshot for paginated serving, so a
     /// far-behind peer can download the state in bounded pages that all hash
     /// to one root (see `CachedSnapshot`/`snapshot_page`). Lazily captured on
@@ -2034,6 +2074,18 @@ impl Engine {
                     // The node is now entering `next_epoch` (its next proposal
                     // round is in it), so the current committee becomes this one.
                     *self.validators.write().expect("validators lock not poisoned") = std::sync::Arc::new(committee.clone());
+                    // Persist it so a restart can rebuild the schedule without
+                    // re-deriving from state the ledger no longer holds
+                    // (best-effort; a disk error just means that epoch re-syncs
+                    // from peers on the next boot, same as a lost certificate).
+                    if let Some(db) = &self.committee_log {
+                        match db.insert(next_epoch.to_be_bytes(), serialize_committee(&committee)) {
+                            Ok(_) => {
+                                let _ = db.flush();
+                            }
+                            Err(e) => tracing::warn!("failed to persist epoch {next_epoch} committee: {e}"),
+                        }
+                    }
                     tracing::info!("epoch {next_epoch}: committee ({} validators, {} stake) derived from the on-chain registry; resolvable frontier raised", committee.len(), committee.total_stake());
                 }
             }
@@ -2246,6 +2298,16 @@ mod tests {
         assert_eq!(committee.len(), 2);
         assert_eq!(committee.total_stake(), MIN_VALIDATOR_STAKE * 3);
         assert_eq!(committee.stake_of(&kp1.pubkey()), MIN_VALIDATOR_STAKE * 2);
+
+        // The committee round-trips through the on-disk persistence format
+        // (the reason a restarted rotation node can rebuild its schedule).
+        let bytes = serialize_committee(&committee);
+        let back = deserialize_committee(&bytes).expect("a serialized committee always deserializes");
+        assert_eq!(back.len(), committee.len());
+        assert_eq!(back.total_stake(), committee.total_stake());
+        assert_eq!(back.ids_sorted(), committee.ids_sorted());
+        assert_eq!(back.stake_of(&kp1.pubkey()), MIN_VALIDATOR_STAKE * 2);
+        assert!(deserialize_committee(b"not a committee").is_none());
     }
 
     fn new_state() -> EngineState {
