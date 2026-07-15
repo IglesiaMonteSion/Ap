@@ -29,6 +29,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/staking_activity", get(staking_activity))
         .route("/validators", get(validators))
         .route("/validator_registry", get(validator_registry))
+        .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
         .route("/version", get(version))
@@ -328,6 +329,33 @@ async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<se
         .map(|v| json!({ "validator": v.validator.to_string(), "address": v.address, "stake": v.stake }))
         .collect();
     Ok(Json(json!({ "validators": validators })))
+}
+
+/// `/active_validators` - the ACTIVE validator set for the current epoch,
+/// selected deterministically from the on-chain registry: the top
+/// `MAX_ACTIVE_VALIDATORS` by stake (ties broken by address), the same pure
+/// function every node computes identically (phase 3.2 - see
+/// `validator_registry::select_active_set`). Inert this increment: consensus
+/// still uses the static config set; this endpoint just previews what the
+/// stake-ranked active set *would* be, so the selection can be inspected on a
+/// live network before phase 3.3 wires it into `qchain-consensus`. `epoch` is
+/// derived from the node's current round.
+async fn active_validators(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use qchain_execution::validator_registry::{active_set_for_epoch, epoch_of, ValidatorRegistryData, MAX_ACTIVE_VALIDATORS};
+    use qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID;
+    let current_round = engine.status().await.next_round;
+    let epoch = epoch_of(current_round);
+    let registry = match engine.get_account(&VALIDATOR_REGISTRY_ACCOUNT_ID).await {
+        Some(acct) => ValidatorRegistryData::try_read(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("validator registry decode: {e}")))?,
+        None => ValidatorRegistryData::default(),
+    };
+    let active = active_set_for_epoch(&registry, epoch, MAX_ACTIVE_VALIDATORS);
+    let validators: Vec<serde_json::Value> = active
+        .validators
+        .iter()
+        .map(|v| json!({ "validator": v.validator.to_string(), "address": v.address, "stake": v.stake }))
+        .collect();
+    Ok(Json(json!({ "epoch": active.epoch, "current_round": current_round, "epoch_rounds": qchain_execution::validator_registry::EPOCH_ROUNDS, "max_active": MAX_ACTIVE_VALIDATORS, "validators": validators })))
 }
 
 /// Every equivocation this validator has independently witnessed and
