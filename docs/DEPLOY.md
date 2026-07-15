@@ -322,25 +322,68 @@ una versión nueva. Es solo un aviso (nunca afecta el consenso ni actúa
 automáticamente) y solo lo levanta un par que de verdad está en el conjunto
 de validadores.
 
-**Para actualizar un nodo** (desde el repo, en la VPS del nodo):
+**Para actualizar un nodo** — ahora es UN SOLO COMANDO (desde el repo, en la
+VPS del nodo):
 
 ```
-git pull                        # traé el código nuevo
-sudo ./deploy/update-node.sh    # reconstruye la imagen y reinicia el nodo
+sudo ./deploy/update-node.sh    # git pull + rebuild + restart + health-check
 ```
 
-`update-node.sh` muestra la versión actual vs. la del repo, reconstruye
-`qchain:latest` desde el código, y reinicia el servicio systemd. **Tu clave,
-`config.json` y `data/` no se tocan** — el nodo resume su estado exacto desde
-`data_dir` (balances, nonces, DAG, todo). Es seguro correrlo aunque no haya
-cambios. Para cortar una versión nueva (cuando hagas mejoras): subí `version`
-en el `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador
-corre `update-node.sh`.
+El script hace todo solo, en orden: **(1)** `git pull` del repo (como el dueño
+del repo, no como root, para evitar el error de "dubious ownership" de git);
+**(2)** si el commit no cambió desde la última actualización, **no reconstruye**
+(salvo `--force`); **(3)** etiqueta la imagen actual como `qchain:previous`
+(punto de **rollback** real); **(4)** reconstruye `qchain:latest`; **(5)**
+reinicia el servicio systemd; **(6)** hace un **health-check de verdad** — no
+solo que systemd diga "active", sino que el RPC responda **y que la ronda de
+consenso avance** (detecta un nodo congelado). Si no queda sano, con
+`--rollback` vuelve solo a la imagen anterior; sin la bandera te deja el
+comando exacto de rollback. **Tu clave, `config.json` y `data/` nunca se
+tocan** — el nodo resume su estado exacto desde `data_dir`.
+
+Banderas: `--no-pull` (no hacer git pull), `--force` (reconstruir aunque no
+haya cambios), `--rollback` (volver solo a la versión anterior si el nodo no
+queda sano), `--yes` (sin preguntar).
+
+**Actualizar nodo Y wallet de una vez:** `sudo ./deploy/update.sh` — hace el
+flujo completo de arriba y además reinicia la wallet contra la misma imagen,
+**reconstruyendo una sola vez** (no dos).
 
 **Actualización rápida de solo la wallet** (cambios de interfaz — lo más
-frecuente): `sudo ./deploy/update-wallet.sh` reconstruye la imagen (rápido
-con la cache) y reinicia **solo** `qchain-wallet`, sin reiniciar el
-validador. Usá `update-node.sh` cuando cambie el nodo/consenso.
+frecuente): `sudo ./deploy/update-wallet.sh` (también hace git pull +
+skip-si-no-cambió + health-check HTTP) reconstruye la imagen y reinicia
+**solo** `qchain-wallet`, sin reiniciar el validador.
+
+Para cortar una versión nueva (cuando hagas mejoras): subí `version` en el
+`Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador corre
+`update-node.sh`.
+
+### Agregar un validador nuevo (incluso de alguien que no conocés)
+
+El registro de validadores es **on-chain y permissionless** — no hace falta
+que un coordinador recolecte a mano el bundle/dirección/stake de cada uno:
+
+1. **El nuevo validador se registra a sí mismo** (necesita QCH; pedilo al
+   faucet): bloquea self-stake y publica su bundle + dirección P2P on-chain.
+   ```
+   qchain stake-delegate --rpc <nodo> --keypair suya.json --validator <su propia dirección> --amount 10000000
+   qchain register-validator --rpc <nodo> --keypair suya.json --stake-account <la que imprimió> --address <su_ip:puerto>
+   ```
+2. **Un coordinador regenera la lista de validadores** desde el registro
+   on-chain, con un comando, y la pega en la config:
+   ```
+   qchain gen-validators --rpc <nodo>     # imprime el array `validators` listo para la config
+   ```
+   Pegá ese array en el campo `validators` de la config de **cada** nodo
+   (todos deben usar el **mismo** array, o los nodos no se ponen de acuerdo
+   sobre el conjunto), commiteá, y cada operador corre `sudo ./deploy/update.sh`.
+
+Esto elimina el recolectar-a-mano y el editar genesis. Sigue habiendo un
+redeploy coordinado (un `update.sh` por operador). **Nota honesta:** la
+rotación **automática** del conjunto sin redeploy (que un validador entre solo
+al consenso en cuanto se registra) es un cambio de protocolo de consenso más
+profundo (BFT reconfiguration), documentado como trabajo siguiente — el camino
+de arriba es el seguro y ya disponible.
 
 **Cómo elegir el número de versión:**
 - **Cambio chico** (fix puntual, ajuste de UI, tooling, mejora menor): subí el

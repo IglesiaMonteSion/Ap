@@ -364,6 +364,22 @@ enum Command {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
     },
+    /// Regenerate a node config's `validators` array straight from the
+    /// on-chain validator registry (phase 3). Fetches every self-registered
+    /// validator (bundle + address + stake) and prints the JSON array ready
+    /// to paste into each node's config `validators` field - so adding a
+    /// newcomer is: they register on-chain (permissionless), then a
+    /// coordinator runs this once and redeploys the refreshed config to every
+    /// operator (a coordinated restart via deploy/update.sh). No hand-editing,
+    /// no collecting each stranger's key bundle by hand. NOTE: this does NOT
+    /// change consensus live - the set is still applied via config at (re)start
+    /// (fully-automatic mid-epoch rotation is a separate consensus change);
+    /// every operator must deploy the SAME generated array, or nodes disagree
+    /// on the set.
+    GenValidators {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+    },
     /// Print the current on-chain economic parameters.
     Params {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -853,6 +869,30 @@ fn main() -> anyhow::Result<()> {
             let account = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?.ok_or_else(|| anyhow::anyhow!("params account not found - is genesis seeded?"))?;
             let params: EconomicParams = borsh::from_slice(&account.data)?;
             println!("{params:#?}");
+        }
+        Command::GenValidators { rpc } => {
+            // Read the live on-chain registry via the node's RPC (includes the
+            // pubkey_bundle) and emit a config-ready `validators` array. Each
+            // registered entry's `address` string ("ip:port") maps directly to
+            // the config's `addr: SocketAddr` (same textual form).
+            let resp: serde_json::Value = reqwest::blocking::get(format!("{rpc}/validator_registry"))?.error_for_status()?.json()?;
+            let list = resp.get("validators").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if list.is_empty() {
+                eprintln!("the on-chain validator registry is empty - no validators have registered yet (see `qchain register-validator`)");
+            }
+            let validators: Vec<serde_json::Value> = list
+                .iter()
+                .filter_map(|v| {
+                    let bundle = v.get("pubkey_bundle")?.clone();
+                    let addr = v.get("address")?.as_str()?.to_string();
+                    let stake = v.get("stake")?.as_u64()?;
+                    Some(serde_json::json!({ "pubkey_bundle": bundle, "addr": addr, "stake": stake }))
+                })
+                .collect();
+            // Print just the array - paste it into each node config's
+            // `validators` field. Pretty-printed for easy diffing/review.
+            println!("{}", serde_json::to_string_pretty(&validators)?);
+            eprintln!("\n{} validator(s) from the on-chain registry. Paste this into the `validators` field of EVERY node's config, then redeploy (deploy/update.sh) - all operators must use the same set.", validators.len());
         }
         Command::ProposalStatus { rpc, proposal } => {
             let proposal_pk: Pubkey = proposal.parse()?;

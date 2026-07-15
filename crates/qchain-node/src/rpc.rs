@@ -326,7 +326,18 @@ async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<se
     let validators: Vec<serde_json::Value> = registry
         .validators
         .iter()
-        .map(|v| json!({ "validator": v.validator.to_string(), "address": v.address, "stake": v.stake }))
+        .map(|v| {
+            // `pubkey_bundle` is included so a coordinator tool (`qchain
+            // gen-validators`) can rebuild a node `validators` config array
+            // straight from on-chain registrations - no hand-collecting each
+            // newcomer's bundle. It's public key material, safe to expose.
+            json!({
+                "validator": v.validator.to_string(),
+                "address": v.address,
+                "stake": v.stake,
+                "pubkey_bundle": v.pubkey_bundle,
+            })
+        })
         .collect();
     Ok(Json(json!({ "validators": validators })))
 }
