@@ -277,11 +277,38 @@ impl<'a> Bullshark<'a> {
     /// reached via a second path is always already in `memo` by the time that
     /// path re-enters it, so it is never re-expanded - the same anti-blowup
     /// guarantee the per-call memo gave the recursive version.
-    fn walk_causal_history(&self, root: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>, memo: &mut HashMap<Digest, bool>) -> bool {
+    fn walk_causal_history(&self, root: Digest, seen: &mut HashSet<Digest>, ordered: &mut Vec<Digest>) -> bool {
         enum Step {
             Enter(Digest),
             Exit(Digest),
         }
+        // ATOMIC per-leader commit. Emissions go into a LOCAL buffer and are
+        // merged into the shared committed order (`ordered`/`seen`) ONLY if
+        // `root`'s ENTIRE causal history turns out to be present. If any ancestor
+        // is still missing, nothing is committed for this leader and the walk is
+        // retried on a later call once re-sync fills the gap.
+        //
+        // **This is a SAFETY requirement, not an optimization.** An earlier
+        // version emitted a leader's already-present causal *siblings* into the
+        // committed order immediately, even when the leader itself couldn't fully
+        // resolve (a missing ancestor). A certificate that then arrived LATE — the
+        // canonical case being a departed validator's certificate re-synced from a
+        // survivor after a committee shrink — would append into the order AFTER
+        // siblings that a node with the full DAG places BEFORE it. Committed order
+        // is append-only, so the two honest nodes would permanently disagree: a
+        // fork. Reproduced deterministically (see the shrink-safety unit test) and
+        // guarded by the membership-change DST. Making each leader's history
+        // commit all-or-nothing removes the reordering window entirely.
+        //
+        // `memo` is per-walk (created here, not threaded across leaders): it still
+        // gives the O(1)-per-shared-ancestor anti-blowup WITHIN one leader's walk
+        // (the real exponential bug it was introduced for). Cross-leader sharing
+        // now flows through `seen` instead — a certificate a prior leader already
+        // committed is in `seen` and short-circuited — which is exactly the set
+        // that is safe to share, since only fully-committed history lives there.
+        let mut local_ordered: Vec<Digest> = Vec::new();
+        let mut local_seen: HashSet<Digest> = HashSet::new();
+        let mut memo: HashMap<Digest, bool> = HashMap::new();
         let mut stack = vec![Step::Enter(root)];
         while let Some(step) = stack.pop() {
             match step {
@@ -300,8 +327,8 @@ impl<'a> Bullshark<'a> {
                     // visited, so a restart re-derivation stops cleanly at the
                     // barrier instead of failing on a dropped certificate.
                     if cert.vertex.round <= self.gc_floor {
-                        seen.insert(digest);
-                        ordered.push(digest);
+                        local_seen.insert(digest);
+                        local_ordered.push(digest);
                         memo.insert(digest, true);
                         continue;
                     }
@@ -320,21 +347,29 @@ impl<'a> Bullshark<'a> {
                         continue;
                     }
                     let cert = self.dag.get(&digest).expect("a digest present at Enter is still present at Exit");
-                    let all_parents_resolved = cert.vertex.parents.iter().all(|p| seen.contains(p) || memo.get(p).copied().unwrap_or(false));
+                    let all_parents_resolved = cert.vertex.parents.iter().all(|p| seen.contains(p) || local_seen.contains(p));
                     if all_parents_resolved {
-                        seen.insert(digest);
-                        ordered.push(digest);
+                        local_seen.insert(digest);
+                        local_ordered.push(digest);
                         memo.insert(digest, true);
                     } else {
-                        // A sibling reachable via a different parent already
-                        // committed on its own merits during the walk; only
-                        // this digest's own chain is still unresolved.
+                        // This digest's own chain is still unresolved (a missing
+                        // ancestor). It is NOT committed; if `root` depends on it,
+                        // the whole leader stays uncommitted and is retried later.
                         memo.insert(digest, false);
                     }
                 }
             }
         }
-        seen.contains(&root)
+        let fully_resolved = seen.contains(&root) || local_seen.contains(&root);
+        if fully_resolved {
+            // Commit the whole causal history atomically, in the post-order the
+            // walk produced (byte-identical to the eager version's order for a
+            // fully-present history).
+            ordered.extend(local_ordered);
+            seen.extend(local_seen);
+        }
+        fully_resolved
     }
 
     /// Extend the total order across every leader round in `from_round
@@ -367,13 +402,6 @@ impl<'a> Bullshark<'a> {
     /// `ConsensusState::advance`/`set_gc_floor`.
     pub fn extend_order(&self, from_round: Round, up_to_round: Round, seen: &mut HashSet<Digest>, committed_cache: &mut HashMap<Round, Digest>) -> (Vec<Digest>, Round) {
         let mut ordered = Vec::new();
-        // Scoped to this one call only - see `walk_causal_history`'s doc
-        // comment for the real exponential-blowup bug this closes. Many
-        // rounds' leader digests share ancestors in a real (wide, multi-
-        // parent) DAG; without this, each shared-but-still-unresolved
-        // ancestor gets fully re-walked from scratch on every path that
-        // reaches it, within this single call.
-        let mut memo = HashMap::new();
         let mut round = from_round;
         while round <= up_to_round {
             // A `Committed` verdict is permanent (see `ConsensusState::
@@ -393,7 +421,7 @@ impl<'a> Bullshark<'a> {
             };
             match outcome {
                 RoundOutcome::Committed(digest) => {
-                    if !self.walk_causal_history(digest, seen, &mut ordered, &mut memo) {
+                    if !self.walk_causal_history(digest, seen, &mut ordered) {
                         break;
                     }
                     round += 1;
@@ -648,8 +676,7 @@ mod tests {
         let bull = Bullshark::new(&dag, &schedule);
         let mut seen = HashSet::new();
         let mut ordered = Vec::new();
-        let mut memo = HashMap::new();
-        assert!(bull.walk_causal_history(*digests.last().unwrap(), &mut seen, &mut ordered, &mut memo), "a fully-present deep chain must resolve");
+        assert!(bull.walk_causal_history(*digests.last().unwrap(), &mut seen, &mut ordered), "a fully-present deep chain must resolve");
         assert_eq!(ordered.len() as u64, depth, "every certificate in the chain is emitted exactly once");
         assert_eq!(ordered, digests, "a linear chain must emit ancestor-first (deepest first), identical to the recursive post-order");
     }
@@ -837,6 +864,80 @@ mod tests {
         let leader_2 = Bullshark::new(&dag_full, &schedule).leader_for_round(2).expect("the shrunk committee elects a leader");
         let leader_2_digest = r2.iter().find(|c| c.vertex.author == leader_2).unwrap().digest();
         assert!(order_full.contains(&leader_2_digest), "consensus must commit a committee-B round through the shrink (liveness)");
+    }
+
+    /// **The shrink SAFETY proof the node-layer re-sync fix depends on: a
+    /// departed validator's late-arriving certificate must not reorder the
+    /// already-committed prefix (an append-only committed order forks if it
+    /// does).** This is the exact scenario `retry_pending_resync_requests`'s
+    /// broadcast-on-departed-peer fix makes recoverable at the node layer, tested
+    /// here at the ordering layer with a PERSISTENT `ConsensusState`: a survivor
+    /// commits everything it can while missing the departed validator's round-1
+    /// certificate, then that certificate arrives late (re-sync). Its final
+    /// committed order — the concatenation of both `advance` calls, append-only,
+    /// exactly as a real node accumulates it — must equal a node that had the
+    /// full DAG from the start. If Bullshark ever emitted a committed leader's
+    /// causal-history siblings before the leader's whole history was present, the
+    /// late certificate would append out of order and two honest survivors would
+    /// diverge; this proves it does not.
+    #[test]
+    fn a_departed_validators_late_certificate_does_not_reorder_the_committed_prefix() {
+        use crate::ConsensusState;
+        let kps: Vec<Keypair> = (0..4).map(|_| Keypair::generate().unwrap()).collect();
+        let info = |i: usize| crate::quorum::ValidatorInfo { id: kps[i].pubkey(), pubkey_bundle: kps[i].public_key_bundle(), stake: 1 };
+        let committee_a = ValidatorSet::new((0..4).map(info).collect());
+        let committee_b = ValidatorSet::new((0..2).map(info).collect());
+        let a_ids: Vec<ValidatorId> = (0..4).map(|i| kps[i].pubkey()).collect();
+        let b_ids: Vec<ValidatorId> = (0..2).map(|i| kps[i].pubkey()).collect();
+        let mut schedule = ValidatorSchedule::new(2, committee_a);
+        schedule.install_epoch(1, committee_b);
+        schedule.set_frontier_epoch(1);
+
+        // A deeper DAG (rounds 0-5) so committee-B rounds genuinely commit through
+        // anchors, giving a real committed order whose prefix could be reordered.
+        let r0: Vec<Certificate> = a_ids.iter().map(|id| cert(0, *id, vec![])).collect();
+        let r0d: Vec<Digest> = r0.iter().map(|c| c.digest()).collect();
+        let r1: Vec<Certificate> = a_ids.iter().map(|id| cert(1, *id, r0d.clone())).collect();
+        let r1d: Vec<Digest> = r1.iter().map(|c| c.digest()).collect();
+        let r2: Vec<Certificate> = b_ids.iter().map(|id| cert(2, *id, r1d.clone())).collect();
+        let r2d: Vec<Digest> = r2.iter().map(|c| c.digest()).collect();
+        let r3: Vec<Certificate> = b_ids.iter().map(|id| cert(3, *id, r2d.clone())).collect();
+        let r3d: Vec<Digest> = r3.iter().map(|c| c.digest()).collect();
+        let r4: Vec<Certificate> = b_ids.iter().map(|id| cert(4, *id, r3d.clone())).collect();
+        let r4d: Vec<Digest> = r4.iter().map(|c| c.digest()).collect();
+        let r5: Vec<Certificate> = b_ids.iter().map(|id| cert(5, *id, r4d.clone())).collect();
+
+        let insert_all = |dag: &mut DagStore, certs: &[&[Certificate]]| {
+            for group in certs {
+                for c in group.iter() {
+                    dag.insert(c.clone());
+                }
+            }
+        };
+
+        // Reference: the full DAG, resolved in one shot.
+        let mut dag_ref = DagStore::new();
+        insert_all(&mut dag_ref, &[&r0, &r1, &r2, &r3, &r4, &r5]);
+        let order_ref = ConsensusState::new().advance(&dag_ref, &schedule);
+
+        // Survivor B: persistent state. Commits everything it can WITHOUT the
+        // departed validator v3's round-1 certificate, then that certificate
+        // arrives late and it advances again — accumulating append-only.
+        let v3_r1 = r1.iter().find(|c| c.vertex.author == a_ids[3]).unwrap().clone();
+        let mut dag_b = DagStore::new();
+        let mut state_b = ConsensusState::new();
+        let mut order_b = Vec::new();
+        insert_all(&mut dag_b, &[&r0]);
+        for c in r1.iter().filter(|c| c.vertex.author != a_ids[3]) {
+            dag_b.insert(c.clone());
+        }
+        insert_all(&mut dag_b, &[&r2, &r3, &r4, &r5]);
+        order_b.extend(state_b.advance(&dag_b, &schedule));
+        // The departed validator's certificate finally re-syncs.
+        dag_b.insert(v3_r1);
+        order_b.extend(state_b.advance(&dag_b, &schedule));
+
+        assert_eq!(order_b, order_ref, "a departed validator's late certificate must not reorder the committed prefix (append-only order would fork)");
     }
 
     /// **Phase-3.3 stage-2b: the resolvable frontier holds back rounds of an
