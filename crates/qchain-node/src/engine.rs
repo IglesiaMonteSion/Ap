@@ -419,15 +419,22 @@ pub struct EngineState {
     /// confirmed-live bug this closes: without an independent retry, a
     /// single lost response (not just a lost original broadcast) left a
     /// permanent gap.
-    pub pending_cert_requests: HashMap<Digest, ValidatorId>,
-    pub pending_batch_requests: HashMap<(WorkerId, Digest), ValidatorId>,
+    /// Value: (who to ask, the round this request was first made). The round is
+    /// what lets `prune_stale_round_state` bound this map by round window - a
+    /// Byzantine committee member could otherwise stream `VertexProposal`s each
+    /// carrying fresh random parent digests that never resolve, growing this map
+    /// (and its per-tick re-send bandwidth) without bound (found in a proactive
+    /// audit; the per-message `parents.len()` cap bounds one message, not the
+    /// cross-message accumulation).
+    pub pending_cert_requests: HashMap<Digest, (ValidatorId, Round)>,
+    pub pending_batch_requests: HashMap<(WorkerId, Digest), (ValidatorId, Round)>,
     /// Outstanding `Vote` replies this validator owes to a vertex's author,
     /// keyed by the vertex digest being voted for, valued by (who to send
     /// it to, the signature itself) - see `retry_pending_resync_requests`'s
     /// doc comment for the real, confirmed-live bug this closes: unlike
     /// `VertexProposal`/`CertificateRequest`/`WorkerBatchRequest`, a `Vote`
     /// was a single-attempt send with no retry at all.
-    pub pending_votes_to_send: HashMap<Digest, (ValidatorId, MultiSignature)>,
+    pub pending_votes_to_send: HashMap<Digest, (ValidatorId, MultiSignature, Round)>,
     /// The most recent certificate this validator itself authored -
     /// unconditionally re-broadcast every tick (see
     /// `retry_pending_resync_requests`'s doc comment for the real,
@@ -1587,7 +1594,8 @@ impl Engine {
                 // socket that wasn't bound yet.
                 {
                     let mut state = self.state.lock().await;
-                    state.pending_votes_to_send.insert(digest, (from, sig.clone()));
+                    let vote_round = state.next_round;
+                    state.pending_votes_to_send.insert(digest, (from, sig.clone(), vote_round));
                 }
                 if let Some(addr) = self.network.addr_of(&from) {
                     if let Err(e) = self.network.send_to(addr, &NetMessage::Vote { vertex_digest: digest, signature: sig }).await {
@@ -1756,8 +1764,9 @@ impl Engine {
                 return;
             }
             let missing: Vec<Digest> = parents.iter().copied().filter(|d| !state.dag.contains(d)).collect();
+            let req_round = state.next_round;
             for &digest in &missing {
-                state.pending_cert_requests.insert(digest, from);
+                state.pending_cert_requests.entry(digest).or_insert((from, req_round));
             }
             missing
         };
@@ -1786,8 +1795,9 @@ impl Engine {
         let missing: Vec<(WorkerId, Digest)> = {
             let mut state = self.state.lock().await;
             let missing: Vec<(WorkerId, Digest)> = batch_digests.iter().copied().filter(|(_, d)| !state.batches.contains_key(d)).collect();
+            let req_round = state.next_round;
             for &(worker_id, digest) in &missing {
-                state.pending_batch_requests.insert((worker_id, digest), from);
+                state.pending_batch_requests.entry((worker_id, digest)).or_insert((from, req_round));
             }
             missing
         };
@@ -1927,11 +1937,11 @@ impl Engine {
             for digest in &resolved_votes {
                 state.pending_votes_to_send.remove(digest);
             }
-            let cert_retries: Vec<(Digest, ValidatorId)> = state.pending_cert_requests.iter().map(|(&d, &from)| (d, from)).collect();
+            let cert_retries: Vec<(Digest, ValidatorId)> = state.pending_cert_requests.iter().map(|(&d, &(from, _))| (d, from)).collect();
             let batch_retries: Vec<(WorkerId, Digest, ValidatorId)> =
-                state.pending_batch_requests.iter().map(|(&(worker_id, d), &from)| (worker_id, d, from)).collect();
+                state.pending_batch_requests.iter().map(|(&(worker_id, d), &(from, _))| (worker_id, d, from)).collect();
             let vote_retries: Vec<(Digest, ValidatorId, MultiSignature)> =
-                state.pending_votes_to_send.iter().map(|(&d, (from, sig))| (d, *from, sig.clone())).collect();
+                state.pending_votes_to_send.iter().map(|(&d, (from, sig, _))| (d, *from, sig.clone())).collect();
             let own_cert_retry = state.own_last_certificate.clone();
             (cert_retries, batch_retries, vote_retries, own_cert_retry)
         };
@@ -1987,6 +1997,19 @@ impl Engine {
         if round_horizon > 0 {
             state.voted_for.retain(|(round, _), _| *round >= round_horizon);
             state.first_seen_vertex.retain(|(round, _), _| *round >= round_horizon);
+            // Bound the outstanding re-sync request maps by the same round
+            // window. Without this a Byzantine committee member could stream
+            // `VertexProposal`s each carrying fresh random parent digests that
+            // never resolve, growing these maps AND their per-tick re-send
+            // bandwidth without bound (the per-message `parents.len()` cap bounds
+            // one message, not the cross-message accumulation - found in a
+            // proactive audit). A genuinely missing recent parent/batch/vote
+            // resolves well within `ROUND_STATE_RETENTION` rounds; anything older
+            // is unreachable via reactive resync anyway (that's the snapshot
+            // path's job), so dropping it is safe.
+            state.pending_cert_requests.retain(|_, v| v.1 >= round_horizon);
+            state.pending_batch_requests.retain(|_, v| v.1 >= round_horizon);
+            state.pending_votes_to_send.retain(|_, v| v.2 >= round_horizon);
         }
 
         // Bound `equivocation_evidence` to at most one entry per author. A
@@ -2000,19 +2023,34 @@ impl Engine {
             state.equivocation_evidence.retain(|(_, author), _| seen_authors.insert(*author));
         }
 
-        // Evict worker batches older than `BATCH_RETENTION_ROUNDS` - the
-        // round-windowed bound on the otherwise-unbounded `batches` cache
-        // (fed by unauthenticated gossip). Kept long enough that a peer
-        // resyncing within the window can still fetch them.
+        // Evict worker batches from the IN-MEMORY cache older than
+        // `BATCH_RETENTION_ROUNDS` - the round-windowed bound on the otherwise-
+        // unbounded `batches` map (fed by unauthenticated gossip). The retention
+        // *tags* (`batch_seen_round`) are deliberately kept past this point (see
+        // the on-disk prune below) so the disk log can be bounded on a different,
+        // lower floor.
         let batch_horizon = state.next_round.saturating_sub(BATCH_RETENTION_ROUNDS);
         if batch_horizon > 0 {
             let stale: Vec<Digest> = state.batch_seen_round.iter().filter(|(_, &seen)| seen < batch_horizon).map(|(&d, _)| d).collect();
             for digest in &stale {
                 state.batches.remove(digest);
+            }
+        }
+        // Prune the ON-DISK batch log (and its retention tags) at the DAG GC
+        // floor (`finalized_floor - DAG_RETENTION_ROUNDS`), the SAME window the
+        // certificate log uses - NEVER at the higher `batch_horizon`. A restart
+        // reloads the retained certificates and re-derives their committed order;
+        // if a retained certificate's batch were already deleted from disk, a
+        // solo validator (no peer to re-sync from) would re-freeze execution
+        // exactly as before v3.5.1. Because `finalized_floor <= next_round`, this
+        // floor is at or below `batch_horizon`, so disk batches always outlive
+        // the in-memory cache and every retained cert keeps its batch on disk.
+        let disk_batch_floor = state.consensus.finalized_floor().saturating_sub(DAG_RETENTION_ROUNDS);
+        if disk_batch_floor > 0 {
+            let expired: Vec<Digest> = state.batch_seen_round.iter().filter(|(_, &seen)| seen < disk_batch_floor).map(|(&d, _)| d).collect();
+            for digest in &expired {
                 state.batch_seen_round.remove(digest);
-                // Keep the on-disk batch log bounded in lock-step with the
-                // in-memory cache (same `BATCH_RETENTION_ROUNDS` window) - a
-                // best-effort delete, a dead key just gets re-pruned next tick.
+                state.batches.remove(digest);
                 if let Some(db) = &self.batch_log {
                     if let Err(e) = db.remove(digest) {
                         tracing::warn!("failed to delete pruned batch {digest:?} from the batch log: {e}");

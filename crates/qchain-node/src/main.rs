@@ -239,7 +239,13 @@ async fn main() -> anyhow::Result<()> {
         let mut max_epoch = 0u64;
         for kv in db.iter() {
             let (k, v) = kv?;
-            let epoch = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+            // A malformed (non-8-byte) key would otherwise map to epoch 0 and
+            // clobber the genesis committee - skip it loudly instead.
+            let Ok(epoch_bytes) = <[u8; 8]>::try_from(k.as_ref()) else {
+                tracing::warn!("skipping a committee-log entry with a malformed {}-byte key (expected 8)", k.len());
+                continue;
+            };
+            let epoch = u64::from_be_bytes(epoch_bytes);
             match qchain_node::engine::deserialize_committee(&v) {
                 Some(committee) => {
                     validator_schedule.install_epoch(epoch, committee);
@@ -346,12 +352,14 @@ async fn main() -> anyhow::Result<()> {
             let (digest_bytes, bytes) = entry?;
             match borsh::from_slice::<qchain_core::Batch>(&bytes) {
                 Ok(batch) => {
-                    let mut digest = [0u8; 32];
                     if digest_bytes.len() == 32 {
+                        let mut digest = [0u8; 32];
                         digest.copy_from_slice(&digest_bytes);
                         reloaded_batches.insert(digest, batch);
                         reloaded_batch_rounds.insert(digest, next_round);
                         loaded += 1;
+                    } else {
+                        tracing::warn!("skipping a batch-log entry with a malformed {}-byte key (expected 32)", digest_bytes.len());
                     }
                 }
                 Err(e) => tracing::warn!("skipping a corrupt batch in the on-disk batch log: {e}"),
