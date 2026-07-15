@@ -473,6 +473,18 @@ enum Command {
         /// the tool tries `GET /validators` and uses the first one.
         #[arg(long)]
         validator: Option<String>,
+        /// If > 0, run a CONTINUOUS mode instead of the geometric ramp: every
+        /// worker submits transactions back-to-back for this many seconds (no
+        /// per-step settle pause), then the tool waits for the mempool to drain
+        /// and reports a full submitted → accepted → executed → still-queued
+        /// reconciliation (so you can see exactly whether anything was lost).
+        #[arg(long, default_value_t = 0)]
+        sustained_secs: u64,
+        /// In continuous mode, top up any worker whose balance drops below one
+        /// transaction's worth of the (risen) fee, so the dynamic fee can't
+        /// strand the load generator before the node itself is the limit.
+        #[arg(long, default_value_t = true)]
+        refund: bool,
     },
     /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
     /// see `qchain-execution::native`). Prints the fresh address the
@@ -705,6 +717,42 @@ fn deploy_noop_contract(rpc: &str, bank: &Keypair, chain_id: [u8; 32]) -> anyhow
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     Ok(program_pk)
+}
+
+/// Builds one stress-load instruction from `payer`, choosing the op type by a
+/// cheap deterministic hash of `bucket_seed` so the transfer/staking/contract
+/// ratios stay stable. Shared by the ramp and the continuous modes so both mix
+/// load identically.
+fn build_stress_ix(
+    payer: Pubkey,
+    recipient: Pubkey,
+    program_pk: Option<Pubkey>,
+    validator_pk: Option<Pubkey>,
+    contract_pct: u64,
+    stake_pct: u64,
+    bucket_seed: u64,
+) -> Instruction {
+    let bucket = (bucket_seed.wrapping_mul(2654435761) >> 8) % 100;
+    if bucket < contract_pct {
+        if let Some(program) = program_pk {
+            return Instruction { program_id: program, accounts: vec![payer], data: 0i64.to_le_bytes().to_vec() };
+        }
+    }
+    if bucket < contract_pct + stake_pct {
+        if let Some(validator) = validator_pk {
+            let stake_pk = Keypair::generate().unwrap().pubkey();
+            return Instruction {
+                program_id: STAKING_PROGRAM_ID,
+                accounts: vec![payer, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+                data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 1_000_000 }).unwrap(),
+            };
+        }
+    }
+    Instruction {
+        program_id: Pubkey::system_program_id(),
+        accounts: vec![payer, recipient],
+        data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+    }
 }
 
 fn submit_instruction(
@@ -1216,6 +1264,8 @@ fn main() -> anyhow::Result<()> {
             stake_pct,
             contract_pct,
             validator,
+            sustained_secs,
+            refund,
         } => {
             let bank = qchain_crypto::read_keypair_file(&keypair)?;
             let chain_id = fetch_chain_id(&rpc)?;
@@ -1303,10 +1353,157 @@ fn main() -> anyhow::Result<()> {
             }
             println!(" done\n");
 
+            // Nonce-based executed accounting (refund-proof): a worker's on-chain
+            // nonce only advances when one of ITS transactions actually executes,
+            // so summing each worker's nonce delta over the whole run counts
+            // exactly the worker transactions that committed - never the bank's
+            // funding/refund transactions. Captured before the load starts.
+            let run_initial_nonces: Vec<u64> = workers_kp
+                .iter()
+                .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
+                .collect();
+            let mut total_attempted = 0u64; // signed + POSTed
+            let mut total_accepted = 0u64; // admitted to a mempool (RPC returned 2xx)
+            let mut total_failed = 0u64; // rejected at admission (RPC returned an error)
+            let mut broke = false;
+
+            if sustained_secs > 0 {
+                // ---- CONTINUOUS MODE: every worker submits back-to-back for the
+                // whole window, no per-step settle. An optional refunder thread
+                // tops workers up so the rising fee can't strand the generator
+                // before the node itself is the bottleneck.
+                println!("continuous mode: {workers} workers submitting for {sustained_secs}s (refund={refund})...");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(sustained_secs);
+                let bank_ref = &bank;
+                let workers_ref = &workers_kp;
+                let rpc_ref = &rpc;
+                let program_ref = program_pk;
+                let validator_ref = validator_pk;
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                let stop_ref = &stop;
+                let results: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
+                    // Refunder: single writer of the bank account (no nonce race),
+                    // tops up any worker below a per-tx fee estimate every ~1.5s.
+                    if refund {
+                        scope.spawn(move || {
+                            let client = reqwest::blocking::Client::new();
+                            let mut bank_nonce = fetch_account(rpc_ref, &bank_ref.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0);
+                            while !stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                                let bf = fetch_account(rpc_ref, &PARAMS_ACCOUNT_ID).ok().flatten()
+                                    .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
+                                    .map(|p| p.base_fee_per_byte).unwrap_or(180);
+                                let one_tx = bf.saturating_mul(6_000).max(2_000_000);
+                                let topup = one_tx.saturating_mul(50);
+                                for w in workers_ref.iter() {
+                                    let bal = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.balance).unwrap_or(0);
+                                    if bal < one_tx.saturating_mul(4) {
+                                        let ix = Instruction {
+                                            program_id: Pubkey::system_program_id(),
+                                            accounts: vec![bank_ref.pubkey(), w.pubkey()],
+                                            data: borsh::to_vec(&SystemInstruction::Transfer { amount: topup }).unwrap(),
+                                        };
+                                        if let Ok(tx) = Transaction::new_signed(bank_ref, bank_nonce, chain_id, 1_000_000_000, vec![ix]) {
+                                            if client.post(format!("{rpc_ref}/tx")).json(&tx).send().map(|r| r.status().is_success()).unwrap_or(false) {
+                                                bank_nonce += 1;
+                                            } else {
+                                                bank_nonce = fetch_account(rpc_ref, &bank_ref.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(bank_nonce);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    let handles: Vec<_> = workers_ref
+                        .iter()
+                        .enumerate()
+                        .map(|(wi, w)| {
+                            scope.spawn(move || {
+                                // In-flight throttle: never let a worker run more
+                                // than MAX_INFLIGHT nonces ahead of its confirmed
+                                // on-chain nonce. This makes the OFFERED load track
+                                // the node's real EXECUTION rate instead of piling
+                                // an unbounded backlog — which otherwise spikes the
+                                // dynamic fee so high that queued txs fail (fee >
+                                // fee_limit / insufficient funds) and, because the
+                                // base fee only decays inside a *successful* tx, the
+                                // whole network can wedge at a pinned-high fee. With
+                                // the cap the fee stabilizes near equilibrium and
+                                // "continuous" means sustainable, not a self-DoS.
+                                const MAX_INFLIGHT: u64 = 48;
+                                let client = reqwest::blocking::Client::new();
+                                let mut confirmed = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0);
+                                let mut nonce = confirmed;
+                                let (mut attempted, mut accepted, mut failed) = (0u64, 0u64, 0u64);
+                                let mut since_sync = 0u64;
+                                let mut counter = wi as u64;
+                                while std::time::Instant::now() < deadline {
+                                    // Throttle: if too far ahead of confirmed, refresh
+                                    // the on-chain nonce and wait for execution to
+                                    // catch up rather than adding to the backlog.
+                                    if nonce.saturating_sub(confirmed) >= MAX_INFLIGHT {
+                                        confirmed = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(confirmed);
+                                        if nonce.saturating_sub(confirmed) >= MAX_INFLIGHT {
+                                            std::thread::sleep(std::time::Duration::from_millis(20));
+                                            continue;
+                                        }
+                                    }
+                                    let recipient = workers_ref[(wi + 1) % workers_ref.len()].pubkey();
+                                    let ix = build_stress_ix(w.pubkey(), recipient, program_ref, validator_ref, contract_pct, stake_pct, counter);
+                                    counter = counter.wrapping_add(workers_ref.len() as u64);
+                                    let tx = match Transaction::new_signed(w, nonce, chain_id, 1_000_000_000, vec![ix]) {
+                                        Ok(t) => t,
+                                        Err(_) => continue,
+                                    };
+                                    attempted += 1;
+                                    match client.post(format!("{rpc_ref}/tx")).json(&tx).send() {
+                                        Ok(r) if r.status().is_success() => {
+                                            accepted += 1;
+                                            nonce += 1;
+                                            since_sync += 1;
+                                            if since_sync >= 16 {
+                                                confirmed = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(confirmed);
+                                                since_sync = 0;
+                                            }
+                                        }
+                                        _ => {
+                                            failed += 1;
+                                            // A rejected tx never consumed its nonce;
+                                            // resync to the real on-chain nonce and
+                                            // back off so a stranded worker (e.g. its
+                                            // balance ran low before a refund lands)
+                                            // doesn't spin hot.
+                                            confirmed = fetch_account(rpc_ref, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(confirmed);
+                                            nonce = confirmed;
+                                            since_sync = 0;
+                                            std::thread::sleep(std::time::Duration::from_millis(40));
+                                        }
+                                    }
+                                }
+                                (attempted, accepted, failed)
+                            })
+                        })
+                        .collect();
+                    let out: Vec<(u64, u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    out
+                });
+                for (a, ac, f) in results {
+                    total_attempted += a;
+                    total_accepted += ac;
+                    total_failed += f;
+                }
+                let s = fetch_stress_sample(&rpc).ok();
+                println!(
+                    "  submitted {total_attempted} ({total_accepted} accepted, {total_failed} rejected at admission); base_fee now {}",
+                    s.map(|s| s.base_fee).unwrap_or(0)
+                );
+            } else {
+
             println!("{:<5} {:>8} {:>10} {:>10} {:>9} {:>7} {:>7} {:>6}", "step", "burst", "submit/s", "exec tx/s", "base_fee", "Δround", "fail", "fork");
             println!("{}", "-".repeat(72));
 
-            let mut broke = false;
             for step in 1..=steps {
                 let burst = base_burst.saturating_mul(growth.saturating_pow((step - 1) as u32)).max(1);
                 let per_worker_txs = (burst as usize).div_ceil(workers).max(1);
@@ -1327,26 +1524,9 @@ fn main() -> anyhow::Result<()> {
                     let mut txs = Vec::with_capacity(per_worker_txs);
                     for j in 0..per_worker_txs {
                         let nonce = worker_nonces[wi] + j as u64;
-                        let bucket = (global_ix.wrapping_mul(2654435761) >> 8) % 100;
+                        let recipient = workers_kp[(wi + 1) % workers].pubkey();
+                        let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, global_ix);
                         global_ix += 1;
-                        let ix = if bucket < contract_pct {
-                            // contract call: one i64 arg, no accounts touched
-                            Instruction { program_id: program_pk.unwrap(), accounts: vec![w.pubkey()], data: 0i64.to_le_bytes().to_vec() }
-                        } else if bucket < contract_pct + stake_pct {
-                            let stake_pk = Keypair::generate().unwrap().pubkey();
-                            Instruction {
-                                program_id: STAKING_PROGRAM_ID,
-                                accounts: vec![w.pubkey(), stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-                                data: borsh::to_vec(&StakingInstruction::Delegate { validator: validator_pk.unwrap(), amount: 1_000_000 }).unwrap(),
-                            }
-                        } else {
-                            let to = workers_kp[(wi + 1) % workers].pubkey();
-                            Instruction {
-                                program_id: Pubkey::system_program_id(),
-                                accounts: vec![w.pubkey(), to],
-                                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
-                            }
-                        };
                         // Generous fee_limit: only balance/nonce should ever be
                         // the limiting factor, so a failure is a real breaking
                         // signal, never a self-imposed cap on a risen fee.
@@ -1376,6 +1556,9 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect();
                 let failures: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                total_attempted += submitted;
+                total_failed += failures;
+                total_accepted += submitted.saturating_sub(failures);
                 let submit_elapsed = submit_start.elapsed();
                 let submit_rate = submitted as f64 / submit_elapsed.as_secs_f64().max(1e-9);
 
@@ -1436,7 +1619,55 @@ fn main() -> anyhow::Result<()> {
             if !broke {
                 println!("\n✓ Completed all {steps} steps without a freeze, fork, or mass-failure. The network absorbed the ramp.");
             }
-            println!("\nNote: end-to-end tx/s counts REAL executed transactions (submit → gossip → consensus → execution), converged across the monitored node(s). A rising base_fee is the EIP-1559 mechanism responding to congestion, not a failure.");
+            } // end ramp mode (else branch)
+
+            // ---- RECONCILIATION (both modes): submitted → accepted → executed →
+            // still-queued. Wait for the mempool to drain first (executed count
+            // stops climbing), then count executed WORKER transactions via each
+            // worker's on-chain nonce delta (refund-proof - the bank's funding
+            // txs never touch a worker's nonce). This is the real answer to "did
+            // any transaction get lost?".
+            print!("\nwaiting for the mempool to drain");
+            std::io::stdout().flush().ok();
+            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            let mut last = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(0);
+            let mut stable = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                print!(".");
+                std::io::stdout().flush().ok();
+                let now = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(last);
+                if now == last {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                last = now;
+                if stable >= 5 || std::time::Instant::now() > drain_deadline {
+                    break;
+                }
+            }
+            println!(" done");
+
+            let final_nonces: Vec<u64> = workers_kp
+                .iter()
+                .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
+                .collect();
+            let worker_executed: u64 = final_nonces.iter().zip(run_initial_nonces.iter()).map(|(f, i)| f.saturating_sub(*i)).sum();
+            let queued_or_lost = total_accepted.saturating_sub(worker_executed);
+
+            println!("\n=== reconciliación de transacciones ===");
+            println!("  enviadas (firmadas + POST):        {total_attempted}");
+            println!("  aceptadas (admitidas al mempool):  {total_accepted}");
+            println!("  rechazadas en admisión:            {total_failed}  (fee/saldo/nonce — el emisor conserva su nonce, se pueden reenviar)");
+            println!("  EJECUTADAS (confirmadas on-chain): {worker_executed}");
+            println!("  aún en cola / no ejecutadas:       {queued_or_lost}");
+            if queued_or_lost == 0 {
+                println!("\n✓ CERO transacciones perdidas: cada tx aceptada se ejecutó. Las rechazadas nunca entraron (no se pierden: se reintenta).");
+            } else {
+                println!("\nℹ  {queued_or_lost} aceptadas no se ejecutaron dentro de la ventana de drenaje. En un nodo sano y en marcha esto son tx TODAVÍA EN COLA que se ejecutarán en rondas siguientes (el mempool no expira por tiempo). Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria, no en disco). Volvé a consultar el balance/nonce en unos segundos para confirmar que drenaron.");
+            }
+            println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). Un base_fee alto que baja solo después es el mecanismo EIP-1559, no una falla.");
         }
         Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
