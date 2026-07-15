@@ -61,6 +61,13 @@ struct Cli {
     /// historial de comandos).
     #[arg(long)]
     password: Option<String>,
+    /// URL del faucet de la red (el `qchain-faucet`), si el operador tiene uno.
+    /// Cuando se setea, la pantalla "Comprar" de la wallet muestra un botón
+    /// "Pedir QCH de prueba" que pide fondos al faucet para la cuenta activa.
+    /// El navegador no puede llamar al faucet directo (otro origen, sin CORS),
+    /// así que la wallet lo proxya en `/api/faucet`. Ausente = botón oculto.
+    #[arg(long)]
+    faucet: Option<String>,
 }
 
 struct AppState {
@@ -88,6 +95,10 @@ struct AppState {
     /// we do NOT gate on it there - enforcing an allowlist would break the
     /// user's real tunnel deployment.
     loopback_bound: bool,
+    /// Optional testnet faucet URL (the `qchain-faucet`). When set, the browser
+    /// can ask for test QCH via the `/api/faucet` proxy (the faucet is a
+    /// separate origin the browser can't reach directly). None = feature off.
+    faucet: Option<String>,
 }
 
 #[tokio::main]
@@ -124,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         password: password.clone(),
         custodial_enabled,
         loopback_bound,
+        faucet: cli.faucet.clone().map(|u| u.trim_end_matches('/').to_string()),
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -164,7 +176,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/qr/:address", get(qr_code))
         .route("/api/transfers", get(recent_transfers))
         .route("/api/staking_activity/:address", get(staking_activity))
-        .route("/api/validators", get(validators));
+        .route("/api/validators", get(validators))
+        .route("/api/faucet", post(faucet_request));
 
     // Protected routes: the custodial wallet (keys held on the server), now at
     // `/custodial`. These DO need the password gate - whoever reaches them could
@@ -280,7 +293,57 @@ async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
     // removal from circulation. Computed with the node's exact base58 encoding
     // (`Pubkey`'s `Display`) so the string the wallet sends matches byte-for-byte
     // what the node parses. Used by "delete wallet" to burn any residual balance.
-    Json(json!({ "rpc": st.rpc, "burn_address": Pubkey([0xFFu8; 32]).to_string() }))
+    Json(json!({
+        "rpc": st.rpc,
+        "burn_address": Pubkey([0xFFu8; 32]).to_string(),
+        // Only whether a faucet is configured (the UI shows/hides the button) -
+        // the faucet URL itself is never leaked to the browser; requests go
+        // through the `/api/faucet` proxy.
+        "faucet_enabled": st.faucet.is_some(),
+    }))
+}
+
+/// Proxy a faucet drip request to the configured `qchain-faucet`. The browser
+/// can't call the faucet directly (a different origin with no CORS headers), so
+/// the wallet's own backend relays it. The recipient address is the only
+/// client-supplied field; the faucet decides the amount (never the caller) and
+/// rate-limits per address. Returns 404 if no faucet is configured.
+async fn faucet_request(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let faucet = st
+        .faucet
+        .as_deref()
+        .ok_or((StatusCode::NOT_FOUND, "no hay faucet configurado en esta wallet".to_string()))?;
+    // Validate the address before forwarding: reject anything that isn't a real
+    // Pubkey (no path/query injection into the faucet URL, and a clean 400
+    // instead of bouncing garbage off the faucet).
+    let address = req.get("address").and_then(|v| v.as_str()).unwrap_or_default();
+    let _pk: Pubkey = address
+        .parse()
+        .map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let resp = st
+        .http
+        .post(format!("{faucet}/faucet"))
+        .json(&json!({ "address": address }))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("no pude contactar el faucet: {e}")))?;
+    let status = resp.status();
+    // The faucet returns JSON on success but a plain-text body on error
+    // (its handler's `Err` arm is `(StatusCode, String)`), so read text and
+    // parse leniently.
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "ok": true }));
+        Ok(Json(body))
+    } else {
+        Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            if text.is_empty() { "el faucet rechazó el pedido".to_string() } else { text },
+        ))
+    }
 }
 
 // ---- non-custodial WASM wallet (keys live in the browser) ----------------
