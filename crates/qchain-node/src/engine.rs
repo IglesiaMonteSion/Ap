@@ -76,6 +76,80 @@ pub fn active_committee_from_registry(registry: &qchain_execution::validator_reg
     Some(ValidatorSet::new(infos))
 }
 
+/// Grow-only (monotonic) committee adoption for automatic rotation. The next
+/// epoch's committee is `current ∪ (derived members not already in current)`,
+/// capped at `MAX_ACTIVE_VALIDATORS` — a current member is **never dropped**
+/// mid-flight, only newcomers are added (and a current member's stake is
+/// refreshed to its newly-derived value).
+///
+/// Why grow-only rather than adopting the derived set wholesale: automatic
+/// *removal* of a live validator is the DAG-BFT **reconfiguration** problem
+/// (Sui/Mysticeti solve it with a dedicated epoch-change protocol where the
+/// outgoing committee cleanly finalizes everything before the new one starts).
+/// A naive mid-flight shrink freezes consensus — confirmed live: after a
+/// committee derived 3→2, the DAG still carried a round with three
+/// certificates (the dropped validator certified before the drop propagated),
+/// so honest round-(r) vertices legitimately referenced 3 parents while the
+/// new committee size was 2, and every such proposal was rejected forever
+/// (`request_missing_parents` for the now-orphaned third parent never
+/// resolving). Grow-only makes that impossible: `for_round(r-1) >= for_round(r)`
+/// never holds in the shrinking direction, so a round never references more
+/// parents than its own committee allows. Removal (unregister, slash-driven
+/// eviction, rank-out beyond `MAX_ACTIVE`) is deliberately deferred to a real
+/// reconfiguration protocol; until then a validator that leaves the registry
+/// stays in the active committee (still safe — it keeps consensing) but simply
+/// isn't auto-evicted.
+///
+/// Pure and deterministic: every honest node computing this from the identical
+/// `current` and identical committed registry gets the byte-identical result.
+pub fn merge_committee_grow_only(current: &ValidatorSet, derived: &ValidatorSet) -> ValidatorSet {
+    use qchain_execution::validator_registry::MAX_ACTIVE_VALIDATORS;
+    // Start from every current member, refreshing stake from `derived` when the
+    // registry now records a different value for them.
+    let mut infos: Vec<ValidatorInfo> = current
+        .infos()
+        .into_iter()
+        .map(|mut vi| {
+            if let Some(d) = derived.get(&vi.id) {
+                vi.stake = d.stake;
+            }
+            vi
+        })
+        .collect();
+    // Add newcomers (derived members not currently seated), in deterministic
+    // stake-desc / id-asc order, until the active cap is reached.
+    let mut newcomers: Vec<ValidatorInfo> = derived.infos().into_iter().filter(|d| current.get(&d.id).is_none()).collect();
+    newcomers.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.id.cmp(&b.id)));
+    for nc in newcomers {
+        if infos.len() >= MAX_ACTIVE_VALIDATORS {
+            break;
+        }
+        infos.push(nc);
+    }
+    ValidatorSet::new(infos)
+}
+
+/// Stage-3 peer discovery: the P2P peer set to install when the committee is
+/// derived from the on-chain registry — the config mesh **unioned** with the
+/// active committee's registered addresses (excluding self, deduped by id,
+/// skipping any unparseable address). Union rather than replace so a reachable
+/// config peer is never dropped because of a bad registry address, while a
+/// genuinely new validator (registered, not in anyone's config) is added and
+/// therefore dialed automatically.
+pub fn merge_peers(config_peers: &[PeerInfo], active: &[qchain_execution::validator_registry::RegisteredValidator], self_id: &qchain_core::ValidatorId) -> Vec<PeerInfo> {
+    let mut peers = config_peers.to_vec();
+    for rv in active {
+        if &rv.validator == self_id || peers.iter().any(|p| p.id == rv.validator) {
+            continue;
+        }
+        match rv.address.parse::<std::net::SocketAddr>() {
+            Ok(addr) => peers.push(PeerInfo { id: rv.validator, addr }),
+            Err(e) => tracing::warn!("skipping unparseable registry address '{}' for validator {}: {e}", rv.address, rv.validator),
+        }
+    }
+    peers
+}
+
 /// One validator's entry in a persisted epoch committee (phase-3.3 rotation).
 /// Borsh-encoded to `data_dir/committees` so a restarted rotation node can
 /// reconstruct the committee for each already-finalized epoch — those committees
@@ -110,7 +184,7 @@ pub fn deserialize_committee(bytes: &[u8]) -> Option<ValidatorSet> {
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
-use qchain_network::{NetMessage, Network};
+use qchain_network::{NetMessage, Network, PeerInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -472,6 +546,14 @@ pub struct Engine {
     /// built from the node config at startup and served via `GET /validators`.
     pub validator_directory: Vec<ValidatorDirEntry>,
     pub network: Arc<Network>,
+    /// The static P2P mesh from the node config (`validators[].addr`). Under
+    /// phase-3.3 rotation the epoch ratchet unions this with the current
+    /// committee's on-chain registry addresses and installs the result as the
+    /// live peer set (`Network::set_peers`), so a genuinely new validator is
+    /// dialed automatically — stage 3 peer discovery. Kept as the base so a
+    /// validator dropped from the config mesh is never lost to a bad registry
+    /// address (union, not replace). Empty/unused when rotation is off.
+    pub config_peers: Vec<PeerInfo>,
     pub state: Mutex<EngineState>,
     /// This network's own genesis-derived identity - see
     /// `qchain_node::config::NodeConfig::chain_id`'s doc comment. Checked
@@ -1367,15 +1449,27 @@ impl Engine {
                 }
                 // Structural bounds before we act on the (attacker-controlled)
                 // vectors: a legitimate vertex references at most one round-(r-1)
-                // certificate per validator (`parents.len() <= n`) and at most
-                // `WORKER_COUNT` worker batches. Without this, a Byzantine author
-                // whose signature verifies could put millions of fabricated
-                // digests in `parents`/`batch_digests` and make every honest node
-                // register + forever-retry a resync request per digest (unbounded
-                // memory + outbound-bandwidth amplification from one message).
-                let n = round_committee.len();
-                if vertex.parents.len() > n {
-                    tracing::warn!("dropping vertex proposal from {from}: {} parents exceeds validator count {n}", vertex.parents.len());
+                // certificate per validator and at most `WORKER_COUNT` worker
+                // batches. Without this, a Byzantine author whose signature
+                // verifies could put millions of fabricated digests in
+                // `parents`/`batch_digests` and make every honest node register +
+                // forever-retry a resync request per digest (unbounded memory +
+                // outbound-bandwidth amplification from one message).
+                //
+                // The parent bound MUST use the committee of the PARENT round
+                // (`vertex.round - 1`), not the current round: parents are
+                // round-(r-1) certificates, one per validator of THAT round. At an
+                // epoch boundary where the committee shrinks (e.g. 3 -> 2), the
+                // first round of the new, smaller epoch legitimately references up
+                // to `old_n` parents from the last round of the previous epoch;
+                // bounding by the new (smaller) `n` would reject those honest
+                // proposals and freeze the network (a real liveness bug found in a
+                // live rotation test). Using the parent round's committee keeps the
+                // DoS bound tight (still a real committee size, never unbounded)
+                // while allowing the boundary case.
+                let max_parents = sched.for_round(vertex.round.saturating_sub(1)).len();
+                if vertex.parents.len() > max_parents {
+                    tracing::warn!("dropping vertex proposal from {from}: {} parents exceeds round-{} validator count {max_parents}", vertex.parents.len(), vertex.round.saturating_sub(1));
                     return;
                 }
                 if vertex.batch_digests.len() > WORKER_COUNT as usize {
@@ -2062,8 +2156,20 @@ impl Engine {
                     // inherit (the frontier epoch's) when the registry has no
                     // viable active set — so a rotation network keeps running on
                     // its genesis validators until real registrations exist.
-                    let committee = active_committee_from_registry(&registry)
-                        .unwrap_or_else(|| (*sched.for_round(frontier.saturating_mul(epoch_rounds))).clone());
+                    let derived = active_committee_from_registry(&registry);
+                    // The committee this epoch inherits (the frontier epoch's) —
+                    // also the base for the grow-only merge below.
+                    let inherited = sched.for_round(frontier.saturating_mul(epoch_rounds));
+                    let committee = match &derived {
+                        // Grow-only: add newly-registered validators to the current
+                        // committee, never drop a seated one mid-flight. See
+                        // `merge_committee_grow_only` for why a mid-flight shrink
+                        // freezes DAG-BFT consensus (a live-confirmed freeze) and
+                        // why automatic removal is deferred to a real
+                        // reconfiguration protocol.
+                        Some(d) => merge_committee_grow_only(inherited, d),
+                        None => (*inherited).clone(),
+                    };
                     {
                         let mut w = self.validator_schedule.write().expect("schedule lock not poisoned");
                         let mut new_sched = (**w).clone();
@@ -2086,7 +2192,22 @@ impl Engine {
                             Err(e) => tracing::warn!("failed to persist epoch {next_epoch} committee: {e}"),
                         }
                     }
-                    tracing::info!("epoch {next_epoch}: committee ({} validators, {} stake) derived from the on-chain registry; resolvable frontier raised", committee.len(), committee.total_stake());
+                    // Stage 3 peer discovery: when the committee was genuinely
+                    // derived from the registry (not the genesis fallback), dial
+                    // its members' registered addresses — union with the config
+                    // mesh so a good config peer is never dropped by a bad
+                    // registry address, and a genuinely new validator (not in
+                    // the config) is now reached automatically.
+                    if derived.is_some() {
+                        let active = qchain_execution::validator_registry::select_active_set(&registry, qchain_execution::validator_registry::MAX_ACTIVE_VALIDATORS);
+                        self.network.set_peers(merge_peers(&self.config_peers, &active, &self.self_id));
+                    }
+                    let source = if derived.is_some() {
+                        "derived from the on-chain registry"
+                    } else {
+                        "inherited from the genesis fallback (registry has no viable active set yet)"
+                    };
+                    tracing::info!("epoch {next_epoch}: committee ({} validators, {} stake) {source}; resolvable frontier raised", committee.len(), committee.total_stake());
                 }
             }
         }
@@ -2308,6 +2429,51 @@ mod tests {
         assert_eq!(back.ids_sorted(), committee.ids_sorted());
         assert_eq!(back.stake_of(&kp1.pubkey()), MIN_VALIDATOR_STAKE * 2);
         assert!(deserialize_committee(b"not a committee").is_none());
+    }
+
+    #[test]
+    fn merge_peers_unions_config_with_registry_and_excludes_self() {
+        use qchain_execution::validator_registry::RegisteredValidator;
+        let self_id = Keypair::generate().unwrap().pubkey();
+        let v_config = Keypair::generate().unwrap().pubkey(); // already a config peer
+        let v_new = Keypair::generate().unwrap().pubkey(); // a genuinely new registrant
+        let bundle = qchain_crypto::Keypair::generate().unwrap().public_key_bundle();
+        let config_peers = vec![PeerInfo { id: v_config, addr: "10.0.0.2:9000".parse().unwrap() }];
+        let reg = |id, addr: &str| RegisteredValidator { validator: id, pubkey_bundle: bundle.clone(), address: addr.to_string(), stake: 10_000_000 };
+        let active = vec![
+            reg(self_id, "10.0.0.1:9000"), // self — must be excluded
+            reg(v_config, "10.0.0.2:9000"), // already a peer — no duplicate
+            reg(v_new, "10.0.0.9:9000"),   // new — must be added
+            reg(Keypair::generate().unwrap().pubkey(), "not-an-address"), // unparseable — skipped
+        ];
+        let peers = merge_peers(&config_peers, &active, &self_id);
+        let ids: Vec<_> = peers.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&v_config), "config peer kept");
+        assert!(ids.contains(&v_new), "new registrant added (stage-3 discovery)");
+        assert!(!ids.contains(&self_id), "self is never a peer");
+        assert_eq!(peers.iter().filter(|p| p.id == v_config).count(), 1, "no duplicate for an already-known peer");
+        assert_eq!(peers.iter().find(|p| p.id == v_new).unwrap().addr.to_string(), "10.0.0.9:9000");
+    }
+
+    #[test]
+    fn merge_committee_grow_only_adds_newcomers_and_never_drops_a_seated_member() {
+        let a = Keypair::generate().unwrap();
+        let b = Keypair::generate().unwrap();
+        let c = Keypair::generate().unwrap();
+        let vi = |kp: &Keypair, stake| ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake };
+        let current = ValidatorSet::new(vec![vi(&a, 10), vi(&b, 10)]);
+        // Derived set adds `c`, refreshes `a`'s stake, and DROPS `b` (e.g. `b`
+        // unregistered). Grow-only must keep `b`, add `c`, and refresh `a`.
+        let derived = ValidatorSet::new(vec![vi(&a, 25), vi(&c, 30)]);
+        let merged = merge_committee_grow_only(&current, &derived);
+        assert_eq!(merged.len(), 3, "b is NOT dropped; c is added");
+        assert!(merged.get(&b.pubkey()).is_some(), "a seated member is never removed mid-flight");
+        assert!(merged.get(&c.pubkey()).is_some(), "a newcomer is added");
+        assert_eq!(merged.stake_of(&a.pubkey()), 25, "a seated member's stake is refreshed from the registry");
+        assert_eq!(merged.stake_of(&b.pubkey()), 10, "a dropped-from-derived member keeps its last stake");
+        // Never shrinks: for the same current, an empty-derived-overlap still
+        // returns at least the current members.
+        assert!(merged.len() >= current.len());
     }
 
     fn new_state() -> EngineState {

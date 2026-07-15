@@ -57,11 +57,20 @@ async fn main() -> anyhow::Result<()> {
             peers.push(PeerInfo { id, addr: v.addr });
         }
     }
-    if !validator_infos.iter().any(|v| v.id == self_id) {
+    // A fixed-membership node MUST be in its own configured validator set. A
+    // rotation node need not be: a genuine newcomer joins by staking and
+    // registering on-chain, so it runs with the *genesis* validators as its
+    // config (to bootstrap P2P connectivity + the epoch-0 committee, identical
+    // to everyone else's) without being one of them, and enters the active
+    // committee once the registry-derived set includes it (stage-3 discovery).
+    if !config.validator_rotation && !validator_infos.iter().any(|v| v.id == self_id) {
         anyhow::bail!("this node's keypair ({self_id}) is not present in the configured validator set");
     }
     let validators = ValidatorSet::new(validator_infos);
 
+    // Keep the config mesh so the phase-3.3 rotation ratchet can union it with
+    // the current committee's registry addresses (stage-3 peer discovery).
+    let config_peers = peers.clone();
     let (network, mut rx) = Network::start(self_id, config.listen_addr, peers).await?;
     let network = Arc::new(network);
 
@@ -180,10 +189,26 @@ async fn main() -> anyhow::Result<()> {
         // consensus yet), but seeded at genesis the same way every other
         // program singleton is so the account exists for the first
         // registration to mutate.
+        // With rotation ON, pre-seed the registry with the genesis validators
+        // so the per-epoch committee derived from it starts out equal to the
+        // genesis committee (nobody dropped; a newcomer is *added* by stake
+        // rank). With rotation OFF, seed the EMPTY registry exactly as before,
+        // so the genesis state root is byte-identical for existing networks
+        // (`genesis_validator_registry_with` vs `..._account_data`).
+        let validator_registry_data = if config.validator_rotation {
+            qchain_execution::validator_registry::genesis_validator_registry_with(
+                config
+                    .validators
+                    .iter()
+                    .map(|v| (v.pubkey_bundle.clone(), v.addr.to_string(), v.stake)),
+            )
+        } else {
+            qchain_execution::validator_registry::genesis_validator_registry_account_data()
+        };
         ledger.seed_account(
             VALIDATOR_REGISTRY_ACCOUNT_ID,
             qchain_core::Account {
-                data: qchain_execution::validator_registry::genesis_validator_registry_account_data(),
+                data: validator_registry_data,
                 ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
             },
         );
@@ -400,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
         chain_id: config.chain_id(),
         cert_log,
         committee_log,
+        config_peers,
         receipt_log,
         staking_log,
         economics_path,

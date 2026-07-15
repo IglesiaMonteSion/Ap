@@ -108,6 +108,40 @@ pub fn genesis_validator_registry_account_data() -> Vec<u8> {
     borsh::to_vec(&ValidatorRegistryData::default()).expect("empty validator registry always serializes")
 }
 
+/// Genesis registry `data` PRE-SEEDED with the config's genesis validators -
+/// used only when `validator_rotation` is enabled. This is the correct
+/// foundation for dynamic rotation: with the genesis validators already IN
+/// the registry, the per-epoch committee derived from it starts out exactly
+/// equal to the genesis committee, so nobody is dropped and a genuinely new
+/// registrant is simply *added* by stake rank (up to `MAX_ACTIVE_VALIDATORS`).
+///
+/// Without this seeding, `select_active_set` would return the first lone
+/// registrant the instant they register, dropping every genesis validator and
+/// handing the whole chain to whoever staked `MIN_VALIDATOR_STAKE` first (a
+/// takeover), plus churning the committee size on every registration - both
+/// found in a live rotation test. Each `(address, pubkey_bundle, stake)` comes
+/// straight from the shared genesis config, so every node seeds an identical
+/// registry (deterministic; no fork). The registrant's `validator` identity is
+/// its `pubkey_bundle.to_address()`, exactly as `RegisterValidator` verifies.
+///
+/// Rotation-OFF networks keep seeding the EMPTY registry
+/// (`genesis_validator_registry_account_data`), so their genesis state root is
+/// byte-identical to before this change.
+pub fn genesis_validator_registry_with(
+    validators: impl IntoIterator<Item = (PublicKeyBundle, String, u64)>,
+) -> Vec<u8> {
+    let entries = validators
+        .into_iter()
+        .map(|(pubkey_bundle, address, stake)| RegisteredValidator {
+            validator: pubkey_bundle.to_address(),
+            pubkey_bundle,
+            address,
+            stake,
+        })
+        .collect();
+    borsh::to_vec(&ValidatorRegistryData { validators: entries }).expect("genesis validator registry always serializes")
+}
+
 // ---- active-set selection + epochs (phase 3.2) ----
 //
 // The registry above is the full *directory* of everyone who has registered.
@@ -200,6 +234,34 @@ mod tests {
             address: format!("10.0.0.{addr_byte}:9000"),
             stake,
         }
+    }
+
+    #[test]
+    fn genesis_registry_with_seeds_config_validators_and_derives_the_same_set() {
+        use qchain_crypto::Keypair;
+        // Two genesis validators, each with config stake at exactly the floor.
+        let kp1 = Keypair::generate().unwrap();
+        let kp2 = Keypair::generate().unwrap();
+        let b1 = kp1.public_key_bundle();
+        let b2 = kp2.public_key_bundle();
+        let seeded = genesis_validator_registry_with(vec![
+            (b1.clone(), "10.0.0.1:9000".to_string(), MIN_VALIDATOR_STAKE),
+            (b2.clone(), "10.0.0.2:9000".to_string(), MIN_VALIDATOR_STAKE * 3),
+        ]);
+        let reg = ValidatorRegistryData::try_read(&seeded).expect("seeded registry decodes");
+        assert_eq!(reg.validators.len(), 2);
+        // Identity is the bundle address, exactly as RegisterValidator checks.
+        assert_eq!(reg.validators[0].validator, b1.to_address());
+        assert_eq!(reg.validators[1].validator, b2.to_address());
+        // The derived active set starts equal to the genesis set (nobody
+        // dropped) - the whole point of pre-seeding vs an empty registry.
+        let active = select_active_set(&reg, MAX_ACTIVE_VALIDATORS);
+        assert_eq!(active.len(), 2);
+        // And the empty seeding is unchanged (rotation-off byte-identical path).
+        assert_eq!(
+            genesis_validator_registry_account_data(),
+            borsh::to_vec(&ValidatorRegistryData::default()).unwrap()
+        );
     }
 
     #[test]

@@ -87,6 +87,14 @@ impl ValidatorSet {
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
     }
+
+    /// The validator infos, in the same deterministic order as `ids_sorted`.
+    /// Used by the node's grow-only committee merge (phase-3.3 rotation) to
+    /// reconstruct a set from `current ∪ newcomers` without depending on
+    /// `HashMap` iteration order.
+    pub fn infos(&self) -> Vec<ValidatorInfo> {
+        self.ids_sorted().into_iter().map(|id| self.validators[&id].clone()).collect()
+    }
 }
 
 #[cfg(test)]

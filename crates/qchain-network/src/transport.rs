@@ -27,7 +27,7 @@ use crate::message::{Envelope, NetMessage};
 use qchain_core::ValidatorId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,7 +60,13 @@ pub struct PeerInfo {
 /// framing.
 pub struct Network {
     self_id: ValidatorId,
-    peers: Vec<PeerInfo>,
+    /// The peers this node dials/broadcasts to. Interior-mutable (behind a
+    /// `std::sync::RwLock`, held only for a cheap clone/lookup, never across an
+    /// await) so phase-3.3 dynamic rotation can update the peer set at runtime —
+    /// `set_peers` — from the on-chain registry addresses as the committee
+    /// changes, letting a genuinely new validator be dialed automatically. For a
+    /// fixed-membership network it is set once at startup and never changes.
+    peers: StdRwLock<Vec<PeerInfo>>,
     connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
 }
 
@@ -169,11 +175,21 @@ impl Network {
         let listener = TcpListener::bind(listen_addr).await?;
         let (tx, rx) = mpsc::channel(4096);
         tokio::spawn(accept_loop(listener, tx));
-        Ok((Network { self_id, peers, connections: Mutex::new(HashMap::new()) }, rx))
+        Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()) }, rx))
     }
 
-    pub fn peers(&self) -> &[PeerInfo] {
-        &self.peers
+    /// A snapshot of the current peer set.
+    pub fn peers(&self) -> Vec<PeerInfo> {
+        self.peers.read().expect("peers lock not poisoned").clone()
+    }
+
+    /// Replace the peer set (phase-3.3 dynamic rotation). The caller passes the
+    /// full desired set (typically the config mesh unioned with the current
+    /// committee's on-chain registry addresses); `self_id` is expected to be
+    /// excluded already. A no-op-equivalent call (same set) is harmless. Only
+    /// ever used when validator rotation is on.
+    pub fn set_peers(&self, peers: Vec<PeerInfo>) {
+        *self.peers.write().expect("peers lock not poisoned") = peers;
     }
 
     /// Best-effort broadcast: a peer that's temporarily unreachable just
@@ -204,7 +220,8 @@ impl Network {
     /// actually keep that promise instead of only keeping it when every
     /// peer happens to be fast.
     pub async fn broadcast(self: &Arc<Self>, message: &NetMessage) {
-        for peer in self.peers.clone() {
+        let current_peers = self.peers.read().expect("peers lock not poisoned").clone();
+        for peer in current_peers {
             let net = self.clone();
             let message = message.clone();
             tokio::spawn(async move {
@@ -300,7 +317,7 @@ impl Network {
     }
 
     pub fn addr_of(&self, id: &ValidatorId) -> Option<SocketAddr> {
-        self.peers.iter().find(|p| &p.id == id).map(|p| p.addr)
+        self.peers.read().expect("peers lock not poisoned").iter().find(|p| &p.id == id).map(|p| p.addr)
     }
 }
 
