@@ -1883,6 +1883,48 @@ fn main() -> anyhow::Result<()> {
                 println!("\nℹ  {queued_or_lost} aceptadas no se ejecutaron dentro de la ventana de drenaje. En un nodo sano y en marcha esto son tx TODAVÍA EN COLA que se ejecutarán en rondas siguientes (el mempool no expira por tiempo). Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria, no en disco). Volvé a consultar el balance/nonce en unos segundos para confirmar que drenaron.");
             }
             println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). Un base_fee alto que baja solo después es el mecanismo EIP-1559, no una falla.");
+
+            // ---- RECOVER FUNDS: sweep each worker's leftover balance back to the
+            // bank so a stress run doesn't permanently drain the test wallet (the
+            // worker keypairs are ephemeral - without this their funds are lost).
+            // Best-effort: skip a worker that can't even cover one transfer fee.
+            print!("\ndevolviendo fondos sobrantes de los workers al banco");
+            std::io::stdout().flush().ok();
+            let sweep_fee = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?
+                .and_then(|a| borsh::from_slice::<EconomicParams>(&a.data).ok())
+                .map(|p| p.base_fee_per_byte)
+                .unwrap_or(180)
+                .saturating_mul(6_000)
+                .max(2_000_000);
+            let mut recovered = 0u64;
+            let mut swept = 0u64;
+            let client = reqwest::blocking::Client::new();
+            for w in workers_kp.iter() {
+                let acc = match fetch_account(&rpc, &w.pubkey())? {
+                    Some(a) => a,
+                    None => continue,
+                };
+                // Leave a margin (2× fee) so the transfer itself clears; the tiny
+                // remainder is swept to zero/burned by the node's dust rule.
+                let send = acc.balance.saturating_sub(sweep_fee.saturating_mul(2));
+                if send == 0 {
+                    continue;
+                }
+                let ix = Instruction {
+                    program_id: Pubkey::system_program_id(),
+                    accounts: vec![w.pubkey(), bank.pubkey()],
+                    data: borsh::to_vec(&SystemInstruction::Transfer { amount: send })?,
+                };
+                if let Ok(tx) = Transaction::new_signed(w, acc.nonce, chain_id, 1_000_000_000, vec![ix]) {
+                    if client.post(format!("{rpc}/tx")).json(&tx).send().map(|r| r.status().is_success()).unwrap_or(false) {
+                        recovered = recovered.saturating_add(send);
+                        swept += 1;
+                    }
+                }
+            }
+            let to_qch = |u: u64| u as f64 / 1e9;
+            println!(" listo");
+            println!("  {swept} workers barridos, ~{:.4} QCH devueltos al banco (confirmá el saldo en unos segundos).", to_qch(recovered));
         }
         Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
