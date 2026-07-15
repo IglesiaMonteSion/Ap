@@ -22,9 +22,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
+# `--locked`: build from the COMMITTED Cargo.lock exactly, never silently
+# re-resolve against a moving crates.io index. This makes the image
+# reproducible AND fails loudly with a clear message if the lock is ever
+# inconsistent with Cargo.toml, instead of resolving to some other version
+# (the exact failure mode a corrupted lock caused once — see the v4.1.6 note
+# in CLAUDE.md). A committed lock that builds locally now always builds here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet && \
+    cargo build --locked --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet && \
     mkdir -p /out && \
     cp target/release/qchain-node \
        target/release/qchain-genesis-build \
