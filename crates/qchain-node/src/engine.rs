@@ -422,16 +422,20 @@ fn take_executable_prefix(
 pub struct Engine {
     pub self_id: ValidatorId,
     pub keypair: Keypair,
-    pub validators: ValidatorSet,
-    /// Phase-3.3 stage-1 plumbing: the per-round committee resolver Bullshark
-    /// ordering reads (`ConsensusState::advance`). Currently a single-committee
-    /// schedule built from `validators` at startup — identical membership, so
-    /// consensus behaves exactly as before (proven by the DST). A later stage
-    /// makes this authoritative and lets the committee vary by epoch (derived
-    /// from the on-chain validator registry); it is kept *alongside*
-    /// `validators` rather than replacing the 14 direct reads, to keep this
-    /// no-op refactor minimal and reviewable.
-    pub validator_schedule: ValidatorSchedule,
+    /// The consensus committee currently in effect (this epoch). Under fixed
+    /// membership (rotation off) it never changes; under phase-3.3 rotation the
+    /// epoch ratchet in `try_commit` swaps it at each boundary. Used for
+    /// everything that concerns the *current* round — proposing, voting, the
+    /// round-advancement quorum, status. `RwLock<Arc<>>` so the frequent reads
+    /// are a cheap `Arc` clone and the rare boundary swap is one write.
+    pub validators: std::sync::RwLock<Arc<ValidatorSet>>,
+    /// The full per-epoch committee schedule (phase-3.3). `for_round` resolves
+    /// *any* round's committee — read per round by `ConsensusState::advance`
+    /// (ordering) and `verify_certificate` (a certificate can be for an older
+    /// round than the current one, e.g. during resync). Under rotation the
+    /// epoch ratchet installs each new epoch's committee and raises the
+    /// resolvable frontier. Same `RwLock<Arc<>>` rationale as `validators`.
+    pub validator_schedule: std::sync::RwLock<Arc<ValidatorSchedule>>,
     /// The validator set as a wallet-facing directory (address, name, stake),
     /// built from the node config at startup and served via `GET /validators`.
     pub validator_directory: Vec<ValidatorDirEntry>,
@@ -487,6 +491,22 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// The committee currently in effect (this epoch) — a cheap `Arc` clone of
+    /// the current set, guard dropped immediately. Use for anything about the
+    /// *current* round (propose/vote/quorum/status). Under fixed membership it
+    /// is always the genesis set; under rotation the epoch ratchet swaps it.
+    fn committee(&self) -> Arc<ValidatorSet> {
+        self.validators.read().expect("validators lock not poisoned").clone()
+    }
+
+    /// A snapshot of the full per-epoch schedule (cheap `Arc` clone). Use
+    /// `for_round(round)` on it for anything about a *specific* round — chiefly
+    /// `verify_certificate` (a cert can be for an older epoch's committee) and
+    /// consensus ordering.
+    fn schedule(&self) -> Arc<ValidatorSchedule> {
+        self.validator_schedule.read().expect("schedule lock not poisoned").clone()
+    }
+
     /// Appends a newly captured transfer receipt to the on-disk log, if this
     /// node persists to disk. Keyed by a sled-generated monotonic id so the
     /// on-disk order matches capture order (oldest first) on reload. Best-
@@ -1218,7 +1238,7 @@ impl Engine {
         EconomicsResponse {
             validator: self.self_id.to_string(),
             validator_balance,
-            validator_stake: self.validators.stake_of(&self.self_id),
+            validator_stake: self.committee().stake_of(&self.self_id),
             total_burned: state.ledger.total_burned,
             fee_burned: state.ledger.fee_burned,
             dust_burned: state.ledger.dust_burned,
@@ -1234,7 +1254,7 @@ impl Engine {
             next_round: state.next_round,
             executed_transactions: state.executed,
             dag_certificates: state.dag.len(),
-            peer_count: self.validators.len().saturating_sub(1),
+            peer_count: self.committee().len().saturating_sub(1),
         }
     }
 
@@ -1293,7 +1313,11 @@ impl Engine {
                 // from a genuine one, and no equivocation evidence could ever
                 // be trusted (see `EquivocationEvidence` below).
                 let digest = vertex.digest();
-                let Some(author_info) = self.validators.get(&vertex.author) else {
+                // Committee in effect for the proposal's round (under rotation a
+                // proposer must be a member of *that round's* committee).
+                let sched = self.schedule();
+                let round_committee = sched.for_round(vertex.round);
+                let Some(author_info) = round_committee.get(&vertex.author) else {
                     tracing::warn!("dropping vertex proposal from unknown validator {from}");
                     return;
                 };
@@ -1309,7 +1333,7 @@ impl Engine {
                 // digests in `parents`/`batch_digests` and make every honest node
                 // register + forever-retry a resync request per digest (unbounded
                 // memory + outbound-bandwidth amplification from one message).
-                let n = self.validators.len();
+                let n = round_committee.len();
                 if vertex.parents.len() > n {
                     tracing::warn!("dropping vertex proposal from {from}: {} parents exceeds validator count {n}", vertex.parents.len());
                     return;
@@ -1423,7 +1447,11 @@ impl Engine {
                 // `qchain_crypto::verify` check the `VertexProposal` arm
                 // already applies to an author's signature) means only real,
                 // attributable votes are ever stored or counted.
-                let Some(voter_info) = self.validators.get(&from) else {
+                // A vote is only ever for THIS node's own current pending
+                // proposal (current round), so the current committee is the
+                // right membership set to check the voter against.
+                let committee = self.committee();
+                let Some(voter_info) = committee.get(&from) else {
                     tracing::warn!("dropping vote from unknown validator {from}");
                     return;
                 };
@@ -1437,7 +1465,9 @@ impl Engine {
                 }
             }
             NetMessage::CertificateBroadcast(cert) => {
-                if !verify_certificate(&cert, &self.validators) {
+                // A certificate can be for an older round than the current one
+                // (resync), so verify it against *its round's* committee.
+                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round)) {
                     tracing::warn!("dropping certificate that fails quorum verification");
                     return;
                 }
@@ -1464,7 +1494,7 @@ impl Engine {
                 }
             }
             NetMessage::CertificateResponse(cert) => {
-                if !verify_certificate(&cert, &self.validators) {
+                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round)) {
                     tracing::warn!("dropping certificate response that fails quorum verification");
                     return;
                 }
@@ -1499,7 +1529,7 @@ impl Engine {
                 // enough to nudge the operator: the sender must be a real
                 // member of the validator set, and the version must parse and
                 // be strictly newer than ours. Never affects consensus.
-                if self.validators.get(&from).is_none() {
+                if self.committee().get(&from).is_none() {
                     return;
                 }
                 if version_is_newer(&version, NODE_VERSION) {
@@ -1862,8 +1892,11 @@ impl Engine {
         }
         state.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
 
-        let stake: u64 = state.pending_votes[&vertex_digest].keys().map(|id| self.validators.stake_of(id)).sum();
-        if stake < self.validators.quorum_threshold() {
+        // The pending vertex is this validator's own current proposal, so its
+        // votes are weighted by the current committee.
+        let committee = self.committee();
+        let stake: u64 = state.pending_votes[&vertex_digest].keys().map(|id| committee.stake_of(id)).sum();
+        if stake < committee.quorum_threshold() {
             return None;
         }
 
@@ -1897,7 +1930,8 @@ impl Engine {
         {
         let mut state = self.state.lock().await;
         let state = &mut *state;
-        let newly_ordered = state.consensus.advance(&state.dag, &self.validator_schedule);
+        let schedule_snapshot = self.schedule();
+        let newly_ordered = state.consensus.advance(&state.dag, &schedule_snapshot);
         // Append every newly-ordered certificate to the execution queue in
         // committed order. `advance` emits a digest exactly once, so a full
         // clone is buffered (not just the digest) - DAG pruning can then never
@@ -1953,6 +1987,54 @@ impl Engine {
                         }
                         Err(e) => tracing::warn!("transaction execution failed: {e}"),
                     }
+                }
+            }
+        }
+
+        // ---- Phase-3.3 rotation ratchet ----
+        // If this schedule rotates and the frontier epoch is now fully
+        // committed, derive the NEXT epoch's committee from the committed
+        // on-chain validator registry and install it, then raise the resolvable
+        // frontier so consensus may proceed into that epoch. A clean ratchet
+        // with no circularity: finalize epoch e-1 -> derive+install committee(e)
+        // -> raise frontier to e -> the next `advance` resolves epoch e. No-op
+        // for a fixed-membership (`single`) schedule, where the frontier is
+        // `u64::MAX` (this whole block is skipped) — so a non-rotating node is
+        // byte-for-byte unchanged. Runs under the state lock: the registry it
+        // reads is committed state at the exact end of the frontier epoch,
+        // identical on every honest node, so every node derives the identical
+        // committee (what keeps the rotation fork-free).
+        {
+            let sched = self.schedule();
+            let frontier = sched.frontier_epoch();
+            if frontier != u64::MAX {
+                let epoch_rounds = sched.epoch_rounds();
+                let finalized_floor = state.consensus.finalized_floor();
+                if finalized_floor >= (frontier + 1).saturating_mul(epoch_rounds) {
+                    let next_epoch = frontier + 1;
+                    let registry = state
+                        .ledger
+                        .store()
+                        .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+                        .and_then(|a| qchain_execution::validator_registry::ValidatorRegistryData::try_read(&a.data).ok())
+                        .unwrap_or_default();
+                    // Fall back to the committee this epoch would otherwise
+                    // inherit (the frontier epoch's) when the registry has no
+                    // viable active set — so a rotation network keeps running on
+                    // its genesis validators until real registrations exist.
+                    let committee = active_committee_from_registry(&registry)
+                        .unwrap_or_else(|| (*sched.for_round(frontier.saturating_mul(epoch_rounds))).clone());
+                    {
+                        let mut w = self.validator_schedule.write().expect("schedule lock not poisoned");
+                        let mut new_sched = (**w).clone();
+                        new_sched.install_epoch(next_epoch, committee.clone());
+                        new_sched.set_frontier_epoch(next_epoch);
+                        *w = std::sync::Arc::new(new_sched);
+                    }
+                    // The node is now entering `next_epoch` (its next proposal
+                    // round is in it), so the current committee becomes this one.
+                    *self.validators.write().expect("validators lock not poisoned") = std::sync::Arc::new(committee.clone());
+                    tracing::info!("epoch {next_epoch}: committee ({} validators, {} stake) derived from the on-chain registry; resolvable frontier raised", committee.len(), committee.total_stake());
                 }
             }
         }
@@ -2039,7 +2121,11 @@ impl Engine {
             let round = state.next_round;
             if round > 0 {
                 let prev_round = round - 1;
-                let quorum = self.validators.quorum_threshold();
+                // The gate is "did round `prev_round` certify?", weighted by the
+                // committee that certified it — `for_round(prev_round)`.
+                let sched = self.schedule();
+                let prev_committee = sched.for_round(prev_round);
+                let quorum = prev_committee.quorum_threshold();
                 // Real permanent-freeze regression found live while
                 // building the dashboard (restarting a persisted
                 // single-validator node for a screenshot): this gate's
@@ -2068,9 +2154,9 @@ impl Engine {
                 // real spread-stake network (there, no single validator's
                 // stake reaches quorum alone, so the check below still
                 // runs exactly as before).
-                if self.validators.stake_of(&self.self_id) < quorum {
+                if prev_committee.stake_of(&self.self_id) < quorum {
                     let stake: u64 =
-                        state.dag.certificates_in_round(prev_round).map(|c| self.validators.stake_of(&c.vertex.author)).sum();
+                        state.dag.certificates_in_round(prev_round).map(|c| prev_committee.stake_of(&c.vertex.author)).sum();
                     if stake < quorum {
                         return;
                     }

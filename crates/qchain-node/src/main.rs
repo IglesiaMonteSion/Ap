@@ -341,15 +341,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Phase-3.3 stage-1: a single-committee schedule (all rounds → the same
-    // set), built before `validators` is moved into the engine. Identical
-    // membership, so consensus behaves exactly as before.
-    let validator_schedule = ValidatorSchedule::single(validators.clone());
+    // Phase-3.3: build the committee schedule. With rotation OFF (the default,
+    // and every existing config) it is a single fixed committee — the exact
+    // phase-1/2 behavior, and `for_round` always returns it. With rotation ON
+    // it is a rotating schedule seeded with epoch 0 = the genesis validators
+    // (the bootstrap committee); the epoch ratchet in `try_commit` then derives
+    // and installs each later epoch's committee from the on-chain registry and
+    // raises the resolvable frontier. Epoch 0 governs until a viable active set
+    // exists on-chain, so a rotation network still starts from its genesis set.
+    let validator_schedule = if config.validator_rotation {
+        tracing::info!("validator rotation ENABLED (epoch_rounds={}) - the active committee will be re-derived from the on-chain registry each epoch", config.epoch_rounds());
+        ValidatorSchedule::new(config.epoch_rounds(), validators.clone())
+    } else {
+        ValidatorSchedule::single(validators.clone())
+    };
     let engine = Arc::new(Engine {
         self_id,
         keypair,
-        validators,
-        validator_schedule,
+        validators: std::sync::RwLock::new(std::sync::Arc::new(validators)),
+        validator_schedule: std::sync::RwLock::new(std::sync::Arc::new(validator_schedule)),
         validator_directory,
         network,
         chain_id: config.chain_id(),
