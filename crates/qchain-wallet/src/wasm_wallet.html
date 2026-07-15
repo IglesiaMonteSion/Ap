@@ -386,6 +386,9 @@
     </div>
 
     <div class="balance-card">
+      <button id="h-acct" class="nav" data-to="accounts" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border:none;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:6px">
+        <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.8">▾</span>
+      </button>
       <div class="lbl">Saldo</div>
       <div class="amt" id="h-balance">—</div>
       <div class="acct"><span class="mono" id="h-addr">—</span><button class="btn-ghost" id="h-copy" style="color:#fff;padding:0 4px">copiar</button></div>
@@ -399,6 +402,15 @@
 
     <div class="section-title">Actividad</div>
     <div class="card" id="activity"><div class="empty">sin movimientos todavía</div></div>
+  </section>
+
+  <!-- ===== CUENTAS ===== -->
+  <section class="view" id="v-accounts">
+    <button class="backlink nav" data-to="home">← volver</button>
+    <h2 class="view-title">Tus <span class="grad">cuentas</span></h2>
+    <p class="view-sub">Todas tus direcciones se derivan de la <b>misma</b> semilla, así que tu único respaldo las recupera a todas. Tocá una para usarla, o creá una nueva.</p>
+    <div class="card" id="acct-list"><div class="empty">cargando…</div></div>
+    <button class="btn-block" id="acct-new" style="margin-top:14px">+ Crear nueva cuenta</button>
   </section>
 
   <!-- ===== RECIBIR ===== -->
@@ -538,13 +550,20 @@
 <div class="toast" id="toast">copiado</div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, stakeAddressFromSeed } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, stakeAddressFromSeed, deriveAccountSeed } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
 const BIO_KEY = "qchain_bio_v1";   // semilla cifrada con una clave del enclave seguro (WebAuthn PRF)
+const ACCOUNTS_KEY = "qchain_accounts_v1"; // cuentas HD por-wallet (cuántas, nombres, cuál está activa) - NO secreto (las direcciones son públicas)
 const TX_BYTES = 5571n; // tamaño real de una transferencia híbrida firmada (documentado)
-let SEED = null;        // Uint8Array(32), solo en memoria mientras está desbloqueada
+// MASTER es la semilla maestra (lo único que se respalda). SEED es la semilla de
+// la cuenta ACTIVA, derivada de MASTER con deriveAccountSeed(MASTER, ACCT). La
+// cuenta 0 == MASTER exactamente (la dirección de siempre no cambia); las cuentas
+// 1,2,3… son direcciones nuevas, TODAS recuperables desde la misma semilla maestra.
+let MASTER = null;      // Uint8Array(32), semilla maestra, solo en memoria mientras está desbloqueada
+let ACCT = 0;           // índice de la cuenta activa
+let SEED = null;        // Uint8Array(32) de la cuenta activa = deriveAccountSeed(MASTER, ACCT)
 let PW = null;          // contraseña en memoria (solo para cifrar el respaldo sin re-preguntar); nunca se persiste ni se muestra
 let lastActivitySig = "";
 let nodeTimer = null, balTimer = null;
@@ -592,7 +611,7 @@ async function bioKeyFromAssertion(credId, salt){
 // Activa el biométrico: crea una credencial de plataforma, obtiene su PRF y
 // cifra la semilla con esa clave. Requiere la wallet desbloqueada (SEED).
 async function enrollBiometric(){
-  if(!SEED) throw new Error("desbloqueá la wallet primero");
+  if(!MASTER) throw new Error("desbloqueá la wallet primero");
   const cred = await navigator.credentials.create({ publicKey: {
     challenge: crypto.getRandomValues(new Uint8Array(32)),
     // rp.id se OMITE a propósito: el navegador usa el dominio del origen actual
@@ -611,7 +630,7 @@ async function enrollBiometric(){
   const key = await bioKeyFromAssertion(credId, salt);
   if(!key) throw new Error("tu teléfono/navegador no soporta el cifrado por biométrico (WebAuthn PRF) todavía. Seguí usando la contraseña.");
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, SEED));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, MASTER)); // cifra la MAESTRA, no la cuenta activa (recupera TODAS las cuentas)
   localStorage.setItem(BIO_KEY, JSON.stringify({ v:1, credId:b64(credId), salt:b64(salt), iv:b64(iv), ct:b64(ct) }));
 }
 // Desbloquea con el biométrico: pide el PRF y descifra la semilla.
@@ -751,6 +770,7 @@ function showView(name){
   $("v-"+name).classList.add("active");
   window.scrollTo(0,0);
   if(name==="home"){ renderHome(); }
+  if(name==="accounts") renderAccounts();
   if(name==="receive") renderReceive();
   if(name==="send") renderSend();
   if(name==="staking") renderStaking();
@@ -780,17 +800,77 @@ async function loadNode(){
   }catch(e){ $("dot").className="dot bad"; $("node-text").textContent="sin conexión"; }
 }
 
+// ---- cuentas HD (múltiples direcciones desde una semilla) ----
+// La dirección de la cuenta 0 identifica a esta wallet; la lista de cuentas se
+// guarda por-wallet (localStorage) solo como caché de conveniencia (cuántas hay,
+// sus nombres, cuál está activa). Como cada cuenta es determinista por índice,
+// nada de esto es secreto ni imprescindible: se puede re-derivar desde la semilla.
+function master0Addr(){ return MASTER ? addressFromSeed(MASTER) : null; }
+function acctSeed(i){ return new Uint8Array(deriveAccountSeed(MASTER, i)); }
+function acctAddr(i){ return addressFromSeed(acctSeed(i)); }
+function accountsStore(){ try{ return JSON.parse(localStorage.getItem(ACCOUNTS_KEY)||"{}"); }catch(e){ return {}; } }
+function myAccounts(){ const s=accountsStore()[master0Addr()]; return s&&s.count>=1 ? s : {count:1, names:{}, active:0}; }
+function saveAccounts(o){ const all=accountsStore(); all[master0Addr()]=o; localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(all)); }
+function accountName(i, o){ o=o||myAccounts(); return (o.names&&o.names[i]) || (i===0?"Cuenta principal":"Cuenta "+(i+1)); }
+// Cambia la cuenta activa: re-deriva SEED, persiste la elección y refresca la vista.
+function setAccount(i){
+  ACCT=i; SEED=acctSeed(i);
+  const o=myAccounts(); o.active=i; if(i+1>o.count) o.count=i+1; saveAccounts(o);
+  lastActivitySig="";  // forzá el re-render de la actividad para la cuenta nueva
+}
+// Al desbloquear/crear/restaurar: fijá MASTER y activá la última cuenta usada.
+function bootAccounts(){ const o=myAccounts(); setAccount(Math.min(o.active||0, o.count-1)); }
+// Crea la siguiente cuenta (índice determinista libre) y la activa.
+function createAccount(){ const o=myAccounts(); const i=o.count; o.count=i+1; o.active=i; saveAccounts(o); setAccount(i); return i; }
+
 // ---- home / saldo / actividad ----
 function myAddress(){ return SEED ? addressFromSeed(SEED) : null; }
 
 async function renderHome(){
   const addr = myAddress(); if(!addr){ showView("unlock"); return; }
+  const nm=$("h-acct-name"); if(nm) nm.textContent=accountName(ACCT);
   $("h-addr").textContent = short(addr);
   $("h-copy").onclick = ()=>copy(addr);
   try{ const acct = await api("/api/account/"+encodeURIComponent(addr)); $("h-balance").textContent = qchDisp(acct.balance); }
   catch(e){ /* no borramos lo que ya se ve ante un error de red */ }
   renderActivity(addr);
 }
+
+// ---- vista de cuentas (múltiples direcciones desde una semilla) ----
+async function renderAccounts(){
+  if(!MASTER){ showView("unlock"); return; }
+  const box=$("acct-list"), o=myAccounts();
+  const rows=[];
+  for(let i=0;i<o.count;i++){
+    const addr=acctAddr(i), name=accountName(i,o), activo=(i===ACCT);
+    rows.push(`<div class="acct-row" data-i="${i}" style="display:flex;align-items:center;gap:10px;padding:12px 4px;cursor:pointer;border-bottom:1px solid var(--line)">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:700;display:flex;align-items:center;gap:8px">${esc(name)} ${activo?'<span style="font-size:11px;color:var(--good);border:1px solid var(--good);border-radius:6px;padding:0 6px">activa</span>':''}</div>
+        <div class="mono" style="font-size:12px;opacity:.7">${esc(short(addr))}</div>
+      </div>
+      <div class="acct-bal" data-addr="${esc(addr)}" style="font-weight:700;white-space:nowrap">…</div>
+      <button class="btn-ghost acct-rename" data-i="${i}" title="renombrar" style="padding:2px 6px">✎</button>
+    </div>`);
+  }
+  box.innerHTML=rows.join("");
+  // switch al tocar una fila
+  box.querySelectorAll(".acct-row").forEach(r=>r.addEventListener("click",e=>{
+    if(e.target.closest(".acct-rename")) return;   // el lápiz no cambia de cuenta
+    setAccount(+r.dataset.i); toast("cuenta "+accountName(+r.dataset.i)); showView("home");
+  }));
+  // renombrar
+  box.querySelectorAll(".acct-rename").forEach(b=>b.addEventListener("click",e=>{
+    e.stopPropagation();
+    const i=+b.dataset.i, cur=accountName(i), nn=(prompt("Nombre de la cuenta:", cur)||"").trim();
+    if(nn){ const oo=myAccounts(); oo.names=oo.names||{}; oo.names[i]=nn.slice(0,40); saveAccounts(oo); renderAccounts(); }
+  }));
+  // saldos (best-effort, en paralelo)
+  box.querySelectorAll(".acct-bal").forEach(async el=>{
+    try{ const a=await api("/api/account/"+encodeURIComponent(el.dataset.addr)); el.textContent=qchDisp(a.balance); }
+    catch(e){ el.textContent="—"; }
+  });
+}
+$("acct-new").onclick=()=>{ const i=createAccount(); toast("cuenta creada"); renderAccounts(); };
 
 async function renderActivity(addr){
   const box=$("activity");
@@ -871,11 +951,11 @@ async function renderSettings(){
 // usa la wallet para guardar la semilla en el navegador). Un archivo robado no
 // sirve sin la contraseña. Se restaura en la wallet tipeando esa contraseña.
 async function downloadEncryptedBackup(){
-  if(!SEED){ toast("desbloqueá la wallet primero"); return; }
+  if(!MASTER){ toast("desbloqueá la wallet primero"); return; }
   let pw=PW;
   if(!pw){ pw=prompt("Contraseña para cifrar el respaldo (mínimo 8):")||""; if(pw.length<8){ toast("contraseña muy corta"); return; } }
-  const addr=myAddress();
-  const store=await encryptSeed(SEED, pw);   // { v, salt, iv, ct }
+  const addr=master0Addr();   // identidad de la wallet (cuenta 0)
+  const store=await encryptSeed(MASTER, pw);   // { v, salt, iv, ct } — respalda la MAESTRA (todas las cuentas)
   const data=JSON.stringify({ type:"qchain-wallet-encrypted-backup", version:2, address:addr,
     kdf:"PBKDF2-SHA256", cipher:"AES-256-GCM", ...store,
     note:"Respaldo CIFRADO de una wallet qchain no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
@@ -899,7 +979,7 @@ $("c-btn").onclick=async()=>{
     const seed=crypto.getRandomValues(new Uint8Array(32));       // entropía real del navegador
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed; PW=p; disableBiometric();
+    MASTER=seed; PW=p; disableBiometric(); bootAccounts();
     showView("backup");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo crear: "+e.message; }
   $("c-btn").disabled=false;
@@ -968,7 +1048,7 @@ $("i-btn").onclick=async()=>{
     if(p.length<8) throw new Error("la contraseña debe tener al menos 8 caracteres");
     const store=await encryptSeed(seed, p);
     localStorage.setItem(LS_KEY, JSON.stringify(store));
-    SEED=seed; PW=p; disableBiometric();
+    MASTER=seed; PW=p; disableBiometric(); bootAccounts();
     toast("wallet restaurada"); showView("home");
   }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
   $("i-btn").disabled=false;
@@ -984,10 +1064,10 @@ document.querySelectorAll("#shamir-preset button").forEach(b=>b.onclick=()=>{
 });
 $("shamir-gen").onclick=async()=>{
   const msg=$("shamir-msg"); msg.className="msg"; msg.textContent="";
-  if(!SEED){ msg.className="msg err"; msg.textContent="desbloqueá la wallet primero"; return; }
+  if(!MASTER){ msg.className="msg err"; msg.textContent="desbloqueá la wallet primero"; return; }
   $("shamir-gen").disabled=true;
   try{
-    shamirShares=await shamirSplit(SEED, shamirK, shamirN);
+    shamirShares=await shamirSplit(MASTER, shamirK, shamirN);   // divide la MAESTRA (recupera todas las cuentas)
     $("shamir-list").innerHTML=shamirShares.map((s,i)=>`
       <div class="row-item" style="align-items:flex-start">
         <div style="min-width:0;flex:1">
@@ -1019,8 +1099,9 @@ $("u-btn").onclick=async()=>{
   $("u-btn").disabled=true;
   try{
     const store=JSON.parse(localStorage.getItem(LS_KEY));
-    SEED=await decryptSeed(store, p);
+    MASTER=await decryptSeed(store, p);
     PW=p;
+    bootAccounts();
     $("u-pass").value="";
     showView("home");
   }catch(e){ msg.className="msg err"; msg.textContent="contraseña incorrecta"; }
@@ -1035,7 +1116,8 @@ $("u-bio").onclick=async()=>{
   const msg=$("u-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="esperando Face ID / huella…";
   $("u-bio").disabled=true;
   try{
-    SEED=await unlockWithBiometric();
+    MASTER=await unlockWithBiometric();
+    bootAccounts();
     msg.textContent=""; $("u-pass").value="";
     showView("home");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo con biométrico — usá tu contraseña"; }
@@ -1290,7 +1372,7 @@ async function stakeAction(kind, pos){
 
 // configuración
 $("set-download").onclick=()=>downloadEncryptedBackup();
-$("set-lock").onclick=()=>{ SEED=null; PW=null; $("u-pass").value=""; showView("unlock"); };
+$("set-lock").onclick=()=>{ MASTER=null; SEED=null; ACCT=0; PW=null; $("u-pass").value=""; showView("unlock"); };
 $("set-remove").onclick=()=>{
   if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu respaldo. ¿Seguir?")){
     localStorage.removeItem(LS_KEY); localStorage.removeItem(BIO_KEY); location.reload();

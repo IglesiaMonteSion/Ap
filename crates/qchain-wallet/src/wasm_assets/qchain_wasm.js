@@ -64,6 +64,37 @@ export function addressFromSeed(seed) {
 }
 
 /**
+ * `deriveAccountSeed(masterSeed: Uint8Array, index: number) -> Uint8Array`
+ * The 32-byte seed for HD account `index` (0 returns the master unchanged).
+ * The browser keeps the master seed and derives each account's seed on the
+ * fly; every existing sign/address function then works unchanged on the
+ * per-account seed.
+ * @param {Uint8Array} master_seed
+ * @param {number} index
+ * @returns {Uint8Array}
+ */
+export function deriveAccountSeed(master_seed, index) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(master_seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.deriveAccountSeed(retptr, ptr0, len0, index);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        var v2 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * `signClaimReward(seed, stakeAccount, nonce, chainId, feeLimit) -> string`
  * @param {Uint8Array} seed
  * @param {string} stake_account
@@ -292,6 +323,11 @@ function dropObject(idx) {
     if (idx < 1028) return;
     heap[idx] = heap_next;
     heap_next = idx;
+}
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedDataViewMemory0 = null;
