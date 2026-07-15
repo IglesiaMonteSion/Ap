@@ -859,11 +859,17 @@ pub struct EconomicsResponse {
     /// Current balance sitting in the staking rewards pool, claimable by
     /// delegators.
     pub reward_pool_balance: u64,
+    /// Total new QCH minted into the staking reward pool by emission since
+    /// node start (real inflation, v4.0.0). Persisted, survives restarts.
+    pub total_emitted: u64,
     /// Live governance-set economic parameters.
     pub base_fee_per_byte: u64,
     pub dust_threshold: u64,
     pub staking_commission_bps: u16,
     pub gas_price_per_fuel: u64,
+    /// Annual QCH emission rate (basis points of `total_staked`), minted into
+    /// the reward pool per round to fund the target staking APR.
+    pub emission_apr_bps: u16,
     /// The fraction of every fee that is burned (currently a fixed 50%).
     pub burn_pct: u64,
     /// Consensus liveness figures, so the panel is one-stop for an operator.
@@ -1443,10 +1449,12 @@ impl Engine {
             own_commission: state.ledger.commission_of(&self.self_id),
             pool_earned: state.ledger.pool_earned,
             reward_pool_balance,
+            total_emitted: state.ledger.total_emitted,
             base_fee_per_byte: params.base_fee_per_byte,
             dust_threshold: params.dust_threshold,
             staking_commission_bps: params.staking_commission_bps,
             gas_price_per_fuel: params.gas_price_per_fuel,
+            emission_apr_bps: params.emission_apr_bps,
             burn_pct: 50,
             next_round: state.next_round,
             executed_transactions: state.executed,

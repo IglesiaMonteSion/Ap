@@ -296,6 +296,11 @@
           <div class="stat-sub">reclamable por delegadores</div>
         </div>
         <div class="stat-card">
+          <div class="stat-label">🌱 emitido (nuevo QCH)</div>
+          <div class="stat-value" id="econ-emitted" style="color:#8fb0ff">–</div>
+          <div class="stat-sub">acuñado al pool por emisión</div>
+        </div>
+        <div class="stat-card">
           <div class="stat-label">💼 balance de ESTE validador</div>
           <div class="stat-value" id="econ-validator-balance" style="color:#5be3a0">–</div>
           <div class="stat-sub">lo que llevás ganado + génesis</div>
@@ -306,6 +311,7 @@
         <div class="stat-card"><div class="stat-label">fee por byte</div><div class="stat-value" id="econ-base-fee">–</div></div>
         <div class="stat-card"><div class="stat-label">umbral de polvo</div><div class="stat-value" id="econ-dust-thr">–</div></div>
         <div class="stat-card"><div class="stat-label">comisión del validador</div><div class="stat-value" id="econ-commission">–</div></div>
+        <div class="stat-card"><div class="stat-label">emisión anual (APR)</div><div class="stat-value" id="econ-emission-apr">–</div></div>
         <div class="stat-card"><div class="stat-label">se quema de cada fee</div><div class="stat-value" id="econ-burn-pct">–</div></div>
         <div class="stat-card"><div class="stat-label">peso en el quórum (BFT)</div><div class="stat-value" id="econ-stake">–</div></div>
         <div class="stat-card"><div class="stat-label">pares (otros validadores)</div><div class="stat-value" id="econ-peers">–</div></div>
@@ -781,6 +787,8 @@ async function refreshEconomics() {
     setText("econ-own", qch(e.own_commission));
     setText("econ-validator-earned", qch(e.validator_earned));
     setText("econ-pool", qch(e.reward_pool_balance));
+    setText("econ-emitted", qch(e.total_emitted));
+    setText("econ-emission-apr", (e.emission_apr_bps / 100) + " %");
     setText("econ-validator-balance", qch(e.validator_balance));
     setText("econ-base-fee", fmtNum(e.base_fee_per_byte) + " u/byte");
     setText("econ-dust-thr", qch(e.dust_threshold));

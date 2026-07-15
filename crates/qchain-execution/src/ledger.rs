@@ -39,6 +39,10 @@ pub struct EconomicSnapshot {
     pub validator_earned: u64,
     pub pool_earned: u64,
     pub validator_commissions: Vec<(Pubkey, u64)>,
+    /// v4.0.0 emission total. Appended last; a pre-v4 economics snapshot simply
+    /// fails to decode and the report-only counters reset to 0 on that one
+    /// upgrade (economics is best-effort/report-only, never consensus state).
+    pub total_emitted: u64,
 }
 
 pub struct Ledger {
@@ -66,6 +70,12 @@ pub struct Ledger {
     /// Total routed into the shared staking rewards pool (the rest of the
     /// non-burned fee half), later claimable by delegators pro-rata.
     pub pool_earned: u64,
+    /// Total NEW QCH minted as staking-reward emission (v4.0.0) - the real
+    /// inflation counterpart to `total_burned`. Running total since this
+    /// `Ledger` was constructed, deterministic across nodes, persisted via
+    /// `export_economics`. `pool_earned` above counts only the fee-funded
+    /// pool inflow; this counts the freshly-emitted inflow.
+    pub total_emitted: u64,
     /// Real, live-maintained incremental sparse Merkle tree - see
     /// `qchain-storage::tree`'s `IncrementalStateTree` doc comment for
     /// the measured performance problem this closes (a single validator
@@ -119,6 +129,7 @@ impl Ledger {
             dust_burned: 0,
             validator_earned: 0,
             pool_earned: 0,
+            total_emitted: 0,
             tree,
             transfer_receipts: Vec::new(),
             staking_events: Vec::new(),
@@ -205,6 +216,7 @@ impl Ledger {
             validator_earned: self.validator_earned,
             pool_earned: self.pool_earned,
             validator_commissions: self.validator_commissions.iter().map(|(k, v)| (*k, *v)).collect(),
+            total_emitted: self.total_emitted,
         }
     }
 
@@ -217,6 +229,7 @@ impl Ledger {
         self.dust_burned = snap.dust_burned;
         self.validator_earned = snap.validator_earned;
         self.pool_earned = snap.pool_earned;
+        self.total_emitted = snap.total_emitted;
         self.validator_commissions = snap.validator_commissions.into_iter().collect();
     }
 
@@ -293,7 +306,7 @@ impl Ledger {
     pub fn current_params(&self) -> EconomicParams {
         self.store
             .get(&PARAMS_ACCOUNT_ID)
-            .and_then(|a| EconomicParams::try_from_slice(&a.data).ok())
+            .and_then(|a| EconomicParams::read_or_legacy(&a.data))
             .unwrap_or_default()
     }
 
@@ -326,8 +339,8 @@ impl Ledger {
         let existing = self.store.get(&FEE_STATE_ACCOUNT_ID);
         let mut fs = existing
             .as_ref()
-            .and_then(|a| FeeState::try_from_slice(&a.data).ok())
-            .unwrap_or(FeeState { epoch_round: current_round, epoch_bytes: 0 });
+            .and_then(|a| FeeState::read_or_legacy(&a.data))
+            .unwrap_or(FeeState { epoch_round: current_round, epoch_bytes: 0, emission_carry: 0 });
 
         if existing.is_some() && current_round > fs.epoch_round {
             // Close the previous epoch: adjust the base fee from its traffic.
@@ -341,6 +354,38 @@ impl Ledger {
                     .unwrap_or_else(|| Account::new_wallet(Pubkey::new([3u8; 32])));
                 pacct.data = borsh::to_vec(&params).expect("params always serialize");
                 self.write_account(PARAMS_ACCOUNT_ID, pacct);
+            }
+            // Emission (v4.0.0): mint new QCH into the delegator reward pool for
+            // every round that elapsed in the just-closed span, funding the
+            // target staking APR on top of fees. Deterministic: every validator
+            // computes the identical mint from the identical committed
+            // `total_staked`/`emission_apr_bps`/elapsed-rounds/carry, so no fork.
+            // `accrue_reward_pool` both mints the whole units to the pool balance
+            // (real new supply / inflation) and distributes them to stakers via
+            // the reward-per-share accumulator. Nothing is emitted when nothing
+            // is staked (`total_staked == 0`) or the APR is 0 (emission off);
+            // the fractional carry then stays 0, so switching emission on later
+            // starts cleanly.
+            let total_staked = self.store.get(&STAKING_STATS_ID).and_then(|a| u64::try_from_slice(&a.data).ok()).unwrap_or(0);
+            if total_staked > 0 && params.emission_apr_bps > 0 {
+                let rounds = (current_round - fs.epoch_round).min(crate::params::ROUNDS_PER_YEAR);
+                let (whole, new_carry) = crate::params::emission_for_rounds(total_staked, params.emission_apr_bps, rounds, fs.emission_carry);
+                fs.emission_carry = new_carry;
+                if whole > 0 {
+                    let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+                    if let Some(s) = self.store.get(&STAKING_STATS_ID) {
+                        accounts.insert(STAKING_STATS_ID, s);
+                    }
+                    if let Some(p) = self.store.get(&STAKING_REWARDS_POOL_ID) {
+                        accounts.insert(STAKING_REWARDS_POOL_ID, p);
+                    }
+                    if let Ok(true) = crate::staking::accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, whole) {
+                        if let Some(pool) = accounts.remove(&STAKING_REWARDS_POOL_ID) {
+                            self.write_account(STAKING_REWARDS_POOL_ID, pool);
+                        }
+                        self.total_emitted = self.total_emitted.saturating_add(whole);
+                    }
+                }
             }
             fs.epoch_round = current_round;
             fs.epoch_bytes = 0;
@@ -1101,6 +1146,74 @@ mod tests {
     }
 
     #[test]
+    fn emission_mints_new_qch_into_the_reward_pool_over_elapsed_rounds() {
+        // With real stake delegated and the default 12% APR, closing a fee epoch
+        // that spanned several rounds mints new QCH straight into the reward
+        // pool - real inflation on top of fees, tracked by `total_emitted`.
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 100_000_000);
+
+        // Seed `total_staked`. Chosen so the per-round emission is a clean whole
+        // number: 63,072,000,000 staked at 12% APR / 63,072,000 rounds-per-year
+        // = 120 units minted per round.
+        let total_staked: u64 = 63_072_000_000;
+        ledger.store.set(
+            STAKING_STATS_ID,
+            Account { data: borsh::to_vec(&total_staked).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        // Seed an empty reward pool so we can watch it grow from zero base.
+        ledger.store.set(
+            STAKING_REWARDS_POOL_ID,
+            Account { data: borsh::to_vec(&crate::staking::RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+
+        let mk = |nonce: u64| {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+            };
+            Transaction::new_signed(&alice, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+        };
+        // First tx opens the fee epoch at round 0 (no elapsed rounds -> no emission).
+        ledger.apply_transaction(&mk(0), &validator, 0).unwrap();
+        assert_eq!(ledger.total_emitted, 0, "no rounds elapsed yet -> nothing minted");
+        // A tx ten rounds later closes epoch 0, spanning 10 rounds -> 10 x 120 = 1200.
+        ledger.apply_transaction(&mk(1), &validator, 10).unwrap();
+        assert_eq!(ledger.total_emitted, 1_200, "10 rounds x 120/round of emission");
+        // The pool balance grew by at least the emitted amount (fee-share may add
+        // more, but emission alone accounts for `total_emitted`).
+        let pool_balance = ledger.store.get(&STAKING_REWARDS_POOL_ID).unwrap().balance;
+        assert!(pool_balance >= 1_200, "emission must be minted into the pool, got {pool_balance}");
+    }
+
+    #[test]
+    fn emission_is_off_when_no_stake_is_delegated() {
+        // With `total_staked == 0` (the pre-staking state), no emission is minted
+        // no matter how many rounds elapse - emission funds delegators, and there
+        // are none.
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 100_000_000);
+        let mk = |nonce: u64| {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+            };
+            Transaction::new_signed(&alice, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+        };
+        ledger.apply_transaction(&mk(0), &validator, 0).unwrap();
+        ledger.apply_transaction(&mk(1), &validator, 100).unwrap();
+        assert_eq!(ledger.total_emitted, 0, "no stake -> no emission");
+    }
+
+    #[test]
     fn economics_snapshot_round_trips_exactly() {
         // A ledger with some real economic state, then export -> import into a
         // fresh ledger must reproduce every counter and the per-validator map
@@ -1111,6 +1224,7 @@ mod tests {
         a.dust_burned = 200;
         a.validator_earned = 900;
         a.pool_earned = 100;
+        a.total_emitted = 4_242;
         let v1 = Keypair::generate().unwrap().pubkey();
         let v2 = Keypair::generate().unwrap().pubkey();
         a.note_validator_commission(v1, 640);
@@ -1126,6 +1240,7 @@ mod tests {
         assert_eq!(b.dust_burned, 200);
         assert_eq!(b.validator_earned, 900);
         assert_eq!(b.pool_earned, 100);
+        assert_eq!(b.total_emitted, 4_242);
         assert_eq!(b.commission_of(&v1), 650);
         assert_eq!(b.commission_of(&v2), 260);
         assert_eq!(b.commission_of(&Keypair::generate().unwrap().pubkey()), 0, "an unknown validator has zero commission");

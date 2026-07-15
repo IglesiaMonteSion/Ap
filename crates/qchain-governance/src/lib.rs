@@ -102,6 +102,10 @@ pub enum ProposalAction {
     /// staking-reward share of `base_fee` (`ARCHITECTURE.md` §5's staking
     /// rewards paragraph).
     SetStakingCommissionBps(u16),
+    /// New QCH emission rate (annual, basis points out of 10,000) minted into
+    /// the staking reward pool per round (`ARCHITECTURE.md` §5's emission
+    /// paragraph). Tunes the sustainable staking APR on top of fees.
+    SetEmissionApr(u16),
 }
 
 impl ProposalAction {
@@ -113,7 +117,8 @@ impl ProposalAction {
             ProposalAction::SetBaseFeePerByte(_)
             | ProposalAction::SetDustThreshold(_)
             | ProposalAction::SetGasPricePerFuel(_)
-            | ProposalAction::SetStakingCommissionBps(_) => RiskTier::Low,
+            | ProposalAction::SetStakingCommissionBps(_)
+            | ProposalAction::SetEmissionApr(_) => RiskTier::Low,
         }
     }
 }

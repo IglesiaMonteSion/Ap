@@ -212,14 +212,16 @@ impl NativeProgram for GovernanceProgram {
                     ProposalAction::SetBaseFeePerByte(_)
                     | ProposalAction::SetDustThreshold(_)
                     | ProposalAction::SetGasPricePerFuel(_)
-                    | ProposalAction::SetStakingCommissionBps(_) => {
+                    | ProposalAction::SetStakingCommissionBps(_)
+                    | ProposalAction::SetEmissionApr(_) => {
                         if target_pk != crate::ids::PARAMS_ACCOUNT_ID {
                             return Err(ExecError::ProgramError(
                                 "Execute accounts[1] must be the canonical economic-params account for a Low-tier action".into(),
                             ));
                         }
                         let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
-                        let mut params = crate::params::EconomicParams::try_from_slice(&target_account.data).map_err(borsh_err)?;
+                        let mut params = crate::params::EconomicParams::read_or_legacy(&target_account.data)
+                            .ok_or_else(|| ExecError::ProgramError("economic-params account is unreadable".into()))?;
                         apply_economic_action(&mut params, &proposal.action)?;
                         accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&params).map_err(borsh_err)?;
                     }
@@ -263,7 +265,8 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
         ProposalAction::SetBaseFeePerByte(_)
         | ProposalAction::SetDustThreshold(_)
         | ProposalAction::SetGasPricePerFuel(_)
-        | ProposalAction::SetStakingCommissionBps(_) => {
+        | ProposalAction::SetStakingCommissionBps(_)
+        | ProposalAction::SetEmissionApr(_) => {
             unreachable!("Execute only calls apply_registry_action for Registry-tier actions")
         }
     }
@@ -329,6 +332,19 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                 return Err(ExecError::ProgramError("staking commission cannot exceed 10,000 bps (100%)".into()));
             }
             params.staking_commission_bps = *v;
+        }
+        // Cap: emission is real new supply minted every round; an unbounded APR
+        // (e.g. u16::MAX ≈ 655%) executed with zero time-lock would inflate the
+        // token catastrophically before anyone could react. The cap keeps it in
+        // a plausible monetary-policy band.
+        ProposalAction::SetEmissionApr(v) => {
+            if *v > crate::params::MAX_EMISSION_APR_BPS {
+                return Err(ExecError::ProgramError(format!(
+                    "emission APR {v} bps exceeds the safety cap {} bps",
+                    crate::params::MAX_EMISSION_APR_BPS
+                )));
+            }
+            params.emission_apr_bps = *v;
         }
         ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
             unreachable!("Execute only calls apply_economic_action for Low-tier actions")
@@ -729,11 +745,16 @@ mod tests {
         // The state must be untouched after every rejection.
         assert_eq!(p.dust_threshold, EconomicParams::default().dust_threshold);
         assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
+        // An emission APR above the safety cap is rejected (unbounded inflation).
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(u16::MAX)).is_err());
+        assert_eq!(p.emission_apr_bps, EconomicParams::default().emission_apr_bps);
         // Legitimate in-range recalibrations still apply.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(MAX_DUST_THRESHOLD)).is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::FEE_MIN_BASE_FEE_PER_BYTE)).is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(1)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(crate::params::MAX_EMISSION_APR_BPS)).is_ok());
         assert_eq!(p.dust_threshold, MAX_DUST_THRESHOLD);
+        assert_eq!(p.emission_apr_bps, crate::params::MAX_EMISSION_APR_BPS);
     }
 
     #[test]

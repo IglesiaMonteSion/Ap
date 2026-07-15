@@ -313,6 +313,21 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// Propose a new QCH emission APR (annual, basis points). Low-tier.
+    ProposeSetEmissionApr {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        proposal_id: ProposalId,
+        #[arg(long)]
+        value: u16,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
     /// Cast a vote on a proposal, weighted by a stake account's balance.
     Vote {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -820,6 +835,15 @@ fn main() -> anyhow::Result<()> {
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
+        Command::ProposeSetEmissionApr { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
+            let proposer = qchain_crypto::read_keypair_file(&keypair)?;
+            let proposal_pk = Keypair::generate()?.pubkey();
+            let action = ProposalAction::SetEmissionApr(value);
+            let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposal account: {proposal_pk}");
+        }
         Command::Vote { rpc, keypair, proposal, stake_account, choice, nonce, fee_limit } => {
             let voter = qchain_crypto::read_keypair_file(&keypair)?;
             let proposal_pk: Pubkey = proposal.parse()?;
@@ -852,7 +876,8 @@ fn main() -> anyhow::Result<()> {
                 ProposalAction::SetBaseFeePerByte(_)
                 | ProposalAction::SetDustThreshold(_)
                 | ProposalAction::SetGasPricePerFuel(_)
-                | ProposalAction::SetStakingCommissionBps(_) => PARAMS_ACCOUNT_ID,
+                | ProposalAction::SetStakingCommissionBps(_)
+                | ProposalAction::SetEmissionApr(_) => PARAMS_ACCOUNT_ID,
             };
             let data = borsh::to_vec(&GovernanceInstruction::Execute)?;
             let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, target], data, nonce, fee_limit)?;
