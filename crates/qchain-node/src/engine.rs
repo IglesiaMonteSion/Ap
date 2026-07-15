@@ -575,6 +575,26 @@ pub struct Engine {
     /// never double-charges or corrupts balances - the same idempotence the
     /// pre-existing network-refetch restart already relied on.
     pub cert_log: Option<sled::Db>,
+    /// On-disk log of every worker batch this validator has cached (a `sled`
+    /// tree at `data_dir/batches`, `None` for an in-memory node), keyed by the
+    /// batch's content digest. Persisting batches is the necessary companion to
+    /// `cert_log`: `cert_log` reloads the certificates, but a certificate only
+    /// carries the *digest* of its worker batches, not their transactions. On
+    /// restart, a fresh `ConsensusState` re-derives the committed order over the
+    /// retained DAG and pushes every committed certificate onto
+    /// `pending_execution`; `take_executable_prefix` then BLOCKS at the first
+    /// certificate whose batch isn't locally cached (it never skips — see its
+    /// docs). A multi-validator node re-syncs that batch from a peer; a **single
+    /// validator has no peer**, so without persisting batches its execution
+    /// stalls permanently at the first reloaded certificate that carried a
+    /// transaction (a real, live-confirmed freeze of the solo-node deploy mode:
+    /// rounds keep advancing but no new transaction ever executes). Re-applying
+    /// the reloaded batches' transactions is idempotent — `apply_transaction`'s
+    /// nonce check rejects an already-applied tx before touching state — so this
+    /// only lets execution walk *past* the already-applied history to reach new
+    /// transactions; it never double-applies. Best-effort persist, same contract
+    /// as `cert_log`.
+    pub batch_log: Option<sled::Db>,
     /// Phase-3.3 rotation: on-disk log of each epoch's committee (a `sled` db at
     /// `data_dir/committees`, `Some` only when rotation is on and the node
     /// persists to disk). The epoch ratchet writes each newly-installed
@@ -716,6 +736,26 @@ impl Engine {
                     }
                 }
                 Err(e) => tracing::warn!("failed to encode certificate {digest:?} for the DAG log: {e}"),
+            }
+        }
+    }
+
+    /// Best-effort persist of a worker batch to `batch_log`, keyed by its
+    /// content digest (see the `batch_log` field docs for why this is the
+    /// necessary companion to `insert_certificate`). Same contract as the DAG
+    /// log: a disk error is logged, not fatal — the batch stays in the in-memory
+    /// cache for this run, and on a later restart that certificate just re-syncs
+    /// from peers exactly as it did before batch persistence existed (a lone
+    /// validator being the one case that can't, which is the freeze this closes).
+    fn persist_batch(&self, digest: &Digest, batch: &Batch) {
+        if let Some(db) = &self.batch_log {
+            match borsh::to_vec(batch) {
+                Ok(bytes) => {
+                    if let Err(e) = db.insert(digest, bytes) {
+                        tracing::warn!("failed to persist batch {digest:?} to the batch log: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("failed to encode batch {digest:?} for the batch log: {e}"),
             }
         }
     }
@@ -1417,6 +1457,7 @@ impl Engine {
             NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
                 {
                     let mut state = self.state.lock().await;
+                    self.persist_batch(&batch.digest(), &batch);
                     cache_batch(&mut state, batch);
                 }
                 // A newly-arrived batch may be exactly the one blocking the
@@ -1656,6 +1697,7 @@ impl Engine {
             }
             NetMessage::WorkerBatchResponse { worker_id: _, batch } => {
                 let mut state = self.state.lock().await;
+                self.persist_batch(&batch.digest(), &batch);
                 cache_batch(&mut state, batch);
             }
             NetMessage::VersionAnnounce { version } => {
@@ -1965,9 +2007,17 @@ impl Engine {
         let batch_horizon = state.next_round.saturating_sub(BATCH_RETENTION_ROUNDS);
         if batch_horizon > 0 {
             let stale: Vec<Digest> = state.batch_seen_round.iter().filter(|(_, &seen)| seen < batch_horizon).map(|(&d, _)| d).collect();
-            for digest in stale {
-                state.batches.remove(&digest);
-                state.batch_seen_round.remove(&digest);
+            for digest in &stale {
+                state.batches.remove(digest);
+                state.batch_seen_round.remove(digest);
+                // Keep the on-disk batch log bounded in lock-step with the
+                // in-memory cache (same `BATCH_RETENTION_ROUNDS` window) - a
+                // best-effort delete, a dead key just gets re-pruned next tick.
+                if let Some(db) = &self.batch_log {
+                    if let Err(e) = db.remove(digest) {
+                        tracing::warn!("failed to delete pruned batch {digest:?} from the batch log: {e}");
+                    }
+                }
             }
         }
 
@@ -2339,9 +2389,17 @@ impl Engine {
             let txs: Vec<Transaction> = drain_ready_transactions(&mut state);
             let worker_batches = partition_into_worker_batches(txs);
             let mut batch_digests: Vec<(WorkerId, Digest)> = Vec::with_capacity(worker_batches.len());
+            let seen_round = state.next_round;
             for (worker_id, batch) in &worker_batches {
                 let digest = batch.digest();
+                self.persist_batch(&digest, batch);
                 state.batches.insert(digest, batch.clone());
+                // Track own batches for retention too, so both the in-memory
+                // cache and the on-disk batch log are pruned by the same
+                // `BATCH_RETENTION_ROUNDS` window (see `prune_stale_round_state`).
+                // Without this an own batch would never be evicted - unbounded
+                // growth, and for a solo validator EVERY batch is its own.
+                state.batch_seen_round.entry(digest).or_insert(seen_round);
                 batch_digests.push((*worker_id, digest));
             }
             let parents: Vec<Digest> = if round == 0 {

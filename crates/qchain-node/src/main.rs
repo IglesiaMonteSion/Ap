@@ -326,6 +326,41 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("reloaded {loaded} certificates from the on-disk DAG log");
         }
     }
+    // Worker batches (the transaction payloads the reloaded certificates only
+    // reference by digest). Reloaded into the initial `batches` cache so a
+    // restarted validator can EXECUTE the transactions those certificates carry
+    // instead of blocking `take_executable_prefix` on a batch it can no longer
+    // fetch (a single validator has no peer to re-sync from) - see
+    // `Engine::batch_log`. `None`/empty for an in-memory node, exactly the prior
+    // behavior. Their retention round is unknown after a restart, so they are
+    // tagged with the current resume round; the next prune tick re-windows them.
+    let batch_log: Option<sled::Db> = match &config.data_dir {
+        Some(dir) => Some(sled::open(dir.join("batches"))?),
+        None => None,
+    };
+    let mut reloaded_batches: HashMap<qchain_core::Digest, qchain_core::Batch> = HashMap::new();
+    let mut reloaded_batch_rounds: HashMap<qchain_core::Digest, u64> = HashMap::new();
+    if let Some(db) = &batch_log {
+        let mut loaded = 0usize;
+        for entry in db.iter() {
+            let (digest_bytes, bytes) = entry?;
+            match borsh::from_slice::<qchain_core::Batch>(&bytes) {
+                Ok(batch) => {
+                    let mut digest = [0u8; 32];
+                    if digest_bytes.len() == 32 {
+                        digest.copy_from_slice(&digest_bytes);
+                        reloaded_batches.insert(digest, batch);
+                        reloaded_batch_rounds.insert(digest, next_round);
+                        loaded += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("skipping a corrupt batch in the on-disk batch log: {e}"),
+            }
+        }
+        if loaded > 0 {
+            tracing::info!("reloaded {loaded} worker batches from the on-disk batch log");
+        }
+    }
     // If this node persisted a *pruned* DAG (a long-lived validator that
     // garbage-collected old rounds - see `engine::DAG_RETENTION_ROUNDS`), its
     // reloaded DAG starts at some round > 0. Set the consensus GC barrier to
@@ -424,6 +459,7 @@ async fn main() -> anyhow::Result<()> {
         network,
         chain_id: config.chain_id(),
         cert_log,
+        batch_log,
         committee_log,
         config_peers,
         receipt_log,
@@ -436,8 +472,8 @@ async fn main() -> anyhow::Result<()> {
             dag,
             consensus,
             mempool: HashMap::new(),
-            batches: HashMap::new(),
-            batch_seen_round: HashMap::new(),
+            batches: reloaded_batches,
+            batch_seen_round: reloaded_batch_rounds,
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round,
