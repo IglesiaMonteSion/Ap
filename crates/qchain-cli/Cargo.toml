@@ -21,3 +21,4 @@ reqwest.workspace = true
 hex.workspace = true
 borsh.workspace = true
 wat.workspace = true
+tokio.workspace = true

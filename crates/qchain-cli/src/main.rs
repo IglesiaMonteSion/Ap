@@ -492,6 +492,18 @@ enum Command {
         /// 0 (default) uses the sustainable in-flight throttle instead.
         #[arg(long, default_value_t = 0)]
         offer_rate: u64,
+        /// Continuous mode only. Async FIRE-AND-FORGET flood: pre-sign a big pool
+        /// of varied txs (transfers + staking + contract calls) and blast them
+        /// with high concurrency WITHOUT waiting for each RPC response — the only
+        /// way to out-run the node's ~hundreds-of-ms RPC latency under load and
+        /// pile THOUSANDS into the mempool at once, spiking the dynamic fee and
+        /// letting you see a real backlog. Reports the peak queue depth reached.
+        #[arg(long, default_value_t = false)]
+        fire_and_forget: bool,
+        /// With --fire-and-forget: how many transactions to pre-sign and blast
+        /// (the target backlog to try to build). Split across workers.
+        #[arg(long, default_value_t = 8000)]
+        queue_target: u64,
     },
     /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
     /// see `qchain-execution::native`). Prints the fresh address the
@@ -760,6 +772,101 @@ fn build_stress_ix(
         accounts: vec![payer, recipient],
         data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
     }
+}
+
+/// Async fire-and-forget blast of a pre-signed pool of transactions: fires them
+/// all at high concurrency WITHOUT blocking one-per-response, the only way to
+/// out-run the node's hundreds-of-ms RPC latency under load and pile a real
+/// backlog into the mempool. A sampler tracks the peak queue depth (admitted
+/// minus executed) and the peak dynamic base fee reached. Returns
+/// `(accepted, failed, peak_backlog, peak_base_fee)`.
+fn blast_txs_async(rpc: &str, txs: Vec<Transaction>, baseline_executed: u64) -> (u64, u64, u64, u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(6).enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return (0, 0, 0, 0),
+    };
+    rt.block_on(async move {
+        let client = reqwest::Client::builder().pool_max_idle_per_host(512).build().unwrap_or_default();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+        let peak_backlog = Arc::new(AtomicU64::new(0));
+        let peak_fee = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Sampler: peak mempool backlog (admitted - executed) and peak base_fee.
+        let sampler = {
+            let (client, rpc) = (client.clone(), rpc.to_string());
+            let (accepted, peak_backlog, peak_fee, done) = (accepted.clone(), peak_backlog.clone(), peak_fee.clone(), done.clone());
+            tokio::spawn(async move {
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(r) = client.get(format!("{rpc}/status")).send().await {
+                        if let Ok(v) = r.json::<serde_json::Value>().await {
+                            let executed = v["executed_transactions"].as_u64().unwrap_or(baseline_executed);
+                            let exec_delta = executed.saturating_sub(baseline_executed);
+                            let backlog = accepted.load(Ordering::Relaxed).saturating_sub(exec_delta);
+                            peak_backlog.fetch_max(backlog, Ordering::Relaxed);
+                        }
+                    }
+                    if let Ok(r) = client.get(format!("{rpc}/status")).send().await {
+                        if let Ok(v) = r.json::<serde_json::Value>().await {
+                            if let Some(bf) = v["base_fee_per_byte"].as_u64() {
+                                peak_fee.fetch_max(bf, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            })
+        };
+
+        // Blast with bounded concurrency so we don't exhaust file descriptors.
+        let sem = Arc::new(tokio::sync::Semaphore::new(400));
+        let mut handles = Vec::new();
+        for tx in txs {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let (client, rpc) = (client.clone(), rpc.to_string());
+            let (accepted, failed) = (accepted.clone(), failed.clone());
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                match client.post(format!("{rpc}/tx")).json(&tx).timeout(std::time::Duration::from_secs(15)).send().await {
+                    Ok(r) if r.status().is_success() => accepted.fetch_add(1, Ordering::Relaxed),
+                    _ => failed.fetch_add(1, Ordering::Relaxed),
+                };
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        // Drain-wait with the sampler STILL running: the dynamic fee keeps
+        // climbing as the backlog drains over many full rounds AFTER the blast
+        // finishes, so the real peak fee happens here, not during submission.
+        // Poll executed until it stops climbing (drained / wedged) or a timeout.
+        let mut last = fetch_stress_sample(rpc).map(|s| s.executed).unwrap_or(0);
+        let mut stable = 0;
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let now = client.get(format!("{rpc}/status")).send().await.ok();
+            let ex = match now {
+                Some(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v["executed_transactions"].as_u64()).unwrap_or(last),
+                None => last,
+            };
+            if ex == last {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            last = ex;
+            if stable >= 8 || std::time::Instant::now() > drain_deadline {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        let _ = sampler.await;
+        (accepted.load(Ordering::Relaxed), failed.load(Ordering::Relaxed), peak_backlog.load(Ordering::Relaxed), peak_fee.load(Ordering::Relaxed))
+    })
 }
 
 fn submit_instruction(
@@ -1274,6 +1381,8 @@ fn main() -> anyhow::Result<()> {
             sustained_secs,
             refund,
             offer_rate,
+            fire_and_forget,
+            queue_target,
         } => {
             let bank = qchain_crypto::read_keypair_file(&keypair)?;
             let chain_id = fetch_chain_id(&rpc)?;
@@ -1375,7 +1484,51 @@ fn main() -> anyhow::Result<()> {
             let mut total_failed = 0u64; // rejected at admission (RPC returned an error)
             let mut broke = false;
 
-            if sustained_secs > 0 {
+            if sustained_secs > 0 && fire_and_forget {
+                // ---- ASYNC FIRE-AND-FORGET FLOOD: pre-sign a big pool of varied
+                // txs (untimed), then blast them with high concurrency without
+                // waiting per response, to build a real mempool backlog and spike
+                // the dynamic fee.
+                let per_worker = (queue_target as usize).div_ceil(workers).max(1);
+                println!("fire-and-forget: pre-signing {} varied txs ({per_worker}/worker, untimed)...", per_worker * workers);
+                let mut pool: Vec<Transaction> = Vec::with_capacity(per_worker * workers);
+                let mut gc = 0u64;
+                for (wi, w) in workers_kp.iter().enumerate() {
+                    let start = fetch_account(&rpc, &w.pubkey())?.map(|a| a.nonce).unwrap_or(0);
+                    for j in 0..per_worker {
+                        let recipient = workers_kp[(wi + 1) % workers].pubkey();
+                        let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, gc);
+                        gc += 1;
+                        pool.push(Transaction::new_signed(w, start + j as u64, chain_id, 1_000_000_000, vec![ix])?);
+                    }
+                }
+                let baseline = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(0);
+                println!("blasting {} txs at high concurrency (async, no per-response wait)...", pool.len());
+                let (accepted, failed, peak_backlog, peak_fee_bf) = blast_txs_async(&rpc, pool, baseline);
+                total_attempted = accepted + failed;
+                total_accepted = accepted;
+                total_failed = failed;
+                println!("  blasted {total_attempted}: {accepted} accepted, {failed} rejected");
+                println!("  PICO de cola (mempool backlog): {peak_backlog} transacciones esperando ejecución");
+
+                // Peak fee-per-transfer at the peak base_fee reached by the flood.
+                let floor_bf = qchain_execution::params::FEE_MIN_BASE_FEE_PER_BYTE;
+                let max_bf = qchain_execution::params::MAX_BASE_FEE_PER_BYTE;
+                let peak = peak_fee_bf.max(floor_bf);
+                let sample_tx = {
+                    let to = Keypair::generate()?.pubkey();
+                    let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![bank.pubkey(), to], data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 })? };
+                    Transaction::new_signed(&bank, 0, chain_id, 1_000_000_000, vec![ix])?
+                };
+                let tx_bytes = sample_tx.byte_size() as u64;
+                let to_qch = |u: u64| u as f64 / 1e9;
+                println!("\n=== fee por transferencia ===");
+                println!("  tamaño de una transferencia firmada: {tx_bytes} bytes");
+                println!("  base_fee_per_byte en el PICO:        {peak} unidades/byte");
+                println!("  fee por transferencia en el PICO:    {} unidades = {:.9} QCH", peak.saturating_mul(tx_bytes), to_qch(peak.saturating_mul(tx_bytes)));
+                println!("  (referencia, piso base_fee={floor_bf}: {} unidades = {:.9} QCH)", floor_bf.saturating_mul(tx_bytes), to_qch(floor_bf.saturating_mul(tx_bytes)));
+                println!("  (tope duro teórico base_fee={max_bf}: {} unidades = {:.3} QCH)", max_bf.saturating_mul(tx_bytes), to_qch(max_bf.saturating_mul(tx_bytes)));
+            } else if sustained_secs > 0 {
                 // ---- CONTINUOUS MODE: every worker submits back-to-back for the
                 // whole window, no per-step settle. An optional refunder thread
                 // tops workers up so the rising fee can't strand the generator
