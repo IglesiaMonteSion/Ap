@@ -133,6 +133,8 @@ fn main() -> anyhow::Result<()> {
             state_sync_peers: Vec::new(),
             state_sync_trusted_root: None,
             state_sync_trusted_round: None,
+            validator_rotation: false,
+            epoch_rounds: None,
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;

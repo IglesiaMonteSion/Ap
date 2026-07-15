@@ -81,6 +81,30 @@ pub struct NodeConfig {
     pub state_sync_trusted_root: Option<String>,
     #[serde(default)]
     pub state_sync_trusted_round: Option<u64>,
+    /// **Opt-in dynamic validator rotation (phase 3.3).** When `false` (the
+    /// default, and what every existing config resolves to), the validator set
+    /// is fixed for the life of the network — exactly the phase-1/2 behavior,
+    /// zero change. When `true`, the *active* consensus committee is re-derived
+    /// each epoch from the on-chain validator registry (who has staked and
+    /// called `register-validator`): a newcomer with enough self-stake enters
+    /// the committee automatically at the next epoch boundary, and one that
+    /// unregisters or falls below the minimum leaves — no coordinated redeploy.
+    ///
+    /// **Hard requirement: every node in a network must set this identically.**
+    /// It changes how consensus resolves each round's committee, so a mismatch
+    /// would fork the network. It is a genesis-level, network-wide decision.
+    /// The `validators` list still seeds epoch 0 (the bootstrap committee) and
+    /// governs until/unless a viable active set exists on-chain, so a rotation
+    /// network still starts exactly from its genesis validators.
+    #[serde(default)]
+    pub validator_rotation: bool,
+    /// Rounds per epoch — only meaningful when `validator_rotation` is `true`.
+    /// The granularity at which the active committee may change. Omitted (the
+    /// default) uses the standard `EPOCH_ROUNDS` (1024). Exposed mainly so a
+    /// test network can use a small value to cross an epoch boundary quickly;
+    /// like `validator_rotation`, it must match across all nodes.
+    #[serde(default)]
+    pub epoch_rounds: Option<u64>,
 }
 
 fn default_round_interval_ms() -> u64 {
@@ -109,6 +133,13 @@ impl NodeConfig {
         let bytes = serde_json::to_vec(&(&self.validators, &self.genesis)).expect("genesis data always serializes");
         Sha3_256::digest(bytes).into()
     }
+
+    /// Rounds per epoch for validator rotation (the config override, or the
+    /// standard `EPOCH_ROUNDS` default). Only meaningful when
+    /// `validator_rotation` is set.
+    pub fn epoch_rounds(&self) -> u64 {
+        self.epoch_rounds.unwrap_or(qchain_consensus::schedule::DEFAULT_EPOCH_ROUNDS)
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +159,8 @@ mod tests {
             state_sync_peers: Vec::new(),
             state_sync_trusted_root: None,
             state_sync_trusted_round: None,
+            validator_rotation: false,
+            epoch_rounds: None,
         }
     }
 

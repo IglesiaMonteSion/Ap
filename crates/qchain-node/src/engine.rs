@@ -54,7 +54,27 @@
 //! already accounted for, and anything with a gap ahead of it just stays
 //! queued for a later round instead of being drained blindly.
 
-use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule, ValidatorSet};
+use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorInfo, ValidatorSchedule, ValidatorSet};
+
+/// Derive the active consensus committee from the on-chain validator registry
+/// (phase-3.3 rotation). Runs the deterministic `select_active_set` (top-N by
+/// stake, min-stake filtered — see `qchain_execution::validator_registry`) and
+/// maps each registered validator to a consensus `ValidatorInfo`. Returns
+/// `None` when the registry yields no viable committee (empty), so the caller
+/// keeps the current committee — the reason a rotation network still runs on
+/// its genesis validators until real on-chain registrations exist. **Pure and
+/// deterministic**: every honest node computing this from the identical
+/// committed registry state gets the byte-identical committee, which is what
+/// keeps a live rotation fork-free.
+pub fn active_committee_from_registry(registry: &qchain_execution::validator_registry::ValidatorRegistryData) -> Option<ValidatorSet> {
+    use qchain_execution::validator_registry::{select_active_set, MAX_ACTIVE_VALIDATORS};
+    let active = select_active_set(registry, MAX_ACTIVE_VALIDATORS);
+    if active.is_empty() {
+        return None;
+    }
+    let infos: Vec<ValidatorInfo> = active.into_iter().map(|rv| ValidatorInfo { id: rv.validator, pubkey_bundle: rv.pubkey_bundle, stake: rv.stake }).collect();
+    Some(ValidatorSet::new(infos))
+}
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Keypair, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
@@ -2121,6 +2141,26 @@ mod tests {
     use qchain_crypto::Keypair;
     use qchain_execution::Ledger;
     use qchain_storage::InMemoryStore;
+
+    #[test]
+    fn active_committee_from_registry_maps_stakes_and_rejects_an_empty_registry() {
+        use qchain_execution::validator_registry::{RegisteredValidator, ValidatorRegistryData, MIN_VALIDATOR_STAKE};
+        // Empty registry → no viable committee (caller keeps the current one).
+        assert!(active_committee_from_registry(&ValidatorRegistryData::default()).is_none());
+        // Two registered validators → a committee carrying their exact stakes.
+        let kp1 = Keypair::generate().unwrap();
+        let kp2 = Keypair::generate().unwrap();
+        let reg = ValidatorRegistryData {
+            validators: vec![
+                RegisteredValidator { validator: kp1.pubkey(), pubkey_bundle: kp1.public_key_bundle(), address: "10.0.0.1:9000".into(), stake: MIN_VALIDATOR_STAKE * 2 },
+                RegisteredValidator { validator: kp2.pubkey(), pubkey_bundle: kp2.public_key_bundle(), address: "10.0.0.2:9000".into(), stake: MIN_VALIDATOR_STAKE },
+            ],
+        };
+        let committee = active_committee_from_registry(&reg).expect("a non-empty registry yields a committee");
+        assert_eq!(committee.len(), 2);
+        assert_eq!(committee.total_stake(), MIN_VALIDATOR_STAKE * 3);
+        assert_eq!(committee.stake_of(&kp1.pubkey()), MIN_VALIDATOR_STAKE * 2);
+    }
 
     fn new_state() -> EngineState {
         EngineState {
