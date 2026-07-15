@@ -496,6 +496,8 @@ pub enum VerifyError {
     ValueOutOfU64Range { column: usize, step: usize },
     #[error("malformed proof rejected before verification (e.g. wrong trace width)")]
     Malformed,
+    #[error("value conservation violated at row {row} - a transfer that does not conserve value (mint/destroy)")]
+    ConservationViolated { row: usize },
 }
 
 fn is_valid_u64(value: BaseElement) -> bool {
@@ -534,6 +536,35 @@ pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), Verify
             if !is_valid_u64(value) {
                 return Err(VerifyError::ValueOutOfU64Range { column, step });
             }
+        }
+    }
+    // Conservation re-check on EVERY row, directly over the public column
+    // values. CRITICAL: the two conservation equations are AIR *transition*
+    // constraints, which Winterfell evaluates only on rows 0..n-2 - the LAST
+    // row of the trace is outside the transition domain and is NEVER checked by
+    // the proof itself. An honest `build_trace` always pads so the last row is
+    // an all-zero padding row (which trivially conserves), so honest proofs are
+    // safe - but `verify_batch` accepts UNTRUSTED proofs from a possibly-
+    // malicious node (the whole point of the light client and `catch_unwind`
+    // hardening), which can hand-craft a raw trace whose last row mints value
+    // (e.g. credits the recipient without debiting the payer) and it would
+    // verify. Re-checking both equations here, in the field, for every row
+    // closes that gap regardless of the transition domain or padding. The
+    // range check above already proved every value is a real `u64` (< 2^64), so
+    // the sum of three of them is < 2^66 << the field modulus (~2^128) - the
+    // field arithmetic is exact, no wraparound, and a padding row (all zeros)
+    // satisfies both equations. Cheap: O(rows).
+    let rows = pub_inputs.columns[COL_FROM_BEFORE].len();
+    for row in 0..rows {
+        let from_before = pub_inputs.columns[COL_FROM_BEFORE][row];
+        let to_before = pub_inputs.columns[COL_TO_BEFORE][row];
+        let amount = pub_inputs.columns[COL_AMOUNT][row];
+        let fee = pub_inputs.columns[COL_FEE][row];
+        let from_after = pub_inputs.columns[COL_FROM_AFTER][row];
+        let to_after = pub_inputs.columns[COL_TO_AFTER][row];
+        // from_after == from_before - amount - fee  AND  to_after == to_before + amount
+        if from_after + amount + fee != from_before || to_after != to_before + amount {
+            return Err(VerifyError::ConservationViolated { row });
         }
     }
     Ok(())
@@ -815,6 +846,46 @@ mod tests {
             Err(VerifyError::ValueOutOfU64Range { column: 2, step: 0 }) => {} // caught exactly where expected
             Err(other) => panic!("expected the range check on column 2 (amount) to reject this, got a different error: {other:?}"),
             Ok(()) => panic!("a disguised out-of-range amount must never verify"),
+        }
+    }
+
+    #[test]
+    fn a_minting_last_row_is_rejected_even_though_the_air_transition_domain_never_checks_it() {
+        // CRITICAL soundness regression: the two conservation equations are AIR
+        // TRANSITION constraints, evaluated by Winterfell only on rows 0..n-2 -
+        // the LAST row is outside the transition domain and the proof never
+        // checks it. A malicious prover crafts a raw trace whose last row mints
+        // value: rows 0..6 all-zero (trivially conserving), row 7 credits the
+        // recipient 500 WITHOUT debiting the payer. Every value is a real u64,
+        // so the range check passes; the transition domain skips row 7; so
+        // before the post-verification conservation re-check this VERIFIED - a
+        // mint-from-nothing against the light client. Confirmed empirically.
+        let padded_len = TraceInfo::MIN_TRACE_LENGTH; // 8
+        let last = padded_len - 1;
+        let mut columns: Vec<Vec<BaseElement>> = vec![vec![BaseElement::ZERO; padded_len]; TRACE_WIDTH];
+        columns[COL_FROM_BEFORE][last] = BaseElement::new(1_000);
+        columns[COL_AMOUNT][last] = BaseElement::new(500);
+        columns[COL_FEE][last] = BaseElement::ZERO;
+        columns[COL_FROM_AFTER][last] = BaseElement::new(1_000); // NOT debited - the mint
+        columns[COL_TO_BEFORE][last] = BaseElement::ZERO;
+        columns[COL_TO_AFTER][last] = BaseElement::new(500); // credited out of nothing
+        let trace = TraceTable::init(columns);
+
+        // In a debug build Winterfell's `Trace::validate` panics at prove time
+        // on the inconsistent last row; in release that check is compiled out
+        // and the proof is produced. Either outcome is a valid rejection - the
+        // one thing that must NEVER happen is `verify_batch` returning `Ok`.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let prover = TransferProver::new(default_proof_options());
+            let pub_inputs = prover.get_pub_inputs(&trace);
+            let proof = prover.prove(trace).expect("the release prover does not validate the trace");
+            verify_batch(proof, pub_inputs)
+        }));
+        match outcome {
+            Err(_) => {} // debug build: rejected at prove time by Trace::validate
+            Ok(Err(VerifyError::ConservationViolated { row })) => assert_eq!(row, last),
+            Ok(Err(other)) => panic!("expected ConservationViolated, got {other:?}"),
+            Ok(Ok(())) => panic!("SOUNDNESS BREAK: a minting last row verified"),
         }
     }
 
