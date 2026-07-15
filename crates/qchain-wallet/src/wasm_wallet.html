@@ -409,6 +409,10 @@
     <button class="backlink nav" data-to="home">← volver</button>
     <h2 class="view-title">Tus <span class="grad">cuentas</span></h2>
     <p class="view-sub">Todas tus direcciones se derivan de la <b>misma</b> semilla, así que tu único respaldo las recupera a todas. Tocá una para usarla, o creá una nueva.</p>
+    <div class="balance-card" style="margin-bottom:12px">
+      <div class="lbl">Saldo total · todas las cuentas</div>
+      <div class="amt" id="acct-total">…</div>
+    </div>
     <div class="card" id="acct-list"><div class="empty">cargando…</div></div>
     <button class="btn-block" id="acct-new" style="margin-top:14px">+ Crear nueva cuenta</button>
     <button class="btn-block btn-sec" id="acct-recover" style="margin-top:10px">↻ Recuperar cuentas desde mi semilla</button>
@@ -431,6 +435,7 @@
     <h2 class="view-title">Enviar QCH</h2>
     <div class="card" style="margin-top:4px">
       <div class="section-title" style="margin:0 0 4px">Desde</div>
+      <select id="s-from" style="display:none;margin-bottom:8px"></select>
       <div class="wi-addr mono" id="s-from-addr" style="font-size:12px;color:var(--muted);word-break:break-all">—</div>
     </div>
     <label for="s-to">Dirección de destino</label>
@@ -901,10 +906,13 @@ async function renderAccounts(){
     const i=+b.dataset.i, cur=accountName(i), nn=(prompt("Nombre de la cuenta:", cur)||"").trim();
     if(nn){ const oo=myAccounts(); oo.names=oo.names||{}; oo.names[i]=nn.slice(0,40); saveAccounts(oo); renderAccounts(); }
   }));
-  // saldos (best-effort, en paralelo)
+  // saldos (best-effort, en paralelo) + saldo total sumado de todas las cuentas
+  let total=0n;
+  const totalEl=$("acct-total"); if(totalEl) totalEl.textContent="…";
   box.querySelectorAll(".acct-bal").forEach(async el=>{
-    try{ const a=await api("/api/account/"+encodeURIComponent(el.dataset.addr)); el.textContent=qchDisp(a.balance); }
-    catch(e){ el.textContent="—"; }
+    try{ const a=await api("/api/account/"+encodeURIComponent(el.dataset.addr)); el.textContent=qchDisp(a.balance); total+=BigInt(a.balance||0); }
+    catch(e){ el.textContent="—"; }   // 404 = cuenta sin usar = 0, no suma nada
+    if(totalEl) totalEl.textContent=qchDisp(total);   // se actualiza a medida que llegan
   });
 }
 $("acct-new").onclick=()=>{ const i=createAccount(); toast("cuenta creada"); renderAccounts(); };
@@ -969,9 +977,26 @@ function renderReceive(){
   $("r-copy").onclick=()=>copy(addr);
 }
 
+// Semilla/dirección de la cuenta ORIGEN elegida en el envío (por defecto la
+// activa). Deriva de la misma semilla — enviar desde otra cuenta no cambia la
+// cuenta activa del home.
+function sendFromSeed(){ const s=$("s-from"); const i=(s&&s.value!=="")?+s.value:ACCT; return acctSeed(i); }
+function sendFromAddr(){ return addressFromSeed(sendFromSeed()); }
 function renderSend(){
-  const addr=myAddress(); if(!addr) return;
-  $("s-from-addr").textContent=addr;
+  if(!MASTER) return;
+  const o=myAccounts(), sel=$("s-from");
+  // Poblá el selector de origen con todas las cuentas (default = la activa).
+  // textContent (no innerHTML) → sin riesgo de inyección por el nombre.
+  sel.innerHTML="";
+  for(let i=0;i<o.count;i++){
+    const op=document.createElement("option");
+    op.value=i; op.textContent=accountName(i,o)+" · "+short(acctAddr(i));
+    sel.appendChild(op);
+  }
+  sel.value=String(ACCT);
+  sel.style.display = o.count>1 ? "block" : "none";   // el selector solo aparece si hay >1 cuenta
+  const upd=()=>{ $("s-from-addr").textContent=sendFromAddr(); };
+  sel.onchange=upd; upd();
   $("s-amount").value=""; $("s-to").value="";
   $("s-fee").textContent="El fee de red se calcula solo al enviar.";
   const msg=$("s-msg"); msg.className="msg"; msg.textContent="";
@@ -1173,7 +1198,7 @@ $("u-reset").onclick=()=>{
 
 // máximo (saldo menos fee estimado)
 $("s-max").onclick=async()=>{
-  const addr=myAddress(); if(!addr) return;
+  const addr=sendFromAddr(); if(!addr) return;
   $("s-max").disabled=true;
   try{
     const acct=await api("/api/account/"+encodeURIComponent(addr));
@@ -1193,11 +1218,12 @@ $("s-btn").onclick=async()=>{
   let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
   $("s-btn").disabled=true; msg.className="msg"; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
   try{
-    const addr=addressFromSeed(SEED);
+    const seed=sendFromSeed();          // cuenta origen elegida (default = activa)
+    const addr=addressFromSeed(seed);
     const acct=await api("/api/account/"+encodeURIComponent(addr));
     const cid=await api("/api/chain_id");
     const chainId=fromHex(cid.chain_id);
-    const txJson=signTransfer(SEED, to, amount, BigInt(acct.nonce), chainId, 10000000n);
+    const txJson=signTransfer(seed, to, amount, BigInt(acct.nonce), chainId, 10000000n);
     msg.textContent="enviando al nodo…";
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
     const body=await r.json().catch(()=>({}));
