@@ -2037,15 +2037,37 @@ impl Engine {
         // (at most one in-flight send at a time), the same property that
         // made this class of bug possible to reintroduce by spawning.
         for (digest, from) in cert_retries {
-            let Some(addr) = self.network.addr_of(&from) else { continue };
-            if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
-                tracing::warn!("retry: failed to request missing certificate {digest:?} from {from}: {e}");
+            match self.network.addr_of(&from) {
+                Some(addr) => {
+                    if let Err(e) = self.network.send_to(addr, &NetMessage::CertificateRequest { digest }).await {
+                        tracing::warn!("retry: failed to request missing certificate {digest:?} from {from}: {e}");
+                    }
+                }
+                // The peer that originally referenced this certificate is no
+                // longer in our peer set - the canonical case is a validator
+                // that LEFT the committee at an epoch boundary (dynamic rotation
+                // shrink). Certificates are content-addressed, so any peer that
+                // holds it can serve it; broadcasting the request lets a
+                // surviving holder answer. Without this the request was silently
+                // dropped forever (`else { continue }`), which is exactly the
+                // documented freeze that forced committee changes to be grow-only:
+                // a departed author's certificate, referenced as a parent by a
+                // new-epoch vertex, could never be re-fetched. Only unreachable-
+                // `from` requests broadcast (the rare post-departure case), so
+                // this doesn't flood the common path.
+                None => self.network.broadcast(&NetMessage::CertificateRequest { digest }).await,
             }
         }
         for (worker_id, digest, from) in batch_retries {
-            let Some(addr) = self.network.addr_of(&from) else { continue };
-            if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
-                tracing::warn!("retry: failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
+            match self.network.addr_of(&from) {
+                Some(addr) => {
+                    if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
+                        tracing::warn!("retry: failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
+                    }
+                }
+                // Same departed-peer fallback as certificates above: broadcast so
+                // a surviving holder of this content-addressed batch can serve it.
+                None => self.network.broadcast(&NetMessage::WorkerBatchRequest { worker_id, digest }).await,
             }
         }
         for (vertex_digest, from, signature) in vote_retries {

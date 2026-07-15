@@ -110,11 +110,34 @@ impl<'a> Bullshark<'a> {
         let validators = self.schedule.for_round(round);
         let quorum = validators.quorum_threshold();
         let next_round_certs: Vec<&Certificate> = self.dag.certificates_in_round(round + 1).collect();
-        let known_stake: u64 = next_round_certs.iter().map(|c| validators.stake_of(&c.vertex.author)).sum();
-        // However much round+1 stake this validator simply hasn't seen a
-        // certificate for yet - the upper bound on how much MORE support
-        // could still show up, no matter what it turns out to reference.
-        let unknown_stake = validators.total_stake().saturating_sub(known_stake);
+        // The upper bound on how much MORE support could still show up for this
+        // round's leader from round+1 certificates not yet seen. Round+1's
+        // certificates are authored by the committee of round+1's epoch, which
+        // may DIFFER from this round's committee at an epoch boundary — so the
+        // still-possible support is the round-r-weighted stake of round+1's
+        // committee members who haven't produced a round+1 certificate yet.
+        //
+        // Using round+1's committee (not this round's) is what makes a committee
+        // SHRINK terminate: a validator that LEFT the set at the boundary can
+        // never author a round+1 certificate, so it contributes zero unknown
+        // stake. The old formula (`round-r total − known`) treated the departed
+        // validators' stake as still-possible support, so a boundary round whose
+        // leader had only the surviving minority's support stayed `Undecided`
+        // forever, `extend_order` stopped there, and the whole chain past the
+        // boundary froze — the real reason automatic committee removal was
+        // deferred (confirmed live). Off a boundary the two committees are
+        // identical and this is byte-identical to `total_stake − known_stake`
+        // (every round+1 author is a current-committee member, so the set of
+        // "committee members not yet seen" carries exactly the complementary
+        // stake). The membership-change DST proves both directions.
+        let next_committee = self.schedule.for_round(round + 1);
+        let seen_next_authors: std::collections::HashSet<ValidatorId> = next_round_certs.iter().map(|c| c.vertex.author).collect();
+        let unknown_stake: u64 = next_committee
+            .ids_sorted()
+            .into_iter()
+            .filter(|id| !seen_next_authors.contains(id))
+            .map(|id| validators.stake_of(&id))
+            .sum();
 
         match self.dag.certificate_by_author(round, &leader) {
             Some(leader_cert) => {
@@ -750,6 +773,70 @@ mod tests {
         let leader_2 = Bullshark::new(&dag_full, &schedule).leader_for_round(2).expect("epoch-1 committee elects a leader");
         let leader_2_digest = r2.iter().find(|c| c.vertex.author == leader_2).unwrap().digest();
         assert!(order_full.contains(&leader_2_digest), "consensus must cross the epoch boundary and commit a committee-B round (liveness under rotation)");
+    }
+
+    /// **Phase-3.3 real-shrink proof: a NET committee SHRINK (4 -> 2) at an epoch
+    /// boundary keeps honest validators consistent and live** — the ordering-layer
+    /// half of automatic validator removal. Epoch 0 committee A = {v0,v1,v2,v3}
+    /// (rounds 0-1); epoch 1 committee B = {v0,v1} (rounds 2-3) — v2 and v3 leave.
+    /// The last round-1 (committee A) certificates from the DEPARTING validators
+    /// are still referenced as parents by round-2 (committee B) vertices, exactly
+    /// the situation that froze a live node when a departed author's certificate
+    /// couldn't be re-fetched (fixed separately at the node layer). Here we prove
+    /// the *ordering* is unaffected: the committed order is delivery-order
+    /// independent (safety), a peer missing a certificate commits a prefix (never
+    /// a fork), and a committee-B round commits (liveness through the shrink).
+    #[test]
+    fn a_net_committee_shrink_at_an_epoch_boundary_keeps_honest_validators_consistent_and_live() {
+        use crate::ConsensusState;
+        let kps: Vec<Keypair> = (0..4).map(|_| Keypair::generate().unwrap()).collect();
+        let info = |i: usize| crate::quorum::ValidatorInfo { id: kps[i].pubkey(), pubkey_bundle: kps[i].public_key_bundle(), stake: 1 };
+        let committee_a = ValidatorSet::new((0..4).map(info).collect()); // 4 validators
+        let committee_b = ValidatorSet::new((0..2).map(info).collect()); // shrink to 2 (v2, v3 leave)
+        let a_ids: Vec<ValidatorId> = (0..4).map(|i| kps[i].pubkey()).collect();
+        let b_ids: Vec<ValidatorId> = (0..2).map(|i| kps[i].pubkey()).collect();
+        let mut schedule = ValidatorSchedule::new(2, committee_a);
+        schedule.install_epoch(1, committee_b);
+        schedule.set_frontier_epoch(1);
+
+        // Epoch 0 (rounds 0,1) authored by all 4; epoch 1 (rounds 2,3) by the
+        // surviving 2. Round 2 still references ALL of round 1's certificates,
+        // including the two DEPARTING validators' — the parents that a live node
+        // would have to have (or re-fetch) to process the round-2 vertices.
+        let r0: Vec<Certificate> = a_ids.iter().map(|id| cert(0, *id, vec![])).collect();
+        let r0d: Vec<Digest> = r0.iter().map(|c| c.digest()).collect();
+        let r1: Vec<Certificate> = a_ids.iter().map(|id| cert(1, *id, r0d.clone())).collect();
+        let r1d: Vec<Digest> = r1.iter().map(|c| c.digest()).collect();
+        let r2: Vec<Certificate> = b_ids.iter().map(|id| cert(2, *id, r1d.clone())).collect();
+        let r2d: Vec<Digest> = r2.iter().map(|c| c.digest()).collect();
+        let r3: Vec<Certificate> = b_ids.iter().map(|id| cert(3, *id, r2d.clone())).collect();
+
+        let insert_all = |dag: &mut DagStore, certs: &[&[Certificate]]| {
+            for group in certs {
+                for c in group.iter() {
+                    dag.insert(c.clone());
+                }
+            }
+        };
+
+        // Full delivery vs incremental-across-the-boundary: identical order (safety).
+        let mut dag_full = DagStore::new();
+        insert_all(&mut dag_full, &[&r0, &r1, &r2, &r3]);
+        let order_full = ConsensusState::new().advance(&dag_full, &schedule);
+
+        let mut dag_inc = DagStore::new();
+        let mut state_y = ConsensusState::new();
+        let mut order_inc = Vec::new();
+        insert_all(&mut dag_inc, &[&r0, &r1, &r2]);
+        order_inc.extend(state_y.advance(&dag_inc, &schedule));
+        insert_all(&mut dag_inc, &[&r3]);
+        order_inc.extend(state_y.advance(&dag_inc, &schedule));
+        assert_eq!(order_full, order_inc, "a net shrink must not make the committed order depend on delivery order");
+
+        // Liveness through the shrink: a committee-B (2-validator) round commits.
+        let leader_2 = Bullshark::new(&dag_full, &schedule).leader_for_round(2).expect("the shrunk committee elects a leader");
+        let leader_2_digest = r2.iter().find(|c| c.vertex.author == leader_2).unwrap().digest();
+        assert!(order_full.contains(&leader_2_digest), "consensus must commit a committee-B round through the shrink (liveness)");
     }
 
     /// **Phase-3.3 stage-2b: the resolvable frontier holds back rounds of an
