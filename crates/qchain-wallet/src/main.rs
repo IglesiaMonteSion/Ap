@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/wasm", get(wasm_page))
         .route("/wasm/qchain_wasm.js", get(wasm_js))
         .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
+        .route("/vendor/jsQR.min.js", get(jsqr_js))
         // brand / PWA assets (favicon, home-screen icons, manifest)
         .route("/icon.svg", get(icon_svg))
         .route("/favicon.ico", get(icon_svg))
@@ -300,6 +301,19 @@ async fn wasm_bg() -> Response {
         .header(header::CONTENT_TYPE, "application/wasm")
         .body(Body::from(&include_bytes!("wasm_assets/qchain_wasm_bg.wasm")[..]))
         .expect("static wasm response always builds")
+}
+
+/// jsQR (MIT), a pure-JS QR decoder, vendored so the wallet's camera scanner
+/// works on ANY browser — including iOS Safari, which lacks the native
+/// `BarcodeDetector` API. Served from the binary (no CDN, no external trust
+/// surface); the browser decodes camera frames locally, nothing leaves the
+/// device.
+async fn jsqr_js() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/javascript")
+        .header(header::CACHE_CONTROL, "public, max-age=604800")
+        .body(Body::from(include_str!("wasm_assets/jsQR.min.js")))
+        .expect("static js response always builds")
 }
 
 // ---- brand / PWA assets (favicon, home-screen app icons, manifest) --------

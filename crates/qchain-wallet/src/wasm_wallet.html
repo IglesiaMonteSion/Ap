@@ -222,6 +222,33 @@
   .cf-total .cf-k,.cf-total .cf-v{font-size:17px}
   @media(prefers-reduced-motion:reduce){.modal,.modal-bg.show{animation:none}}
 
+  /* ===== Escáner QR (cámara) ===== */
+  .scan-bg{position:fixed;inset:0;z-index:200;display:none;flex-direction:column;background:#05060d}
+  .scan-bg.show{display:flex}
+  .scan-video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .scan-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(closest-side,transparent 46%,rgba(4,6,13,.72) 62%)}
+  .scan-frame{width:min(72vw,300px);aspect-ratio:1;border-radius:26px;position:relative;box-shadow:0 0 0 100vmax rgba(4,6,13,.55)}
+  .scan-frame::before,.scan-frame::after,.scan-frame>i::before,.scan-frame>i::after{content:"";position:absolute;width:34px;height:34px;
+    border:3px solid var(--brand1)}
+  .scan-frame::before{top:-2px;left:-2px;border-right:0;border-bottom:0;border-radius:26px 0 0 0}
+  .scan-frame::after{top:-2px;right:-2px;border-left:0;border-bottom:0;border-radius:0 26px 0 0}
+  .scan-frame>i::before{bottom:-2px;left:-2px;border-right:0;border-top:0;border-radius:0 0 0 26px}
+  .scan-frame>i::after{bottom:-2px;right:-2px;border-left:0;border-top:0;border-radius:0 0 26px 0}
+  .scan-line{position:absolute;left:8%;right:8%;height:2px;background:linear-gradient(90deg,transparent,var(--brand1),transparent);
+    top:8%;box-shadow:0 0 12px var(--brand1);animation:scanmove 2.2s ease-in-out infinite}
+  @keyframes scanmove{0%,100%{top:8%}50%{top:90%}}
+  .scan-top{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;
+    padding:calc(12px + env(safe-area-inset-top)) 16px 12px;z-index:2}
+  .scan-top .st-title{color:#fff;font-weight:700;font-size:16px;text-shadow:0 1px 6px rgba(0,0,0,.6)}
+  .scan-close{width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,.45);color:#fff;border:0;font-size:20px;
+    display:grid;place-items:center;box-shadow:none}
+  .scan-hint{position:absolute;bottom:calc(28px + env(safe-area-inset-bottom));left:0;right:0;text-align:center;
+    color:#e7e9f5;font-size:14px;padding:0 24px;text-shadow:0 1px 6px rgba(0,0,0,.7);z-index:2}
+  .scan-msg{position:absolute;bottom:calc(78px + env(safe-area-inset-bottom));left:16px;right:16px;text-align:center;
+    color:#fff;background:rgba(200,60,50,.85);border-radius:12px;padding:12px 14px;font-size:14px;display:none;z-index:3}
+  @media(prefers-reduced-motion:reduce){.scan-line{animation:none;top:50%}}
+
   /* ===== Libreta de contactos ===== */
   .contact{display:flex;align-items:center;gap:12px;padding:13px 4px;border-top:1px solid var(--line)}
   .contact:first-child{border-top:0}
@@ -459,8 +486,8 @@
         <span class="brand-name">QCHAIN <span class="grad">Wallet</span></span>
       </div>
       <div style="display:flex;align-items:center;gap:4px">
-        <button class="icon-btn nav" data-to="receive" title="recibir / mostrar QR" aria-label="recibir">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/></svg>
+        <button class="icon-btn" id="h-scan" title="escanear para pagar" aria-label="escanear QR">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
         </button>
         <button class="icon-btn" id="h-bell" title="notificaciones" aria-label="notificaciones" style="position:relative">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
@@ -602,7 +629,12 @@
     </div>
     <label for="s-to">Dirección de destino</label>
     <select id="s-contact" style="display:none;margin-bottom:8px"></select>
-    <input id="s-to" placeholder="pegá la dirección de quien recibe" autocomplete="off">
+    <div class="row">
+      <input id="s-to" placeholder="pegá la dirección de quien recibe" autocomplete="off">
+      <button class="btn-sec" id="s-scan" title="escanear QR" aria-label="escanear QR" style="flex:0 0 auto;padding:14px 16px">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
+      </button>
+    </div>
     <div id="s-save-contact" style="display:none;margin-top:8px" class="hint">
       Guardar como contacto: <input id="s-cname" placeholder="nombre" autocomplete="off" style="margin:6px 0 0;padding:10px 12px">
     </div>
@@ -760,6 +792,20 @@
 
 </div>
 <div class="toast" id="toast">copiado</div>
+
+<!-- ===== Escáner QR (cámara) ===== -->
+<div class="scan-bg" id="scan-bg">
+  <video class="scan-video" id="scan-video" playsinline muted autoplay></video>
+  <div class="scan-overlay">
+    <div class="scan-frame"><i></i><div class="scan-line"></div></div>
+  </div>
+  <div class="scan-top">
+    <span class="st-title">Escaneá un código QR</span>
+    <button class="scan-close" id="scan-close" aria-label="cerrar">✕</button>
+  </div>
+  <div class="scan-msg" id="scan-msg"></div>
+  <div class="scan-hint">Apuntá la cámara al QR de una dirección de QCHAIN</div>
+</div>
 
 <!-- ===== Modal de confirmación de envío ===== -->
 <div class="modal-bg" id="confirm-bg">
@@ -1746,6 +1792,85 @@ $("cf-ok").onclick=async()=>{
 
 // Detectar dirección nueva mientras se escribe/pega → ofrecer guardarla.
 $("s-to").addEventListener("input", onSendToChanged);
+
+// ---- escáner de QR con la cámara ----
+// Usa jsQR (vendorizado, MIT) en el navegador — funciona en cualquier equipo,
+// incluido iOS Safari (que NO tiene BarcodeDetector). La cámara se decodifica
+// localmente; ningún frame sale del dispositivo. Requiere HTTPS (getUserMedia),
+// que ya está por el túnel de Cloudflare.
+let _jsqrPromise=null;
+function loadJsQR(){
+  if(window.jsQR) return Promise.resolve(window.jsQR);
+  if(_jsqrPromise) return _jsqrPromise;
+  _jsqrPromise=new Promise((res,rej)=>{
+    const s=document.createElement("script");
+    s.src="/vendor/jsQR.min.js"; s.onload=()=>res(window.jsQR); s.onerror=()=>rej(new Error("no pude cargar el decodificador"));
+    document.head.appendChild(s);
+  });
+  return _jsqrPromise;
+}
+// Extrae una dirección base58 de lo que sea que traiga el QR: dirección cruda,
+// un URI `qchain:<addr>` / `qch:<addr>`, o una URL con la dirección en el path/query.
+function extractAddress(text){
+  if(!text) return null;
+  let t=String(text).trim();
+  const m=t.match(/(?:qchain|qch):\/*([1-9A-HJ-NP-Za-km-z]{32,})/i) || t.match(/[?&](?:to|address|addr)=([1-9A-HJ-NP-Za-km-z]{32,})/i);
+  if(m) t=m[1];
+  else { const parts=t.split(/[\/?#=:\s]+/).filter(Boolean); const cand=parts.reverse().find(p=>/^[1-9A-HJ-NP-Za-km-z]{32,}$/.test(p)); if(cand) t=cand; }
+  return /^[1-9A-HJ-NP-Za-km-z]{32,}$/.test(t) ? t : null;
+}
+let _scanStream=null, _scanRAF=null, _scanOnResult=null;
+async function openScanner(onResult){
+  _scanOnResult=onResult;
+  const bg=$("scan-bg"), video=$("scan-video"), msg=$("scan-msg");
+  msg.style.display="none";
+  bg.classList.add("show");
+  let jsQR;
+  try{ jsQR=await loadJsQR(); }catch(e){ msg.textContent="No pude cargar el escáner."; msg.style.display="block"; return; }
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    msg.textContent="Este navegador no permite usar la cámara. Pegá la dirección a mano."; msg.style.display="block"; return;
+  }
+  try{
+    _scanStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}}, audio:false});
+  }catch(e){
+    msg.textContent = (e&&e.name==="NotAllowedError")
+      ? "Permiso de cámara denegado. Habilitalo en el navegador y probá de nuevo."
+      : "No pude abrir la cámara. Pegá la dirección a mano.";
+    msg.style.display="block"; return;
+  }
+  video.srcObject=_scanStream; await video.play().catch(()=>{});
+  const canvas=document.createElement("canvas"); const ctx=canvas.getContext("2d",{willReadFrequently:true});
+  const tick=()=>{
+    if(!_scanStream){ return; }
+    if(video.readyState===video.HAVE_ENOUGH_DATA && video.videoWidth){
+      const w=canvas.width=video.videoWidth, h=canvas.height=video.videoHeight;
+      ctx.drawImage(video,0,0,w,h);
+      let img; try{ img=ctx.getImageData(0,0,w,h); }catch(e){ img=null; }
+      if(img){
+        const code=jsQR(img.data,w,h,{inversionAttempts:"dontInvert"});
+        if(code&&code.data){
+          const addr=extractAddress(code.data);
+          if(addr){ const cb=_scanOnResult; closeScanner(); if(cb) cb(addr); return; }
+          else { msg.textContent="Ese QR no es una dirección de QCHAIN."; msg.style.display="block"; }
+        }
+      }
+    }
+    _scanRAF=requestAnimationFrame(tick);
+  };
+  _scanRAF=requestAnimationFrame(tick);
+}
+function closeScanner(){
+  const bg=$("scan-bg"), video=$("scan-video");
+  if(_scanRAF){ cancelAnimationFrame(_scanRAF); _scanRAF=null; }
+  if(_scanStream){ _scanStream.getTracks().forEach(t=>t.stop()); _scanStream=null; }
+  if(video){ video.pause(); video.srcObject=null; }
+  bg.classList.remove("show");
+}
+$("scan-close").onclick=closeScanner;
+// Escanear desde la pantalla de envío → rellena el destino.
+$("s-scan").onclick=()=>openScanner(a=>{ showView("send"); $("s-to").value=a; onSendToChanged(); toast("dirección escaneada"); });
+// Ícono de escaneo del header (escanear para pagar) → abre el envío ya rellenado.
+if($("h-scan")) $("h-scan").onclick=()=>openScanner(a=>{ showView("send"); $("s-to").value=a; onSendToChanged(); toast("dirección escaneada"); });
 
 // Guardar un contacto desde la libreta.
 $("c-add").onclick=()=>{
