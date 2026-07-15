@@ -221,6 +221,21 @@ const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 /// transaction's size instead of "however many the attacker cares to send."
 const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 
+/// Hard cap on how many activity rows ONE `/transfers` or `/staking_activity`
+/// response returns, regardless of the caller-supplied `limit`. The activity
+/// logs are unbounded and reloaded in full on restart, so an unauthenticated
+/// request with a huge `limit` would otherwise clone the entire history under
+/// the global consensus lock (a liveness DoS growing with chain age). Clients
+/// page through more with `offset`.
+const MAX_ACTIVITY_LIMIT: usize = 1_000;
+
+/// Hard cap on how many rows the FILTERED (`?staker=`) staking-activity scan
+/// examines before giving up, so a sparse or never-staked address can't force a
+/// full-history walk under the lock. A wallet sees its activity within the most
+/// recent `MAX_ACTIVITY_SCAN` network staking events - ample for a recent-view;
+/// deeper history is the future real-indexer's job.
+const MAX_ACTIVITY_SCAN: usize = 100_000;
+
 /// How many `GET /stark_proof` proofs may be generated concurrently across
 /// the whole node. Each proof is already row-capped (`MAX_STARK_PROOF_RECEIPTS`)
 /// so one call's cost is bounded, but `prove_batch` is CPU-heavy and the
@@ -826,12 +841,20 @@ pub struct StatusResponse {
 /// `data_dir/economics`) so they survive a clean restart. They are REPORT-ONLY
 /// (never consensus state, never in the Merkle root) and best-effort: the
 /// snapshot is written just after the state lock is released each committing
-/// round, so an *unclean* crash in that narrow window loses the last round's
-/// burn/earn delta permanently (balances are already durable and correct;
-/// only these dashboard counters under-count). In the steady no-crash path
-/// every honest node accrues the identical figures (same deterministic
-/// `fee_collector`/round stream); after crashes at different points two nodes
-/// can differ slightly - expected for a monitoring counter, not a fork.
+/// round. The counters and the on-chain state they mirror live in SEPARATE
+/// persistence sinks (this `economics` file vs the `SledStore` accounts + the
+/// `cert_log`), so an *unclean* crash can leave them out of step in EITHER
+/// direction: the last round's burn/earn delta can be lost if the snapshot
+/// didn't flush (under-count), OR - now that emission mints on restart-replayed
+/// rounds whose account writes were lost but whose `cert_log` survived - the
+/// re-execution can re-add those rounds' emission on top of the restored
+/// `total_emitted` (over-count). Either way the on-chain balances are
+/// deterministically reconstructed and CORRECT (these figures are never in the
+/// Merkle root, never consensus state); only the dashboard counters drift. In
+/// the steady no-crash path every honest node accrues identical figures (same
+/// deterministic `fee_collector`/round stream); after crashes at different
+/// points two nodes can differ slightly - expected for a monitoring counter,
+/// not a fork.
 #[derive(serde::Serialize, Clone)]
 pub struct EconomicsResponse {
     /// This validator's own address (the `fee_collector` when it proposes).
@@ -1261,6 +1284,12 @@ impl Engine {
     /// module docs on that limitation) - this endpoint doesn't add any
     /// new persistence, just a paginated read of what was already there.
     pub async fn list_transfers(&self, limit: usize, offset: usize) -> Vec<qchain_execution::TransferReceipt> {
+        // Clamp the caller-supplied limit: the receipt log is unbounded and now
+        // reloaded in full on restart, so an unauthenticated `?limit=<u64::MAX>`
+        // would clone the ENTIRE history under the global consensus lock - a real
+        // liveness DoS proportional to chain age. `MAX_ACTIVITY_LIMIT` caps one
+        // response; a client paginates with `offset` for more.
+        let limit = limit.min(MAX_ACTIVITY_LIMIT);
         let state = self.state.lock().await;
         let all = state.ledger.transfer_receipts();
         if offset >= all.len() {
@@ -1281,6 +1310,7 @@ impl Engine {
         offset: usize,
         staker: Option<Pubkey>,
     ) -> Vec<qchain_execution::StakingEvent> {
+        let limit = limit.min(MAX_ACTIVITY_LIMIT);
         let state = self.state.lock().await;
         let all = state.ledger.staking_events();
         match staker {
@@ -1296,12 +1326,18 @@ impl Engine {
                 let start = end.saturating_sub(limit);
                 all[start..end].iter().rev().cloned().collect()
             }
-            // Filtered to one staker: walk newest-first and stop once enough
-            // rows are collected, so the work is bounded by `offset + limit`
-            // matches, not by the full history length.
+            // Filtered to one staker: walk newest-first and stop once enough rows
+            // are collected. The `take(MAX_ACTIVITY_SCAN)` BEFORE the filter bounds
+            // the examined-item count too: without it, an address with few/zero
+            // events (e.g. any never-staked address) would walk the ENTIRE
+            // unbounded history before yielding nothing - the same lock-held DoS
+            // the unfiltered path avoids. So a wallet sees its activity within the
+            // most recent `MAX_ACTIVITY_SCAN` network staking events (ample for a
+            // recent-activity view; older history needs the future real indexer).
             Some(s) => all
                 .iter()
                 .rev()
+                .take(MAX_ACTIVITY_SCAN)
                 .filter(|e| e.staker == s)
                 .skip(offset)
                 .take(limit)

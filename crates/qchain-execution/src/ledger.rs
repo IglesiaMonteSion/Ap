@@ -363,13 +363,23 @@ impl Ledger {
             // `accrue_reward_pool` both mints the whole units to the pool balance
             // (real new supply / inflation) and distributes them to stakers via
             // the reward-per-share accumulator. Nothing is emitted when nothing
-            // is staked (`total_staked == 0`) or the APR is 0 (emission off);
-            // the fractional carry then stays 0, so switching emission on later
-            // starts cleanly.
+            // is staked (`total_staked == 0`) or the APR is 0 (emission off) - the
+            // block is skipped entirely, so the fractional carry is untouched
+            // (it freezes at its last sub-unit value, always < 1 unit, and simply
+            // resumes accumulating if emission is switched back on later).
             let total_staked = self.store.get(&STAKING_STATS_ID).and_then(|a| u64::try_from_slice(&a.data).ok()).unwrap_or(0);
             if total_staked > 0 && params.emission_apr_bps > 0 {
                 let rounds = (current_round - fs.epoch_round).min(crate::params::ROUNDS_PER_YEAR);
                 let (whole, new_carry) = crate::params::emission_for_rounds(total_staked, params.emission_apr_bps, rounds, fs.emission_carry);
+                // Advance the carry only for the fraction that WON'T be minted
+                // this epoch. The `whole` units are subtracted from the carry
+                // (folded into `new_carry`) ONLY once the mint is confirmed
+                // below - otherwise a failed mint (a corrupt pool singleton, the
+                // only way `accrue_reward_pool` returns anything but `Ok(true)`
+                // here since `total_staked > 0` is already gated) would silently
+                // drop those units (a deflationary loss). On failure the carry is
+                // left carrying the full fixed-point amount, so the next epoch
+                // retries it - emission is never lost, only deferred.
                 fs.emission_carry = new_carry;
                 if whole > 0 {
                     let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
@@ -384,6 +394,12 @@ impl Ledger {
                             self.write_account(STAKING_REWARDS_POOL_ID, pool);
                         }
                         self.total_emitted = self.total_emitted.saturating_add(whole);
+                    } else {
+                        // Mint didn't land: restore the `whole` units to the carry
+                        // (new_carry + whole·PRECISION == the original total
+                        // fixed-point) so nothing is lost and the next epoch retries.
+                        fs.emission_carry = new_carry
+                            .saturating_add((whole as u128).saturating_mul(crate::params::EMISSION_PRECISION));
                     }
                 }
             }

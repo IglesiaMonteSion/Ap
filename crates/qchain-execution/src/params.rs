@@ -43,6 +43,31 @@ pub const FEE_ADJUST_DENOMINATOR: u64 = 8;
 /// The fee surges above this under load and decays back to it when load clears.
 pub const FEE_MIN_BASE_FEE_PER_BYTE: u64 = BASE_FEE_PER_BYTE_UNITS;
 
+/// Hard ceiling on `base_fee_per_byte` — the symmetric partner of
+/// `MAX_DUST_THRESHOLD`, closing the same class of catastrophe for the fee.
+/// A `Low`-tier `SetBaseFeePerByte` executes with zero time-lock, so an
+/// unbounded value (`u64::MAX`) would make the byte fee exceed every account's
+/// balance for EVERY transaction — including the governance tx needed to lower
+/// it back (governance txs pay the same byte fee), so the dynamic-fee decay
+/// (which only runs *inside* `apply_transaction`) could never fire. That is a
+/// PERMANENT, unrecoverable chain brick with no on-chain recovery path (strictly
+/// worse than the dust case, which leaves governance operable). This ceiling
+/// keeps `base_fee_per_byte` recoverable: at ~1e9 units/byte a standard ~5.5 KB
+/// transfer costs ~5.5 M units, painful but affordable by any validator
+/// (min self-stake 10 M units) to submit a recovery proposal — while giving
+/// ~5.5 million× headroom over the floor for legitimate USD-repeg recalibration
+/// (`ARCHITECTURE.md` §5's floating-fee decision). Also clamps the *dynamic*
+/// base fee (`next_base_fee`) so congestion can never climb past it either,
+/// making `base_fee_per_byte ∈ [floor, ceiling]` a true invariant.
+pub const MAX_BASE_FEE_PER_BYTE: u64 = 1_000_000_000;
+
+/// Hard ceiling on `gas_price_per_fuel`, mirroring `MAX_BASE_FEE_PER_BYTE`.
+/// An unbounded gas price makes every WASM-consuming tx unaffordable; the blast
+/// radius is smaller than the base fee (plain transfers/governance carry no
+/// WASM fuel, so recovery via a system-transfer governance tx always works), but
+/// a symmetric cap keeps the whole economic-parameter surface airtight.
+pub const MAX_GAS_PRICE_PER_FUEL: u64 = 1_000_000_000;
+
 /// EIP-1559 elasticity: the per-round inclusion LIMIT is this multiple of the
 /// target (`FEE_TARGET_BYTES_PER_ROUND`). Below the limit everything ready is
 /// included and the base fee just drifts toward target; once demand exceeds the
@@ -170,7 +195,11 @@ pub fn next_base_fee(current: u64, committed_bytes: u64, target: u64) -> u64 {
         cur.saturating_sub(delta)
     };
     let next = next.min(u64::MAX as u128) as u64;
-    next.max(FEE_MIN_BASE_FEE_PER_BYTE)
+    // Clamp to [floor, ceiling]: the floor is the uncongested anchor; the ceiling
+    // (`MAX_BASE_FEE_PER_BYTE`) means even sustained congestion can never push the
+    // committed base fee past the same bound governance is held to - keeping
+    // `base_fee_per_byte` a bounded, recoverable value on every path.
+    next.clamp(FEE_MIN_BASE_FEE_PER_BYTE, MAX_BASE_FEE_PER_BYTE)
 }
 
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
@@ -263,11 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn next_base_fee_is_overflow_safe_for_a_huge_governance_fee() {
-        // A near-u64::MAX base fee must not panic or wrap.
+    fn next_base_fee_is_overflow_safe_and_clamps_to_the_ceiling() {
+        // A near-u64::MAX base fee must not panic or wrap, and must clamp DOWN to
+        // the ceiling (the dynamic path can never exceed the governance bound).
         let huge = u64::MAX / 2;
         let r = next_base_fee(huge, FEE_TARGET_BYTES_PER_ROUND * 10, FEE_TARGET_BYTES_PER_ROUND);
-        assert!(r >= huge, "should not wrap downward");
+        assert_eq!(r, MAX_BASE_FEE_PER_BYTE, "the dynamic fee must clamp to the ceiling, not wrap");
+        // Sustained congestion just below the ceiling rises but never past it.
+        let near = MAX_BASE_FEE_PER_BYTE - 1;
+        assert_eq!(next_base_fee(near, FEE_TARGET_BYTES_PER_ROUND * 2, FEE_TARGET_BYTES_PER_ROUND), MAX_BASE_FEE_PER_BYTE);
+        // The floor still holds under an empty round.
+        assert_eq!(next_base_fee(FEE_MIN_BASE_FEE_PER_BYTE, 0, FEE_TARGET_BYTES_PER_ROUND), FEE_MIN_BASE_FEE_PER_BYTE);
     }
 
     #[test]

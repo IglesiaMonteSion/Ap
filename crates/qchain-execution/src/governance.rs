@@ -301,6 +301,18 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     crate::params::FEE_MIN_BASE_FEE_PER_BYTE
                 )));
             }
+            // Ceiling: without it a passed `Low`-tier proposal setting the fee to
+            // `u64::MAX` bricks the chain PERMANENTLY - every tx (including the
+            // governance tx needed to lower it back) would exceed any balance, and
+            // the dynamic-fee decay only runs inside `apply_transaction`, so no tx
+            // could ever apply to self-heal. `MAX_BASE_FEE_PER_BYTE` keeps it
+            // recoverable while leaving huge headroom for legitimate repeg.
+            if *v > crate::params::MAX_BASE_FEE_PER_BYTE {
+                return Err(ExecError::ProgramError(format!(
+                    "base_fee_per_byte {v} exceeds the safety cap {} - a higher value would brick the chain with no recovery path",
+                    crate::params::MAX_BASE_FEE_PER_BYTE
+                )));
+            }
             params.base_fee_per_byte = *v;
         }
         // Hard cap: `dust_threshold` is the balance BELOW which a system-owned
@@ -324,6 +336,16 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
         ProposalAction::SetGasPricePerFuel(v) => {
             if *v == 0 {
                 return Err(ExecError::ProgramError("gas_price_per_fuel cannot be zero - would make WASM compute free (DoS)".into()));
+            }
+            // Ceiling, symmetric with `base_fee`: an unbounded gas price makes
+            // every WASM-consuming tx unaffordable (smaller blast radius than the
+            // base fee - transfers/governance carry no fuel - but capped for a
+            // fully airtight economic-parameter surface).
+            if *v > crate::params::MAX_GAS_PRICE_PER_FUEL {
+                return Err(ExecError::ProgramError(format!(
+                    "gas_price_per_fuel {v} exceeds the safety cap {}",
+                    crate::params::MAX_GAS_PRICE_PER_FUEL
+                )));
             }
             params.gas_price_per_fuel = *v;
         }
@@ -748,13 +770,24 @@ mod tests {
         // An emission APR above the safety cap is rejected (unbounded inflation).
         assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(u16::MAX)).is_err());
         assert_eq!(p.emission_apr_bps, EconomicParams::default().emission_apr_bps);
+        // base_fee ABOVE the ceiling is rejected — the permanent-brick vector
+        // (a value that makes every tx, including the recovery tx, unaffordable).
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(u64::MAX)).is_err());
+        assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
+        // gas_price ABOVE the ceiling is rejected too (symmetric bound).
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(u64::MAX)).is_err());
         // Legitimate in-range recalibrations still apply.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(MAX_DUST_THRESHOLD)).is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::FEE_MIN_BASE_FEE_PER_BYTE)).is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(1)).is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(crate::params::MAX_EMISSION_APR_BPS)).is_ok());
+        // A base fee / gas price exactly AT the ceiling is a legitimate value.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::MAX_BASE_FEE_PER_BYTE)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(crate::params::MAX_GAS_PRICE_PER_FUEL)).is_ok());
         assert_eq!(p.dust_threshold, MAX_DUST_THRESHOLD);
         assert_eq!(p.emission_apr_bps, crate::params::MAX_EMISSION_APR_BPS);
+        assert_eq!(p.base_fee_per_byte, crate::params::MAX_BASE_FEE_PER_BYTE);
+        assert_eq!(p.gas_price_per_fuel, crate::params::MAX_GAS_PRICE_PER_FUEL);
     }
 
     #[test]
