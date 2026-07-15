@@ -44,7 +44,7 @@
 //! else's stake is put at risk by another party's misbehavior.
 
 use crate::error::ExecError;
-use crate::ids::STAKING_PROGRAM_ID;
+use crate::ids::{STAKING_PROGRAM_ID, STAKING_STATS_ID};
 use crate::native::NativeProgram;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, EquivocationEvidence, Instruction, Round};
@@ -296,6 +296,19 @@ impl NativeProgram for StakingProgram {
                 let stats_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[2]".into()))?;
                 let pool_pk = *instruction.accounts.get(3).ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[3]".into()))?;
 
+                // Pin the staking-stats singleton. `total_staked` (the governance
+                // quorum denominator) is only meaningful if EVERY Delegate/
+                // Undelegate maintains the SAME canonical account. Without this,
+                // anyone could Delegate naming the real stats (real total += A)
+                // then Undelegate naming a throwaway account (real total NEVER
+                // decremented), permanently inflating `total_staked` while
+                // keeping their capital → the participation floor becomes
+                // unreachable and governance freezes. The read side (`Finalize`)
+                // was already pinned; this closes the write side.
+                if stats_pk != STAKING_STATS_ID {
+                    return Err(ExecError::Unauthorized("Delegate must name the canonical staking-stats account".into()));
+                }
+
                 if staker != *payer {
                     return Err(ExecError::Unauthorized("Delegate's funding account must be the transaction payer".into()));
                 }
@@ -337,6 +350,12 @@ impl NativeProgram for StakingProgram {
                 let stake_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[0]".into()))?;
                 let stats_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[1]".into()))?;
                 let pool_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[2]".into()))?;
+
+                // Pin the staking-stats singleton (see the matching check in
+                // Delegate) - the write side of the `total_staked` invariant.
+                if stats_pk != STAKING_STATS_ID {
+                    return Err(ExecError::Unauthorized("Undelegate must name the canonical staking-stats account".into()));
+                }
 
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
                 let mut data = StakeAccountData::try_from_slice(&stake_account.data)
@@ -451,6 +470,15 @@ impl NativeProgram for StakingProgram {
                 // omits it degrades to a no-op on the counter rather than a
                 // hard rejection (the slash itself still applies either way).
                 let stats_pk = instruction.accounts.get(1).copied();
+                // Pin the stats singleton when present (it's optional here) - a
+                // reporter naming a throwaway account would leave the real
+                // `total_staked` un-decremented after a slash, the same
+                // invariant corruption Delegate/Undelegate now guard against.
+                if let Some(s) = stats_pk {
+                    if s != STAKING_STATS_ID {
+                        return Err(ExecError::Unauthorized("ReportEquivocation's stats account must be the canonical staking-stats account".into()));
+                    }
+                }
 
                 if evidence.vertex_a.round != evidence.vertex_b.round || evidence.vertex_a.author != evidence.vertex_b.author {
                     return Err(ExecError::ProgramError("evidence must reference the same (round, author)".into()));
@@ -629,6 +657,36 @@ mod tests {
 
     fn pool_account() -> Account {
         Account { data: borsh::to_vec(&RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }
+    }
+
+    #[test]
+    fn delegate_and_undelegate_reject_a_non_canonical_stats_account() {
+        // Audit finding B: the `total_staked` invariant (the governance quorum
+        // denominator) is only sound if every Delegate/Undelegate names the SAME
+        // canonical stats singleton. A caller naming a throwaway account must be
+        // rejected - otherwise they could inflate/deflate real `total_staked`
+        // and freeze governance while keeping their capital.
+        let staker = Pubkey::new([22u8; 32]);
+        let stake_pk = Pubkey::new([20u8; 32]);
+        let fake_stats = Pubkey::new([77u8; 32]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (fake_stats, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker, stake_pk, fake_stats, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 4_000 }).unwrap(),
+        };
+        assert!(StakingProgram.process(&mut accounts, &ix, &staker, 0).is_err(), "Delegate must reject a non-canonical stats account");
+        // Undelegate likewise (accounts[1] = stats).
+        let un = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, fake_stats, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+        };
+        assert!(StakingProgram.process(&mut accounts, &un, &staker, 0).is_err(), "Undelegate must reject a non-canonical stats account");
     }
 
     #[test]

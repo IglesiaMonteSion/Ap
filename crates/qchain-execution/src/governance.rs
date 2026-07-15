@@ -84,6 +84,17 @@ impl NativeProgram for GovernanceProgram {
                 let stake_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Vote requires accounts[1]".into()))?;
 
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                // Defense in depth: the vote weight is derived from bytes in
+                // this account's `data`, so it must be a genuine staking-program
+                // account, not an arbitrary account whose `data` an attacker
+                // packed to forge a large `amount`. No current instruction lets
+                // a caller write arbitrary bytes with their own pubkey as the
+                // StakeAccountData layout, but pinning the owner here makes a
+                // future arbitrary-data primitive unable to silently enable
+                // vote-weight forgery.
+                if stake_account.owner != crate::ids::STAKING_PROGRAM_ID {
+                    return Err(ExecError::Unauthorized("Vote's stake account must be owned by the staking program".into()));
+                }
                 let mut stake_data = StakeAccountData::try_from_slice(&stake_account.data).map_err(borsh_err)?;
                 if stake_data.owner != *payer {
                     return Err(ExecError::Unauthorized("Vote's stake account must be owned by the transaction payer".into()));
@@ -110,7 +121,14 @@ impl NativeProgram for GovernanceProgram {
                 // stake behind it must stay locked at least until this
                 // proposal is decided - `max` because one position can
                 // vote on several proposals with overlapping periods.
-                stake_data.locked_until_round = stake_data.locked_until_round.max(proposal.voting_ends_round);
+                // Locked through the ENTIRE window the vote has effect: the
+                // voting period PLUS the post-passage time-lock (Registry tier),
+                // so a Yes-voter can't reclaim their capital the instant voting
+                // ends and sit out the review window with zero exposure while
+                // their recorded vote still drives execution. Low tier has a
+                // zero time-lock, so this is unchanged there.
+                let lock_until = proposal.voting_ends_round.saturating_add(quorum_rule(proposal.action.risk_tier()).timelock_rounds);
+                stake_data.locked_until_round = stake_data.locked_until_round.max(lock_until);
                 accounts.get_mut(&stake_pk).unwrap().data = borsh::to_vec(&stake_data).map_err(borsh_err)?;
             }
 
@@ -252,17 +270,60 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
     Ok(())
 }
 
-/// Only ever called with a `Low`-tier action (the `Execute` match arm
-/// routes accordingly) - the other variants are unreachable here.
-/// Returns an error for a commission above 100% (10,000 bps) - the one
-/// `Low`-tier value with a real invariant to violate (unlike a fee/dust
-/// constant, which is just a placeholder number with no upper bound that
-/// would break arithmetic elsewhere).
+/// Safety ceiling for the governance-settable `dust_threshold`. 1,000× the
+/// ~1,000,000-unit fee anchor - generous headroom for any legitimate
+/// recalibration, while far below any real account balance, so a passed
+/// proposal can never set it high enough to sweep-and-burn ordinary accounts
+/// (the catastrophe an unbounded `dust_threshold` allowed - see
+/// `apply_economic_action`).
+const MAX_DUST_THRESHOLD: u64 = 1_000_000_000;
+
+/// Only ever called with a `Low`-tier action (the `Execute` match arm routes
+/// accordingly) - the other variants are unreachable here. Enforces sanity
+/// bounds on each economic parameter: a passed `Low`-tier proposal executes
+/// with zero time-lock, so an out-of-range value (e.g. `dust_threshold =
+/// u64::MAX`, `base_fee = 0`, `gas_price = 0`) would take effect immediately
+/// with no window to react - these bounds keep governance from bricking the
+/// chain even with a transient majority.
 fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &ProposalAction) -> Result<(), ExecError> {
     match action {
-        ProposalAction::SetBaseFeePerByte(v) => params.base_fee_per_byte = *v,
-        ProposalAction::SetDustThreshold(v) => params.dust_threshold = *v,
-        ProposalAction::SetGasPricePerFuel(v) => params.gas_price_per_fuel = *v,
+        // Floor: below the anti-spam minimum the dynamic fee mechanism already
+        // clamps to (`FEE_MIN_BASE_FEE_PER_BYTE`), so a governance-set value
+        // under it is both pointless (the next round would raise it back) and
+        // dangerous (a `0` would make transactions free - spam DoS).
+        ProposalAction::SetBaseFeePerByte(v) => {
+            if *v < crate::params::FEE_MIN_BASE_FEE_PER_BYTE {
+                return Err(ExecError::ProgramError(format!(
+                    "base_fee_per_byte {v} is below the anti-spam floor {}",
+                    crate::params::FEE_MIN_BASE_FEE_PER_BYTE
+                )));
+            }
+            params.base_fee_per_byte = *v;
+        }
+        // Hard cap: `dust_threshold` is the balance BELOW which a system-owned
+        // account is zeroed-and-burned when it participates in any transaction.
+        // With no ceiling a single passed `Low`-tier proposal could set it to
+        // `u64::MAX` and irreversibly burn EVERY ordinary account the next time
+        // it transacts (even as a mere transfer recipient) - total supply
+        // destruction. The cap keeps the value in genuine "dust" territory
+        // (generous headroom over the ~1M anchor for recalibration) while making
+        // that catastrophe impossible.
+        ProposalAction::SetDustThreshold(v) => {
+            if *v > MAX_DUST_THRESHOLD {
+                return Err(ExecError::ProgramError(format!(
+                    "dust_threshold {v} exceeds the safety cap {MAX_DUST_THRESHOLD} - a higher value would sweep-and-burn ordinary balances"
+                )));
+            }
+            params.dust_threshold = *v;
+        }
+        // A `0` gas price makes WASM compute free, defeating the gas-metering
+        // DoS protections (trap billing, memory limiter, fuel limit).
+        ProposalAction::SetGasPricePerFuel(v) => {
+            if *v == 0 {
+                return Err(ExecError::ProgramError("gas_price_per_fuel cannot be zero - would make WASM compute free (DoS)".into()));
+            }
+            params.gas_price_per_fuel = *v;
+        }
         ProposalAction::SetStakingCommissionBps(v) => {
             if *v > 10_000 {
                 return Err(ExecError::ProgramError("staking commission cannot exceed 10,000 bps (100%)".into()));
@@ -593,8 +654,17 @@ mod tests {
         assert!(too_early.is_err(), "reclaiming the stake before the vote it cast is decided must be rejected");
         assert_eq!(accounts[&STAKE_PK].balance, 5_000, "the position must remain fully intact while locked");
 
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds).unwrap();
-        assert_eq!(accounts[&STAKE_PK].balance, 0, "once the proposal's voting period has genuinely ended, the same position can undelegate normally");
+        // The lock now extends through the ENTIRE Registry window: voting period
+        // PLUS the post-passage time-lock. Undelegating the instant the voting
+        // period ends must still be rejected - a Yes-voter can't sit out the
+        // review window with zero economic exposure while their vote drives
+        // execution (audit finding C).
+        let still_locked = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds);
+        assert!(still_locked.is_err(), "a Registry-tier voter stays locked through the time-lock window, not just the voting period");
+        assert_eq!(accounts[&STAKE_PK].balance, 5_000, "still fully intact during the time-lock");
+
+        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds + rule.timelock_rounds).unwrap();
+        assert_eq!(accounts[&STAKE_PK].balance, 0, "once voting period + time-lock have genuinely elapsed, the same position can undelegate normally");
     }
 
     /// The `Low` tier's whole point is to be cheap to move: no
@@ -615,7 +685,10 @@ mod tests {
             (PARAMS_ACCOUNT_ID, params_account()),
         ]);
 
-        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(9), 0);
+        // A valid recalibration: at or above the anti-spam floor (a value below
+        // it is now rejected - see `apply_economic_action`'s bounds).
+        let new_fee = crate::params::FEE_MIN_BASE_FEE_PER_BYTE + 20;
+        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(new_fee), 0);
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
 
@@ -636,11 +709,31 @@ mod tests {
         GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round).unwrap();
 
         let params = crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap();
-        assert_eq!(params.base_fee_per_byte, 9);
+        assert_eq!(params.base_fee_per_byte, new_fee);
         assert_eq!(params.dust_threshold, crate::params::EconomicParams::default().dust_threshold, "unrelated params must be untouched");
 
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn economic_parameter_bounds_reject_catastrophic_values() {
+        use crate::params::EconomicParams;
+        let mut p = EconomicParams::default();
+        // dust_threshold = u64::MAX would burn every account on touch - rejected.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(u64::MAX)).is_err());
+        // base_fee below the anti-spam floor (e.g. 0 = free spam) - rejected.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(0)).is_err());
+        // gas_price 0 = free WASM compute - rejected.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(0)).is_err());
+        // The state must be untouched after every rejection.
+        assert_eq!(p.dust_threshold, EconomicParams::default().dust_threshold);
+        assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
+        // Legitimate in-range recalibrations still apply.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(MAX_DUST_THRESHOLD)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::FEE_MIN_BASE_FEE_PER_BYTE)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(1)).is_ok());
+        assert_eq!(p.dust_threshold, MAX_DUST_THRESHOLD);
     }
 
     #[test]

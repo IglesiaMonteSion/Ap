@@ -1351,7 +1351,7 @@ async function renderStaking(){
     return `<div class="row-item" style="align-items:flex-start">
       <div style="min-width:0;flex:1">
         <div style="font-weight:700">${qchDisp(amount)}</div>
-        <div class="wi-addr mono" style="font-size:11px">a ${short(s.validator)}</div>
+        <div class="wi-addr mono" style="font-size:11px">a ${esc(short(s.validator))}</div>
         ${rewardLine}${lockLine}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px">
