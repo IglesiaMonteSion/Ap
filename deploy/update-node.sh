@@ -131,6 +131,15 @@ if [ "$SANO" -eq 1 ]; then
   echo "Versión activa: $(version_rpc). La ronda de consenso está avanzando."
   echo "Ver logs en vivo:  journalctl -u $SERVICE -f"
   [ -n "$COMMIT_ACTUAL" ] && echo "$COMMIT_ACTUAL" > "$MARCA" 2>/dev/null || true
+  # Este script actualiza SOLO el validador. Si además tenés la wallet web
+  # instalada, sigue corriendo la versión vieja hasta que la reinicies aparte.
+  if systemctl list-unit-files qchain-wallet.service >/dev/null 2>&1 && systemctl cat qchain-wallet >/dev/null 2>&1; then
+    echo
+    echo "NOTA: también tenés la wallet web instalada, y este comando NO la actualizó."
+    echo "  Para actualizar el nodo Y la wallet de una:  sudo ./deploy/update.sh --yes"
+    echo "  O solo la wallet:                            sudo ./deploy/update-wallet.sh --yes"
+    echo "  (Después, en el navegador: refresco fuerte Ctrl+Shift+R o pestaña privada — el .wasm se cachea.)"
+  fi
   exit 0
 fi
 
