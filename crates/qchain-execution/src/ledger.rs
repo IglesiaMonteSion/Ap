@@ -610,7 +610,7 @@ impl Ledger {
                     let entry_point = entry_point.clone();
                     match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
-                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
+                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
                     }
                 }
                 // Not one of the fixed native programs - check whether a
@@ -639,7 +639,7 @@ impl Ledger {
                         params.gas_price_per_fuel,
                     ) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
-                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, &working, e)),
+                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
                     }
                 }
             }
@@ -771,7 +771,20 @@ impl Ledger {
         }
 
         for (pk, mut account) in working {
-            if account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold {
+            // Never dust-sweep the fee collector (block proposer): on the WASM
+            // gas path it is seeded into `working` from its real store balance
+            // and credited its gas share here, so a proposer whose accumulated
+            // balance is still below `dust_threshold` (e.g. its first small fee)
+            // would otherwise have its legitimately-earned fee zeroed and burned
+            // - value destruction the normal (non-gas) path never suffers,
+            // because there the proposer is never placed in `working`. (Singleton
+            // program accounts are already immune: they are program-owned, not
+            // system-owned, so the owner check below excludes them.)
+            if pk != *fee_collector
+                && account.owner == Pubkey::system_program_id()
+                && account.balance > 0
+                && account.balance < params.dust_threshold
+            {
                 self.total_burned = self.total_burned.saturating_add(account.balance);
                 self.dust_burned = self.dust_burned.saturating_add(account.balance);
                 account.balance = 0;
@@ -809,12 +822,34 @@ impl Ledger {
     /// payer's current balance rather than allowed to underflow - this is
     /// billing for real work already done, not a fresh solvency check, so
     /// there's nothing to reject here, only an amount to collect.
-    fn bill_trapped_wasm_fuel(&mut self, payer: &Pubkey, fee_collector: &Pubkey, working: &HashMap<Pubkey, Account>, err: ExecError) -> ExecError {
+    fn bill_trapped_wasm_fuel(&mut self, payer: &Pubkey, fee_collector: &Pubkey, upfront_fee: u64, fee_limit: u64, err: ExecError) -> ExecError {
         if let ExecError::Wasm { fuel_consumed, .. } = &err {
             if *fuel_consumed > 0 {
                 let params = self.current_params();
                 let trap_fee = fuel_consumed.saturating_mul(params.gas_price_per_fuel);
-                if let Some(mut payer_account) = working.get(payer).cloned() {
+                // Enforce `fee_limit` on the trap path too (the success path
+                // checks `combined_fee > fee_limit` at `apply_transaction`, but
+                // a trap returns before reaching it): the byte/priority
+                // `upfront_fee` is already committed and was already `<=
+                // fee_limit`, so the trap fee is capped at the remaining
+                // allowance. Without this a payer who signed a low `fee_limit`
+                // whose contract traps after burning millions of fuel would be
+                // charged the full gas, exceeding the ceiling they authorized.
+                let trap_fee = trap_fee.min(fee_limit.saturating_sub(upfront_fee));
+                // CRITICAL: bill against the payer's committed STORE balance
+                // (post-`upfront_fee`, written just before the instruction loop),
+                // NEVER `working[payer]`. On a trap the whole transaction fails
+                // and every `working` mutation is discarded by the early return
+                // this feeds - but `working[payer]` already carries the balance
+                // effects of any EARLIER successful instruction in the same tx
+                // (e.g. an `Undelegate` that credited principal+reward, or a
+                // `Transfer` that debited the payer). Committing that one account
+                // while discarding its counterparts (the zeroed stake account,
+                // the debited pool, the credited recipient) mints or destroys
+                // value - a real, repeatable, network-wide supply break. Reading
+                // the store instead commits ONLY `upfront_fee + trap_fee`, with
+                // no leaked instruction effects.
+                if let Some(mut payer_account) = self.store.get(payer) {
                     let charge = trap_fee.min(payer_account.balance);
                     payer_account.balance -= charge;
                     self.write_account(*payer, payer_account);
@@ -2012,5 +2047,65 @@ mod tests {
             expensive_cost > cheap_cost,
             "a call that burns real fuel before trapping ({expensive_cost}) must cost more than one that traps instantly ({cheap_cost}), not the same flat byte fee"
         );
+    }
+
+    #[test]
+    fn a_trapped_multi_instruction_tx_does_not_commit_earlier_instruction_effects() {
+        // CRITICAL regression: when a later instruction in a multi-instruction
+        // transaction traps, the whole transaction must fail atomically - NONE
+        // of an earlier instruction's balance effects may persist. The trap
+        // billing used to commit `working[payer]` (which already carried those
+        // effects) while discarding the counterpart accounts, minting/destroying
+        // value. Here: [Transfer(payer->victim, N), trapping-call]. The transfer
+        // debits the payer and credits the victim IN `working`; the trap then
+        // fails the tx. Neither effect may survive: the victim must NOT be
+        // credited, and the payer must NOT lose N (only the byte + trap fee).
+        const CHEAP_TRAP_WAT: &str = r#"(module (func (export "go") unreachable))"#;
+        let mut ledger = new_test_ledger();
+        let validator = Keypair::generate().unwrap().pubkey();
+        let deployer = Keypair::generate().unwrap();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = Keypair::generate().unwrap().pubkey();
+        let module_bytes = wat::parse_str(CHEAP_TRAP_WAT).unwrap();
+        let deploy_ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![program_pk],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into() }).unwrap(),
+        };
+        let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
+        ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();
+
+        let payer = Keypair::generate().unwrap();
+        let victim = Keypair::generate().unwrap().pubkey();
+        ledger.credit(payer.pubkey(), 50_000_000);
+        let n: u64 = 7_000_000;
+        let sum = |l: &Ledger| l.get_balance(&payer.pubkey()) + l.get_balance(&victim) + l.get_balance(&validator) + l.get_balance(&deployer.pubkey());
+        let payer_before = ledger.get_balance(&payer.pubkey());
+        let victim_before = ledger.get_balance(&victim);
+        let sum_before = sum(&ledger);
+        let burned_before = ledger.total_burned;
+
+        let transfer_ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![payer.pubkey(), victim],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: n }).unwrap(),
+        };
+        let trap_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+        let tx = Transaction::new_signed(&payer, 0, [0u8; 32], 50_000_000, vec![transfer_ix, trap_ix]).unwrap();
+        let result = ledger.apply_transaction(&tx, &validator, 0);
+        assert!(result.is_err(), "the trapping tx must fail overall");
+
+        // The victim's transfer credit must have been discarded with the failed tx.
+        assert_eq!(ledger.get_balance(&victim), victim_before, "victim must NOT be credited from a trapped tx");
+        // The payer must only have lost fees (byte + trap), NEVER the transferred
+        // N - the transfer debit belonged to the failed tx and must be discarded.
+        let payer_lost = payer_before - ledger.get_balance(&payer.pubkey());
+        assert!(payer_lost < n, "payer must lose only the fee (byte+trap), not the transferred {n} (lost {payer_lost})");
+        // Supply is conserved: the tracked balances drop by exactly the newly
+        // burned fee, nothing minted or destroyed (the victim credit and the
+        // discarded payer debit must net to zero).
+        let sum_after = sum(&ledger);
+        let burned_delta = ledger.total_burned - burned_before;
+        assert_eq!(sum_before - sum_after, burned_delta, "supply must drop by exactly the burned fee");
     }
 }

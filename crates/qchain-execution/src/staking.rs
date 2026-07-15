@@ -408,7 +408,9 @@ impl NativeProgram for StakingProgram {
                     let pool_account = accounts.get_mut(&pool_pk).ok_or(ExecError::AccountNotFound(pool_pk))?;
                     pool_account.balance = pool_account.balance.saturating_sub(reward);
                 }
-                accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id())).balance += amount + reward;
+                let credit = amount.saturating_add(reward);
+                let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+                acct.balance = acct.balance.saturating_add(credit);
 
                 let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
                 let total = read_stats(stats)?.saturating_sub(amount);
@@ -435,7 +437,8 @@ impl NativeProgram for StakingProgram {
                 if reward > 0 {
                     let pool_account = accounts.get_mut(&pool_pk).unwrap();
                     pool_account.balance = pool_account.balance.saturating_sub(reward);
-                    accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id())).balance += reward;
+                    let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+                    acct.balance = acct.balance.saturating_add(reward);
                 }
             }
             StakingInstruction::ReportEquivocation { evidence } => {
