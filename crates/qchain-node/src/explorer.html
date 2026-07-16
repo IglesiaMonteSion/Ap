@@ -115,6 +115,18 @@
   .stat-value.mono:hover { color: var(--accent); }
   .stat-sub { font-size: 0.75rem; color: var(--text-dim); margin-top: 0.15rem; }
 
+  /* Transaction-history pagination bar */
+  .pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; margin-top: 0.9rem; }
+  /* `.pager` sets an explicit display, which would otherwise override the
+     `hidden` attribute's UA `display:none` - restore it so hiding works. */
+  .pager[hidden] { display: none; }
+  .pager-rows { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-dim); }
+  .pager-rows select { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.5rem; font: inherit; }
+  .pager-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+  .pager-nav .btn-ghost { padding: 0.35rem 0.6rem; font-size: 0.8rem; }
+  .pager-nav .btn-ghost:disabled { opacity: 0.4; cursor: default; }
+  .pager-info { font-size: 0.8rem; color: var(--text-dim); padding: 0 0.4rem; white-space: nowrap; }
+
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -385,6 +397,24 @@ qchain propose-set-dust-threshold --value &lt;unidades&gt; ...</pre>
         </table>
       </div>
       <p id="tx-empty" class="empty" hidden>todavía no se ejecutó ninguna transacción en este validador</p>
+      <div id="tx-pager" class="pager" hidden>
+        <div class="pager-rows">
+          <span>Mostrar filas:</span>
+          <select id="tx-pagesize">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+        <div class="pager-nav">
+          <button id="tx-first" class="btn-ghost">« Primera</button>
+          <button id="tx-prev" class="btn-ghost">‹ Anterior</button>
+          <span id="tx-pageinfo" class="pager-info">Página 1 de 1</span>
+          <button id="tx-next" class="btn-ghost">Siguiente ›</button>
+          <button id="tx-last" class="btn-ghost">Última »</button>
+        </div>
+      </div>
     </section>
 
     <section class="panel" id="detail-panel" hidden>
@@ -654,8 +684,15 @@ async function refreshEquivocations() {
 // round (like a real explorer - ETH/SOL don't split by tx type; they split
 // "transactions" vs "blocks"). Only rebuilds the DOM when the list actually
 // changed (signature check), so it doesn't flicker every refresh.
-const ACTIVITY_LIMIT = 40;
+// How many recent items to pull from the node for the paginated view. The
+// in-memory log is bounded (last ~5000 receipts, /transfers caps a single
+// response at 1000), so this is the recent window - a full-history index is a
+// separate indexer's job (documented). The user paginates through this window.
+const ACTIVITY_FETCH = 1000;
 let lastActivitySig = "";
+let activityItems = [];   // merged + round-sorted, newest first
+let activityPage = 0;     // 0-indexed
+let activityPageSize = 20; // default: show the last 20, rest below via pager
 const STAKE_TYPE = {
   delegate:     { label: "Staking · delegación", cls: "amt-out" },
   undelegate:   { label: "Staking · retiro",     cls: "amt-in" },
@@ -663,11 +700,9 @@ const STAKE_TYPE = {
 };
 
 async function loadActivity(force = false) {
-  const body = document.getElementById("tx-body");
-  const emptyNote = document.getElementById("tx-empty");
   let txs = [], stk = [];
-  try { txs = await getJson(`/transfers?limit=${ACTIVITY_LIMIT}`); } catch (e) {}
-  try { stk = await getJson(`/staking_activity?limit=${ACTIVITY_LIMIT}`); } catch (e) {}
+  try { txs = await getJson(`/transfers?limit=${ACTIVITY_FETCH}`); } catch (e) {}
+  try { stk = await getJson(`/staking_activity?limit=${ACTIVITY_FETCH}`); } catch (e) {}
   const items = [];
   for (const t of (txs || [])) {
     items.push({ round: t.round || 0, hash: t.tx_hash, click: true,
@@ -683,25 +718,54 @@ async function loadActivity(force = false) {
       type: meta.label, from: s.staker, to, amount: s.amount, cls: meta.cls });
   }
   items.sort((a, b) => b.round - a.round);
-  const shown = items.slice(0, ACTIVITY_LIMIT);
-  const sig = shown.map(i => i.hash + i.type).join(",");
-  if (!force && sig === lastActivitySig) return; // sin cambios -> sin parpadeo
+  // Signature over the WHOLE fetched set so a new tx anywhere refreshes the view
+  // (but an unchanged list never redraws -> no flicker, no losing your page).
+  const sig = items.map(i => i.hash + i.type).join(",");
+  if (!force && sig === lastActivitySig) return;
   lastActivitySig = sig;
-  if (!shown.length) { body.innerHTML = ""; emptyNote.hidden = false; return; }
+  activityItems = items;
+  // Keep the current page valid if the list grew/shrank.
+  const pages = Math.max(1, Math.ceil(activityItems.length / activityPageSize));
+  if (activityPage >= pages) activityPage = pages - 1;
+  renderActivityPage();
+}
+
+function renderActivityPage() {
+  const body = document.getElementById("tx-body");
+  const emptyNote = document.getElementById("tx-empty");
+  const pager = document.getElementById("tx-pager");
+  if (!activityItems.length) {
+    body.innerHTML = ""; emptyNote.hidden = false; pager.hidden = true; return;
+  }
   emptyNote.hidden = true;
+  const total = activityItems.length;
+  const pages = Math.max(1, Math.ceil(total / activityPageSize));
+  if (activityPage < 0) activityPage = 0;
+  if (activityPage >= pages) activityPage = pages - 1;
+  const start = activityPage * activityPageSize;
+  const shown = activityItems.slice(start, start + activityPageSize);
   body.innerHTML = "";
   for (const i of shown) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${i.type}</td><td class="mono">${short(i.from)}</td><td class="mono">${short(i.to)}</td><td class="amount ${i.cls}">${qch(i.amount)}</td><td>${fmtNum(i.round)}</td>`;
     if (i.click) {
       tr.style.cursor = "pointer";
-      // Staking rows carry `raw` and open the staking detail; transfers open the
-      // transfer detail (before/after balances + Merkle proofs).
       tr.addEventListener("click", () => (i.raw ? showStaking(i.raw) : showTransfer(i.hash)));
     }
     body.appendChild(tr);
   }
+  // Pager: shown once there's more than one page worth of history.
+  pager.hidden = total <= activityPageSize;
+  const from = start + 1, to = Math.min(start + activityPageSize, total);
+  document.getElementById("tx-pageinfo").textContent =
+    `Página ${activityPage + 1} de ${pages} · filas ${from}–${to} de ${total}`;
+  document.getElementById("tx-first").disabled = activityPage === 0;
+  document.getElementById("tx-prev").disabled = activityPage === 0;
+  document.getElementById("tx-next").disabled = activityPage >= pages - 1;
+  document.getElementById("tx-last").disabled = activityPage >= pages - 1;
 }
+
+function goActivityPage(p) { activityPage = p; renderActivityPage(); }
 
 function accountCard(title, address, before, after) {
   return `<div class="compare-card">
@@ -777,6 +841,19 @@ document.getElementById("close-detail").addEventListener("click", () => {
   document.getElementById("detail-panel").hidden = true;
 });
 document.getElementById("refresh-transfers").addEventListener("click", () => loadActivity(true));
+// Pagination controls (pure client-side over the fetched window - no refetch).
+document.getElementById("tx-pagesize").addEventListener("change", (e) => {
+  activityPageSize = parseInt(e.target.value, 10) || 20;
+  activityPage = 0;
+  renderActivityPage();
+});
+document.getElementById("tx-first").addEventListener("click", () => goActivityPage(0));
+document.getElementById("tx-prev").addEventListener("click", () => goActivityPage(activityPage - 1));
+document.getElementById("tx-next").addEventListener("click", () => goActivityPage(activityPage + 1));
+document.getElementById("tx-last").addEventListener("click", () => {
+  const pages = Math.max(1, Math.ceil(activityItems.length / activityPageSize));
+  goActivityPage(pages - 1);
+});
 
 document.getElementById("lookup").addEventListener("click", async () => {
   const addr = document.getElementById("addr").value.trim();
