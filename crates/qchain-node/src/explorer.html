@@ -127,6 +127,17 @@
   .pager-nav .btn-ghost:disabled { opacity: 0.4; cursor: default; }
   .pager-info { font-size: 0.8rem; color: var(--text-dim); padding: 0 0.4rem; white-space: nowrap; }
 
+  /* Transactions / Blocks tab switcher */
+  .tabs { display: flex; gap: 0.4rem; margin: 0.2rem 0 0.6rem; border-bottom: 1px solid var(--border); }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--text-dim); font: inherit; font-size: 0.9rem; padding: 0.5rem 0.9rem; cursor: pointer; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  /* Round-fill (bytes used / limit) mini bar */
+  .fill { display: inline-flex; align-items: center; gap: 0.4rem; min-width: 90px; }
+  .fill-bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .fill-bar > i { display: block; height: 100%; background: linear-gradient(90deg, #5be3a0, #ffcf5b); }
+  .fill-pct { font-size: 0.72rem; color: var(--text-dim); white-space: nowrap; }
+
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -266,6 +277,11 @@
         <div class="stat-sub" id="stat-tps">&nbsp;</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">pendientes (mempool)</div>
+        <div class="stat-value" id="stat-pending">–</div>
+        <div class="stat-sub" id="stat-pending-sub">esperando ejecución</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">fee de transferencia</div>
         <div class="stat-value" id="stat-fee">–</div>
         <div class="stat-sub" id="stat-fee-sub">&nbsp;</div>
@@ -386,33 +402,70 @@ qchain propose-set-dust-threshold --value &lt;unidades&gt; ...</pre>
 
     <section class="panel">
       <div class="panel-header">
-        <h2>transacciones</h2>
+        <h2>actividad de la red</h2>
         <button id="refresh-transfers" class="btn-ghost">↻ actualizar</button>
       </div>
-      <div class="panel-sub">Todo lo que este validador ejecutó y confirmó — transferencias Y staking en una sola lista, como un explorador real. No es un índice de toda la red: cada validador solo ve lo que él mismo procesó.</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>tipo</th><th>desde</th><th>hacia / detalle</th><th>monto (QCH)</th><th>ronda</th></tr></thead>
-          <tbody id="tx-body"></tbody>
-        </table>
+      <div class="tabs">
+        <button class="tab active" data-tab="tx" id="tab-btn-tx">Transacciones</button>
+        <button class="tab" data-tab="blocks" id="tab-btn-blocks">Bloques (rondas)</button>
       </div>
-      <p id="tx-empty" class="empty" hidden>todavía no se ejecutó ninguna transacción en este validador</p>
-      <div id="tx-pager" class="pager" hidden>
-        <div class="pager-rows">
-          <span>Mostrar filas:</span>
-          <select id="tx-pagesize">
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
+      <div class="panel-sub">Todo lo que este validador ejecutó y confirmó. Como un explorador real (ETH/SOL): la pestaña <b>Transacciones</b> lista cada transferencia/staking; <b>Bloques (rondas)</b> las agrupa por ronda de consenso — en Qchain el "bloque" es una ronda — con cuántas transacciones lleva cada una. No es un índice de toda la red: cada validador solo ve lo que él mismo procesó.</div>
+
+      <!-- ===== pestaña TRANSACCIONES ===== -->
+      <div id="tab-tx">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>tipo</th><th>desde</th><th>hacia / detalle</th><th>monto (QCH)</th><th>ronda</th></tr></thead>
+            <tbody id="tx-body"></tbody>
+          </table>
         </div>
-        <div class="pager-nav">
-          <button id="tx-first" class="btn-ghost">« Primera</button>
-          <button id="tx-prev" class="btn-ghost">‹ Anterior</button>
-          <span id="tx-pageinfo" class="pager-info">Página 1 de 1</span>
-          <button id="tx-next" class="btn-ghost">Siguiente ›</button>
-          <button id="tx-last" class="btn-ghost">Última »</button>
+        <p id="tx-empty" class="empty" hidden>todavía no se ejecutó ninguna transacción en este validador</p>
+        <div id="tx-pager" class="pager" hidden>
+          <div class="pager-rows">
+            <span>Mostrar filas:</span>
+            <select id="tx-pagesize">
+              <option value="10">10</option>
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <div class="pager-nav">
+            <button id="tx-first" class="btn-ghost">« Primera</button>
+            <button id="tx-prev" class="btn-ghost">‹ Anterior</button>
+            <span id="tx-pageinfo" class="pager-info">Página 1 de 1</span>
+            <button id="tx-next" class="btn-ghost">Siguiente ›</button>
+            <button id="tx-last" class="btn-ghost">Última »</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== pestaña BLOQUES (RONDAS) ===== -->
+      <div id="tab-blocks" hidden>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ronda</th><th>edad</th><th>txns</th><th>fees</th><th>quemado</th><th>recompensa</th><th>llenado</th></tr></thead>
+            <tbody id="blocks-body"></tbody>
+          </table>
+        </div>
+        <p id="blocks-empty" class="empty" hidden>todavía no hay rondas con transacciones en este validador</p>
+        <div id="blocks-pager" class="pager" hidden>
+          <div class="pager-rows">
+            <span>Mostrar filas:</span>
+            <select id="blocks-pagesize">
+              <option value="10">10</option>
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <div class="pager-nav">
+            <button id="blocks-first" class="btn-ghost">« Primera</button>
+            <button id="blocks-prev" class="btn-ghost">‹ Anterior</button>
+            <span id="blocks-pageinfo" class="pager-info">Página 1 de 1</span>
+            <button id="blocks-next" class="btn-ghost">Siguiente ›</button>
+            <button id="blocks-last" class="btn-ghost">Última »</button>
+          </div>
         </div>
       </div>
     </section>
@@ -595,6 +648,14 @@ async function refreshStatus() {
     document.getElementById("stat-certs").textContent = fmtNum(status.dag_certificates);
     document.getElementById("stat-executed").textContent = fmtNum(status.executed_transactions);
     document.getElementById("stat-round").textContent = fmtNum(status.next_round);
+    // Pending (mempool) - the real backlog waiting to be included in a round.
+    const pending = status.mempool_transactions || 0;
+    document.getElementById("stat-pending").textContent = fmtNum(pending);
+    document.getElementById("stat-pending-sub").textContent =
+      pending > 0 ? "esperando ejecución" : "mempool vacío";
+    // Shared with the "Bloques (rondas)" view for age computation.
+    curRound = status.next_round;
+    roundIntervalMs = status.round_interval_ms || 500;
     validatorAddr = status.validator;
     document.getElementById("stat-validator").textContent = short(validatorAddr, 10, 8);
 
@@ -693,6 +754,27 @@ let lastActivitySig = "";
 let activityItems = [];   // merged + round-sorted, newest first
 let activityPage = 0;     // 0-indexed
 let activityPageSize = 20; // default: show the last 20, rest below via pager
+// Shared with the "Bloques (rondas)" view (set by refreshStatus).
+let curRound = 0, roundIntervalMs = 500;
+// The per-round inclusion cap (FEE_MAX_BYTES_PER_ROUND = 2 x 500KB target).
+// Used as the "gas limit" analog to show how full each round is. Constant in
+// the protocol; if it changes, this display estimate would need updating.
+const ROUND_BYTE_LIMIT = 1000000;
+const TX_BYTES_EST = 5571; // ~size of a standard hybrid-signed transfer
+let activeTab = "tx";     // "tx" | "blocks"
+let blocks = [];          // grouped by round, newest first
+let blocksPage = 0;
+let blocksPageSize = 20;
+
+// "hace 3 s / 5 min / 2 h" from a round number, using the live round + interval.
+function ageFromRound(r) {
+  if (!curRound || r <= 0) return "–";
+  const secs = Math.max(0, (curRound - r) * roundIntervalMs / 1000);
+  if (secs < 60) return `hace ${Math.round(secs)} s`;
+  if (secs < 3600) return `hace ${Math.round(secs / 60)} min`;
+  if (secs < 86400) return `hace ${Math.round(secs / 3600)} h`;
+  return `hace ${Math.round(secs / 86400)} d`;
+}
 const STAKE_TYPE = {
   delegate:     { label: "Staking · delegación", cls: "amt-out" },
   undelegate:   { label: "Staking · retiro",     cls: "amt-in" },
@@ -705,16 +787,17 @@ async function loadActivity(force = false) {
   try { stk = await getJson(`/staking_activity?limit=${ACTIVITY_FETCH}`); } catch (e) {}
   const items = [];
   for (const t of (txs || [])) {
-    items.push({ round: t.round || 0, hash: t.tx_hash, click: true,
+    // `fee` (from /transfers) lets the Bloques view sum per-round fees/burnt/reward.
+    items.push({ round: t.round || 0, hash: t.tx_hash, click: true, fee: t.fee || 0,
       type: "Transferencia", from: t.from, to: t.to, amount: t.amount, cls: "" });
   }
   for (const s of (stk || [])) {
     const meta = STAKE_TYPE[s.kind] || { label: s.kind, cls: "" };
     // "hacia / detalle" = the counterparty most useful per action.
     const to = s.kind === "delegate" ? s.validator : s.staker;
-    // `raw` carries the full staking event so the row opens a detail panel too
-    // (same as a transfer) - every field is already in the list response.
-    items.push({ round: s.round || 0, hash: s.tx_hash, click: true, raw: s,
+    // Staking txs don't produce a receipt with a fee here, so fee 0 for the
+    // block totals (documented: per-round fees are from transfers).
+    items.push({ round: s.round || 0, hash: s.tx_hash, click: true, raw: s, fee: 0,
       type: meta.label, from: s.staker, to, amount: s.amount, cls: meta.cls });
   }
   items.sort((a, b) => b.round - a.round);
@@ -724,10 +807,27 @@ async function loadActivity(force = false) {
   if (!force && sig === lastActivitySig) return;
   lastActivitySig = sig;
   activityItems = items;
-  // Keep the current page valid if the list grew/shrank.
+  buildBlocks();
+  // Keep the current pages valid if the lists grew/shrank.
   const pages = Math.max(1, Math.ceil(activityItems.length / activityPageSize));
   if (activityPage >= pages) activityPage = pages - 1;
+  const bpages = Math.max(1, Math.ceil(blocks.length / blocksPageSize));
+  if (blocksPage >= bpages) blocksPage = bpages - 1;
   renderActivityPage();
+  renderBlocksPage();
+}
+
+// Group the merged activity by round to form "blocks" (a Qchain block = a
+// consensus round). Per round: tx count, total transfer fees, burnt (50%),
+// validator reward (the rest), and an approximate byte-fill vs the round cap.
+function buildBlocks() {
+  const byRound = new Map();
+  for (const i of activityItems) {
+    let b = byRound.get(i.round);
+    if (!b) { b = { round: i.round, count: 0, fees: 0, txs: [] }; byRound.set(i.round, b); }
+    b.count++; b.fees += (i.fee || 0); b.txs.push(i);
+  }
+  blocks = [...byRound.values()].sort((a, b) => b.round - a.round);
 }
 
 function renderActivityPage() {
@@ -766,6 +866,95 @@ function renderActivityPage() {
 }
 
 function goActivityPage(p) { activityPage = p; renderActivityPage(); }
+
+// ===== Bloques (rondas) =====
+const BURN_PCT = 50; // protocol split: 50% of each fee burned, rest to validators.
+function renderBlocksPage() {
+  const body = document.getElementById("blocks-body");
+  const emptyNote = document.getElementById("blocks-empty");
+  const pager = document.getElementById("blocks-pager");
+  if (!blocks.length) { body.innerHTML = ""; emptyNote.hidden = false; pager.hidden = true; return; }
+  emptyNote.hidden = true;
+  const total = blocks.length;
+  const pages = Math.max(1, Math.ceil(total / blocksPageSize));
+  if (blocksPage < 0) blocksPage = 0;
+  if (blocksPage >= pages) blocksPage = pages - 1;
+  const start = blocksPage * blocksPageSize;
+  const shown = blocks.slice(start, start + blocksPageSize);
+  body.innerHTML = "";
+  for (const b of shown) {
+    const burnt = Math.round(b.fees * BURN_PCT / 100);
+    const reward = b.fees - burnt;
+    const bytes = b.count * TX_BYTES_EST;
+    const pct = Math.min(100, Math.round(bytes / ROUND_BYTE_LIMIT * 100));
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="mono">#${fmtNum(b.round)}</td>` +
+      `<td>${ageFromRound(b.round)}</td>` +
+      `<td>${fmtNum(b.count)}</td>` +
+      `<td class="amount">${qch(b.fees)}</td>` +
+      `<td class="amount" style="color:#ff9a62">${qch(burnt)}</td>` +
+      `<td class="amount" style="color:#5be3a0">${qch(reward)}</td>` +
+      `<td><span class="fill"><span class="fill-bar"><i style="width:${pct}%"></i></span><span class="fill-pct">${pct}%</span></span></td>`;
+    tr.style.cursor = "pointer";
+    tr.addEventListener("click", () => showRound(b));
+    body.appendChild(tr);
+  }
+  pager.hidden = total <= blocksPageSize;
+  const from = start + 1, to = Math.min(start + blocksPageSize, total);
+  document.getElementById("blocks-pageinfo").textContent =
+    `Página ${blocksPage + 1} de ${pages} · rondas ${from}–${to} de ${total}`;
+  document.getElementById("blocks-first").disabled = blocksPage === 0;
+  document.getElementById("blocks-prev").disabled = blocksPage === 0;
+  document.getElementById("blocks-next").disabled = blocksPage >= pages - 1;
+  document.getElementById("blocks-last").disabled = blocksPage >= pages - 1;
+}
+function goBlocksPage(p) { blocksPage = p; renderBlocksPage(); }
+
+// Round (block) detail: header stats + the list of its transactions.
+function showRound(b) {
+  const panel = document.getElementById("detail-panel");
+  const out = document.getElementById("detail-body");
+  document.getElementById("detail-title").textContent = `ronda #${fmtNum(b.round)} (bloque)`;
+  panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const burnt = Math.round(b.fees * BURN_PCT / 100);
+  const reward = b.fees - burnt;
+  let rows = b.txs.map(i =>
+    `<tr style="cursor:pointer" onclick="__openTx('${i.hash}')"><td>${i.type}</td><td class="mono">${short(i.from)}</td><td class="mono">${short(i.to)}</td><td class="amount ${i.cls}">${qch(i.amount)}</td></tr>`
+  ).join("");
+  out.innerHTML = `
+    <div class="kv">
+      <dt>ronda (bloque)</dt><dd class="mono">#${fmtNum(b.round)}</dd>
+      <dt>edad</dt><dd>${ageFromRound(b.round)}</dd>
+      <dt>transacciones</dt><dd>${fmtNum(b.count)}</dd>
+      <dt>fees totales (transferencias)</dt><dd>${qch(b.fees)}</dd>
+      <dt>quemado (50%)</dt><dd>${qch(burnt)}</dd>
+      <dt>recompensa a validadores</dt><dd>${qch(reward)}</dd>
+    </div>
+    <div class="panel-sub" style="margin:12px 0 6px">transacciones de esta ronda</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>tipo</th><th>desde</th><th>hacia / detalle</th><th>monto (QCH)</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+// Helper for the inline onclick above (a row inside the round detail opens the
+// individual transaction's detail). Staking rows open the transfer path is n/a,
+// so we look the item up to route correctly.
+function __openTx(hash) {
+  const it = activityItems.find(i => i.hash === hash);
+  if (it && it.raw) showStaking(it.raw); else showTransfer(hash);
+}
+
+// Tab switching between Transacciones and Bloques.
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById("tab-tx").hidden = tab !== "tx";
+  document.getElementById("tab-blocks").hidden = tab !== "blocks";
+  document.getElementById("tab-btn-tx").classList.toggle("active", tab === "tx");
+  document.getElementById("tab-btn-blocks").classList.toggle("active", tab === "blocks");
+  if (tab === "blocks") renderBlocksPage(); else renderActivityPage();
+}
 
 function accountCard(title, address, before, after) {
   return `<div class="compare-card">
@@ -853,6 +1042,22 @@ document.getElementById("tx-next").addEventListener("click", () => goActivityPag
 document.getElementById("tx-last").addEventListener("click", () => {
   const pages = Math.max(1, Math.ceil(activityItems.length / activityPageSize));
   goActivityPage(pages - 1);
+});
+// Tab switching (Transacciones / Bloques).
+document.getElementById("tab-btn-tx").addEventListener("click", () => switchTab("tx"));
+document.getElementById("tab-btn-blocks").addEventListener("click", () => switchTab("blocks"));
+// Blocks (rondas) pagination.
+document.getElementById("blocks-pagesize").addEventListener("change", (e) => {
+  blocksPageSize = parseInt(e.target.value, 10) || 20;
+  blocksPage = 0;
+  renderBlocksPage();
+});
+document.getElementById("blocks-first").addEventListener("click", () => goBlocksPage(0));
+document.getElementById("blocks-prev").addEventListener("click", () => goBlocksPage(blocksPage - 1));
+document.getElementById("blocks-next").addEventListener("click", () => goBlocksPage(blocksPage + 1));
+document.getElementById("blocks-last").addEventListener("click", () => {
+  const pages = Math.max(1, Math.ceil(blocks.length / blocksPageSize));
+  goBlocksPage(pages - 1);
 });
 
 document.getElementById("lookup").addEventListener("click", async () => {
