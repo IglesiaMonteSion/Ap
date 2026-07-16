@@ -1431,7 +1431,7 @@ fn main() -> anyhow::Result<()> {
             // observe at the top of the ramp, not an artifact of stingy funding.
             let workers_kp: Vec<Keypair> = (0..workers).map(|_| Keypair::generate().unwrap()).collect();
             let bank_balance = fetch_account(&rpc, &bank.pubkey())?.map(|a| a.balance).unwrap_or(0);
-            let per_worker = if fire_and_forget && sustained_secs > 0 {
+            let per_worker = if fire_and_forget {
                 // Fund each worker for ALL its pre-signed transactions even if the
                 // dynamic fee spikes hard during the flood, so NONE fail at
                 // execution for lack of funds. This matters because a tx that
@@ -1497,8 +1497,13 @@ fn main() -> anyhow::Result<()> {
             let mut total_failed = 0u64; // rejected at admission (RPC returned an error)
             let mut broke = false;
 
-            if sustained_secs > 0 && fire_and_forget {
+            if fire_and_forget {
                 // ---- ASYNC FIRE-AND-FORGET FLOOD: pre-sign a big pool of varied
+                // txs (untimed), then blast them with high concurrency. Takes
+                // precedence over the continuous/ramp modes and does NOT require
+                // `--sustained-secs` (a real UX bug before: `--fire-and-forget`
+                // alone silently fell through to the ramp, so a `--queue-target
+                // 50000` blast quietly ran a 6k-tx ramp instead).
                 // txs (untimed), then blast them with high concurrency without
                 // waiting per response, to build a real mempool backlog and spike
                 // the dynamic fee.
