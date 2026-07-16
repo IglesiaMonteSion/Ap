@@ -32,6 +32,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_ORIGEN=""
 LISTEN_PORT_ARG=""
 RPC_PORT_ARG=""
+# Milisegundos entre rondas de consenso. 500 (2 rondas/s) es el default seguro.
+# Bajarlo (p.ej. 250) sube el techo de TPS en una red multi-nodo limitada por
+# latencia de consenso - es config node-local, sin fork (un tick demasiado
+# rápido no-opea hasta que la ronda previa certifica). TODOS los nodos de una
+# red deberían usar el mismo valor. Salvedad: la emisión de staking es nominal
+# por-ronda, así que rondas más rápidas inflan más rápido por año de reloj -
+# retuneá el APR por gobernanza (propose-set-emission-apr) si cambiás esto.
+RONDA_MS="${RONDA_MS:-500}"
 FONDO_WALLET_PRUEBA="1000000000000"
 CON_WALLET=0
 CON_TUNEL=0
@@ -59,6 +67,11 @@ Opciones:
   --rpc-port <puerto>    Puerto RPC a usar en modo "solo" (por defecto 8080).
   --nombre <texto>       (modo "solo") nombre visible del validador, para que
                          las wallets lo muestren al elegir dónde hacer staking.
+  --round-interval <ms>  (modo "solo") ms entre rondas de consenso (por defecto
+                         500). Bajarlo (p.ej. 250) sube el techo de TPS en una
+                         red multi-nodo. TODOS los nodos deben usar el mismo
+                         valor. Ojo: la emisión de staking es por-ronda (retuneá
+                         el APR por gobernanza si cambiás esto).
   --con-wallet           Instalar también la wallet web sin preguntar (con --yes
                          te genera y muestra una contraseña fuerte).
   --con-tunel            Instalar también el túnel de Cloudflare (HTTPS público)
@@ -84,6 +97,7 @@ while [ $# -gt 0 ]; do
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
+    --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --con-wallet) CON_WALLET=1; shift ;;
     --con-tunel) CON_TUNEL=1; shift ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
@@ -308,7 +322,7 @@ EOF
 EOF
 
       decir "Armando la configuracion de la red (config.json)"
-      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms 500
+      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS"
       cp "$QCHAIN_HOME/out/node1.json" "$QCHAIN_HOME/config.json"
       rm -rf "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out" "$QCHAIN_HOME/genesis.json"
       mkdir -p "$QCHAIN_HOME/data"

@@ -358,6 +358,57 @@ Para cortar una versión nueva (cuando hagas mejoras): subí `version` en el
 `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador corre
 `update-node.sh`.
 
+## Ajustar el TPS: `round_interval_ms`
+
+El techo de TPS de qchain está **medido** (no estimado): un `apply_transaction`
+hace ~712 tx/s en un solo hilo, dominado (~82%) por las actualizaciones del árbol
+de Merkle de estado (256 hashes por escritura de cuenta) — NO por la verificación
+de firma PQC (~10%) ni por la captura del recibo STARK (~8%). Un nodo solo drena
+~300 tx/s (apply + lock + consenso + persistencia).
+
+En una red **multi-nodo geodistribuida** el límite real suele ser la **latencia
+de consenso** (propagación de certificados + verificación de votos entre nodos),
+no el `apply`. Ahí el knob más efectivo y seguro es **bajar `round_interval_ms`**
+(ms entre rondas de consenso; por defecto 500 = 2 rondas/s). Bajarlo a **250**
+(4 rondas/s) sube el techo de rondas/s. Es un cambio **node-local, sin fork ni
+riesgo de consenso**: el gate de quórum de `propose_round` lo protege — un tick
+demasiado rápido no-opea hasta que la ronda previa certifica, así que el intervalo
+es un *piso*, no un driver rígido, y el techo real lo pone la CPU/red.
+
+**Reglas:**
+- **TODOS los nodos de una red deben usar el mismo valor** (para una cadencia
+  consistente; `round_interval_ms` está excluido del `chain_id`, así que no
+  forkea, pero conviene uniformarlo).
+- **Salvedad de emisión:** las recompensas de staking se emiten **por ronda**
+  (`ROUNDS_PER_YEAR` asume 500 ms). Rondas más rápidas → más emisión por año de
+  reloj. Si bajás el intervalo a la mitad (500→250), la emisión real por año se
+  duplica; para mantener ~12% real, bajá el APR por gobernanza a la mitad:
+  `qchain propose-set-emission-apr --value 600 ...` (6%). Sin staking activo
+  (`total_staked == 0`) la emisión es 0 y esto no aplica.
+
+**Instalación nueva:** `sudo ./deploy/install-node.sh --round-interval 250 ...`
+
+**Red ya desplegada (tu caso):** editá `round_interval_ms` en el `config.json` de
+CADA nodo y reiniciá:
+```bash
+# en cada VPS, con el mismo valor en todos:
+sudo python3 - <<'PY'
+import json; p="/opt/qchain/config.json"; d=json.load(open(p)); d["round_interval_ms"]=250; json.dump(d,open(p,"w"),indent=2)
+PY
+sudo systemctl restart qchain-validator
+```
+Después mirá el TPS real en el panel del validador (`GET /`, la tarjeta "tx/s" es
+una medición real de ejecutadas/segundo) antes y después para ver la mejora en tu
+hardware. Si el nodo se satura de CPU (load average alto, rondas que no avanzan),
+subí el intervalo de nuevo — el punto óptimo depende de tu hardware y del nº de
+validadores.
+
+**El gran salto de TPS** (reducir ese 82% del árbol de Merkle) requeriría
+reemplazar el árbol disperso de 256 de profundidad por uno path-comprimido estilo
+Jellyfish (Aptos/Diem, O(log n) hashes por escritura) — un rediseño mayor que toca
+el state root (consenso) y el binding STARK, con verificación DST completa. Queda
+como trabajo futuro de mayor alcance.
+
 ### Agregar un validador nuevo (incluso de alguien que no conocés)
 
 El registro de validadores es **on-chain y permissionless** — no hace falta
