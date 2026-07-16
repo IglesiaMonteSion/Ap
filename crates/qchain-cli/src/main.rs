@@ -671,6 +671,7 @@ struct StressSample {
     round: u64,
     base_fee: u64,
     root: String,
+    mempool: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -678,6 +679,11 @@ struct StressStatusWire {
     next_round: u64,
     executed_transactions: u64,
     base_fee_per_byte: u64,
+    /// Real mempool depth (added v4.3.7). `#[serde(default)]` so an older node
+    /// that doesn't report it deserializes as 0 (the bot then can't watch the
+    /// backlog settle and falls back to the fixed drain wait).
+    #[serde(default)]
+    mempool_transactions: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -688,7 +694,7 @@ struct RootWire {
 fn fetch_stress_sample(rpc: &str) -> anyhow::Result<StressSample> {
     let s: StressStatusWire = reqwest::blocking::get(format!("{rpc}/status"))?.error_for_status()?.json()?;
     let r: RootWire = reqwest::blocking::get(format!("{rpc}/root"))?.error_for_status()?.json()?;
-    Ok(StressSample { executed: s.executed_transactions, round: s.next_round, base_fee: s.base_fee_per_byte, root: r.root })
+    Ok(StressSample { executed: s.executed_transactions, round: s.next_round, base_fee: s.base_fee_per_byte, root: r.root, mempool: s.mempool_transactions })
 }
 
 #[derive(serde::Deserialize)]
@@ -1863,7 +1869,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let submitted: u64 = per_worker_txs_vec.iter().map(|v| v.len() as u64).sum();
 
-                let before: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: 0, round: 0, base_fee, root: String::new() })).collect();
+                let before: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: 0, round: 0, base_fee, root: String::new(), mempool: 0 })).collect();
                 let submit_start = std::time::Instant::now();
                 let handles: Vec<_> = per_worker_txs_vec
                     .into_iter()
@@ -1907,7 +1913,7 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                 }
-                let after: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: last_exec, round: 0, base_fee, root: String::new() })).collect();
+                let after: Vec<StressSample> = monitors.iter().map(|m| fetch_stress_sample(m).unwrap_or(StressSample { executed: last_exec, round: 0, base_fee, root: String::new(), mempool: 0 })).collect();
 
                 let exec_delta = after[0].executed.saturating_sub(before[0].executed);
                 let total_elapsed = submit_start.elapsed().as_secs_f64().max(1e-9);
@@ -1954,27 +1960,47 @@ fn main() -> anyhow::Result<()> {
             // worker's on-chain nonce delta (refund-proof - the bank's funding
             // txs never touch a worker's nonce). This is the real answer to "did
             // any transaction get lost?".
-            print!("\nwaiting for the mempool to drain");
+            // Watch the REAL mempool depth settle, not just the executed count -
+            // so we follow the txs to their actual end (executed, still-waiting,
+            // or dropped) instead of guessing. A big backlog can take minutes to
+            // drain, and with the fee-market parking (v4.3.7) it oscillates as the
+            // fee decays, so wait generously and settle on: mempool empty, OR
+            // nothing moving for a while, OR the deadline.
+            print!("\nsiguiendo el mempool hasta que se asiente (esto puede tardar varios minutos con un backlog grande)");
             std::io::stdout().flush().ok();
-            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-            let mut last = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(0);
-            let mut stable = 0;
+            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            let s0 = fetch_stress_sample(&rpc).ok();
+            let mut last_exec = s0.as_ref().map(|s| s.executed).unwrap_or(0);
+            let mut last_mp = s0.as_ref().map(|s| s.mempool).unwrap_or(0);
+            let mut stable = 0u32;
+            let mut ticks = 0u32;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-                print!(".");
-                std::io::stdout().flush().ok();
-                let now = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(last);
-                if now == last {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                ticks += 1;
+                let s = fetch_stress_sample(&rpc).ok();
+                let exec = s.as_ref().map(|s| s.executed).unwrap_or(last_exec);
+                let mp = s.as_ref().map(|s| s.mempool).unwrap_or(last_mp);
+                if ticks.is_multiple_of(4) {
+                    print!("  [cola={mp} ejec={exec}]");
+                    std::io::stdout().flush().ok();
+                }
+                if exec == last_exec && mp == last_mp {
                     stable += 1;
                 } else {
                     stable = 0;
                 }
-                last = now;
-                if stable >= 5 || std::time::Instant::now() > drain_deadline {
+                last_exec = exec;
+                last_mp = mp;
+                if mp == 0 && ticks > 2 {
+                    break; // fully drained
+                }
+                // Nothing moved for ~18s: settled (either drained or genuinely stuck).
+                if stable >= 12 || std::time::Instant::now() > drain_deadline {
                     break;
                 }
             }
             println!(" done");
+            let final_mempool = last_mp;
 
             // Load + drain are done: stop the resource sampler and snapshot peaks.
             sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1985,20 +2011,31 @@ fn main() -> anyhow::Result<()> {
                 .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
                 .collect();
             let worker_executed: u64 = final_nonces.iter().zip(run_initial_nonces.iter()).map(|(f, i)| f.saturating_sub(*i)).sum();
-            let queued_or_lost = total_accepted.saturating_sub(worker_executed);
+            // Honest three-way split of every accepted transaction:
+            //   executed      = advanced a worker's nonce (real success)
+            //   still_pending = still in the mempool (waiting for the fee to drop)
+            //   dropped       = accepted but neither executed nor still queued -
+            //                   consumed as a failure (fee>fee_limit, or stranded
+            //                   behind a nonce gap). With the fee-market parking
+            //                   fix this should be ~0.
+            let still_pending = final_mempool;
+            let dropped = total_accepted.saturating_sub(worker_executed).saturating_sub(still_pending);
 
             println!("\n=== reconciliación de transacciones ===");
             println!("  enviadas (firmadas + POST):        {total_attempted}");
             println!("  aceptadas (admitidas al mempool):  {total_accepted}");
             println!("  rechazadas en admisión:            {total_failed}  (fee/saldo/nonce — el emisor conserva su nonce, se pueden reenviar)");
             println!("  EJECUTADAS (confirmadas on-chain): {worker_executed}");
-            println!("  aún en cola / no ejecutadas:       {queued_or_lost}");
-            if queued_or_lost == 0 {
-                println!("\n✓ CERO transacciones perdidas: cada tx aceptada se ejecutó. Las rechazadas nunca entraron (no se pierden: se reintenta).");
+            println!("  AÚN EN EL MEMPOOL (esperando):     {still_pending}");
+            println!("  DESCARTADAS (ni ejec. ni en cola): {dropped}");
+            if worker_executed == total_accepted {
+                println!("\n✓ TODO lo aceptado se ejecutó — cero pendientes, cero descartadas.");
+            } else if dropped == 0 {
+                println!("\n✓ CERO descartadas: las {still_pending} que faltan siguen en el mempool ESPERANDO (con el fee-market, una tx que no puede pagar el fee actual espera a que baje — no se pierde). Reconsultá `GET /status` (campo mempool_transactions): la cola debe seguir bajando sola a medida que el fee decae. Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria).");
             } else {
-                println!("\nℹ  {queued_or_lost} aceptadas no se ejecutaron dentro de la ventana de drenaje. En un nodo sano y en marcha esto son tx TODAVÍA EN COLA que se ejecutarán en rondas siguientes (el mempool no expira por tiempo). Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria, no en disco). Volvé a consultar el balance/nonce en unos segundos para confirmar que drenaron.");
+                println!("\n⚠  {dropped} transacciones se aceptaron pero NO están ni ejecutadas ni en el mempool: se DESCARTARON. Causa típica bajo un flood extremo: el fee dinámico superó el `fee_limit` (por defecto 1e9) con el que el bot las firmó, así que se rechazan al ejecutar, y como una tx rechazada no avanza el nonce, las siguientes de ese worker quedan detrás de un hueco de nonce. Con el fix del fee-market (parking, v4.3.7) el nodo NO debería descartarlas — deberían esperar. Si este número es alto contra un nodo v4.3.7, avisá: el fee superó 1e9/5579≈179k/byte y ni el parking alcanza (ahí hay que firmar con más fee_limit o floodear menos).");
             }
-            println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). Un base_fee alto que baja solo después es el mecanismo EIP-1559, no una falla.");
+            println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). 'aún en el mempool' es el campo real `mempool_transactions` de /status. Un base_fee alto que baja solo después es el mecanismo EIP-1559.");
 
             // Peak node resources observed over the whole run (RAM/CPU/disk).
             {

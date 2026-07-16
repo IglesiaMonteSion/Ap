@@ -920,6 +920,12 @@ pub struct StatusResponse {
     /// This node's configured round interval in ms - lets the dashboard scale
     /// its stall-detection threshold to the real cadence (see `Engine::round_interval_ms`).
     pub round_interval_ms: u64,
+    /// Number of transactions sitting in this node's mempool right now (across
+    /// all per-payer queues), so a load tool can watch the REAL backlog drain
+    /// and settle instead of inferring it from executed counts. Includes txs
+    /// parked because they can't yet afford the current fee (see
+    /// `drain_ready_transactions`).
+    pub mempool_transactions: u64,
 }
 
 /// Total size in bytes of every regular file under `dir`, recursively (a plain
@@ -1219,16 +1225,59 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
     // so the tip only reorders *across* independent payers. The tip key is the
     // group's highest tip so a payer that tipped on any of its ready txs is
     // prioritized as a whole.
+    // The base fee a transaction committed this round would actually pay (the
+    // stored fee rolled forward through idle rounds - see
+    // `Ledger::effective_base_fee_at`). Used below to PARK, not drain, any tx
+    // that can't afford the current fee.
+    let eff_fee = state.ledger.effective_base_fee_at(state.next_round);
     let mut groups: Vec<(u64, Vec<Transaction>)> = Vec::new();
     let mut empty_accounts = Vec::new();
     for (payer, queue) in state.mempool.iter_mut() {
-        let mut expected_nonce = state.ledger.store().get(payer).map(|a| a.nonce).unwrap_or(0);
+        let acct = state.ledger.store().get(payer);
+        let mut expected_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
+        let mut remaining_balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
         while queue.keys().next().is_some_and(|&n| n < expected_nonce) {
             queue.pop_first();
         }
         let mut run = Vec::new();
-        while let Some(tx) = queue.remove(&expected_nonce) {
-            run.push(tx);
+        // Only drain a transaction the payer can actually afford at the CURRENT
+        // effective fee; PARK the rest (leave them in the queue, don't remove).
+        // Before this, a fee spike above a tx's signed `fee_limit` still drained
+        // it into a batch where it FAILED (fee>limit / insufficient funds) and
+        // was consumed - and because a failed tx doesn't advance the nonce, every
+        // later tx of that payer then hit a nonce gap and failed too, so a whole
+        // worker's backlog silently VANISHED under a flood instead of waiting.
+        // Now an unaffordable tx just waits (Ethereum-style: a tx below the
+        // current base fee stays pending) until the fee decays (v4.3.3) and it
+        // becomes affordable - so a flood's excess drains later instead of being
+        // burned. Cumulative `remaining_balance` so a run that would overdraw
+        // stops at the first tx the payer can't cover.
+        loop {
+            // Peek affordability (immutable borrow), then drop it before removing.
+            let margin = match queue.get(&expected_nonce) {
+                None => break,
+                Some(tx) => {
+                    let c = eff_fee
+                        .saturating_mul(tx.byte_size() as u64)
+                        .saturating_add(tx.message.priority_fee);
+                    // Park with a one-round safety margin (+12.5%, the max the fee
+                    // can rise in a single round): a tx drained this round may not
+                    // execute until a slightly later, higher-fee round, so leaving
+                    // this headroom stops it from being drained-then-priced-out at
+                    // execution (which would drop it and gap the nonce). Purely
+                    // conservative - it only ever PARKS a borderline tx one extra
+                    // round, never drops one. The same margin is subtracted from
+                    // the running balance so a payer's run stops before the rising
+                    // execution-fee could overdraw it.
+                    let margin = c.saturating_add(c / 8);
+                    if margin > tx.message.fee_limit || margin > remaining_balance {
+                        break;
+                    }
+                    margin
+                }
+            };
+            remaining_balance = remaining_balance.saturating_sub(margin);
+            run.push(queue.remove(&expected_nonce).expect("just peeked this nonce"));
             expected_nonce += 1;
         }
         if !run.is_empty() {
@@ -1601,6 +1650,7 @@ impl Engine {
             base_fee_per_byte: state.ledger.effective_base_fee_at(state.next_round),
             dust_threshold: state.ledger.current_params().dust_threshold,
             round_interval_ms: self.round_interval_ms,
+            mempool_transactions: state.mempool.values().map(|q| q.len() as u64).sum(),
         }
     }
 
@@ -3066,7 +3116,17 @@ mod tests {
     }
 
     fn tx(payer: &Keypair, nonce: u64) -> Transaction {
-        Transaction::new_signed(payer, nonce, [0u8; 32], 1, vec![]).unwrap()
+        // A realistic fee_limit (10M units, the CLI default) so the affordability
+        // check in `drain_ready_transactions` treats these as payable at the
+        // floor fee - the drain tests fund their payers to match.
+        Transaction::new_signed(payer, nonce, [0u8; 32], 10_000_000, vec![]).unwrap()
+    }
+
+    /// A funded wallet account for the drain tests, so `drain_ready_transactions`'
+    /// affordability check (which now PARKS txs a payer can't pay for at the
+    /// current fee) doesn't park these at the floor fee.
+    fn funded_wallet() -> Account {
+        Account { balance: 1_000_000_000, ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) }
     }
 
     /// The per-round inclusion cap (see `FEE_MAX_BYTES_PER_ROUND`): under
@@ -3164,7 +3224,7 @@ mod tests {
     fn transactions_are_emitted_in_ascending_nonce_order_regardless_of_arrival_order() {
         let mut state = new_state();
         let alice = Keypair::generate().unwrap();
-        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
 
         // Insert nonce 1 before nonce 0 - simulating the exact race that
         // used to lose a transaction.
@@ -3186,7 +3246,7 @@ mod tests {
     fn a_transaction_with_a_missing_predecessor_stays_queued_instead_of_being_dropped() {
         let mut state = new_state();
         let alice = Keypair::generate().unwrap();
-        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
 
         // Only nonce 1 has arrived; nonce 0 (the account's current expected
         // nonce) is still missing.
@@ -3204,6 +3264,46 @@ mod tests {
         assert_eq!(ready[1].message.nonce, 1);
     }
 
+    /// The fee-market parking fix (the real bug the 50k stress test exposed):
+    /// a transaction whose fee at the CURRENT rate exceeds its signed `fee_limit`
+    /// must be PARKED (left in the mempool to wait for the fee to fall), NOT
+    /// drained into a batch where it would fail and be consumed - which, via the
+    /// resulting nonce gap, silently strands the payer's whole backlog. When the
+    /// fee later drops, the same transaction becomes ready and drains normally.
+    #[test]
+    fn a_tx_that_cant_afford_the_current_fee_is_parked_not_dropped() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
+        // Spike the on-chain base fee so a tx signed with a modest fee_limit can't
+        // afford it. A tx here is ~5.4 KB; at a high base fee its byte fee blows
+        // past a small fee_limit.
+        let spiked = qchain_execution::params::EconomicParams {
+            base_fee_per_byte: 10_000_000,
+            ..qchain_execution::params::EconomicParams::default()
+        };
+        state.ledger.seed_account(
+            qchain_execution::ids::PARAMS_ACCOUNT_ID,
+            Account { data: borsh::to_vec(&spiked).unwrap(), ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
+        );
+        // fee_limit 10M, but the fee at 10M/byte over ~5.4KB is ~54 BILLION >> limit.
+        state.mempool.entry(alice.pubkey()).or_default().insert(0, tx(&alice, 0));
+
+        let ready = drain_ready_transactions(&mut state);
+        assert!(ready.is_empty(), "an unaffordable tx must be PARKED, not drained into a failing batch");
+        assert_eq!(state.mempool.get(&alice.pubkey()).map(|q| q.len()), Some(1), "it must stay in the mempool, waiting");
+
+        // Drop the fee back to the floor: the same tx now affords it and drains.
+        let cheap = qchain_execution::params::EconomicParams::default();
+        state.ledger.seed_account(
+            qchain_execution::ids::PARAMS_ACCOUNT_ID,
+            Account { data: borsh::to_vec(&cheap).unwrap(), ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
+        );
+        let ready = drain_ready_transactions(&mut state);
+        assert_eq!(ready.len(), 1, "once the fee falls, the parked tx drains normally");
+        assert_eq!(ready[0].message.nonce, 0);
+    }
+
     /// Entries at or below the account's current on-chain nonce (already
     /// applied, e.g. via another validator's batch in a multi-node
     /// network) must be garbage-collected rather than left to accumulate
@@ -3215,7 +3315,7 @@ mod tests {
         // Account's on-chain nonce is already 2 - nonce 0 and 1 are stale.
         state.ledger.seed_account(
             alice.pubkey(),
-            Account { nonce: 2, ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
+            Account { nonce: 2, balance: 1_000_000_000, ..Account::new_wallet(qchain_crypto::Pubkey::system_program_id()) },
         );
         state.mempool.entry(alice.pubkey()).or_default().insert(0, tx(&alice, 0));
         state.mempool.entry(alice.pubkey()).or_default().insert(1, tx(&alice, 1));
@@ -3234,8 +3334,8 @@ mod tests {
         let mut state = new_state();
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap();
-        state.ledger.seed_account(alice.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
-        state.ledger.seed_account(bob.pubkey(), Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
+        state.ledger.seed_account(bob.pubkey(), funded_wallet());
 
         // Alice has a gap (missing nonce 0); Bob is ready at nonce 0.
         state.mempool.entry(alice.pubkey()).or_default().insert(1, tx(&alice, 1));
