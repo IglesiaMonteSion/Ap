@@ -285,6 +285,15 @@ pub const MAX_INMEM_STAKING_EVENTS: usize = 5_000;
 /// transaction's size instead of "however many the attacker cares to send."
 const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 
+/// How many nonces past a payer's COMMITTED nonce `drain_ready_transactions`
+/// will propose while earlier ones are still in flight (nonce pipelining). This
+/// bounds how far a single payer can run ahead of its own executed state, so a
+/// payer whose execution is stalled (perpetually unaffordable, or a lost round)
+/// can't have an unbounded run of proposed-but-never-executed txs. Generous
+/// (far above the ~real in-flight window of a few rounds' worth per payer) so it
+/// never limits legitimate pipelining, only caps pathological run-ahead.
+const MAX_PIPELINE_DEPTH: u64 = 1_024;
+
 /// Hard cap on how many activity rows ONE `/transfers` or `/staking_activity`
 /// response returns, regardless of the caller-supplied `limit`. The activity
 /// logs are unbounded and reloaded in full on restart, so an unauthenticated
@@ -494,6 +503,20 @@ pub struct EngineState {
     /// resubmission for a (payer, nonce) pair that's already queued is
     /// ignored, keeping whichever transaction arrived first.
     pub mempool: HashMap<Pubkey, BTreeMap<u64, Transaction>>,
+    /// Per-payer nonce PIPELINING cursor: the NEXT nonce this validator will
+    /// propose for that payer. Lets `drain_ready_transactions` propose a payer's
+    /// LATER nonces while its earlier batch is still in flight (committed but not
+    /// yet executed, ~2 rounds of Bullshark latency) instead of stalling that
+    /// payer for those rounds - the "few distinct payers fills rounds slowly"
+    /// bottleneck. It advances to `last_proposed + 1` as we drain and is reset
+    /// DOWN to M by `admit_to_mempool` whenever a tx at nonce M re-enters the
+    /// mempool (a fee/funds/too-high re-admit, a `select_within_cap` deferral, or
+    /// a genuinely new tx), so a failed-or-deferred run re-proposes in order
+    /// (self-healing) and a client-submitted nonce GAP is never jumped. Stored as
+    /// "next to propose" (not "highest proposed") specifically so nonce 0 is
+    /// representable - a deferred nonce 0 resets the cursor to 0, not to an
+    /// unrepresentable -1. See `drain_ready_transactions` for the full invariant.
+    pub pipeline_next: HashMap<Pubkey, u64>,
     pub batches: HashMap<Digest, Batch>,
     /// The round at which each cached batch was first seen (this node's
     /// `next_round` at cache time) - used only to evict batches by round
@@ -1265,11 +1288,30 @@ fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
 /// admission entry points (RPC `submit_transaction` and the gossip handler)
 /// so the bound can't be enforced in one and forgotten in the other.
 fn admit_to_mempool(state: &mut EngineState, tx: Transaction) -> bool {
-    let queue = state.mempool.entry(tx.message.payer).or_default();
-    if !queue.contains_key(&tx.message.nonce) && queue.len() >= MAX_MEMPOOL_TXS_PER_PAYER {
+    let payer = tx.message.payer;
+    let nonce = tx.message.nonce;
+    let queue = state.mempool.entry(payer).or_default();
+    let already_present = queue.contains_key(&nonce);
+    if !already_present && queue.len() >= MAX_MEMPOOL_TXS_PER_PAYER {
         return false;
     }
-    queue.entry(tx.message.nonce).or_insert(tx);
+    queue.entry(nonce).or_insert(tx);
+    // Reset the nonce-pipelining cursor DOWN to this nonce so it (and everything
+    // after it) is (re-)proposable from here. A re-admit of a failed OR deferred
+    // tx (fee/funds/too-high/inclusion-cap, from `try_commit` or
+    // `drain_ready_transactions` itself) or a brand-new tx at nonce M all mean
+    // drain must propose starting at M again - without this it would skip M (it
+    // starts at the cursor) and strand the payer. `min` so admitting the NEXT
+    // contiguous tx after the current in-flight run (cursor already == M) is a
+    // no-op and pipelining keeps flowing. Stored as "next to propose", so a
+    // deferred nonce 0 correctly resets the cursor to 0 (a "highest proposed"
+    // watermark can't represent -1 and would skip nonce 0 - a real stall found
+    // in live testing).
+    if !already_present {
+        if let Some(c) = state.pipeline_next.get_mut(&payer) {
+            *c = (*c).min(nonce);
+        }
+    }
     true
 }
 
@@ -1292,6 +1334,13 @@ fn is_recoverable_exec_error(e: &qchain_execution::ExecError) -> bool {
         e,
         qchain_execution::ExecError::InsufficientFunds
             | qchain_execution::ExecError::FeeExceedsLimit { .. }
+            // A pipelined tx (nonce lookahead in `drain_ready_transactions`) that
+            // raced ahead of its predecessor and executed first (a skipped round)
+            // fails NonceTooHigh; re-admitting lets it retry once its predecessor
+            // lands, instead of stranding the payer's later nonces. Note this is
+            // still NOT the nonce-too-LOW replay (a `ProgramError`), which stays
+            // permanent/dropped - see `ExecError::NonceTooHigh`.
+            | qchain_execution::ExecError::NonceTooHigh { .. }
     )
 }
 
@@ -1376,12 +1425,36 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
     let eff_fee = state.ledger.effective_base_fee_at(state.next_round);
     let mut groups: Vec<(u64, Vec<Transaction>)> = Vec::new();
     let mut empty_accounts = Vec::new();
+    // Nonce-pipelining cursor advances, collected here and applied after the
+    // loop (can't mutate `state.pipeline_next` while iterating `state.mempool`).
+    let mut cursor_advances: Vec<(Pubkey, u64)> = Vec::new();
     for (payer, queue) in state.mempool.iter_mut() {
         let acct = state.ledger.store().get(payer);
-        let mut expected_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
+        let committed_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
         let mut remaining_balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
-        while queue.keys().next().is_some_and(|&n| n < expected_nonce) {
+        // Drop anything already executed (at or below the committed nonce).
+        while queue.keys().next().is_some_and(|&n| n < committed_nonce) {
             queue.pop_first();
+        }
+        // NONCE PIPELINING: start from the cursor (the next nonce to propose),
+        // which may be AHEAD of the committed nonce because this validator
+        // already proposed the earlier ones into a batch that's still in flight
+        // (executes ~2 rounds after it's proposed). That keeps a payer
+        // contributing THIS round instead of stalling. With no cursor it starts
+        // at the committed nonce, exactly as before. `max(committed_nonce)`
+        // guards against a stale cursor; the depth cap below bounds how far a
+        // payer can run ahead of its own executed state.
+        let mut expected_nonce = state
+            .pipeline_next
+            .get(payer)
+            .copied()
+            .unwrap_or(committed_nonce)
+            .max(committed_nonce);
+        if expected_nonce > committed_nonce.saturating_add(MAX_PIPELINE_DEPTH) {
+            if queue.is_empty() {
+                empty_accounts.push(*payer);
+            }
+            continue;
         }
         let mut run = Vec::new();
         // Only drain a transaction the payer can actually afford at the CURRENT
@@ -1431,12 +1504,24 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
             expected_nonce += 1;
         }
         if !run.is_empty() {
+            // Advance the pipelining cursor to the next nonce to propose
+            // (`expected_nonce` already points one past the last drained). Next
+            // round we continue from there without waiting for these to execute.
+            // Any txs `select_within_cap` DEFERS get re-admitted, which resets the
+            // cursor back DOWN to the first deferred nonce - so it ends at one
+            // past the last SELECTED nonce, exactly right.
+            cursor_advances.push((*payer, expected_nonce));
             let max_tip = run.iter().map(|t| t.message.priority_fee).max().unwrap_or(0);
             groups.push((max_tip, run));
         }
         if queue.is_empty() {
             empty_accounts.push(*payer);
         }
+    }
+    // Apply the cursor advances now that `state.mempool` is no longer borrowed.
+    for (payer, c) in cursor_advances {
+        let e = state.pipeline_next.entry(payer).or_insert(c);
+        *e = (*e).max(c);
     }
     for payer in empty_accounts {
         state.mempool.remove(&payer);
@@ -2579,6 +2664,18 @@ impl Engine {
             state.round_committed.retain(|&r, _| r >= round_horizon);
         }
 
+        // Bound the nonce-pipelining cursor map to payers that still have queued
+        // txs. A payer whose queue emptied has no more to pipeline; if its
+        // in-flight txs later fail and re-admit, they re-enter the mempool and the
+        // start nonce is reconstructed from the committed nonce (safe - the cursor
+        // is only an optimization, never a correctness input). This keeps the map
+        // bounded by the (already bounded) mempool size instead of growing one
+        // entry per distinct payer ever seen.
+        {
+            let active: std::collections::HashSet<Pubkey> = state.mempool.keys().copied().collect();
+            state.pipeline_next.retain(|p, _| active.contains(p));
+        }
+
         // Bound `equivocation_evidence` to at most one entry per author. A
         // Byzantine validator can equivocate every round, and each round would
         // otherwise leave a new, never-collected entry forever (a slow OOM under
@@ -3378,6 +3475,7 @@ mod tests {
             dag: DagStore::new(),
             consensus: ConsensusState::new(),
             mempool: HashMap::new(),
+            pipeline_next: HashMap::new(),
             batches: HashMap::new(),
             batch_seen_round: HashMap::new(),
             pending_votes: HashMap::new(),
@@ -3637,6 +3735,83 @@ mod tests {
         assert_eq!(ready[0].message.nonce, 0);
     }
 
+    /// Nonce pipelining: a payer keeps contributing to consecutive rounds while
+    /// its earlier batch is still in flight (not yet executed). Before this, a
+    /// payer's later nonces were stranded behind a gap (queue lowest > committed
+    /// nonce) until the earlier batch executed ~2 rounds later - the "few payers
+    /// fill rounds slowly" bottleneck. Here the committed nonce is deliberately
+    /// never advanced, so WITHOUT pipelining round 2 would drain nothing.
+    #[test]
+    fn pipelining_proposes_later_nonces_while_the_earlier_batch_is_in_flight() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
+        for n in 0..3 {
+            admit_to_mempool(&mut state, tx(&alice, n));
+        }
+        let r1: Vec<u64> = drain_ready_transactions(&mut state)
+            .iter().map(|t| t.message.nonce).collect();
+        assert_eq!(r1, vec![0, 1, 2], "round 1 proposes the first contiguous run");
+        // Committed nonce is STILL 0 (the batch hasn't executed), but the cursor
+        // remembers the next nonce to propose is 3.
+        assert_eq!(state.ledger.store().get(&alice.pubkey()).unwrap().nonce, 0);
+        assert_eq!(state.pipeline_next.get(&alice.pubkey()), Some(&3));
+        // The payer queues its next nonces. Without pipelining these sit behind a
+        // gap forever (committed 0, queue lowest 3); with it they drain now.
+        for n in 3..5 {
+            admit_to_mempool(&mut state, tx(&alice, n));
+        }
+        let r2: Vec<u64> = drain_ready_transactions(&mut state)
+            .iter().map(|t| t.message.nonce).collect();
+        assert_eq!(r2, vec![3, 4], "round 2 pipelines the later nonces without waiting for execution");
+        assert_eq!(state.pipeline_next.get(&alice.pubkey()), Some(&5));
+    }
+
+    /// Self-healing: re-admitting a failed tx (a fee/funds/too-high re-queue from
+    /// `try_commit`) must reset the pipelining watermark BELOW that nonce, so the
+    /// tx (and everything after it) is proposed again in order rather than being
+    /// skipped behind the stale watermark. This is what keeps pipelining from
+    /// ever stranding a re-queued tx.
+    #[test]
+    fn re_admitting_a_failed_tx_resets_the_watermark_so_it_re_proposes() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
+        for n in 0..3 {
+            admit_to_mempool(&mut state, tx(&alice, n));
+        }
+        drain_ready_transactions(&mut state); // proposes 0,1,2; cursor = 3 (next); queue now empty
+        assert_eq!(state.pipeline_next.get(&alice.pubkey()), Some(&3));
+        // try_commit re-admits nonce 1 after a recoverable failure.
+        admit_to_mempool(&mut state, tx(&alice, 1));
+        assert_eq!(
+            state.pipeline_next.get(&alice.pubkey()),
+            Some(&1),
+            "re-admit at nonce 1 drops the cursor to 1 so it re-proposes from there"
+        );
+        let r: Vec<u64> = drain_ready_transactions(&mut state)
+            .iter().map(|t| t.message.nonce).collect();
+        assert_eq!(r, vec![1], "the re-admitted nonce is re-proposed (committed still 0)");
+    }
+
+    /// A client-submitted nonce GAP (a future nonce with no predecessors queued)
+    /// is never proposed by pipelining - drain only ever advances through the
+    /// contiguous run it actually queued/proposed, so a stray future nonce just
+    /// waits (it can't be executed anyway). Guards against turning a client gap
+    /// into a wasted, perpetually-failing proposal.
+    #[test]
+    fn a_client_submitted_future_nonce_gap_is_not_proposed() {
+        let mut state = new_state();
+        let alice = Keypair::generate().unwrap();
+        state.ledger.seed_account(alice.pubkey(), funded_wallet());
+        // Only nonce 5 queued; 0..=4 are missing (committed nonce is 0).
+        admit_to_mempool(&mut state, tx(&alice, 5));
+        let r = drain_ready_transactions(&mut state);
+        assert!(r.is_empty(), "a future nonce with a gap below it must not be proposed");
+        // It stays queued, waiting for its predecessors.
+        assert_eq!(state.mempool.get(&alice.pubkey()).map(|q| q.len()), Some(1));
+    }
+
     /// The re-queue classifier (`is_recoverable_exec_error`) must re-admit ONLY
     /// the two transient variants and NEVER a permanent one - re-queuing a
     /// nonce-mismatch replay (reported as `ProgramError`) or a bad signature
@@ -3648,10 +3823,13 @@ mod tests {
         // Recoverable: the dynamic fee can decay / the payer can fund up.
         assert!(is_recoverable_exec_error(&ExecError::InsufficientFunds));
         assert!(is_recoverable_exec_error(&ExecError::FeeExceedsLimit { actual: 2, limit: 1 }));
+        // Recoverable: a pipelined tx whose predecessor hasn't executed yet
+        // (nonce TOO HIGH) - it applies once the predecessor lands.
+        assert!(is_recoverable_exec_error(&ExecError::NonceTooHigh { account: 3, tx: 5 }));
         // Permanent: must be dropped, never re-queued.
         assert!(!is_recoverable_exec_error(&ExecError::InvalidSignature));
-        // A replayed / out-of-order tx surfaces as a ProgramError("nonce mismatch")
-        // - re-queuing it would spin forever.
+        // A replayed tx (nonce too LOW) surfaces as a ProgramError("nonce
+        // mismatch") - re-queuing it would spin forever.
         assert!(!is_recoverable_exec_error(&ExecError::ProgramError("nonce mismatch: ...".into())));
         assert!(!is_recoverable_exec_error(&ExecError::Unauthorized("x".into())));
         assert!(!is_recoverable_exec_error(&ExecError::Wasm { message: "trap".into(), fuel_consumed: 5 }));

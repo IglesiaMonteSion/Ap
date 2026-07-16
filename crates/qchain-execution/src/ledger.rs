@@ -794,6 +794,18 @@ impl Ledger {
             return Err(ExecError::FeeExceedsLimit { actual: upfront_fee, limit: tx.message.fee_limit });
         }
         if payer_account.nonce != tx.message.nonce {
+            // Too HIGH (predecessors pending) is transient/recoverable; too LOW
+            // (already-executed replay) is permanent. Splitting them lets the
+            // node re-queue a pipelined tx that raced ahead of its predecessor,
+            // while still dropping a genuine replay (see `ExecError::NonceTooHigh`
+            // and the node's `is_recoverable_exec_error`). Same state change
+            // either way (none - it returns Err), so consensus is unaffected.
+            if tx.message.nonce > payer_account.nonce {
+                return Err(ExecError::NonceTooHigh {
+                    account: payer_account.nonce,
+                    tx: tx.message.nonce,
+                });
+            }
             return Err(ExecError::ProgramError(format!(
                 "nonce mismatch: account is at {}, transaction has {}",
                 payer_account.nonce, tx.message.nonce

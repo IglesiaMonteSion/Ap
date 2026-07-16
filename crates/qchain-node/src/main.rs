@@ -587,6 +587,7 @@ async fn main() -> anyhow::Result<()> {
             dag,
             consensus,
             mempool: HashMap::new(),
+            pipeline_next: HashMap::new(),
             batches: reloaded_batches,
             batch_seen_round: reloaded_batch_rounds,
             pending_votes: HashMap::new(),
