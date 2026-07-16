@@ -16,6 +16,6 @@ pub use ledger::{Ledger, Program, DEFAULT_FUEL_LIMIT};
 pub use native::{NativeProgram, SystemInstruction, SystemProgram};
 pub use params::EconomicParams;
 pub use ledger::EconomicSnapshot;
-pub use receipt::{StakingEvent, StakingEventKind, TransferReceipt};
+pub use receipt::{CompressedProofSet, StakingEvent, StakingEventKind, TransferReceipt};
 pub use staking::{RewardPoolData, StakeAccountData, StakingInstruction, StakingProgram};
 pub use wasm::{WasmCallResult, WasmExecutor};

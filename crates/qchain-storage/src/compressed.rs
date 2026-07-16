@@ -390,6 +390,153 @@ impl IncrementalCompressedTree {
         let terminal = self.root.prove(&target, &mut steps);
         CompressedProof { key: target, terminal, steps }
     }
+
+    /// What `root()` would become if `changes` (a small, bounded set - in
+    /// practice one transaction's working set, not the whole account universe)
+    /// were applied on top of the committed tree, WITHOUT mutating it. The
+    /// compressed-tree counterpart of `IncrementalStateTree::root_with_pending`,
+    /// and what lets `Ledger`'s STARK receipt capture (`pre_capture`/`root_after`)
+    /// stay cheap in compressed mode too. Cost is `O(changes × log n)`: any
+    /// committed subtree with no pending change underneath it is read straight
+    /// from its cached node hash in `O(1)` (the `pending.is_empty()` short
+    /// circuit in `merged_hash`), never walked.
+    pub fn root_with_pending(&self, changes: &[(Pubkey, Account)]) -> [u8; 32] {
+        let leaves: Vec<Leaf> = changes.iter().map(|(k, a)| (k.to_bytes(), hash_leaf(a))).collect();
+        merged_hash(&self.root, &leaves, 0)
+    }
+
+    /// Same idea as `root_with_pending`, for a single key's inclusion/exclusion
+    /// proof against the hypothetical post-`changes` state. A sibling subtree
+    /// untouched by any pending change contributes its committed node hash in
+    /// `O(1)`; only the target's path and the paths of the pending changes are
+    /// walked.
+    pub fn prove_with_pending(&self, key: &Pubkey, changes: &[(Pubkey, Account)]) -> CompressedProof {
+        let leaves: Vec<Leaf> = changes.iter().map(|(k, a)| (k.to_bytes(), hash_leaf(a))).collect();
+        let target = key.to_bytes();
+        let mut steps = Vec::new();
+        let terminal = merged_prove(&self.root, &leaves, 0, &target, &mut steps);
+        CompressedProof { key: target, terminal, steps }
+    }
+}
+
+/// Hash of the subtree represented by `node` with `pending` leaves additionally
+/// inserted, where every leaf under `node` and every `pending` key share the
+/// first `depth` bits (the invariant the recursion maintains as it descends).
+/// `pending` empty ⇒ the committed `node.hash()` verbatim, in `O(1)` - the whole
+/// point, so an untouched subtree costs nothing.
+fn merged_hash(node: &CNode, pending: &[Leaf], depth: usize) -> [u8; 32] {
+    if pending.is_empty() {
+        return node.hash();
+    }
+    match node {
+        CNode::Empty => compute_root(pending, depth),
+        CNode::Leaf { key, value, .. } => {
+            // The existing lone leaf, plus the pending leaves (a pending change
+            // to the same key overrides it). Order-independent `compute_root`
+            // gives the canonical compressed shape for this small leaf set.
+            let mut set: Vec<Leaf> = pending.to_vec();
+            if !pending.iter().any(|(k, _)| k == key) {
+                set.push((*key, *value));
+            }
+            compute_root(&set, depth)
+        }
+        CNode::Internal { depth: nd, rep, left, right, .. } => {
+            let nd = *nd;
+            // The earliest bit (within [depth, nd)) at which any pending key
+            // diverges from this whole subtree's shared prefix. `>= nd` means
+            // every pending key belongs INSIDE the node (routed by bit `nd`).
+            let mut min_div = nd;
+            for (k, _) in pending {
+                let b = first_diff_bit(k, rep);
+                if b < min_div {
+                    min_div = b;
+                }
+            }
+            if min_div >= nd {
+                let (pl, pr) = partition(pending, nd);
+                let lh = merged_hash(left, &pl, nd + 1);
+                let rh = merged_hash(right, &pr, nd + 1);
+                internal_node(&lh, &rh)
+            } else {
+                // A new branch appears at `min_div`, above this internal node:
+                // the entire existing node sits on `rep`'s side (all its leaves
+                // agree with `rep` through bit `nd-1 >= min_div`), pending splits
+                // by bit `min_div`.
+                let rep_bit = bit_at(rep, min_div);
+                let (pl, pr) = partition(pending, min_div);
+                let (rep_pending, other_pending) = if rep_bit { (pr, pl) } else { (pl, pr) };
+                let rep_hash = merged_hash(node, &rep_pending, min_div + 1);
+                let other_hash = compute_root(&other_pending, min_div + 1);
+                let (lh, rh) = if rep_bit { (other_hash, rep_hash) } else { (rep_hash, other_hash) };
+                internal_node(&lh, &rh)
+            }
+        }
+    }
+}
+
+/// Inclusion/exclusion proof for `target` against the hypothetical post-`pending`
+/// state, mirroring `merged_hash`'s structure. A sibling subtree with no pending
+/// change is folded in via its committed hash (through the `pending.is_empty()`
+/// short circuit inside `merged_hash`), so only the target's path and the pending
+/// paths are walked. Same invariant: `target` and every leaf under `node` share
+/// the first `depth` bits.
+fn merged_prove(node: &CNode, pending: &[Leaf], depth: usize, target: &[u8; 32], steps: &mut Vec<ProofStep>) -> Terminal {
+    if pending.is_empty() {
+        return node.prove(target, steps);
+    }
+    match node {
+        CNode::Empty => compute_proof(pending, depth, target, steps),
+        CNode::Leaf { key, value, .. } => {
+            let mut set: Vec<Leaf> = pending.to_vec();
+            if !pending.iter().any(|(k, _)| k == key) {
+                set.push((*key, *value));
+            }
+            compute_proof(&set, depth, target, steps)
+        }
+        CNode::Internal { depth: nd, rep, left, right, .. } => {
+            let nd = *nd;
+            let mut min_div = nd;
+            for (k, _) in pending {
+                let b = first_diff_bit(k, rep);
+                if b < min_div {
+                    min_div = b;
+                }
+            }
+            if min_div >= nd {
+                let (pl, pr) = partition(pending, nd);
+                if bit_at(target, nd) {
+                    let other_hash = merged_hash(left, &pl, nd + 1);
+                    let terminal = merged_prove(right, &pr, nd + 1, target, steps);
+                    steps.push(ProofStep { depth: nd as u16, sibling: other_hash });
+                    terminal
+                } else {
+                    let other_hash = merged_hash(right, &pr, nd + 1);
+                    let terminal = merged_prove(left, &pl, nd + 1, target, steps);
+                    steps.push(ProofStep { depth: nd as u16, sibling: other_hash });
+                    terminal
+                }
+            } else {
+                let rep_bit = bit_at(rep, min_div);
+                let (pl, pr) = partition(pending, min_div);
+                let (rep_pending, other_pending) = if rep_bit { (pr, pl) } else { (pl, pr) };
+                if bit_at(target, min_div) == rep_bit {
+                    // Target descends with the existing node; sibling is the
+                    // pending-only other side.
+                    let other_hash = compute_root(&other_pending, min_div + 1);
+                    let terminal = merged_prove(node, &rep_pending, min_div + 1, target, steps);
+                    steps.push(ProofStep { depth: min_div as u16, sibling: other_hash });
+                    terminal
+                } else {
+                    // Target descends into the pending-only other side; sibling
+                    // is the existing node merged with its share of pending.
+                    let rep_hash = merged_hash(node, &rep_pending, min_div + 1);
+                    let terminal = compute_proof(&other_pending, min_div + 1, target, steps);
+                    steps.push(ProofStep { depth: min_div as u16, sibling: rep_hash });
+                    terminal
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +703,99 @@ mod tests {
         for i in 1000..1064u32 {
             let p = inc.prove(&Pubkey::new(wide_key(i)));
             assert!(!p.is_inclusion() && verify_proof(root, &p), "absent key {i} must prove exclusion+verify");
+        }
+    }
+
+    /// `root_with_pending`/`prove_with_pending` must agree, for BOTH the root
+    /// and every key's proof, with the ground truth: collect the committed leaf
+    /// set, overlay the pending changes, and ask the order-independent functional
+    /// reference. This is the correctness anchor that makes the efficient merged
+    /// walk (which reads untouched subtrees straight from cached node hashes)
+    /// trustworthy - exactly the equivalence test the legacy tree has for its own
+    /// `pending` path. Covered: a pending update to an existing key, a pending
+    /// brand-new key, an untouched key's proof, and an absent key's exclusion.
+    #[test]
+    fn pending_root_and_proofs_match_the_functional_overlay() {
+        let mut inc = IncrementalCompressedTree::new();
+        let mut committed: std::collections::BTreeMap<[u8; 32], [u8; 32]> = std::collections::BTreeMap::new();
+        for i in 0..200u32 {
+            let pk = Pubkey::new(wide_key(i));
+            let a = acct((i as u64 + 1) * 11);
+            inc.note_set(&pk, &a);
+            committed.insert(wide_key(i), hash_leaf(&a));
+        }
+
+        // Pending working set: update an existing account, add a brand-new one.
+        let updated_key = Pubkey::new(wide_key(37));
+        let updated_acct = acct(500_000);
+        let new_key = Pubkey::new(wide_key(9_999));
+        let new_acct = acct(777_777);
+        let pending = vec![(updated_key, updated_acct.clone()), (new_key, new_acct.clone())];
+
+        // Ground truth: committed leaves with the pending overlay applied.
+        let mut overlay = committed.clone();
+        overlay.insert(updated_key.to_bytes(), hash_leaf(&updated_acct));
+        overlay.insert(new_key.to_bytes(), hash_leaf(&new_acct));
+        let overlay_leaves: Vec<Leaf> = overlay.iter().map(|(k, v)| (*k, *v)).collect();
+        let truth_root = CompressedStateTree::root(&overlay_leaves);
+
+        assert_eq!(inc.root_with_pending(&pending), truth_root, "pending root must match the functional overlay");
+        // The committed tree must be untouched by a pending query.
+        assert_ne!(inc.root(), truth_root);
+
+        // Proofs for: the updated key, the brand-new key, an untouched key, and
+        // an absent key - each against the hypothetical post-pending state.
+        for probe in [updated_key, new_key, Pubkey::new(wide_key(120)), Pubkey::new(wide_key(50_000))] {
+            let p = inc.prove_with_pending(&probe, &pending);
+            let truth = CompressedStateTree::prove(&overlay_leaves, &probe.to_bytes());
+            assert_eq!(p, truth, "pending proof for a probed key must match the functional overlay");
+            assert!(verify_proof(truth_root, &p), "pending proof must verify against the pending root");
+        }
+    }
+
+    /// A pending change on an empty tree, and pending changes that force a NEW
+    /// branch point above an existing internal node (keys sharing a long prefix
+    /// with a committed key), exercise the merged walk's Empty/Leaf and
+    /// `min_div < nd` branches respectively.
+    #[test]
+    fn pending_merge_handles_empty_tree_and_new_branch_points() {
+        // Empty tree: pending root/proof must equal a fresh functional tree.
+        let empty = IncrementalCompressedTree::new();
+        let k0 = Pubkey::new(wide_key(1));
+        let a0 = acct(42);
+        let pending0 = vec![(k0, a0.clone())];
+        let leaves0 = vec![(k0.to_bytes(), hash_leaf(&a0))];
+        assert_eq!(empty.root_with_pending(&pending0), CompressedStateTree::root(&leaves0));
+        assert_eq!(empty.prove_with_pending(&k0, &pending0), CompressedStateTree::prove(&leaves0, &k0.to_bytes()));
+
+        // Force a new branch: commit one key, then a pending key crafted to
+        // share a prefix and diverge partway - and a couple of ordinary keys.
+        let mut inc = IncrementalCompressedTree::new();
+        let mut committed: std::collections::BTreeMap<[u8; 32], [u8; 32]> = std::collections::BTreeMap::new();
+        for i in 0..8u32 {
+            let pk = Pubkey::new(wide_key(i));
+            let a = acct(i as u64 + 1);
+            inc.note_set(&pk, &a);
+            committed.insert(wide_key(i), hash_leaf(&a));
+        }
+        // A pending key that equals a committed key in its first byte but not
+        // after - lands near an existing leaf, splitting deep.
+        let base = wide_key(3);
+        let mut near = base;
+        near[16] ^= 0x01; // diverge in the middle
+        let near_pk = Pubkey::new(near);
+        let near_acct = acct(123_456);
+        let pending = vec![(near_pk, near_acct.clone())];
+
+        let mut overlay = committed.clone();
+        overlay.insert(near, hash_leaf(&near_acct));
+        let overlay_leaves: Vec<Leaf> = overlay.iter().map(|(k, v)| (*k, *v)).collect();
+        let truth_root = CompressedStateTree::root(&overlay_leaves);
+        assert_eq!(inc.root_with_pending(&pending), truth_root);
+        for probe in [near_pk, Pubkey::new(base), Pubkey::new(wide_key(5))] {
+            let p = inc.prove_with_pending(&probe, &pending);
+            assert_eq!(p, CompressedStateTree::prove(&overlay_leaves, &probe.to_bytes()));
+            assert!(verify_proof(truth_root, &p));
         }
     }
 

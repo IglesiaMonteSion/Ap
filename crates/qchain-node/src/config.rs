@@ -114,10 +114,11 @@ pub struct NodeConfig {
     /// chain. Like `validator_rotation`, every node in a network must set this
     /// identically (it is folded into `chain_id` below, so a mismatched node
     /// computes a different chain_id and its transactions are rejected rather
-    /// than silently forking). Compressed mode currently defers the STARK
-    /// light-client receipt capture (`/stark_proof`) - the compressed binding
-    /// exists (`qchain-stark::verify_batch_bound_to_compressed_state`) but its
-    /// node/CLI wiring is a follow-up; execution/consensus are unaffected.
+    /// than silently forking). The STARK light-client (`/stark_proof` +
+    /// `light-client-verify`) works in compressed mode too (v5.1.0): a
+    /// compressed node captures receipts carrying O(log n) `CompressedProof`s and
+    /// serves `compressed_bindings` verified with
+    /// `qchain-stark::verify_batch_bound_to_compressed_state`.
     #[serde(default)]
     pub compressed_state_tree: bool,
 }

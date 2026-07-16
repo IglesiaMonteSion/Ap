@@ -37,7 +37,21 @@
 
 use qchain_core::Account;
 use qchain_crypto::Pubkey;
+use qchain_storage::compressed::CompressedProof;
 use qchain_storage::MerkleProof;
+
+/// The four O(log n) path-compressed proofs a transfer receipt carries when the
+/// ledger runs the compressed state tree (`Ledger::is_compressed()`). Present
+/// (`Some`) only in compressed mode; in legacy mode the receipt's four
+/// `*_proof_*: MerkleProof` fields carry the 256-deep proofs instead and this is
+/// `None`. Directly convertible to `qchain_stark::CompressedRowStateBinding`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompressedProofSet {
+    pub from_proof_before: CompressedProof,
+    pub from_proof_after: CompressedProof,
+    pub to_proof_before: CompressedProof,
+    pub to_proof_after: CompressedProof,
+}
 
 /// Which staking action a `StakingEvent` records. Kept as an explicit enum
 /// (not a string) so the wire/JSON is stable and a consumer can switch on it.
@@ -109,4 +123,12 @@ pub struct TransferReceipt {
     pub from_proof_after: MerkleProof,
     pub to_proof_before: MerkleProof,
     pub to_proof_after: MerkleProof,
+    /// In compressed-state-tree mode, the O(log n) proofs for this transfer
+    /// (see `CompressedProofSet`). `None` in legacy mode. `#[serde(default)]` so
+    /// receipts persisted before this field existed still deserialize as `None`
+    /// (legacy). When `Some`, the four `MerkleProof` fields above are unused
+    /// address-only placeholders and the node's `/stark_proof` builder reads
+    /// this instead.
+    #[serde(default)]
+    pub compressed_proofs: Option<CompressedProofSet>,
 }

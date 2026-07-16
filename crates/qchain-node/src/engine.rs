@@ -1146,7 +1146,14 @@ pub struct StarkProofResponse {
     #[serde(serialize_with = "serialize_proof_as_hex")]
     pub proof: qchain_stark::Proof,
     pub pub_inputs: qchain_stark::PublicInputs,
+    /// Legacy 256-deep Merkle bindings - populated when the node runs the legacy
+    /// state tree, empty in compressed mode.
     pub bindings: Vec<qchain_stark::RowStateBinding>,
+    /// O(log n) path-compressed bindings - populated when the node runs the
+    /// compressed state tree, empty (and omitted from JSON) in legacy mode. A
+    /// light client verifies against whichever list is non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compressed_bindings: Vec<qchain_stark::CompressedRowStateBinding>,
     pub row_count: usize,
 }
 
@@ -1655,7 +1662,7 @@ impl Engine {
     /// self-verification below fails with `RootSequenceMismatch`. That is
     /// surfaced as `StarkProofError::ChainBroken`, not swallowed.
     pub async fn stark_proof(&self, limit: Option<usize>) -> Result<StarkProofResponse, StarkProofError> {
-        let receipts: Vec<qchain_execution::TransferReceipt> = {
+        let (receipts, compressed): (Vec<qchain_execution::TransferReceipt>, bool) = {
             let state = self.state.lock().await;
             let all = state.ledger.transfer_receipts();
             // A real, live-measured DoS this closes: `qchain_stark::prove_batch`
@@ -1674,7 +1681,7 @@ impl Engine {
             // principle already used for message size limits and bytecode
             // size caps elsewhere in this codebase.
             let effective_limit = effective_stark_proof_limit(limit, all.len());
-            all[all.len() - effective_limit..].to_vec()
+            (all[all.len() - effective_limit..].to_vec(), state.ledger.is_compressed())
         };
         if receipts.is_empty() {
             return Err(StarkProofError::NoReceipts);
@@ -1693,6 +1700,45 @@ impl Engine {
                 )
             })
             .collect();
+        // Bound how many of these CPU-heavy proofs run at once across the
+        // whole node - see `MAX_CONCURRENT_STARK_PROOFS`. Held only around the
+        // proving/verifying, after the state lock has already been dropped, so
+        // it never serializes ordinary node work, only the expensive
+        // unauthenticated endpoint against itself.
+        let _permit = STARK_PROOF_PERMITS.acquire().await.expect("stark-proof semaphore is never closed");
+        let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).map_err(|e| StarkProofError::Prove(e.to_string()))?;
+
+        // The STARK proof + public inputs are identical regardless of tree; only
+        // the Merkle binding format differs. A compressed-tree node binds each
+        // row to O(log n) `CompressedRowStateBinding`s (read from the receipt's
+        // `compressed_proofs`), a legacy node to the 256-deep `RowStateBinding`s.
+        if compressed {
+            let compressed_bindings: Vec<qchain_stark::CompressedRowStateBinding> = receipts
+                .iter()
+                .map(|r| {
+                    let c = r
+                        .compressed_proofs
+                        .as_ref()
+                        .expect("compressed-mode receipt carries compressed proofs");
+                    qchain_stark::CompressedRowStateBinding {
+                        root_before: r.root_before,
+                        root_after: r.root_after,
+                        from_before: r.from_before.clone(),
+                        from_after: r.from_after.clone(),
+                        to_before: r.to_before.clone(),
+                        to_after: r.to_after.clone(),
+                        from_proof_before: c.from_proof_before.clone(),
+                        from_proof_after: c.from_proof_after.clone(),
+                        to_proof_before: c.to_proof_before.clone(),
+                        to_proof_after: c.to_proof_after.clone(),
+                    }
+                })
+                .collect();
+            qchain_stark::verify_batch_bound_to_compressed_state(proof.clone(), pub_inputs.clone(), &compressed_bindings)
+                .map_err(|e| StarkProofError::ChainBroken(e.to_string()))?;
+            return Ok(StarkProofResponse { proof, pub_inputs, bindings: vec![], compressed_bindings, row_count: receipts.len() });
+        }
+
         let bindings: Vec<qchain_stark::RowStateBinding> = receipts
             .iter()
             .map(|r| qchain_stark::RowStateBinding {
@@ -1708,18 +1754,10 @@ impl Engine {
                 to_proof_after: r.to_proof_after.clone(),
             })
             .collect();
-
-        // Bound how many of these CPU-heavy proofs run at once across the
-        // whole node - see `MAX_CONCURRENT_STARK_PROOFS`. Held only around the
-        // proving/verifying, after the state lock has already been dropped, so
-        // it never serializes ordinary node work, only the expensive
-        // unauthenticated endpoint against itself.
-        let _permit = STARK_PROOF_PERMITS.acquire().await.expect("stark-proof semaphore is never closed");
-        let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).map_err(|e| StarkProofError::Prove(e.to_string()))?;
         qchain_stark::verify_batch_bound_to_state(proof.clone(), pub_inputs.clone(), &bindings)
             .map_err(|e| StarkProofError::ChainBroken(e.to_string()))?;
 
-        Ok(StarkProofResponse { proof, pub_inputs, bindings, row_count: receipts.len() })
+        Ok(StarkProofResponse { proof, pub_inputs, bindings, compressed_bindings: vec![], row_count: receipts.len() })
     }
 
     pub async fn status(&self) -> StatusResponse {

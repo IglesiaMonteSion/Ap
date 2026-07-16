@@ -8,13 +8,13 @@ use crate::ids::{FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, S
 use crate::params::{FeeState, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
-use crate::receipt::{StakingEvent, StakingEventKind, TransferReceipt};
+use crate::receipt::{CompressedProofSet, StakingEvent, StakingEventKind, TransferReceipt};
 use crate::staking::StakeAccountData;
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
-use qchain_storage::compressed::IncrementalCompressedTree;
+use qchain_storage::compressed::{CompressedProof, IncrementalCompressedTree};
 use qchain_storage::{IncrementalStateTree, MerkleProof, StateStore};
 
 /// Which state-commitment tree this `Ledger` maintains. `Legacy` is the
@@ -46,27 +46,42 @@ impl StateTreeImpl {
     }
 
     /// Before-state root + inclusion/exclusion proofs for a transfer's two
-    /// accounts, for STARK receipt capture. `None` in `Compressed` mode: the
-    /// compressed-tree light-client (`/stark_proof`) uses the separate
-    /// `qchain-stark::CompressedRowStateBinding` path and is wired in a
-    /// follow-up, so a compressed-mode node captures no legacy-proof receipt
-    /// (it still executes and commits identically - only the light-client
-    /// history is deferred).
-    fn capture_before(&self, from: &Pubkey, to: &Pubkey) -> Option<([u8; 32], MerkleProof, MerkleProof)> {
+    /// accounts, for STARK receipt capture - now produced in BOTH modes (the
+    /// compressed tree gained `root_with_pending`/`prove_with_pending`, closing
+    /// the follow-up that made `Compressed` return `None` here). The proofs come
+    /// back as [`CapturedProof`], tagged with whichever tree's format they are,
+    /// so the receipt assembler can route them to the right binding shape.
+    fn capture_before(&self, from: &Pubkey, to: &Pubkey) -> ([u8; 32], CapturedProof, CapturedProof) {
         match self {
-            StateTreeImpl::Legacy(t) => Some((t.root(), t.prove(from), t.prove(to))),
-            StateTreeImpl::Compressed(_) => None,
+            StateTreeImpl::Legacy(t) => (t.root(), CapturedProof::Legacy(t.prove(from)), CapturedProof::Legacy(t.prove(to))),
+            StateTreeImpl::Compressed(t) => (t.root(), CapturedProof::Compressed(t.prove(from)), CapturedProof::Compressed(t.prove(to))),
         }
     }
 
     /// After-state root + proofs given a transaction's pending working set (the
-    /// `Legacy` counterpart to `capture_before`).
-    fn capture_after(&self, from: &Pubkey, to: &Pubkey, changes: &[(Pubkey, Account)]) -> Option<([u8; 32], MerkleProof, MerkleProof)> {
+    /// counterpart to `capture_before`), in whichever tree this ledger runs.
+    fn capture_after(&self, from: &Pubkey, to: &Pubkey, changes: &[(Pubkey, Account)]) -> ([u8; 32], CapturedProof, CapturedProof) {
         match self {
-            StateTreeImpl::Legacy(t) => Some((t.root_with_pending(changes), t.prove_with_pending(from, changes), t.prove_with_pending(to, changes))),
-            StateTreeImpl::Compressed(_) => None,
+            StateTreeImpl::Legacy(t) => (
+                t.root_with_pending(changes),
+                CapturedProof::Legacy(t.prove_with_pending(from, changes)),
+                CapturedProof::Legacy(t.prove_with_pending(to, changes)),
+            ),
+            StateTreeImpl::Compressed(t) => (
+                t.root_with_pending(changes),
+                CapturedProof::Compressed(t.prove_with_pending(from, changes)),
+                CapturedProof::Compressed(t.prove_with_pending(to, changes)),
+            ),
         }
     }
+}
+
+/// One captured inclusion/exclusion proof, tagged with the tree format it came
+/// from. A `Ledger`'s tree kind is fixed at construction, so all four proofs a
+/// single receipt carries are always the same variant.
+enum CapturedProof {
+    Legacy(MerkleProof),
+    Compressed(CompressedProof),
 }
 use std::collections::HashMap;
 use wasmtime::Val;
@@ -234,6 +249,13 @@ impl Ledger {
     /// maintained `IncrementalStateTree` above, not a recompute.
     pub fn merkle_root(&self) -> [u8; 32] {
         self.tree.root()
+    }
+
+    /// Whether this ledger runs the path-compressed state tree (vs the legacy
+    /// 256-deep one). The node's `/stark_proof` builder reads this to choose the
+    /// binding format (`CompressedRowStateBinding` vs `RowStateBinding`).
+    pub fn is_compressed(&self) -> bool {
+        matches!(self.tree, StateTreeImpl::Compressed(_))
     }
 
     /// Every `Transfer` receipt captured so far, oldest first - the raw
@@ -729,22 +751,19 @@ impl Ledger {
         // point, so no overlay is needed - a direct read is the real
         // pre-transaction state.
         #[allow(clippy::type_complexity)]
-        let pre_capture: Option<(Pubkey, Pubkey, u64, Account, Account, [u8; 32], MerkleProof, MerkleProof)> =
+        let pre_capture: Option<(Pubkey, Pubkey, u64, Account, Account, [u8; 32], CapturedProof, CapturedProof)> =
             if tx.message.instructions.len() == 1 && tx.message.instructions[0].program_id == Pubkey::system_program_id() {
                 let ix = &tx.message.instructions[0];
                 match (SystemInstruction::try_from_slice(&ix.data), ix.accounts.first(), ix.accounts.get(1)) {
                     (Ok(SystemInstruction::Transfer { amount }), Some(&from), Some(&to)) => {
-                        // `None` in compressed-tree mode - no legacy-proof receipt
-                        // captured (see `StateTreeImpl::capture_before`); the
-                        // transaction still executes and commits identically.
-                        match self.tree.capture_before(&from, &to) {
-                            Some((root_before, from_proof_before, to_proof_before)) => {
-                                let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
-                                let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
-                                Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
-                            }
-                            None => None,
-                        }
+                        // Captured in BOTH tree modes now (compressed included):
+                        // `capture_before` returns proofs tagged with the tree's
+                        // format. `self.store` is still untouched here, so a
+                        // direct read is the real pre-transaction state.
+                        let (root_before, from_proof_before, to_proof_before) = self.tree.capture_before(&from, &to);
+                        let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                        let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                        Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
                     }
                     _ => None,
                 }
@@ -941,14 +960,30 @@ impl Ledger {
             // tree's cache instead of re-scanning every account through an
             // overlay wrapper.
             let working_changes: Vec<(Pubkey, Account)> = working.iter().map(|(k, v)| (*k, v.clone())).collect();
-            // `capture_before` returned `Some`, so we are in legacy mode and
-            // `capture_after` is likewise `Some`.
-            let (root_after, from_proof_after, to_proof_after) = self
-                .tree
-                .capture_after(&from, &to, &working_changes)
-                .expect("legacy tree: capture_after is Some whenever capture_before was");
+            let (root_after, from_proof_after, to_proof_after) = self.tree.capture_after(&from, &to, &working_changes);
             let from_after = working.get(&from).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+            // Route the four captured proofs into either the legacy `MerkleProof`
+            // receipt fields or the compressed `CompressedProofSet` - a receipt
+            // carries exactly one, per the ledger's fixed tree kind. In compressed
+            // mode the four `MerkleProof` fields are unused address-only
+            // placeholders (there is no 256-deep proof to give); the node's
+            // `/stark_proof` builder reads `compressed_proofs` instead.
+            let dummy_merkle = |key: &Pubkey| MerkleProof { key: key.to_bytes(), leaf_value_hash: None, siblings: vec![] };
+            let (from_proof_before, from_proof_after, to_proof_before, to_proof_after, compressed_proofs) =
+                match (from_proof_before, from_proof_after, to_proof_before, to_proof_after) {
+                    (CapturedProof::Legacy(fb), CapturedProof::Legacy(fa), CapturedProof::Legacy(tb), CapturedProof::Legacy(ta)) => {
+                        (fb, fa, tb, ta, None)
+                    }
+                    (CapturedProof::Compressed(fb), CapturedProof::Compressed(fa), CapturedProof::Compressed(tb), CapturedProof::Compressed(ta)) => (
+                        dummy_merkle(&from),
+                        dummy_merkle(&from),
+                        dummy_merkle(&to),
+                        dummy_merkle(&to),
+                        Some(CompressedProofSet { from_proof_before: fb, from_proof_after: fa, to_proof_before: tb, to_proof_after: ta }),
+                    ),
+                    _ => unreachable!("a ledger's tree kind is fixed; all four captured proofs share one variant"),
+                };
             self.transfer_receipts.push(TransferReceipt {
                 tx_hash: tx.hash(),
                 round: current_round,
@@ -966,6 +1001,7 @@ impl Ledger {
                 from_proof_after,
                 to_proof_before,
                 to_proof_after,
+                compressed_proofs,
             });
         }
 
@@ -1316,9 +1352,51 @@ mod tests {
         let accts: Vec<(Pubkey, Account)> = compressed.store().iter().collect();
         let recomputed = qchain_storage::compressed::CompressedStateTree::root_from_accounts(accts.iter().map(|(k, a)| (k, a)));
         assert_eq!(compressed.merkle_root(), recomputed, "the live compressed root must match an independent recompute (deterministic, fork-free)");
-        // Compressed mode captures no legacy-proof receipts (deferred); legacy does.
-        assert!(compressed.transfer_receipts().is_empty(), "compressed mode defers receipt capture");
-        assert!(!legacy.transfer_receipts().is_empty(), "legacy mode still captures receipts");
+        // Both modes now capture receipts (compressed carries CompressedProofs).
+        assert_eq!(compressed.transfer_receipts().len(), legacy.transfer_receipts().len(), "both modes capture the same receipts");
+        assert!(!compressed.transfer_receipts().is_empty());
+    }
+
+    /// v5.1.0: a compressed-mode transfer captures a receipt carrying real
+    /// `CompressedProof`s, and those O(log n) proofs verify against the receipt's
+    /// own `root_before`/`root_after` - the exact binding the node's compressed
+    /// `/stark_proof` light-client relies on. Verified with the cheap
+    /// `compressed::verify_proof` (not the heavy full STARK), which is precisely
+    /// what `qchain_stark::verify_batch_bound_to_compressed_state` calls per row.
+    #[test]
+    fn compressed_mode_captures_verifiable_compressed_proof_receipts() {
+        use qchain_storage::compressed::{verify_proof, Terminal};
+        let mut ledger = new_test_ledger_compressed();
+        let validator = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        // Pre-existing account so bob is a first-ever recipient (exclusion proof
+        // on `to_before`) AND there's an unrelated leaf making the tree branch.
+        ledger.credit(alice.pubkey(), 50_000_000);
+        ledger.credit(Keypair::generate().unwrap().pubkey(), 9_000_000);
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 3_000_000 }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
+
+        let r = ledger.transfer_receipts().last().expect("a receipt was captured");
+        let c = r.compressed_proofs.as_ref().expect("compressed mode carries compressed proofs");
+        // The four proofs verify against the receipt's captured roots.
+        assert!(verify_proof(r.root_before, &c.from_proof_before), "from_before proof must verify against root_before");
+        assert!(verify_proof(r.root_after, &c.from_proof_after), "from_after proof must verify against root_after");
+        assert!(verify_proof(r.root_before, &c.to_proof_before), "to_before proof must verify against root_before");
+        assert!(verify_proof(r.root_after, &c.to_proof_after), "to_after proof must verify against root_after");
+        // bob is a first-ever recipient: to_before is a genuine exclusion proof.
+        assert!(matches!(c.to_proof_before.terminal, Terminal::OtherLeaf { .. } | Terminal::Empty), "bob has no prior leaf");
+        assert_eq!(r.to_before.balance, 0, "an excluded recipient has zero prior balance");
+        // The captured after-proof value matches the committed account hash.
+        assert!(matches!(c.from_proof_after.terminal, Terminal::Leaf { .. }));
+        // root_after chains from the live tree (what the node commits).
+        assert_eq!(r.root_after, ledger.merkle_root(), "captured root_after equals the live committed compressed root");
     }
 
     #[test]
@@ -1546,6 +1624,7 @@ mod tests {
             from_proof_after: dummy_proof(),
             to_proof_before: dummy_proof(),
             to_proof_after: dummy_proof(),
+            compressed_proofs: None,
         };
         let mut ledger = new_test_ledger();
         ledger.restore_receipts((0..6_000u64).map(mk_receipt).collect());

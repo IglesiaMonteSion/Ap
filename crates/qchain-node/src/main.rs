@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     // to every existing network.
     let mut ledger = Ledger::new_with_tree(store, config.compressed_state_tree)?;
     if config.compressed_state_tree {
-        tracing::info!("state tree: COMPRESSED (O(log n)) - a hard-forked network; /stark_proof receipts deferred in this mode");
+        tracing::info!("state tree: COMPRESSED (O(log n)) - a hard-forked network; /stark_proof light-client serves compressed bindings");
     }
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
     ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));

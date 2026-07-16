@@ -634,7 +634,12 @@ struct NodeStatus {
 struct StarkProofWire {
     proof: String,
     pub_inputs: qchain_stark::PublicInputs,
+    #[serde(default)]
     bindings: Vec<qchain_stark::RowStateBinding>,
+    /// Populated by a compressed-state-tree node (see `qchain-node`'s
+    /// `StarkProofResponse`); empty/absent from a legacy node.
+    #[serde(default)]
+    compressed_bindings: Vec<qchain_stark::CompressedRowStateBinding>,
     row_count: usize,
 }
 
@@ -659,11 +664,22 @@ fn fetch_and_verify_stark_proof(rpc: &str, limit: Option<usize>) -> anyhow::Resu
 
     let proof_bytes = hex::decode(&wire.proof)?;
     let proof = qchain_stark::Proof::from_bytes(&proof_bytes).map_err(|e| anyhow::anyhow!("malformed proof bytes: {e}"))?;
-    let final_root = wire.bindings.last().ok_or_else(|| anyhow::anyhow!("proof carries no row bindings"))?.root_after;
 
+    // A compressed-tree node serves `compressed_bindings`; a legacy node serves
+    // `bindings`. Verify against whichever the node actually gave (the STARK
+    // proof + public inputs are identical either way) - the light client never
+    // needs to know or trust which tree the node runs, only that the binding it
+    // received verifies against the proof.
     println!("{rpc}: fetched a proof over {} row(s) ({} proof bytes)", wire.row_count, proof_bytes.len());
-    qchain_stark::verify_batch_bound_to_state(proof, wire.pub_inputs, &wire.bindings)?;
-    Ok(final_root)
+    if !wire.compressed_bindings.is_empty() {
+        let final_root = wire.compressed_bindings.last().expect("non-empty").root_after;
+        qchain_stark::verify_batch_bound_to_compressed_state(proof, wire.pub_inputs, &wire.compressed_bindings)?;
+        Ok(final_root)
+    } else {
+        let final_root = wire.bindings.last().ok_or_else(|| anyhow::anyhow!("proof carries no row bindings"))?.root_after;
+        qchain_stark::verify_batch_bound_to_state(proof, wire.pub_inputs, &wire.bindings)?;
+        Ok(final_root)
+    }
 }
 
 fn fetch_executed_count(rpc: &str) -> anyhow::Result<u64> {
