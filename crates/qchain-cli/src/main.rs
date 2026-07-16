@@ -1431,9 +1431,22 @@ fn main() -> anyhow::Result<()> {
             // observe at the top of the ramp, not an artifact of stingy funding.
             let workers_kp: Vec<Keypair> = (0..workers).map(|_| Keypair::generate().unwrap()).collect();
             let bank_balance = fetch_account(&rpc, &bank.pubkey())?.map(|a| a.balance).unwrap_or(0);
-            let per_worker = (bank_balance / (workers as u64 + 2))
-                .min(2_000_000_000)
-                .max(base_fee.saturating_mul(100_000));
+            let per_worker = if fire_and_forget && sustained_secs > 0 {
+                // Fund each worker for ALL its pre-signed transactions even if the
+                // dynamic fee spikes hard during the flood, so NONE fail at
+                // execution for lack of funds. This matters because a tx that
+                // fails at execution leaves a nonce GAP that strands every later
+                // tx of that worker (unrecoverable) - the "thousands stuck" the
+                // user hit. Budget 200x the floor byte-fee per tx (observed peak
+                // was ~21x); over-funding is free because the leftover is swept
+                // back to the bank at the end. Bounded by what the bank can afford.
+                let per_worker_txs = (queue_target / workers as u64).max(1);
+                let per_tx_budget = base_fee.saturating_mul(5_579).saturating_mul(200).max(2_000_000);
+                let needed = per_worker_txs.saturating_mul(per_tx_budget);
+                (bank_balance / (workers as u64 + 2)).min(needed).max(base_fee.saturating_mul(100_000))
+            } else {
+                (bank_balance / (workers as u64 + 2)).min(2_000_000_000).max(base_fee.saturating_mul(100_000))
+            };
             if bank_balance < per_worker.saturating_mul(workers as u64) {
                 anyhow::bail!(
                     "bank balance {bank_balance} too low to fund {workers} workers at {per_worker} each - fund the bank or lower --workers"
