@@ -121,6 +121,23 @@ pub struct NodeConfig {
     /// `qchain-stark::verify_batch_bound_to_compressed_state`.
     #[serde(default)]
     pub compressed_state_tree: bool,
+    /// On-disk storage engine for the account state (only meaningful with a
+    /// `data_dir`). `"sled"` (the default, and what every existing config
+    /// resolves to) is the original `sled` 0.34 store - unchanged, byte-identical
+    /// behavior. `"redb"` selects the modern pure-Rust `RedbStore` (mmap'd, ACID),
+    /// whose in-RAM mirror + per-round flush keeps memory flat under a write burst
+    /// (fixing sled 0.34's measured multi-GB flood RSS). This is a NODE-LOCAL
+    /// storage choice - it does NOT change the state root, wire, consensus, or
+    /// `chain_id`, so it is NOT a hard fork and nodes on different engines
+    /// interoperate. A node set to `"redb"` whose `data_dir` still holds a legacy
+    /// sled state auto-migrates it once on startup (verified: the migrated account
+    /// set must be identical), keeping the sled files as a backup.
+    #[serde(default = "default_storage_engine")]
+    pub storage_engine: String,
+}
+
+fn default_storage_engine() -> String {
+    "sled".to_string()
 }
 
 fn default_round_interval_ms() -> u64 {
@@ -187,6 +204,7 @@ mod tests {
             validator_rotation: false,
             epoch_rounds: None,
             compressed_state_tree: false,
+            storage_engine: "sled".to_string(),
         }
     }
 

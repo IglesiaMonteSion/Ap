@@ -14,12 +14,72 @@ use qchain_network::{Network, PeerInfo};
 use qchain_node::config::NodeConfig;
 use qchain_node::engine::{Engine, EngineState};
 use qchain_node::rpc;
-use qchain_storage::{InMemoryStore, SledStore, StateStore};
+use qchain_storage::{InMemoryStore, RedbStore, SledStore, StateStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 mod state_sync;
+
+/// Opens the account state store for the configured engine. `"sled"` (default)
+/// is the original path, completely unchanged. `"redb"` opens the modern
+/// `RedbStore` at `data_dir/state.redb`; if the `data_dir` still holds a legacy
+/// sled state (its `db` marker file present) and no redb file exists yet, the
+/// sled state is migrated into redb once, with a verification that the migrated
+/// account set is byte-for-byte identical - the sled files are kept as a backup.
+fn open_state_store(dir: &std::path::Path, engine: &str) -> anyhow::Result<Box<dyn StateStore>> {
+    match engine {
+        "redb" => {
+            std::fs::create_dir_all(dir)?;
+            let redb_path = dir.join("state.redb");
+            let legacy_sled_present = dir.join("db").exists();
+            if !redb_path.exists() && legacy_sled_present {
+                migrate_sled_to_redb(dir, &redb_path)?;
+            }
+            Ok(Box::new(RedbStore::open(&redb_path)?))
+        }
+        // Default (and any unrecognized value, defensively) is the original sled.
+        other => {
+            if other != "sled" {
+                tracing::warn!("unknown storage_engine {other:?}, falling back to sled");
+            }
+            Ok(Box::new(SledStore::open(dir)?))
+        }
+    }
+}
+
+/// One-time migration of a legacy `sled` account state into a fresh `redb` file,
+/// verified: every account is copied and the resulting redb account set must be
+/// identical to the sled one, or the migration aborts (the node refuses to start
+/// rather than run on a partially-migrated state). The sled files are left in
+/// place as a backup - nothing is deleted.
+fn migrate_sled_to_redb(dir: &std::path::Path, redb_path: &std::path::Path) -> anyhow::Result<()> {
+    tracing::info!("migrating legacy sled state at {} into redb...", dir.display());
+    let sled = SledStore::open(dir)?;
+    let sled_accounts: Vec<_> = sled.iter().collect();
+    {
+        let mut redb = RedbStore::open(redb_path)?;
+        for (k, v) in &sled_accounts {
+            redb.set(*k, v.clone());
+        }
+        redb.flush();
+    }
+    // Verify: reopen the redb file fresh and compare its account set to sled's.
+    let redb = RedbStore::open(redb_path)?;
+    let mut s = sled_accounts;
+    let mut r: Vec<_> = redb.iter().collect();
+    s.sort_by_key(|(k, _)| k.to_bytes());
+    r.sort_by_key(|(k, _)| k.to_bytes());
+    if s != r {
+        anyhow::bail!(
+            "sled->redb migration mismatch at {}: migrated {} accounts but the verified redb set differs - refusing to start on a bad migration (the sled state is untouched)",
+            dir.display(),
+            r.len()
+        );
+    }
+    tracing::info!("migrated {} accounts from sled to redb (verified identical); sled files kept as backup", r.len());
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(about = "qchain phase-1 testnet validator")]
@@ -84,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     // (empty store) is what actually distinguishes "first boot" from
     // "restart" - `InMemoryStore` is always fresh by construction.
     let mut store: Box<dyn StateStore> = match &config.data_dir {
-        Some(dir) => Box::new(SledStore::open(dir)?),
+        Some(dir) => open_state_store(dir, &config.storage_engine)?,
         None => Box::new(InMemoryStore::new()),
     };
     let mut is_fresh = store.iter().next().is_none();

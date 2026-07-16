@@ -136,6 +136,7 @@ fn main() -> anyhow::Result<()> {
             validator_rotation: false,
             epoch_rounds: None,
             compressed_state_tree: false,
+            storage_engine: "sled".to_string(),
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;

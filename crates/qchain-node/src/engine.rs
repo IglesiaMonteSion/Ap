@@ -3126,6 +3126,13 @@ impl Engine {
             };
             state.own_pending_vertex = Some((vertex.clone(), sig.clone()));
             state.next_round = round + 1;
+            // For a write-buffering store (RedbStore), make the account state
+            // durable BEFORE the round_checkpoint advances - otherwise a crash
+            // could resume from a round whose state was never flushed. No-op for
+            // sled (its own timer handles it) and in-memory.
+            if state.ledger.store_needs_periodic_flush() {
+                state.ledger.flush();
+            }
             persist_round_checkpoint(&state);
             state.voted_for.insert((round, self.self_id), digest);
             (vertex, sig, worker_batches)

@@ -236,6 +236,15 @@ impl Ledger {
         self.store.flush();
     }
 
+    /// Whether the underlying store buffers writes and must be `flush`ed each
+    /// committed round (not only on shutdown) - `true` for `RedbStore`, `false`
+    /// for sled/in-memory. The node uses this to flush the state durably just
+    /// before advancing `round_checkpoint`, keeping the checkpoint from ever
+    /// being ahead of the persisted account state.
+    pub fn store_needs_periodic_flush(&self) -> bool {
+        self.store.needs_periodic_flush()
+    }
+
     /// The only place this `Ledger` is allowed to write to `self.store` -
     /// see `tree`'s doc comment for why every write must go through here
     /// rather than calling `self.store.set` directly.
