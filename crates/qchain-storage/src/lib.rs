@@ -1,3 +1,4 @@
+pub mod compressed;
 pub mod store;
 pub mod tree;
 
