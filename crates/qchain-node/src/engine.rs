@@ -1192,6 +1192,28 @@ fn admit_to_mempool(state: &mut EngineState, tx: Transaction) -> bool {
     true
 }
 
+/// Whether a transaction that FAILED at execution should be re-admitted to the
+/// mempool (to retry later) rather than dropped. Only two `ExecError`s are
+/// transient and recoverable: `FeeExceedsLimit` (the dynamic base fee rose above
+/// the tx's signed `fee_limit`; it will fit again once the fee decays - v4.3.3)
+/// and `InsufficientFunds` (the payer was momentarily short; a later incoming
+/// transfer, or the same fee decay, makes it affordable). Every other variant is
+/// PERMANENT for this exact transaction and MUST NOT be re-queued or it would
+/// loop forever - most importantly the nonce-mismatch replay, which
+/// `apply_transaction` reports as a `ProgramError` (a genuine already-executed
+/// tx, e.g. applied via another validator's batch). Re-admitting only these two
+/// is what lets a payer's nonce gap heal instead of stranding its whole backlog
+/// (the 50k-flood permanent stall): a failed tx's nonce is NOT advanced (the
+/// bump is after the fee/funds checks in `apply_transaction`), so dropping it
+/// leaves every later tx of that payer behind a gap that never closes.
+fn is_recoverable_exec_error(e: &qchain_execution::ExecError) -> bool {
+    matches!(
+        e,
+        qchain_execution::ExecError::InsufficientFunds
+            | qchain_execution::ExecError::FeeExceedsLimit { .. }
+    )
+}
+
 /// Caches a gossiped/served worker batch by its content digest, tagging it
 /// with the current round so `prune_stale_round_state` can evict it once it
 /// ages past `BATCH_RETENTION_ROUNDS` - the round-windowed bound that closes
@@ -1260,16 +1282,22 @@ fn drain_ready_transactions(state: &mut EngineState) -> Vec<Transaction> {
                     let c = eff_fee
                         .saturating_mul(tx.byte_size() as u64)
                         .saturating_add(tx.message.priority_fee);
-                    // Park with a one-round safety margin (+12.5%, the max the fee
-                    // can rise in a single round): a tx drained this round may not
-                    // execute until a slightly later, higher-fee round, so leaving
-                    // this headroom stops it from being drained-then-priced-out at
-                    // execution (which would drop it and gap the nonce). Purely
-                    // conservative - it only ever PARKS a borderline tx one extra
-                    // round, never drops one. The same margin is subtracted from
-                    // the running balance so a payer's run stops before the rising
-                    // execution-fee could overdraw it.
-                    let margin = c.saturating_add(c / 8);
+                    // Park with a multi-round safety margin (+50%): a tx drained
+                    // this round doesn't execute until its batch commits, ~2-3
+                    // rounds later, and while a backlog drains at the inclusion cap
+                    // (2x target) the dynamic base fee rises ~12.5% PER round - so a
+                    // one-round (+12.5%) margin is provably too small once the
+                    // execution lag reaches 2 rounds (the fee rose ~26.5% by then).
+                    // +50% covers ~3 rounds of that rise, cutting the number of txs
+                    // that pass drain but get priced out at execution. Purely
+                    // conservative - it only ever PARKS a borderline tx a few extra
+                    // rounds, never drops one; and even when the fee outruns this
+                    // margin the drained-then-failed tx is now RE-ADMITTED (see the
+                    // `is_recoverable_exec_error` re-queue in `try_commit`) instead
+                    // of dropped, so no nonce gap forms either way. The same margin
+                    // is subtracted from the running balance so a payer's run stops
+                    // before the rising execution-fee could overdraw it.
+                    let margin = c.saturating_add(c / 2);
                     if margin > tx.message.fee_limit || margin > remaining_balance {
                         break;
                     }
@@ -2557,7 +2585,35 @@ impl Engine {
                             // re-persist of the economics snapshot after the lock.
                             economics_changed = true;
                         }
-                        Err(e) => tracing::warn!("transaction execution failed: {e}"),
+                        Err(e) => {
+                            tracing::warn!("transaction execution failed: {e}");
+                            // Re-admit a transaction that failed ONLY for a
+                            // transient, recoverable reason - the dynamic base
+                            // fee rose above its signed `fee_limit`, or the payer
+                            // was momentarily short of funds - instead of
+                            // dropping it. A dropped tx is gone from the mempool
+                            // (it was removed when drained) yet its nonce never
+                            // advanced (see `apply_transaction`: the nonce bump
+                            // is AFTER the fee/funds checks), so every later tx
+                            // of that same payer is stranded behind a nonce gap
+                            // that never heals - the exact mechanism that left a
+                            // 50k flood permanently stuck at ~30k "pending".
+                            // Re-admitting lets the gap heal once the fee decays
+                            // (v4.3.3 read-time effective fee) or the payer funds
+                            // up: the parked tx becomes affordable and executes,
+                            // nothing is lost. STRICTLY the two recoverable
+                            // variants - never a nonce-mismatch `ProgramError`
+                            // (a genuine replay), which would loop forever;
+                            // `admit_to_mempool` dedups by nonce and enforces the
+                            // per-payer cap, and the next drain drops any tx at or
+                            // below the current nonce, so a re-admitted tx that
+                            // has since become a real replay is discarded cleanly.
+                            // The mempool is strictly node-local (never feeds a
+                            // consensus digest/vote), so this is fork-free.
+                            if is_recoverable_exec_error(&e) {
+                                admit_to_mempool(state, tx.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -3302,6 +3358,30 @@ mod tests {
         let ready = drain_ready_transactions(&mut state);
         assert_eq!(ready.len(), 1, "once the fee falls, the parked tx drains normally");
         assert_eq!(ready[0].message.nonce, 0);
+    }
+
+    /// The re-queue classifier (`is_recoverable_exec_error`) must re-admit ONLY
+    /// the two transient variants and NEVER a permanent one - re-queuing a
+    /// nonce-mismatch replay (reported as `ProgramError`) or a bad signature
+    /// would loop forever. This guards the exact list that heals nonce gaps
+    /// without reintroducing an infinite drain->fail->re-admit loop.
+    #[test]
+    fn only_fee_and_funds_failures_are_re_queued_never_a_replay_or_permanent_error() {
+        use qchain_execution::ExecError;
+        // Recoverable: the dynamic fee can decay / the payer can fund up.
+        assert!(is_recoverable_exec_error(&ExecError::InsufficientFunds));
+        assert!(is_recoverable_exec_error(&ExecError::FeeExceedsLimit { actual: 2, limit: 1 }));
+        // Permanent: must be dropped, never re-queued.
+        assert!(!is_recoverable_exec_error(&ExecError::InvalidSignature));
+        // A replayed / out-of-order tx surfaces as a ProgramError("nonce mismatch")
+        // - re-queuing it would spin forever.
+        assert!(!is_recoverable_exec_error(&ExecError::ProgramError("nonce mismatch: ...".into())));
+        assert!(!is_recoverable_exec_error(&ExecError::Unauthorized("x".into())));
+        assert!(!is_recoverable_exec_error(&ExecError::Wasm { message: "trap".into(), fuel_consumed: 5 }));
+        assert!(!is_recoverable_exec_error(&ExecError::OutOfGas));
+        assert!(!is_recoverable_exec_error(&ExecError::UnknownProgram(qchain_crypto::Pubkey::system_program_id())));
+        assert!(!is_recoverable_exec_error(&ExecError::AccountNotFound(qchain_crypto::Pubkey::system_program_id())));
+        assert!(!is_recoverable_exec_error(&ExecError::AlgorithmNotAcceptable("x".into())));
     }
 
     /// Entries at or below the account's current on-chain nonce (already

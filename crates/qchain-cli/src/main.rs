@@ -1977,36 +1977,55 @@ fn main() -> anyhow::Result<()> {
             // drain, and with the fee-market parking (v4.3.7) it oscillates as the
             // fee decays, so wait generously and settle on: mempool empty, OR
             // nothing moving for a while, OR the deadline.
-            print!("\nsiguiendo el mempool hasta que se asiente (esto puede tardar varios minutos con un backlog grande)");
+            println!("\nsiguiendo el mempool hasta que DRENE de verdad (con un backlog grande y el fee alto esto");
+            println!("tarda: el fee baja solo por rondas, las tx parkeadas se van ejecutando en oleadas).");
             std::io::stdout().flush().ok();
-            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            // Generous hard deadline: a 50k backlog draining at ~target (~90 tx/round,
+            // ~180/s) with the fee-market oscillation can take many minutes.
+            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
             let s0 = fetch_stress_sample(&rpc).ok();
             let mut last_exec = s0.as_ref().map(|s| s.executed).unwrap_or(0);
             let mut last_mp = s0.as_ref().map(|s| s.mempool).unwrap_or(0);
-            let mut stable = 0u32;
+            let mut best_mp = last_mp; // lowest mempool depth ever seen (real progress)
+            // Consecutive samples with NO net progress (mempool not below its best and
+            // executed not climbing). Only a genuinely wedged node stays here; the
+            // normal fee-decay oscillation moves within a few seconds, so this must be
+            // large enough not to trip during a park-phase.
+            let mut no_progress = 0u32;
             let mut ticks = 0u32;
+            let drained;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
                 ticks += 1;
                 let s = fetch_stress_sample(&rpc).ok();
                 let exec = s.as_ref().map(|s| s.executed).unwrap_or(last_exec);
                 let mp = s.as_ref().map(|s| s.mempool).unwrap_or(last_mp);
+                let bf = s.as_ref().map(|s| s.base_fee).unwrap_or(0);
                 if ticks.is_multiple_of(4) {
-                    print!("  [cola={mp} ejec={exec}]");
+                    print!("  [cola={mp} ejec={exec} fee={bf}]");
                     std::io::stdout().flush().ok();
                 }
-                if exec == last_exec && mp == last_mp {
-                    stable += 1;
+                // Real progress = the queue dropped below any depth seen before, or
+                // executed climbed. A stall (flat cola/ejec) during a park-phase is
+                // NOT progress but also NOT terminal - it resolves when the fee decays.
+                if mp < best_mp || exec > last_exec {
+                    no_progress = 0;
+                    best_mp = best_mp.min(mp);
                 } else {
-                    stable = 0;
+                    no_progress += 1;
                 }
                 last_exec = exec;
                 last_mp = mp;
                 if mp == 0 && ticks > 2 {
-                    break; // fully drained
+                    drained = true;
+                    break; // genuinely empty - every accepted tx executed
                 }
-                // Nothing moved for ~18s: settled (either drained or genuinely stuck).
-                if stable >= 12 || std::time::Instant::now() > drain_deadline {
+                // Give up ONLY on a true wedge: no net progress at all for ~120s
+                // (80 * 1.5s) while the queue is still non-empty, or the hard
+                // deadline. A stall this long is a real problem, not the fee
+                // oscillation - reported honestly below (funds are NOT swept).
+                if no_progress >= 80 || std::time::Instant::now() > drain_deadline {
+                    drained = mp == 0;
                     break;
                 }
             }
@@ -2044,7 +2063,7 @@ fn main() -> anyhow::Result<()> {
             } else if dropped == 0 {
                 println!("\n✓ CERO descartadas: las {still_pending} que faltan siguen en el mempool ESPERANDO (con el fee-market, una tx que no puede pagar el fee actual espera a que baje — no se pierde). Reconsultá `GET /status` (campo mempool_transactions): la cola debe seguir bajando sola a medida que el fee decae. Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria).");
             } else {
-                println!("\n⚠  {dropped} transacciones se aceptaron pero NO están ni ejecutadas ni en el mempool: se DESCARTARON. Causa típica bajo un flood extremo: el fee dinámico superó el `fee_limit` (por defecto 1e9) con el que el bot las firmó, así que se rechazan al ejecutar, y como una tx rechazada no avanza el nonce, las siguientes de ese worker quedan detrás de un hueco de nonce. Con el fix del fee-market (parking, v4.3.7) el nodo NO debería descartarlas — deberían esperar. Si este número es alto contra un nodo v4.3.7, avisá: el fee superó 1e9/5579≈179k/byte y ni el parking alcanza (ahí hay que firmar con más fee_limit o floodear menos).");
+                println!("\n⚠  {dropped} transacciones se aceptaron pero NO están ni ejecutadas ni en el mempool: se DESCARTARON. En un nodo v4.4.0+ esto debería ser 0: una tx que falla la ejecución sólo por el fee (fee>fee_limit) o por saldo momentáneo se RE-ADMITE al mempool en vez de descartarse, así el nonce nunca queda con un hueco. Si ves descartadas contra un nodo v4.4.0+, es señal de un error PERMANENTE (firma/programa/algoritmo), no del fee — o de que el nodo aún no se actualizó. (Contra un nodo viejo v4.3.x, un flood extremo sí las descarta por hueco de nonce: actualizá el nodo.)");
             }
             println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). 'aún en el mempool' es el campo real `mempool_transactions` de /status. Un base_fee alto que baja solo después es el mecanismo EIP-1559.");
 
@@ -2072,7 +2091,22 @@ fn main() -> anyhow::Result<()> {
             // ---- RECOVER FUNDS: sweep each worker's leftover balance back to the
             // bank so a stress run doesn't permanently drain the test wallet (the
             // worker keypairs are ephemeral - without this their funds are lost).
-            // Best-effort: skip a worker that can't even cover one transfer fee.
+            // CRITICAL: only sweep once the mempool is EMPTY. A worker's next
+            // sweep tx is signed at its current on-chain nonce - the exact nonce
+            // of its first still-parked tx - so sweeping while txs are still
+            // waiting collides with them AND drains the balance to ~0, leaving the
+            // parked backlog forever un-executable (the payer can no longer afford
+            // the fee). That premature sweep is what turned "~30k waiting" into
+            // "~30k lost" in the earlier run. If the queue hasn't drained, we
+            // deliberately LEAVE the funds in the workers so their parked txs can
+            // still execute as the fee decays.
+            if !drained {
+                println!("\n⚠  NO se barren los fondos: el mempool todavía tiene {final_mempool} tx esperando.");
+                println!("   Barrer ahora firmaría con el nonce de una tx aún pendiente y dejaría a esos");
+                println!("   workers sin saldo, matando su backlog. Los fondos quedan en los workers a");
+                println!("   propósito para que esas tx se ejecuten solas cuando el fee baje. Volvé a");
+                println!("   correr el bot (o mirá `mempool_transactions` en /status) hasta ver la cola en 0.");
+            } else {
             print!("\ndevolviendo fondos sobrantes de los workers al banco");
             std::io::stdout().flush().ok();
             let sweep_fee = fetch_account(&rpc, &PARAMS_ACCOUNT_ID)?
@@ -2110,6 +2144,7 @@ fn main() -> anyhow::Result<()> {
             let to_qch = |u: u64| u as f64 / 1e9;
             println!(" listo");
             println!("  {swept} workers barridos, ~{:.4} QCH devueltos al banco (confirmá el saldo en unos segundos).", to_qch(recovered));
+            }
         }
         Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
