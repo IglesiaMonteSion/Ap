@@ -199,6 +199,40 @@ impl Ledger {
         self.staking_events = events;
     }
 
+    /// Bounds the in-memory transfer-receipt log to at most `max` entries,
+    /// dropping the OLDEST when over the cap (keeping the most recent window).
+    ///
+    /// Each receipt carries four Merkle proofs (~32 KB total: 4 × 256 sibling
+    /// hashes × 32 B), so an unbounded log turns chain age directly into RAM -
+    /// a 50k-transfer flood is ~1.6 GB, and reloading that many from disk on
+    /// boot stalls startup for tens of seconds (both measured live). The
+    /// `/stark_proof` endpoint already serves only the last `<= 500` receipts,
+    /// and dropping from the FRONT never breaks the contiguity of the retained
+    /// suffix (each receipt's `root_before`/`root_after` still chains to its
+    /// neighbour), so bounding is safe for the proof chain. The on-disk log
+    /// keeps the full history for the explorer; this only caps the live window.
+    ///
+    /// The caller (the node's commit loop) invokes this ONLY after it has
+    /// finished capturing the per-transaction receipt delta by index for that
+    /// batch, so draining the front here never invalidates a live index.
+    pub fn cap_receipt_log(&mut self, max: usize) {
+        let len = self.transfer_receipts.len();
+        if len > max {
+            self.transfer_receipts.drain(0..len - max);
+        }
+    }
+
+    /// Bounds the in-memory staking-event log to `max` entries (same rationale
+    /// and same drain-oldest policy as `cap_receipt_log`). Staking events are
+    /// far smaller (no Merkle proofs), but keeping the window bounded keeps the
+    /// dashboard/wallet activity view and boot-time reload cost predictable.
+    pub fn cap_staking_events(&mut self, max: usize) {
+        let len = self.staking_events.len();
+        if len > max {
+            self.staking_events.drain(0..len - max);
+        }
+    }
+
     /// This validator's own accumulated direct commission (as `fee_collector`).
     /// Distinct from the network-wide `validator_earned` total.
     pub fn commission_of(&self, validator: &Pubkey) -> u64 {
@@ -1214,6 +1248,43 @@ mod tests {
         let after = ledger.current_params().base_fee_per_byte;
         assert!(after < start_fee, "the base fee must DECAY across all-failing rounds (was {start_fee}, now {after}) - not stay pinned high forever");
         assert!(after >= crate::params::FEE_MIN_BASE_FEE_PER_BYTE, "but never below the floor");
+    }
+
+    #[test]
+    fn cap_receipt_log_keeps_the_most_recent_window_and_drops_the_oldest() {
+        // Bounding the in-memory receipt log must keep the NEWEST `max` receipts
+        // (dropping from the front), so the STARK proof endpoint's last-N suffix
+        // and the explorer's recent view stay intact while RAM stays bounded.
+        use crate::receipt::TransferReceipt;
+        use qchain_storage::MerkleProof;
+        let dummy_proof = || MerkleProof { key: [0u8; 32], leaf_value_hash: None, siblings: vec![] };
+        let mk_receipt = |round: u64| TransferReceipt {
+            tx_hash: [0u8; 32],
+            round,
+            from: Pubkey::new([1u8; 32]),
+            to: Pubkey::new([2u8; 32]),
+            amount: 1,
+            fee: 1,
+            root_before: [0u8; 32],
+            root_after: [0u8; 32],
+            from_before: Account::new_wallet(Pubkey::new([1u8; 32])),
+            from_after: Account::new_wallet(Pubkey::new([1u8; 32])),
+            to_before: Account::new_wallet(Pubkey::new([2u8; 32])),
+            to_after: Account::new_wallet(Pubkey::new([2u8; 32])),
+            from_proof_before: dummy_proof(),
+            from_proof_after: dummy_proof(),
+            to_proof_before: dummy_proof(),
+            to_proof_after: dummy_proof(),
+        };
+        let mut ledger = new_test_ledger();
+        ledger.restore_receipts((0..6_000u64).map(mk_receipt).collect());
+        ledger.cap_receipt_log(5_000);
+        assert_eq!(ledger.transfer_receipts().len(), 5_000, "must bound to the cap");
+        assert_eq!(ledger.transfer_receipts().first().unwrap().round, 1_000, "oldest 1000 dropped");
+        assert_eq!(ledger.transfer_receipts().last().unwrap().round, 5_999, "newest kept");
+        // Under the cap it's a no-op.
+        ledger.cap_receipt_log(10_000);
+        assert_eq!(ledger.transfer_receipts().len(), 5_000, "no-op when already within bound");
     }
 
     #[test]

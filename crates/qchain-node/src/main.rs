@@ -403,17 +403,26 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     if let Some(db) = &receipt_log {
-        let mut loaded = Vec::new();
-        for entry in db.iter() {
+        // Load only the most recent `MAX_INMEM_RECEIPTS` (newest-first via a
+        // reverse scan, then flipped back to chronological order). Each receipt
+        // is ~32 KB, so loading the full log made boot take ~18 s on a real node
+        // with only ~11.6k receipts (and RPC binds only after this) - which the
+        // updater's health check misread as a "possible freeze". The on-disk log
+        // is pruned to the same bound, so in steady state the reverse scan sees
+        // at most `MAX_INMEM_RECEIPTS` entries anyway; the `.take` is the belt to
+        // that suspenders for a log written by an older, unpruned binary.
+        let mut newest_first = Vec::new();
+        for entry in db.iter().rev().take(qchain_node::engine::MAX_INMEM_RECEIPTS) {
             let (_seq, bytes) = entry?;
             match serde_json::from_slice::<qchain_execution::TransferReceipt>(&bytes) {
-                Ok(r) => loaded.push(r),
+                Ok(r) => newest_first.push(r),
                 Err(e) => tracing::warn!("skipping a corrupt transfer receipt in the on-disk log: {e}"),
             }
         }
-        if !loaded.is_empty() {
-            tracing::info!("reloaded {} transfer receipts from the on-disk log", loaded.len());
-            ledger.restore_receipts(loaded);
+        if !newest_first.is_empty() {
+            newest_first.reverse(); // back to oldest-first, as the chain requires
+            tracing::info!("reloaded {} transfer receipts from the on-disk log", newest_first.len());
+            ledger.restore_receipts(newest_first);
         }
     }
 
@@ -424,17 +433,19 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     if let Some(db) = &staking_log {
-        let mut loaded = Vec::new();
-        for entry in db.iter() {
+        // Bounded reverse reload, same as receipts (see above).
+        let mut newest_first = Vec::new();
+        for entry in db.iter().rev().take(qchain_node::engine::MAX_INMEM_STAKING_EVENTS) {
             let (_seq, bytes) = entry?;
             match serde_json::from_slice::<qchain_execution::StakingEvent>(&bytes) {
-                Ok(e) => loaded.push(e),
+                Ok(e) => newest_first.push(e),
                 Err(e) => tracing::warn!("skipping a corrupt staking event in the on-disk log: {e}"),
             }
         }
-        if !loaded.is_empty() {
-            tracing::info!("reloaded {} staking events from the on-disk log", loaded.len());
-            ledger.restore_staking_events(loaded);
+        if !newest_first.is_empty() {
+            newest_first.reverse();
+            tracing::info!("reloaded {} staking events from the on-disk log", newest_first.len());
+            ledger.restore_staking_events(newest_first);
         }
     }
 

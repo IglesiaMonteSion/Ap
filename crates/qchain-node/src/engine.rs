@@ -241,6 +241,23 @@ const WORKER_COUNT: u8 = 4;
 /// generous "recent activity" window for a real light-client caller.
 const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 
+/// Bound on the in-memory (and reload/on-disk) transfer-receipt log. Each
+/// receipt carries four Merkle proofs (~32 KB), so an unbounded log turns
+/// chain age directly into RAM - a 50k-transfer flood is ~1.6 GB, and
+/// reloading that many on boot stalled a live node's startup for ~18 s (which
+/// read as a false "possible freeze" from the updater's health check, since
+/// RPC only binds after the reload). This window keeps the most recent
+/// receipts for the explorer and comfortably covers `MAX_STARK_PROOF_RECEIPTS`
+/// (the endpoint only ever serves the last 500), while capping RAM at
+/// ~160 MB and keeping boot fast. The on-disk log is pruned to the same
+/// bound so both reload cost and disk growth stay predictable across repeated
+/// stress runs. See `Ledger::cap_receipt_log`.
+pub const MAX_INMEM_RECEIPTS: usize = 5_000;
+
+/// Same bound for the staking-activity log (far smaller per entry - no Merkle
+/// proofs - but kept bounded for the same predictable-reload reason).
+pub const MAX_INMEM_STAKING_EVENTS: usize = 5_000;
+
 /// Hard cap on how many not-yet-ready transactions a single payer may have
 /// queued in this validator's mempool at once. Bounds the real,
 /// unbounded-growth mempool OOM this closes: `payer_can_afford_admission`
@@ -408,6 +425,37 @@ fn persist_round_checkpoint(state: &EngineState) {
     let Some(path) = &state.round_checkpoint_path else { return };
     if let Err(e) = std::fs::write(path, state.next_round.to_string()) {
         tracing::warn!("failed to persist round checkpoint: {e}");
+    }
+}
+
+/// Prunes a best-effort append-only `sled` log (the receipt / staking-event
+/// logs) down to at most `max` entries, removing the OLDEST first. Keys are
+/// monotonic `generate_id()` big-endian ids, so a forward `iter()` yields
+/// oldest-first and the first `len - max` keys are exactly the ones to drop.
+/// Best-effort like `persist_receipt`: a failed removal only leaves a few
+/// extra rows to reload next boot, never a correctness problem. No-op when the
+/// log is absent (in-memory node) or already within bound.
+fn prune_log_to_last(db: Option<&sled::Db>, max: usize) {
+    let Some(db) = db else { return };
+    let len = db.len();
+    if len <= max {
+        return;
+    }
+    let excess = len - max;
+    let mut old_keys: Vec<sled::IVec> = Vec::with_capacity(excess);
+    for entry in db.iter().take(excess) {
+        match entry {
+            Ok((k, _v)) => old_keys.push(k),
+            Err(e) => {
+                tracing::warn!("failed to scan the on-disk log for pruning: {e}");
+                return;
+            }
+        }
+    }
+    for k in old_keys {
+        if let Err(e) = db.remove(&k) {
+            tracing::warn!("failed to prune an old on-disk log entry: {e}");
+        }
     }
 }
 
@@ -2371,6 +2419,13 @@ impl Engine {
                 }
             }
         }
+        // Bound the in-memory receipt/staking logs AFTER the per-transaction
+        // delta above has been captured by index into `to_persist` for this
+        // whole batch - draining the front now can't invalidate a live index
+        // (the next commit re-reads the length fresh). Keeps RAM and boot
+        // reload time bounded regardless of chain age (see `MAX_INMEM_RECEIPTS`).
+        state.ledger.cap_receipt_log(MAX_INMEM_RECEIPTS);
+        state.ledger.cap_staking_events(MAX_INMEM_STAKING_EVENTS);
 
         // ---- Phase-3.3 rotation ratchet ----
         // If this schedule rotates and the frontier epoch is now fully
@@ -2531,6 +2586,18 @@ impl Engine {
         }
         for ev in &staking_to_persist {
             self.persist_staking_event(ev);
+        }
+        // Prune the on-disk logs to the same window as the in-memory ones, so
+        // repeated stress runs don't grow `data/receipts` unbounded on disk and
+        // boot-time reload stays fast (the reloader reads only the last
+        // `MAX_INMEM_RECEIPTS`). Only touched when something was actually
+        // appended this commit; drops the oldest keys (monotonic `generate_id`s,
+        // so smallest = oldest). Best-effort, mirroring `persist_receipt`.
+        if !to_persist.is_empty() {
+            prune_log_to_last(self.receipt_log.as_ref(), MAX_INMEM_RECEIPTS);
+        }
+        if !staking_to_persist.is_empty() {
+            prune_log_to_last(self.staking_log.as_ref(), MAX_INMEM_STAKING_EVENTS);
         }
         if economics_changed {
             self.persist_economics().await;
