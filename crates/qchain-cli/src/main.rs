@@ -692,6 +692,77 @@ fn fetch_stress_sample(rpc: &str) -> anyhow::Result<StressSample> {
 }
 
 #[derive(serde::Deserialize)]
+struct ResourcesWire {
+    rss_bytes: u64,
+    cpu_seconds: f64,
+    disk_bytes: u64,
+    num_threads: u64,
+}
+
+/// Peak node resource usage observed by the sampler over a stress run.
+#[derive(Default)]
+struct ResourcePeaks {
+    peak_rss: u64,
+    peak_cpu_pct: f64,
+    peak_threads: u64,
+    disk_start: u64,
+    disk_end: u64,
+    samples: u64,
+    endpoint_ok: bool,
+}
+
+fn fetch_resources(rpc: &str) -> Option<ResourcesWire> {
+    reqwest::blocking::get(format!("{rpc}/resources")).ok()?.error_for_status().ok()?.json().ok()
+}
+
+/// Background thread that samples every monitor's `GET /resources` and records
+/// the peak RAM/CPU/threads and disk growth of the REAL node process(es) for the
+/// whole load run - so the operator sees what the node cost without watching
+/// `docker stats` by hand. CPU% is the cumulative-cpu delta over the wall-clock
+/// interval (100% == one full core). Global max across monitors (exact for the
+/// common single-node case; the busiest node under a multi-monitor run).
+/// Gracefully reports nothing if `/resources` is absent (older node binary).
+fn spawn_resource_sampler(
+    monitors: Vec<String>,
+) -> (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::Mutex<ResourcePeaks>>) {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peaks = std::sync::Arc::new(std::sync::Mutex::new(ResourcePeaks::default()));
+    let (s, p) = (stop.clone(), peaks.clone());
+    let handle = std::thread::spawn(move || {
+        let mut last: std::collections::HashMap<String, (f64, std::time::Instant)> = std::collections::HashMap::new();
+        while !s.load(Ordering::Relaxed) {
+            for m in &monitors {
+                if let Some(r) = fetch_resources(m) {
+                    let now = std::time::Instant::now();
+                    let mut pk = p.lock().unwrap();
+                    pk.endpoint_ok = true;
+                    pk.samples += 1;
+                    if pk.disk_start == 0 {
+                        pk.disk_start = r.disk_bytes;
+                    }
+                    pk.disk_end = r.disk_bytes;
+                    pk.peak_rss = pk.peak_rss.max(r.rss_bytes);
+                    pk.peak_threads = pk.peak_threads.max(r.num_threads);
+                    if let Some((prev_cpu, prev_t)) = last.get(m) {
+                        let dt = now.duration_since(*prev_t).as_secs_f64();
+                        if dt > 0.0 {
+                            let cpu_pct = (r.cpu_seconds - prev_cpu) / dt * 100.0;
+                            if cpu_pct > pk.peak_cpu_pct {
+                                pk.peak_cpu_pct = cpu_pct;
+                            }
+                        }
+                    }
+                    last.insert(m.clone(), (r.cpu_seconds, now));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+    });
+    (handle, stop, peaks)
+}
+
+#[derive(serde::Deserialize)]
 struct ValidatorDirWire {
     address: String,
 }
@@ -1492,6 +1563,10 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
                 .collect();
+            // Sample the node's real RAM/CPU/disk for the whole load run (blast +
+            // drain), so the operator gets peak footprint without watching
+            // `docker stats` by hand. Stopped just before the reconciliation print.
+            let (sampler_handle, sampler_stop, resource_peaks) = spawn_resource_sampler(monitors.clone());
             let mut total_attempted = 0u64; // signed + POSTed
             let mut total_accepted = 0u64; // admitted to a mempool (RPC returned 2xx)
             let mut total_failed = 0u64; // rejected at admission (RPC returned an error)
@@ -1901,6 +1976,10 @@ fn main() -> anyhow::Result<()> {
             }
             println!(" done");
 
+            // Load + drain are done: stop the resource sampler and snapshot peaks.
+            sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = sampler_handle.join();
+
             let final_nonces: Vec<u64> = workers_kp
                 .iter()
                 .map(|w| fetch_account(&rpc, &w.pubkey()).ok().flatten().map(|a| a.nonce).unwrap_or(0))
@@ -1920,6 +1999,27 @@ fn main() -> anyhow::Result<()> {
                 println!("\nℹ  {queued_or_lost} aceptadas no se ejecutaron dentro de la ventana de drenaje. En un nodo sano y en marcha esto son tx TODAVÍA EN COLA que se ejecutarán en rondas siguientes (el mempool no expira por tiempo). Sólo se perderían de verdad si REINICIÁS el nodo (el mempool vive en memoria, no en disco). Volvé a consultar el balance/nonce en unos segundos para confirmar que drenaron.");
             }
             println!("\nNota: 'ejecutadas' se cuenta por el avance de nonce real de cada worker (a prueba de los refondeos). Un base_fee alto que baja solo después es el mecanismo EIP-1559, no una falla.");
+
+            // Peak node resources observed over the whole run (RAM/CPU/disk).
+            {
+                let pk = resource_peaks.lock().unwrap();
+                println!("\n=== recursos del nodo (picos durante la corrida) ===");
+                if !pk.endpoint_ok {
+                    println!("  (el endpoint /resources no respondió — nodo anterior a esta versión; actualizá el nodo para medir RAM/CPU/disco)");
+                } else {
+                    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+                    println!("  RAM (RSS) pico:      {:.1} MB", mb(pk.peak_rss));
+                    println!("  CPU pico:            {:.0} %   (100% = 1 núcleo completo)", pk.peak_cpu_pct);
+                    println!("  hilos (threads) pico:{:>4}", pk.peak_threads);
+                    println!(
+                        "  disco (data_dir):    {:.1} MB → {:.1} MB (creció {:.1} MB)",
+                        mb(pk.disk_start),
+                        mb(pk.disk_end),
+                        mb(pk.disk_end.saturating_sub(pk.disk_start))
+                    );
+                    println!("  muestras tomadas:    {} (cada ~400ms sobre {} monitor(es))", pk.samples, monitors.len());
+                }
+            }
 
             // ---- RECOVER FUNDS: sweep each worker's leftover balance back to the
             // bank so a stress run doesn't permanently drain the test wallet (the

@@ -922,6 +922,48 @@ pub struct StatusResponse {
     pub round_interval_ms: u64,
 }
 
+/// Total size in bytes of every regular file under `dir`, recursively (a plain
+/// walk, no symlink following). Used by `/resources` to report the node's
+/// on-disk footprint; best-effort - unreadable entries are skipped.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path()));
+        } else if ft.is_file() {
+            if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
+}
+
+/// Live process resource usage this node self-reports on `GET /resources`, so a
+/// load tool (`qchain stress`) can sample and report peak RAM/CPU/disk of the
+/// REAL node process without needing shell access to it (works across separate
+/// containers/hosts). Read from `/proc/self` and the on-disk `data_dir`, off the
+/// consensus state lock - so sampling never contends with block processing.
+/// Linux-only (the deployment target); fields are 0 where `/proc` isn't readable.
+#[derive(Serialize)]
+pub struct ResourcesResponse {
+    /// Resident set size (real physical RAM) in bytes, from `/proc/self/status`
+    /// `VmRSS`. This is the number that matters for OOM risk under load.
+    pub rss_bytes: u64,
+    /// Cumulative CPU time (user + system) this process has consumed, in seconds,
+    /// from `/proc/self/stat`. A sampler computes CPU% as the delta over the
+    /// wall-clock interval between two reads (100% == one full core).
+    pub cpu_seconds: f64,
+    /// Total bytes on disk under the node's `data_dir` (the sled stores: state,
+    /// DAG, batches, receipts, ...), summed by walking it. 0 for an in-memory node.
+    pub disk_bytes: u64,
+    /// OS thread count from `/proc/self/status` `Threads` - a runaway-task blowup
+    /// (the class this project has hit) shows up here before RSS does.
+    pub num_threads: u64,
+}
+
 /// Real validator economics, served at `GET /economics` and rendered on the
 /// node dashboard's validator panel. Answers the operator's real questions:
 /// how do validators earn, how much is being burned right now (and how much
@@ -1596,6 +1638,48 @@ impl Engine {
             dag_certificates: state.dag.len(),
             peer_count: self.committee().len().saturating_sub(1),
         }
+    }
+
+    /// This process's live RAM/CPU/disk/thread usage (see `ResourcesResponse`).
+    /// Reads `/proc/self` and walks the `data_dir` - no consensus state lock, so
+    /// a load tool can sample it at high frequency without slowing the node.
+    pub fn resources(&self) -> ResourcesResponse {
+        fn read_proc_status_kb(field: &str) -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find(|l| l.starts_with(field)).and_then(|l| {
+                        l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                    })
+                })
+                .unwrap_or(0)
+        }
+        // VmRSS / Threads live in /proc/self/status (VmRSS is in kB).
+        let rss_bytes = read_proc_status_kb("VmRSS:").saturating_mul(1024);
+        let num_threads = read_proc_status_kb("Threads:");
+        // utime (field 14) + stime (field 15) in clock ticks; /proc/self/stat's
+        // first field can contain spaces/parens (the comm), so split after the
+        // trailing ')'. Assume the standard 100 ticks/sec (USER_HZ) on Linux.
+        let cpu_seconds = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| {
+                let after = s.rsplit_once(')').map(|(_, rest)| rest.to_string())?;
+                let f: Vec<&str> = after.split_whitespace().collect();
+                // After ')', field indices shift: state is [0], so utime is [11], stime [12].
+                let utime = f.get(11)?.parse::<u64>().ok()?;
+                let stime = f.get(12)?.parse::<u64>().ok()?;
+                Some((utime + stime) as f64 / 100.0)
+            })
+            .unwrap_or(0.0);
+        // Disk: sum of file sizes under the data_dir (parent of the economics
+        // snapshot path). 0 for an in-memory node (no data_dir).
+        let disk_bytes = self
+            .economics_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(dir_size_bytes)
+            .unwrap_or(0);
+        ResourcesResponse { rss_bytes, cpu_seconds, disk_bytes, num_threads }
     }
 
     pub async fn handle_message(&self, from: ValidatorId, msg: NetMessage) {

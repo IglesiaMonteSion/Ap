@@ -22,6 +22,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/stake/:address", get(get_stake))
         .route("/status", get(status))
         .route("/economics", get(economics))
+        .route("/resources", get(resources))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
         .route("/transfers", get(list_transfers))
@@ -163,6 +164,13 @@ async fn status(State(engine): State<Arc<Engine>>) -> Json<StatusResponse> {
 /// current governance parameters. See `EconomicsResponse`.
 async fn economics(State(engine): State<Arc<Engine>>) -> Json<EconomicsResponse> {
     Json(engine.economics().await)
+}
+
+/// `/resources` - the node's own live RAM/CPU/disk/thread usage, so a load tool
+/// can sample and report peaks without shell access to the node. See
+/// `ResourcesResponse`. Not behind the state lock (reads `/proc/self` + data_dir).
+async fn resources(State(engine): State<Arc<Engine>>) -> Json<crate::engine::ResourcesResponse> {
+    Json(engine.resources())
 }
 
 async fn root(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
