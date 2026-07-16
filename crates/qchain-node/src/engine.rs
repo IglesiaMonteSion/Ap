@@ -816,7 +816,14 @@ impl Engine {
         // receipt at all, so this is always a real proof-bearing receipt here).
         if let (Some(full_db), true) = (&self.receipt_full_log, receipt.has_proofs()) {
             if let Ok(id) = full_db.generate_id() {
-                if let Ok(bytes) = serde_json::to_vec(receipt) {
+                // Borsh, not serde_json: a full receipt's four Merkle proofs are
+                // ~32 KB of raw hashes that serde_json inflates to ~130 KB of
+                // decimal-array text, serialized+written per transfer only to be
+                // pruned to the last 600. Borsh keeps it compact binary (~4x less
+                // work + disk), which is ~25% of a legacy node's flood throughput
+                // (measured). Read side (`main.rs`) tries Borsh then falls back to
+                // serde_json so a full log written by an older node still loads.
+                if let Ok(bytes) = borsh::to_vec(receipt) {
                     let _ = full_db.insert(id.to_be_bytes(), bytes);
                 }
             }

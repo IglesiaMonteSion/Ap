@@ -45,7 +45,14 @@ use qchain_storage::MerkleProof;
 /// (`Some`) only in compressed mode; in legacy mode the receipt's four
 /// `*_proof_*: MerkleProof` fields carry the 256-deep proofs instead and this is
 /// `None`. Directly convertible to `qchain_stark::CompressedRowStateBinding`.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+)]
 pub struct CompressedProofSet {
     pub from_proof_before: CompressedProof,
     pub from_proof_after: CompressedProof,
@@ -101,7 +108,14 @@ pub struct StakingEvent {
 /// (`qchain-node`'s RPC layer, kept free of a `qchain-stark` dependency
 /// here in `qchain-execution` deliberately - proof generation is a
 /// presentation-layer concern, not an execution-layer one).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+)]
 pub struct TransferReceipt {
     pub tx_hash: [u8; 32],
     /// The consensus round this transfer executed in. `#[serde(default)]` so

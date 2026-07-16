@@ -111,7 +111,7 @@ fn compute_root(leaves: &[Leaf], depth: usize) -> [u8; 32] {
 /// it sits. The verifier folds these leaf-to-root, combining with the query key's
 /// bit at each `depth`. Only real branch points appear (compressed levels are
 /// absent), so the list is ~log2(n) long, not 256.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct ProofStep {
     pub depth: u16,
     pub sibling: [u8; 32],
@@ -121,7 +121,7 @@ pub struct ProofStep {
 /// leaf occupying the compressed slot (exclusion), or an empty subtree
 /// (exclusion). Carries exactly what the verifier needs to recompute the
 /// terminal node hash and to confirm non-membership.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub enum Terminal {
     /// The queried key's own leaf value hash (inclusion proof).
     Leaf { value_hash: [u8; 32] },
@@ -133,7 +133,7 @@ pub enum Terminal {
 
 /// A compressed inclusion OR exclusion proof for one key. Bound to a root by
 /// `verify_proof`. `steps` are ordered LEAF-TO-ROOT.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct CompressedProof {
     pub key: [u8; 32],
     pub terminal: Terminal,

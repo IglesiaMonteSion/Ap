@@ -505,7 +505,13 @@ async fn main() -> anyhow::Result<()> {
         let mut full: std::collections::HashMap<[u8; 32], qchain_execution::TransferReceipt> = std::collections::HashMap::new();
         for entry in db.iter().rev().take(qchain_node::engine::N_FULL_PROOF_RECEIPTS) {
             let (_seq, bytes) = entry?;
-            if let Ok(r) = serde_json::from_slice::<qchain_execution::TransferReceipt>(&bytes) {
+            // Full receipts are now Borsh (compact); an older node wrote serde_json.
+            // Try Borsh first, fall back to serde_json so a pre-upgrade full log
+            // still loads (no /stark_proof gap on the user's upgrade restart).
+            let decoded = borsh::from_slice::<qchain_execution::TransferReceipt>(&bytes)
+                .ok()
+                .or_else(|| serde_json::from_slice::<qchain_execution::TransferReceipt>(&bytes).ok());
+            if let Some(r) = decoded {
                 full.insert(r.tx_hash, r);
             }
         }
