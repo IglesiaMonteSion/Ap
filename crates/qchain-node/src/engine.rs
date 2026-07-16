@@ -501,6 +501,16 @@ pub struct EngineState {
     /// to persist; it's always fresh on the next process start anyway).
     pub round_checkpoint_path: Option<std::path::PathBuf>,
     pub executed: u64,
+    /// Real committed size of recent rounds: `round -> (committed_bytes,
+    /// tx_count)`, counting EVERY transaction in the round's committed batches
+    /// (transfers, staking, AND contract calls - the last are invisible to
+    /// `/transfers`/`/staking_activity`, which is exactly why the dashboard's
+    /// old transfer-count fill estimate under-reported round fill as ~85%). This
+    /// is the true "how full was the round" measure, served by `GET /rounds`.
+    /// Bounded by the same `ROUND_STATE_RETENTION` window as the other
+    /// round-keyed maps (pruned in `prune_stale_round_state`); read-only
+    /// telemetry, never consensus state.
+    pub round_committed: HashMap<Round, (u64, u32)>,
     /// Which vertex digest this validator has already voted for, per
     /// (round, author) - the equivocation lock. Without it, a Byzantine
     /// author could get two *different* vertices for the same round each
@@ -968,6 +978,29 @@ pub struct ResourcesResponse {
     /// OS thread count from `/proc/self/status` `Threads` - a runaway-task blowup
     /// (the class this project has hit) shows up here before RSS does.
     pub num_threads: u64,
+}
+
+/// Real committed size of one recent round, served at `GET /rounds`. Unlike the
+/// dashboard's old client-side estimate (transfer count x a flat byte guess,
+/// which never saw contract-call txs and so under-reported fill as ~85%), this
+/// counts EVERY transaction actually committed in the round's batches. `fill_pct`
+/// is against the real per-round inclusion cap `FEE_MAX_BYTES_PER_ROUND`.
+#[derive(Serialize)]
+pub struct RoundFill {
+    pub round: Round,
+    /// Sum of `byte_size()` over every committed tx in the round (all kinds).
+    pub bytes: u64,
+    /// Number of committed txs in the round (transfers + staking + contracts).
+    pub tx_count: u32,
+    /// `bytes` as a percentage of `FEE_MAX_BYTES_PER_ROUND` (the 1 MB cap),
+    /// clamped to 100. This is the honest "how full was the round" figure.
+    pub fill_pct: u32,
+    /// The cap the fill is measured against, so the client never hardcodes it.
+    pub cap_bytes: u64,
+    /// The fee-market target (`FEE_TARGET_BYTES_PER_ROUND`), so the dashboard can
+    /// show that a healthy sustained round sits near the TARGET (~50% of cap),
+    /// not the cap - hitting the cap is the burst exception, by EIP-1559 design.
+    pub target_bytes: u64,
 }
 
 /// Real validator economics, served at `GET /economics` and rendered on the
@@ -1511,6 +1544,32 @@ impl Engine {
         let end = all.len() - offset;
         let start = end.saturating_sub(limit);
         all[start..end].iter().rev().cloned().collect()
+    }
+
+    /// The real committed size of the most recent `limit` rounds (newest first) -
+    /// see `RoundFill`. This is what makes the dashboard's fill bar honest: it
+    /// counts every committed tx (including contract calls invisible to
+    /// `/transfers`), so a genuinely full round reads ~100% instead of the old
+    /// ~85% transfer-only estimate.
+    pub async fn recent_round_fill(&self, limit: usize) -> Vec<RoundFill> {
+        use qchain_execution::params::{FEE_MAX_BYTES_PER_ROUND, FEE_TARGET_BYTES_PER_ROUND};
+        let limit = limit.min(MAX_ACTIVITY_LIMIT);
+        let state = self.state.lock().await;
+        let mut rounds: Vec<(Round, (u64, u32))> = state.round_committed.iter().map(|(&r, &v)| (r, v)).collect();
+        // Newest rounds first.
+        rounds.sort_by(|a, b| b.0.cmp(&a.0));
+        rounds.truncate(limit);
+        rounds
+            .into_iter()
+            .map(|(round, (bytes, tx_count))| RoundFill {
+                round,
+                bytes,
+                tx_count,
+                fill_pct: ((bytes.saturating_mul(100)) / FEE_MAX_BYTES_PER_ROUND).min(100) as u32,
+                cap_bytes: FEE_MAX_BYTES_PER_ROUND,
+                target_bytes: FEE_TARGET_BYTES_PER_ROUND,
+            })
+            .collect()
     }
 
     /// Captured staking activity (Delegate/Undelegate/ClaimReward), most recent
@@ -2388,6 +2447,8 @@ impl Engine {
             state.pending_cert_requests.retain(|_, v| v.1 >= round_horizon);
             state.pending_batch_requests.retain(|_, v| v.1 >= round_horizon);
             state.pending_votes_to_send.retain(|_, v| v.2 >= round_horizon);
+            // Same round-window bound for the /rounds telemetry (read-only).
+            state.round_committed.retain(|&r, _| r >= round_horizon);
         }
 
         // Bound `equivocation_evidence` to at most one entry per author. A
@@ -2566,6 +2627,15 @@ impl Engine {
                     .cloned()
                     .expect("take_executable_prefix guarantees every batch of a ready certificate is cached");
                 for tx in &batch.transactions {
+                    // Record the REAL committed size of this round (every tx in
+                    // the committed batches, all kinds), for the honest `/rounds`
+                    // fill metric. Counted before execution so a tx that later
+                    // fails still counts toward how full the proposer packed the
+                    // round (the inclusion cap operates on the batch, not on
+                    // execution success).
+                    let rc = state.round_committed.entry(cert.vertex.round).or_insert((0, 0));
+                    rc.0 = rc.0.saturating_add(tx.byte_size() as u64);
+                    rc.1 = rc.1.saturating_add(1);
                     let receipts_before = state.ledger.transfer_receipts().len();
                     let staking_before = state.ledger.staking_events().len();
                     match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
@@ -3148,6 +3218,7 @@ mod tests {
             next_round: 0,
             round_checkpoint_path: None,
             executed: 0,
+            round_committed: HashMap::new(),
             voted_for: HashMap::new(),
             pending_cert_requests: HashMap::new(),
             pending_batch_requests: HashMap::new(),

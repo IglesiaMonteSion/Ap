@@ -134,8 +134,10 @@
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
   /* Round-fill (bytes used / limit) mini bar */
   .fill { display: inline-flex; align-items: center; gap: 0.4rem; min-width: 90px; }
-  .fill-bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .fill-bar { position: relative; flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
   .fill-bar > i { display: block; height: 100%; background: linear-gradient(90deg, #5be3a0, #ffcf5b); }
+  /* Target marker (~50% of cap): a healthy sustained round sits here, not at the cap. */
+  .fill-bar > b { position: absolute; top: -1px; width: 2px; height: 8px; background: var(--text-dim); opacity: .6; transform: translateX(-1px); }
   .fill-pct { font-size: 0.72rem; color: var(--text-dim); white-space: nowrap; }
 
   .panel {
@@ -360,7 +362,7 @@
         <div class="stat-card"><div class="stat-label">emisión anual (APR)</div><div class="stat-value" id="econ-emission-apr">–</div></div>
         <div class="stat-card"><div class="stat-label">se quema de cada fee</div><div class="stat-value" id="econ-burn-pct">–</div></div>
         <div class="stat-card"><div class="stat-label">peso en el quórum (BFT)</div><div class="stat-value" id="econ-stake">–</div></div>
-        <div class="stat-card"><div class="stat-label">pares (otros validadores)</div><div class="stat-value" id="econ-peers">–</div></div>
+        <div class="stat-card"><div class="stat-label">otros validadores (config)</div><div class="stat-value" id="econ-peers" title="Cuántos OTROS validadores tiene el comité configurado (no conexiones vivas). La caída real de un par la detecta la alerta de consenso estancado, que sí mide avance en vivo.">–</div></div>
       </div>
     </section>
 
@@ -662,7 +664,7 @@ async function refreshStatus() {
     // Live fee: base_fee_per_byte and the fee of a standard ~5.5 KB hybrid
     // transfer (the exact size qchain-cli/the wallet build).
     if (typeof status.base_fee_per_byte === "number") {
-      const transferFee = status.base_fee_per_byte * 5571;
+      const transferFee = status.base_fee_per_byte * 5579;
       document.getElementById("stat-fee").textContent = qch(transferFee);
       document.getElementById("stat-fee-sub").textContent =
         `${fmtNum(status.base_fee_per_byte)} u/byte`;
@@ -760,9 +762,14 @@ let curRound = 0, roundIntervalMs = 500;
 // Used as the "gas limit" analog to show how full each round is. Constant in
 // the protocol; if it changes, this display estimate would need updating.
 const ROUND_BYTE_LIMIT = 1000000;
-const TX_BYTES_EST = 5571; // ~size of a standard hybrid-signed transfer
+const TX_BYTES_EST = 5579; // real size of a standard hybrid-signed transfer (v3.0.0+)
 let activeTab = "tx";     // "tx" | "blocks"
 let blocks = [];          // grouped by round, newest first
+// Real committed size per round from GET /rounds (round -> {bytes, tx_count,
+// fill_pct, cap_bytes, target_bytes}). This is the HONEST fill (counts every
+// committed tx, incl. contract calls invisible to /transfers), so the blocks
+// view no longer under-reports round fill from a transfer-only estimate.
+let roundFill = new Map();
 let blocksPage = 0;
 let blocksPageSize = 20;
 
@@ -782,9 +789,14 @@ const STAKE_TYPE = {
 };
 
 async function loadActivity(force = false) {
-  let txs = [], stk = [];
+  let txs = [], stk = [], rnds = [];
   try { txs = await getJson(`/transfers?limit=${ACTIVITY_FETCH}`); } catch (e) {}
   try { stk = await getJson(`/staking_activity?limit=${ACTIVITY_FETCH}`); } catch (e) {}
+  // Real per-round committed size (all tx kinds). Older nodes without /rounds
+  // just return nothing here, and the blocks view falls back to the estimate.
+  try { rnds = await getJson(`/rounds?limit=300`); } catch (e) {}
+  roundFill = new Map();
+  for (const r of (rnds || [])) roundFill.set(r.round, r);
   const items = [];
   for (const t of (txs || [])) {
     // `fee` (from /transfers) lets the Bloques view sum per-round fees/burnt/reward.
@@ -826,6 +838,18 @@ function buildBlocks() {
     let b = byRound.get(i.round);
     if (!b) { b = { round: i.round, count: 0, fees: 0, txs: [] }; byRound.set(i.round, b); }
     b.count++; b.fees += (i.fee || 0); b.txs.push(i);
+  }
+  // Overlay the REAL committed size from /rounds. This adds rounds that carried
+  // ONLY contract calls (invisible to /transfers, so absent above) and replaces
+  // the transfer-only count/fill with the true committed figure.
+  for (const [round, r] of roundFill) {
+    let b = byRound.get(round);
+    if (!b) { b = { round, count: 0, fees: 0, txs: [] }; byRound.set(round, b); }
+    b.realCount = r.tx_count;         // true tx count (all kinds)
+    b.realBytes = r.bytes;            // true committed bytes
+    b.fillPct = r.fill_pct;           // honest fill vs the 1 MB cap
+    b.capBytes = r.cap_bytes;
+    b.targetBytes = r.target_bytes;
   }
   blocks = [...byRound.values()].sort((a, b) => b.round - a.round);
 }
@@ -885,17 +909,24 @@ function renderBlocksPage() {
   for (const b of shown) {
     const burnt = Math.round(b.fees * BURN_PCT / 100);
     const reward = b.fees - burnt;
-    const bytes = b.count * TX_BYTES_EST;
-    const pct = Math.min(100, Math.round(bytes / ROUND_BYTE_LIMIT * 100));
+    // Prefer the REAL committed fill from /rounds; fall back to the transfer-only
+    // estimate for rounds older than the node's telemetry window.
+    const hasReal = typeof b.fillPct === "number";
+    const pct = hasReal ? b.fillPct
+      : Math.min(100, Math.round((b.count * TX_BYTES_EST) / ROUND_BYTE_LIMIT * 100));
+    const count = hasReal ? b.realCount : b.count;
+    // Mark the target line (~50% of cap) on the bar so the operator sees that a
+    // healthy sustained round sits near the fee TARGET, not the cap.
+    const targetPct = hasReal && b.capBytes ? Math.round(b.targetBytes / b.capBytes * 100) : 50;
     const tr = document.createElement("tr");
     tr.innerHTML =
       `<td class="mono">#${fmtNum(b.round)}</td>` +
       `<td>${ageFromRound(b.round)}</td>` +
-      `<td>${fmtNum(b.count)}</td>` +
+      `<td>${fmtNum(count)}${hasReal ? "" : " ~"}</td>` +
       `<td class="amount">${qch(b.fees)}</td>` +
       `<td class="amount" style="color:#ff9a62">${qch(burnt)}</td>` +
       `<td class="amount" style="color:#5be3a0">${qch(reward)}</td>` +
-      `<td><span class="fill"><span class="fill-bar"><i style="width:${pct}%"></i></span><span class="fill-pct">${pct}%</span></span></td>`;
+      `<td><span class="fill" title="objetivo ~${targetPct}% del cap (fee-market); 100% = cap de 1 MB"><span class="fill-bar"><i style="width:${pct}%"></i><b style="left:${targetPct}%"></b></span><span class="fill-pct">${pct}%${hasReal ? "" : " ~"}</span></span></td>`;
     tr.style.cursor = "pointer";
     tr.addEventListener("click", () => showRound(b));
     body.appendChild(tr);

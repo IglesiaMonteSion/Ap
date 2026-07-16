@@ -498,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
             next_round,
             round_checkpoint_path,
             executed: 0,
+            round_committed: HashMap::new(),
             voted_for: HashMap::new(),
             pending_cert_requests: HashMap::new(),
             pending_batch_requests: HashMap::new(),

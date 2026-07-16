@@ -28,6 +28,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/transfers", get(list_transfers))
         .route("/transfers/:hash", get(get_transfer))
         .route("/staking_activity", get(staking_activity))
+        .route("/rounds", get(rounds))
         .route("/validators", get(validators))
         .route("/validator_registry", get(validator_registry))
         .route("/active_validators", get(active_validators))
@@ -237,6 +238,23 @@ fn default_transfers_limit() -> usize {
 async fn list_transfers(State(engine): State<Arc<Engine>>, Query(query): Query<ListTransfersQuery>) -> Json<Vec<TransferSummary>> {
     let receipts = engine.list_transfers(query.limit, query.offset).await;
     Json(receipts.iter().map(TransferSummary::from).collect())
+}
+
+/// Real committed size of the most recent rounds (newest first) - the honest
+/// "how full is each round" data, counting every committed tx (including
+/// contract calls that never appear in `/transfers`). See `Engine::RoundFill`.
+async fn rounds(State(engine): State<Arc<Engine>>, Query(query): Query<RoundsQuery>) -> Json<Vec<crate::engine::RoundFill>> {
+    Json(engine.recent_round_fill(query.limit).await)
+}
+
+#[derive(serde::Deserialize)]
+struct RoundsQuery {
+    #[serde(default = "default_rounds_limit")]
+    limit: usize,
+}
+
+fn default_rounds_limit() -> usize {
+    30
 }
 
 /// Full detail for one transfer by its transaction hash (hex) - the
