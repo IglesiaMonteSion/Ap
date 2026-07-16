@@ -647,7 +647,29 @@ impl Ledger {
     /// whole store - see the `blockchain-core-rust` skill for why that
     /// distinction is load-bearing, not just an optimization.
     pub fn apply_transaction(&mut self, tx: &Transaction, fee_collector: &Pubkey, current_round: Round) -> Result<u64, ExecError> {
-        if !tx.verify_signature() {
+        self.apply_transaction_inner(tx, fee_collector, current_round, true)
+    }
+
+    /// Same as `apply_transaction`, but ASSUMES the caller has already verified
+    /// `tx.verify_signature()` (returned `true`) - it skips only the pure,
+    /// state-independent PQC signature check, doing everything else identically.
+    /// This is the one thing about applying a transaction that can be computed
+    /// **in parallel, ahead of time**, off the sequential commit thread: signature
+    /// verification is a pure function of the transaction bytes and the embedded
+    /// key bundle, with no dependence on ledger state or on any other transaction,
+    /// so its accept/reject verdict is identical no matter when or on which thread
+    /// it runs. `qchain-node`'s commit loop verifies a whole committed batch's
+    /// signatures across a thread pool, then calls THIS for each one in order -
+    /// the application (state mutation, fee, registry gating, receipts) stays
+    /// strictly sequential and byte-for-byte deterministic. A caller that has NOT
+    /// verified the signature must use `apply_transaction` instead; feeding an
+    /// unverified transaction here would let a forged signature through.
+    pub fn apply_transaction_presigned(&mut self, tx: &Transaction, fee_collector: &Pubkey, current_round: Round) -> Result<u64, ExecError> {
+        self.apply_transaction_inner(tx, fee_collector, current_round, false)
+    }
+
+    fn apply_transaction_inner(&mut self, tx: &Transaction, fee_collector: &Pubkey, current_round: Round, verify_sig: bool) -> Result<u64, ExecError> {
+        if verify_sig && !tx.verify_signature() {
             return Err(ExecError::InvalidSignature);
         }
 
@@ -1355,6 +1377,92 @@ mod tests {
         // Both modes now capture receipts (compressed carries CompressedProofs).
         assert_eq!(compressed.transfer_receipts().len(), legacy.transfer_receipts().len(), "both modes capture the same receipts");
         assert!(!compressed.transfer_receipts().is_empty());
+    }
+
+    /// Measure-first for parallel signature verification: how big a slice of a
+    /// COMPRESSED-mode `apply_transaction` is the pure PQC signature check? If it
+    /// is a large fraction, offloading it to a thread pool (leaving only
+    /// `apply_transaction_presigned`'s work on the sequential commit thread) is
+    /// worth the change to the safety-critical commit loop; if it is marginal, it
+    /// is not (per the project's "only ship a safe optimization if it actually
+    /// helps" rule). Ignored by default; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_verify_fraction_of_compressed_apply() {
+        use std::time::Instant;
+        const PAYERS: usize = 200;
+        const PER_PAYER: u64 = 6;
+        let validator = Keypair::generate().unwrap().pubkey();
+        let payers: Vec<Keypair> = (0..PAYERS).map(|_| Keypair::generate().unwrap()).collect();
+        let recips: Vec<Pubkey> = (0..PAYERS).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+
+        // Build one shared set of signed transfers (nonce runs per payer).
+        let build_txs = || -> Vec<Transaction> {
+            let mut txs = Vec::new();
+            for (pi, p) in payers.iter().enumerate() {
+                for n in 0..PER_PAYER {
+                    let ix = Instruction {
+                        program_id: Pubkey::system_program_id(),
+                        accounts: vec![p.pubkey(), recips[pi]],
+                        data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+                    };
+                    txs.push(Transaction::new_signed(p, n, [0u8; 32], 100_000_000, vec![ix]).unwrap());
+                }
+            }
+            txs
+        };
+        let txs = build_txs();
+        let n = txs.len();
+
+        // Pure signature verification cost.
+        let t = Instant::now();
+        let mut ok = 0usize;
+        for tx in &txs {
+            if tx.verify_signature() {
+                ok += 1;
+            }
+        }
+        let t_verify = t.elapsed();
+        assert_eq!(ok, n);
+
+        let fund = |l: &mut Ledger| {
+            for p in &payers {
+                l.credit(p.pubkey(), 5_000_000_000);
+            }
+        };
+
+        // Full apply (verify inline), compressed tree.
+        let mut a = new_test_ledger_compressed();
+        fund(&mut a);
+        let t = Instant::now();
+        for tx in &txs {
+            let _ = a.apply_transaction(tx, &validator, 0);
+        }
+        let t_full = t.elapsed();
+
+        // Apply with the signature pre-verified (skipped), compressed tree.
+        let mut b = new_test_ledger_compressed();
+        fund(&mut b);
+        let t = Instant::now();
+        for tx in &txs {
+            let _ = b.apply_transaction_presigned(tx, &validator, 0);
+        }
+        let t_presigned = t.elapsed();
+
+        // Same final root (identical execution, verify skip changes nothing but timing).
+        assert_eq!(a.merkle_root(), b.merkle_root(), "presigned apply must produce the identical committed state");
+
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / n as f64;
+        let tps = |d: std::time::Duration| n as f64 / d.as_secs_f64();
+        println!("compressed apply bench over {n} real signed transfers:");
+        println!("  pure verify:        {:.1} us/tx", per(t_verify));
+        println!("  apply (verify):     {:.1} us/tx  =  {:.0} tx/s", per(t_full), tps(t_full));
+        println!("  apply (presigned):  {:.1} us/tx  =  {:.0} tx/s", per(t_presigned), tps(t_presigned));
+        println!(
+            "  verify is {:.0}% of full apply; commit-thread ceiling if verify is parallelized: {:.1}x",
+            100.0 * (t_full.as_secs_f64() - t_presigned.as_secs_f64()) / t_full.as_secs_f64(),
+            t_full.as_secs_f64() / t_presigned.as_secs_f64()
+        );
     }
 
     /// v5.1.0: a compressed-mode transfer captures a receipt carrying real

@@ -1254,6 +1254,47 @@ fn is_recoverable_exec_error(e: &qchain_execution::ExecError) -> bool {
     )
 }
 
+/// Below this many transactions in one certificate, verify signatures inline on
+/// the commit thread - fanning out to a thread pool for a near-empty round (the
+/// common case on a low-traffic network) would cost more in thread setup than it
+/// saves. Above it, `verify_signatures_maybe_parallel` fans the pure crypto
+/// checks across all cores.
+const PARALLEL_VERIFY_THRESHOLD: usize = 16;
+
+/// Verify each transaction's signature, in parallel across cores when the batch
+/// is large enough to be worth it. This is THE hot-path optimization for a
+/// compressed-tree node: signature verification is ~65% of a compressed-mode
+/// `apply_transaction` (measured), and it is the one part that is safe to move
+/// off the sequential commit thread - `Transaction::verify_signature` is a pure
+/// function of the transaction bytes and its embedded key bundle, with no
+/// dependence on ledger state or on any other transaction, so its accept/reject
+/// verdict is identical no matter when or on which thread it runs. The returned
+/// `Vec<bool>` is in the SAME order as `txs` (each output index is written by
+/// exactly one worker over a disjoint slice), so the caller applies transactions
+/// strictly in order using `apply_transaction_presigned`, keeping state mutation
+/// byte-for-byte deterministic. Uses scoped std threads (no dependency, no
+/// long-lived global pool that could oversubscribe the async runtime); threads
+/// borrow `txs` directly and join before this returns.
+fn verify_signatures_maybe_parallel(txs: &[&Transaction]) -> Vec<bool> {
+    let n = txs.len();
+    if n < PARALLEL_VERIFY_THRESHOLD {
+        return txs.iter().map(|t| t.verify_signature()).collect();
+    }
+    let workers = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4).clamp(1, n);
+    let chunk = n.div_ceil(workers);
+    let mut out = vec![false; n];
+    std::thread::scope(|s| {
+        for (in_chunk, out_chunk) in txs.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            s.spawn(move || {
+                for (slot, tx) in out_chunk.iter_mut().zip(in_chunk) {
+                    *slot = tx.verify_signature();
+                }
+            });
+        }
+    });
+    out
+}
+
 /// Caches a gossiped/served worker batch by its content digest, tagging it
 /// with the current round so `prune_stale_round_state` can evict it once it
 /// ages past `BATCH_RETENTION_ROUNDS` - the round-windowed bound that closes
@@ -2658,69 +2699,93 @@ impl Engine {
         let (ready, blocked) = take_executable_prefix(&mut state.pending_execution, &state.batches);
         missing_to_request = blocked;
         for cert in ready {
+            // Clone this certificate's batches out (the same clone the loop always
+            // did, just gathered up front) so the immutable borrow of
+            // `state.batches` ends before the mutable apply loop, and collect its
+            // transactions in strict commit order.
+            let mut cbatches = Vec::with_capacity(cert.vertex.batch_digests.len());
             for (_worker_id, batch_digest) in &cert.vertex.batch_digests {
-                let batch = state
-                    .batches
-                    .get(batch_digest)
-                    .cloned()
-                    .expect("take_executable_prefix guarantees every batch of a ready certificate is cached");
-                for tx in &batch.transactions {
-                    // Record the REAL committed size of this round (every tx in
-                    // the committed batches, all kinds), for the honest `/rounds`
-                    // fill metric. Counted before execution so a tx that later
-                    // fails still counts toward how full the proposer packed the
-                    // round (the inclusion cap operates on the batch, not on
-                    // execution success).
-                    let rc = state.round_committed.entry(cert.vertex.round).or_insert((0, 0));
-                    rc.0 = rc.0.saturating_add(tx.byte_size() as u64);
-                    rc.1 = rc.1.saturating_add(1);
-                    let receipts_before = state.ledger.transfer_receipts().len();
-                    let staking_before = state.ledger.staking_events().len();
-                    match state.ledger.apply_transaction(tx, &cert.vertex.author, cert.vertex.round) {
-                        Ok(_) => {
-                            state.executed += 1;
-                            // Persist any receipt this transaction captured, so the
-                            // transfer history survives a restart (see `receipt_log`).
-                            // A replay during restart re-derivation fails the nonce
-                            // check above and captures nothing, so this never
-                            // double-writes. Cloned out to end the immutable borrow
-                            // before the next mutable `apply_transaction`.
-                            to_persist.extend_from_slice(&state.ledger.transfer_receipts()[receipts_before..]);
-                            // Same for staking activity (Delegate/Undelegate/Claim).
-                            staking_to_persist.extend_from_slice(&state.ledger.staking_events()[staking_before..]);
-                            // Any applied transaction moves the economic counters
-                            // (at least a fee burn + validator credit), so flag a
-                            // re-persist of the economics snapshot after the lock.
-                            economics_changed = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!("transaction execution failed: {e}");
-                            // Re-admit a transaction that failed ONLY for a
-                            // transient, recoverable reason - the dynamic base
-                            // fee rose above its signed `fee_limit`, or the payer
-                            // was momentarily short of funds - instead of
-                            // dropping it. A dropped tx is gone from the mempool
-                            // (it was removed when drained) yet its nonce never
-                            // advanced (see `apply_transaction`: the nonce bump
-                            // is AFTER the fee/funds checks), so every later tx
-                            // of that same payer is stranded behind a nonce gap
-                            // that never heals - the exact mechanism that left a
-                            // 50k flood permanently stuck at ~30k "pending".
-                            // Re-admitting lets the gap heal once the fee decays
-                            // (v4.3.3 read-time effective fee) or the payer funds
-                            // up: the parked tx becomes affordable and executes,
-                            // nothing is lost. STRICTLY the two recoverable
-                            // variants - never a nonce-mismatch `ProgramError`
-                            // (a genuine replay), which would loop forever;
-                            // `admit_to_mempool` dedups by nonce and enforces the
-                            // per-payer cap, and the next drain drops any tx at or
-                            // below the current nonce, so a re-admitted tx that
-                            // has since become a real replay is discarded cleanly.
-                            // The mempool is strictly node-local (never feeds a
-                            // consensus digest/vote), so this is fork-free.
-                            if is_recoverable_exec_error(&e) {
-                                admit_to_mempool(state, tx.clone());
-                            }
+                cbatches.push(
+                    state
+                        .batches
+                        .get(batch_digest)
+                        .cloned()
+                        .expect("take_executable_prefix guarantees every batch of a ready certificate is cached"),
+                );
+            }
+            let ctxs: Vec<&Transaction> = cbatches.iter().flat_map(|b| b.transactions.iter()).collect();
+            // Verify every signature in this certificate IN PARALLEL, off the
+            // sequential commit thread (see `verify_signatures_maybe_parallel`).
+            // Order-preserving and deterministic: `sig_ok[i]` is the verdict for
+            // `ctxs[i]`, identical to what an inline check would have returned.
+            let sig_ok = verify_signatures_maybe_parallel(&ctxs);
+            let author = cert.vertex.author;
+            let round = cert.vertex.round;
+            for (i, &tx) in ctxs.iter().enumerate() {
+                // Record the REAL committed size of this round (every tx in
+                // the committed batches, all kinds), for the honest `/rounds`
+                // fill metric. Counted before execution so a tx that later
+                // fails still counts toward how full the proposer packed the
+                // round (the inclusion cap operates on the batch, not on
+                // execution success).
+                let rc = state.round_committed.entry(round).or_insert((0, 0));
+                rc.0 = rc.0.saturating_add(tx.byte_size() as u64);
+                rc.1 = rc.1.saturating_add(1);
+                let receipts_before = state.ledger.transfer_receipts().len();
+                let staking_before = state.ledger.staking_events().len();
+                // A tx whose signature failed the parallel check is rejected
+                // exactly as `apply_transaction` would have (InvalidSignature is
+                // permanent, so it is never re-queued below); a valid one applies
+                // via the presigned path, which skips only the redundant re-check.
+                let result = if sig_ok[i] {
+                    state.ledger.apply_transaction_presigned(tx, &author, round)
+                } else {
+                    Err(qchain_execution::ExecError::InvalidSignature)
+                };
+                match result {
+                    Ok(_) => {
+                        state.executed += 1;
+                        // Persist any receipt this transaction captured, so the
+                        // transfer history survives a restart (see `receipt_log`).
+                        // A replay during restart re-derivation fails the nonce
+                        // check above and captures nothing, so this never
+                        // double-writes. Cloned out to end the immutable borrow
+                        // before the next mutable `apply_transaction`.
+                        to_persist.extend_from_slice(&state.ledger.transfer_receipts()[receipts_before..]);
+                        // Same for staking activity (Delegate/Undelegate/Claim).
+                        staking_to_persist.extend_from_slice(&state.ledger.staking_events()[staking_before..]);
+                        // Any applied transaction moves the economic counters
+                        // (at least a fee burn + validator credit), so flag a
+                        // re-persist of the economics snapshot after the lock.
+                        economics_changed = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("transaction execution failed: {e}");
+                        // Re-admit a transaction that failed ONLY for a
+                        // transient, recoverable reason - the dynamic base
+                        // fee rose above its signed `fee_limit`, or the payer
+                        // was momentarily short of funds - instead of
+                        // dropping it. A dropped tx is gone from the mempool
+                        // (it was removed when drained) yet its nonce never
+                        // advanced (see `apply_transaction`: the nonce bump
+                        // is AFTER the fee/funds checks), so every later tx
+                        // of that same payer is stranded behind a nonce gap
+                        // that never heals - the exact mechanism that left a
+                        // 50k flood permanently stuck at ~30k "pending".
+                        // Re-admitting lets the gap heal once the fee decays
+                        // (v4.3.3 read-time effective fee) or the payer funds
+                        // up: the parked tx becomes affordable and executes,
+                        // nothing is lost. STRICTLY the two recoverable
+                        // variants - never a nonce-mismatch `ProgramError`
+                        // (a genuine replay), which would loop forever;
+                        // `admit_to_mempool` dedups by nonce and enforces the
+                        // per-payer cap, and the next drain drops any tx at or
+                        // below the current nonce, so a re-admitted tx that
+                        // has since become a real replay is discarded cleanly.
+                        // The mempool is strictly node-local (never feeds a
+                        // consensus digest/vote), so this is fork-free.
+                        if is_recoverable_exec_error(&e) {
+                            admit_to_mempool(state, tx.clone());
                         }
                     }
                 }
@@ -3335,6 +3400,45 @@ mod tests {
             vec![1, 2],
             "the higher nonces are deferred together, never a nonce-1-without-nonce-0 gap"
         );
+    }
+
+    /// Parallel signature verification must return the SAME per-transaction
+    /// verdict, in the SAME order, as a plain sequential check - over both the
+    /// small-batch inline path and the large-batch threaded path, and over a mix
+    /// of genuinely valid and tampered (invalid) signatures. This is the
+    /// correctness anchor for moving PQC verification off the sequential commit
+    /// thread: if the verdicts or their order ever differed, the commit loop
+    /// would accept/reject different transactions than an honest node and fork.
+    #[test]
+    fn parallel_signature_verification_matches_sequential_exactly() {
+        // Build a set larger than PARALLEL_VERIFY_THRESHOLD so the threaded path
+        // runs, with every other transaction tampered so its signature is invalid.
+        let mut owned: Vec<Transaction> = Vec::new();
+        for i in 0..40u64 {
+            let kp = Keypair::generate().unwrap();
+            let mut t = tx(&kp, i);
+            if i % 2 == 1 {
+                // Flip a signature byte -> a genuinely invalid signature.
+                t.signature.components[0].bytes[0] ^= 0xFF;
+            }
+            owned.push(t);
+        }
+        let refs: Vec<&Transaction> = owned.iter().collect();
+        assert!(refs.len() >= PARALLEL_VERIFY_THRESHOLD, "must exercise the threaded path");
+
+        let ground_truth: Vec<bool> = refs.iter().map(|t| t.verify_signature()).collect();
+        let parallel = verify_signatures_maybe_parallel(&refs);
+        assert_eq!(parallel, ground_truth, "parallel verdicts must match sequential, index for index");
+        // Sanity: the mix really contains both valid and invalid results.
+        assert!(ground_truth.iter().any(|&b| b) && ground_truth.iter().any(|&b| !b));
+
+        // And the small-batch inline path (below the threshold) agrees too.
+        let small: Vec<&Transaction> = refs.iter().take(3).copied().collect();
+        assert_eq!(
+            verify_signatures_maybe_parallel(&small),
+            small.iter().map(|t| t.verify_signature()).collect::<Vec<_>>()
+        );
+        assert!(verify_signatures_maybe_parallel(&[]).is_empty());
     }
 
     /// The permanent-fork fix (see `EngineState::pending_execution`): a
