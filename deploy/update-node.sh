@@ -116,10 +116,16 @@ for _ in $(seq 1 15); do sleep 1; if systemctl is-active --quiet "$SERVICE"; the
 
 SANO=0
 if [ "$ACTIVO" -eq 1 ]; then
-  R0=""; for _ in $(seq 1 15); do R0="$(round_rpc)"; [ -n "$R0" ] && break; sleep 1; done
+  # Esperá a que el RPC responda. Tras un test de carga pesado, el nodo
+  # recarga del disco (DAG + worker batches + recibos + comités) ANTES de
+  # bindear el RPC, y eso puede tardar bastantes segundos en una cadena con
+  # mucha historia — el RPC recién responde al terminar. Ventana generosa
+  # (90s) para no dar un FALSO 'congelamiento' en ese caso (el nodo está
+  # sano, sólo tardó en arrancar). Ver la lección documentada en CLAUDE.md.
+  R0=""; for _ in $(seq 1 90); do R0="$(round_rpc)"; [ -n "$R0" ] && break; sleep 1; done
   if [ -n "$R0" ]; then
     # esperá a ver la ronda subir (un nodo sano avanza; uno congelado no)
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 45); do
       sleep 1; R1="$(round_rpc)"
       if [ -n "$R1" ] && [ "$R1" -gt "$R0" ] 2>/dev/null; then SANO=1; break; fi
     done
@@ -145,7 +151,16 @@ fi
 
 # No quedó sano: rollback (automático con --rollback, si no, instrucción exacta)
 printf '\nADVERTENCIA: el nodo NO se ve sano tras la actualización '
-if [ "$ACTIVO" -ne 1 ]; then echo "(el servicio no quedó activo)."; else echo "(RPC no responde o la ronda no avanza — posible congelamiento)."; fi
+if [ "$ACTIVO" -ne 1 ]; then
+  echo "(el servicio no quedó activo)."
+else
+  echo "(el RPC no respondió o la ronda no avanzó dentro del tiempo de espera)."
+  echo "NOTA: tras un test de carga pesado, el nodo puede tardar más de lo esperado en"
+  echo "      recargar el estado del disco al arrancar. Puede estar SANO y sólo lento."
+  echo "      Confirmá a mano antes de hacer rollback:"
+  echo "        curl -s http://127.0.0.1:$RPC_PORT/status; echo; sleep 3; curl -s http://127.0.0.1:$RPC_PORT/status; echo"
+  echo "      Si next_round SUBE entre las dos lecturas, el nodo está sano (fue un falso positivo)."
+fi
 echo "Logs:  journalctl -u $SERVICE -e --no-pager"
 
 if docker image inspect qchain:previous >/dev/null 2>&1; then
