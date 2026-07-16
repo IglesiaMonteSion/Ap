@@ -504,6 +504,16 @@ enum Command {
         /// (the target backlog to try to build). Split across workers.
         #[arg(long, default_value_t = 8000)]
         queue_target: u64,
+        /// `fee_limit` each worker transaction is signed with. Default 10M -
+        /// a REALISTIC value (what a real wallet uses), so that under a flood a
+        /// transaction that can't yet afford the fee is PARKED by the node
+        /// (waits in the mempool) instead of executing-and-failing: with this
+        /// default NONE are lost to the fee, they just wait until the fee decays.
+        /// Raise it (e.g. 1000000000) to let the dynamic fee spike far higher for
+        /// a peak-fee measurement - at the cost of a small residual of
+        /// priced-out transactions once the fee climbs past what a worker can pay.
+        #[arg(long, default_value_t = 10_000_000)]
+        tx_fee_limit: u64,
     },
     /// Deploy a WASM contract on-chain (`SystemInstruction::DeployProgram`,
     /// see `qchain-execution::native`). Prints the fresh address the
@@ -1460,6 +1470,7 @@ fn main() -> anyhow::Result<()> {
             offer_rate,
             fire_and_forget,
             queue_target,
+            tx_fee_limit,
         } => {
             let bank = qchain_crypto::read_keypair_file(&keypair)?;
             let chain_id = fetch_chain_id(&rpc)?;
@@ -1613,7 +1624,7 @@ fn main() -> anyhow::Result<()> {
                         let recipient = workers_kp[(wi + 1) % workers].pubkey();
                         let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, gc);
                         gc += 1;
-                        pool.push(Transaction::new_signed(w, start + j as u64, chain_id, 1_000_000_000, vec![ix])?);
+                        pool.push(Transaction::new_signed(w, start + j as u64, chain_id, tx_fee_limit, vec![ix])?);
                     }
                 }
                 if capped_any {
@@ -1760,7 +1771,7 @@ fn main() -> anyhow::Result<()> {
                                     let recipient = workers_ref[(wi + 1) % workers_ref.len()].pubkey();
                                     let ix = build_stress_ix(w.pubkey(), recipient, program_ref, validator_ref, contract_pct, stake_pct, counter);
                                     counter = counter.wrapping_add(workers_ref.len() as u64);
-                                    let tx = match Transaction::new_signed(w, nonce, chain_id, 1_000_000_000, vec![ix]) {
+                                    let tx = match Transaction::new_signed(w, nonce, chain_id, tx_fee_limit, vec![ix]) {
                                         Ok(t) => t,
                                         Err(_) => continue,
                                     };
@@ -1863,7 +1874,7 @@ fn main() -> anyhow::Result<()> {
                         // Generous fee_limit: only balance/nonce should ever be
                         // the limiting factor, so a failure is a real breaking
                         // signal, never a self-imposed cap on a risen fee.
-                        txs.push(Transaction::new_signed(w, nonce, chain_id, 1_000_000_000, vec![ix]).unwrap());
+                        txs.push(Transaction::new_signed(w, nonce, chain_id, tx_fee_limit, vec![ix]).unwrap());
                     }
                     per_worker_txs_vec.push(txs);
                 }
@@ -2089,7 +2100,7 @@ fn main() -> anyhow::Result<()> {
                     accounts: vec![w.pubkey(), bank.pubkey()],
                     data: borsh::to_vec(&SystemInstruction::Transfer { amount: send })?,
                 };
-                if let Ok(tx) = Transaction::new_signed(w, acc.nonce, chain_id, 1_000_000_000, vec![ix]) {
+                if let Ok(tx) = Transaction::new_signed(w, acc.nonce, chain_id, tx_fee_limit, vec![ix]) {
                     if client.post(format!("{rpc}/tx")).json(&tx).send().map(|r| r.status().is_success()).unwrap_or(false) {
                         recovered = recovered.saturating_add(send);
                         swept += 1;
