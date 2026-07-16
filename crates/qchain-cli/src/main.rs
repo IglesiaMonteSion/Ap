@@ -1489,19 +1489,38 @@ fn main() -> anyhow::Result<()> {
                 // txs (untimed), then blast them with high concurrency without
                 // waiting per response, to build a real mempool backlog and spike
                 // the dynamic fee.
-                let per_worker = (queue_target as usize).div_ceil(workers).max(1);
-                println!("fire-and-forget: pre-signing {} varied txs ({per_worker}/worker, untimed)...", per_worker * workers);
-                let mut pool: Vec<Transaction> = Vec::with_capacity(per_worker * workers);
+                let want_per_worker = (queue_target as usize).div_ceil(workers).max(1);
+                // Affordability cap: never pre-sign more than a worker can PAY for.
+                // A worker funded with B units, at ~fee F per tx, can afford ~B/F
+                // transactions; signing more just piles txs that fail at execution
+                // with "insufficient funds" and clog the mempool (they can't drain
+                // and can't be recovered). Fund the wallet richer (a bigger genesis,
+                // see deploy/reset-testnet-genesis.sh) for a bigger honest queue.
+                // 4x margin covers the dynamic fee rising during the flood.
+                let est_fee_per_tx = base_fee.saturating_mul(6_000).max(1_000_000).saturating_mul(4);
+                let mut pool: Vec<Transaction> = Vec::new();
                 let mut gc = 0u64;
+                let mut capped_any = false;
                 for (wi, w) in workers_kp.iter().enumerate() {
-                    let start = fetch_account(&rpc, &w.pubkey())?.map(|a| a.nonce).unwrap_or(0);
-                    for j in 0..per_worker {
+                    let acc = fetch_account(&rpc, &w.pubkey())?;
+                    let start = acc.as_ref().map(|a| a.nonce).unwrap_or(0);
+                    let bal = acc.as_ref().map(|a| a.balance).unwrap_or(0);
+                    let affordable = (bal / est_fee_per_tx.max(1)) as usize;
+                    let this_worker = want_per_worker.min(affordable);
+                    if this_worker < want_per_worker {
+                        capped_any = true;
+                    }
+                    for j in 0..this_worker {
                         let recipient = workers_kp[(wi + 1) % workers].pubkey();
                         let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, gc);
                         gc += 1;
                         pool.push(Transaction::new_signed(w, start + j as u64, chain_id, 1_000_000_000, vec![ix])?);
                     }
                 }
+                if capped_any {
+                    println!("aviso: acoté el pool a lo que los workers pueden pagar ({} txs, pediste {}). Fondeá la wallet con más QCH (deploy/reset-testnet-genesis.sh) para una cola más grande.", pool.len(), want_per_worker * workers);
+                }
+                println!("fire-and-forget: pre-firmadas {} txs variadas (untimed)...", pool.len());
                 let baseline = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(0);
                 println!("blasting {} txs at high concurrency (async, no per-response wait)...", pool.len());
                 let (accepted, failed, peak_backlog, peak_fee_bf) = blast_txs_async(&rpc, pool, baseline);
