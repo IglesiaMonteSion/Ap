@@ -105,6 +105,21 @@ pub struct NodeConfig {
     /// like `validator_rotation`, it must match across all nodes.
     #[serde(default)]
     pub epoch_rounds: Option<u64>,
+    /// State-commitment tree. `false` (default, every existing network) is the
+    /// legacy 256-deep sparse Merkle tree - byte-identical to phase-1/2, zero
+    /// change. `true` selects the O(log n) path-compressed tree (measured ~34x
+    /// faster per account write / ~4x higher apply throughput). It changes the
+    /// STATE ROOT, so it is a genesis-level HARD FORK: a network choosing it
+    /// needs a fresh genesis and CANNOT be an in-place upgrade of an existing
+    /// chain. Like `validator_rotation`, every node in a network must set this
+    /// identically (it is folded into `chain_id` below, so a mismatched node
+    /// computes a different chain_id and its transactions are rejected rather
+    /// than silently forking). Compressed mode currently defers the STARK
+    /// light-client receipt capture (`/stark_proof`) - the compressed binding
+    /// exists (`qchain-stark::verify_batch_bound_to_compressed_state`) but its
+    /// node/CLI wiring is a follow-up; execution/consensus are unaffected.
+    #[serde(default)]
+    pub compressed_state_tree: bool,
 }
 
 fn default_round_interval_ms() -> u64 {
@@ -130,7 +145,16 @@ impl NodeConfig {
     /// manifest.
     pub fn chain_id(&self) -> [u8; 32] {
         use sha3::{Digest, Sha3_256};
-        let bytes = serde_json::to_vec(&(&self.validators, &self.genesis)).expect("genesis data always serializes");
+        let mut bytes = serde_json::to_vec(&(&self.validators, &self.genesis)).expect("genesis data always serializes");
+        // Fold the compressed-state-tree choice in ONLY when it is enabled, so an
+        // existing (legacy, `false`) network's chain_id is byte-identical to
+        // before this field existed - its live transactions keep verifying. A
+        // compressed network gets a distinct chain_id (it is a genuinely
+        // separate, hard-forked network, and a legacy node must not accept its
+        // transactions or vice versa).
+        if self.compressed_state_tree {
+            bytes.extend_from_slice(b"compressed-state-tree-v1");
+        }
         Sha3_256::digest(bytes).into()
     }
 
@@ -161,6 +185,7 @@ mod tests {
             state_sync_trusted_round: None,
             validator_rotation: false,
             epoch_rounds: None,
+            compressed_state_tree: false,
         }
     }
 

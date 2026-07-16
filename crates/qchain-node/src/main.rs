@@ -147,7 +147,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut ledger = Ledger::new(store)?;
+    // `compressed_state_tree` is a genesis-level, network-wide choice (folded
+    // into chain_id); default false = the legacy 256-deep tree, byte-identical
+    // to every existing network.
+    let mut ledger = Ledger::new_with_tree(store, config.compressed_state_tree)?;
+    if config.compressed_state_tree {
+        tracing::info!("state tree: COMPRESSED (O(log n)) - a hard-forked network; /stark_proof receipts deferred in this mode");
+    }
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
     ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
     ledger.register_program(GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(GovernanceProgram)));

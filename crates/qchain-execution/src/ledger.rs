@@ -14,7 +14,60 @@ use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
 use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
+use qchain_storage::compressed::IncrementalCompressedTree;
 use qchain_storage::{IncrementalStateTree, MerkleProof, StateStore};
+
+/// Which state-commitment tree this `Ledger` maintains. `Legacy` is the
+/// original 256-deep sparse Merkle tree (`IncrementalStateTree`) - the default,
+/// what every existing network runs. `Compressed` is the O(log n) path-compressed
+/// tree (`IncrementalCompressedTree`) - a genesis-level opt-in that changes the
+/// state root (a hard fork; a network choosing it needs a fresh genesis), giving
+/// a measured ~34x faster per-write / ~4x higher apply throughput. The choice is
+/// fixed at construction and folded into `chain_id`, so a validator can never
+/// silently mix the two.
+enum StateTreeImpl {
+    Legacy(IncrementalStateTree),
+    Compressed(IncrementalCompressedTree),
+}
+
+impl StateTreeImpl {
+    fn note_set(&mut self, key: &Pubkey, account: &Account) {
+        match self {
+            StateTreeImpl::Legacy(t) => t.note_set(key, account),
+            StateTreeImpl::Compressed(t) => t.note_set(key, account),
+        }
+    }
+
+    fn root(&self) -> [u8; 32] {
+        match self {
+            StateTreeImpl::Legacy(t) => t.root(),
+            StateTreeImpl::Compressed(t) => t.root(),
+        }
+    }
+
+    /// Before-state root + inclusion/exclusion proofs for a transfer's two
+    /// accounts, for STARK receipt capture. `None` in `Compressed` mode: the
+    /// compressed-tree light-client (`/stark_proof`) uses the separate
+    /// `qchain-stark::CompressedRowStateBinding` path and is wired in a
+    /// follow-up, so a compressed-mode node captures no legacy-proof receipt
+    /// (it still executes and commits identically - only the light-client
+    /// history is deferred).
+    fn capture_before(&self, from: &Pubkey, to: &Pubkey) -> Option<([u8; 32], MerkleProof, MerkleProof)> {
+        match self {
+            StateTreeImpl::Legacy(t) => Some((t.root(), t.prove(from), t.prove(to))),
+            StateTreeImpl::Compressed(_) => None,
+        }
+    }
+
+    /// After-state root + proofs given a transaction's pending working set (the
+    /// `Legacy` counterpart to `capture_before`).
+    fn capture_after(&self, from: &Pubkey, to: &Pubkey, changes: &[(Pubkey, Account)]) -> Option<([u8; 32], MerkleProof, MerkleProof)> {
+        match self {
+            StateTreeImpl::Legacy(t) => Some((t.root_with_pending(changes), t.prove_with_pending(from, changes), t.prove_with_pending(to, changes))),
+            StateTreeImpl::Compressed(_) => None,
+        }
+    }
+}
 use std::collections::HashMap;
 use wasmtime::Val;
 
@@ -90,7 +143,7 @@ pub struct Ledger {
     /// site must go through it too) - this pairing is the whole
     /// correctness invariant this type depends on: `self.tree` only ever
     /// answers correctly for keys this exact `Ledger` has itself written.
-    tree: IncrementalStateTree,
+    tree: StateTreeImpl,
     /// Real captured before/after state for every single-instruction
     /// `Transfer` this ledger has applied - see `receipt.rs` module docs
     /// for exactly what's captured, why it's scoped this narrowly, and
@@ -110,13 +163,28 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// The legacy (256-deep tree) ledger - the default every existing network
+    /// uses. Backward-compatible signature.
     pub fn new(store: Box<dyn StateStore>) -> anyhow::Result<Self> {
-        let mut tree = IncrementalStateTree::new();
+        Self::new_with_tree(store, false)
+    }
+
+    /// Construct a ledger choosing its state-commitment tree: `compressed =
+    /// false` is the legacy 256-deep tree (default, byte-identical to `new`);
+    /// `compressed = true` is the O(log n) path-compressed tree - a genesis-level
+    /// hard-fork opt-in (different state root; needs a fresh genesis). See
+    /// `StateTreeImpl`.
+    pub fn new_with_tree(store: Box<dyn StateStore>, compressed: bool) -> anyhow::Result<Self> {
         // A store opened from a prior run (`SledStore` pointed at an
         // existing `data_dir`) already holds real accounts the tree has
         // never seen - prime the cache from the store's own contents
         // once at construction so `note_set` alone is sufficient from
         // here on. A fresh/empty store makes this a no-op loop.
+        let mut tree = if compressed {
+            StateTreeImpl::Compressed(IncrementalCompressedTree::new())
+        } else {
+            StateTreeImpl::Legacy(IncrementalStateTree::new())
+        };
         for (pk, account) in store.iter() {
             tree.note_set(&pk, &account);
         }
@@ -666,12 +734,17 @@ impl Ledger {
                 let ix = &tx.message.instructions[0];
                 match (SystemInstruction::try_from_slice(&ix.data), ix.accounts.first(), ix.accounts.get(1)) {
                     (Ok(SystemInstruction::Transfer { amount }), Some(&from), Some(&to)) => {
-                        let root_before = self.tree.root();
-                        let from_proof_before = self.tree.prove(&from);
-                        let to_proof_before = self.tree.prove(&to);
-                        let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
-                        let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
-                        Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
+                        // `None` in compressed-tree mode - no legacy-proof receipt
+                        // captured (see `StateTreeImpl::capture_before`); the
+                        // transaction still executes and commits identically.
+                        match self.tree.capture_before(&from, &to) {
+                            Some((root_before, from_proof_before, to_proof_before)) => {
+                                let from_before = self.store.get(&from).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                                let to_before = self.store.get(&to).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
+                                Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before))
+                            }
+                            None => None,
+                        }
                     }
                     _ => None,
                 }
@@ -868,9 +941,12 @@ impl Ledger {
             // tree's cache instead of re-scanning every account through an
             // overlay wrapper.
             let working_changes: Vec<(Pubkey, Account)> = working.iter().map(|(k, v)| (*k, v.clone())).collect();
-            let root_after = self.tree.root_with_pending(&working_changes);
-            let from_proof_after = self.tree.prove_with_pending(&from, &working_changes);
-            let to_proof_after = self.tree.prove_with_pending(&to, &working_changes);
+            // `capture_before` returned `Some`, so we are in legacy mode and
+            // `capture_after` is likewise `Some`.
+            let (root_after, from_proof_after, to_proof_after) = self
+                .tree
+                .capture_after(&from, &to, &working_changes)
+                .expect("legacy tree: capture_after is Some whenever capture_before was");
             let from_after = working.get(&from).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             self.transfer_receipts.push(TransferReceipt {
@@ -1189,6 +1265,60 @@ mod tests {
         let mut ledger = Ledger::new(Box::new(InMemoryStore::new())).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    fn new_test_ledger_compressed() -> Ledger {
+        let mut ledger = Ledger::new_with_tree(Box::new(InMemoryStore::new()), true).unwrap();
+        ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
+        ledger
+    }
+
+    /// Phase C correctness anchor: a compressed-tree ledger and a legacy-tree
+    /// ledger EXECUTE identically (same balances/nonces - execution is
+    /// tree-agnostic); only the state ROOT differs (it's a different, hard-fork
+    /// commitment). And the compressed ledger's live root must equal an
+    /// INDEPENDENT recompute of its final store - the "no fork" guarantee: any
+    /// honest node computing the compressed root over the same accounts gets the
+    /// same value.
+    #[test]
+    fn compressed_ledger_executes_identically_and_its_root_matches_an_independent_recompute() {
+        let mut legacy = new_test_ledger();
+        let mut compressed = new_test_ledger_compressed();
+        let validator = Keypair::generate().unwrap().pubkey();
+        let payers: Vec<Keypair> = (0..8).map(|_| Keypair::generate().unwrap()).collect();
+        let recips: Vec<Pubkey> = (0..8).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+        for p in &payers {
+            legacy.credit(p.pubkey(), 50_000_000);
+            compressed.credit(p.pubkey(), 50_000_000);
+        }
+        for (i, p) in payers.iter().enumerate() {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![p.pubkey(), recips[i]],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 3_000_000 }).unwrap(),
+            };
+            let tx = Transaction::new_signed(p, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+            let rl = legacy.apply_transaction(&tx, &validator, 0);
+            let rc = compressed.apply_transaction(&tx, &validator, 0);
+            assert_eq!(rl.is_ok(), rc.is_ok(), "both trees must accept/reject the same tx");
+        }
+        // Execution is identical - balances match across both trees.
+        for p in &payers {
+            assert_eq!(legacy.get_balance(&p.pubkey()), compressed.get_balance(&p.pubkey()), "payer balance must be tree-agnostic");
+        }
+        for r in &recips {
+            assert_eq!(legacy.get_balance(r), compressed.get_balance(r), "recipient balance must be tree-agnostic");
+        }
+        // Different commitment - the two roots differ.
+        assert_ne!(legacy.merkle_root(), compressed.merkle_root(), "compressed and legacy are distinct commitments");
+        // The compressed live root == an independent recompute over the final
+        // store (determinism / no-fork).
+        let accts: Vec<(Pubkey, Account)> = compressed.store().iter().collect();
+        let recomputed = qchain_storage::compressed::CompressedStateTree::root_from_accounts(accts.iter().map(|(k, a)| (k, a)));
+        assert_eq!(compressed.merkle_root(), recomputed, "the live compressed root must match an independent recompute (deterministic, fork-free)");
+        // Compressed mode captures no legacy-proof receipts (deferred); legacy does.
+        assert!(compressed.transfer_receipts().is_empty(), "compressed mode defers receipt capture");
+        assert!(!legacy.transfer_receipts().is_empty(), "legacy mode still captures receipts");
     }
 
     #[test]

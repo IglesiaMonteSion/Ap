@@ -135,6 +135,7 @@ fn main() -> anyhow::Result<()> {
             state_sync_trusted_round: None,
             validator_rotation: false,
             epoch_rounds: None,
+            compressed_state_tree: false,
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;
