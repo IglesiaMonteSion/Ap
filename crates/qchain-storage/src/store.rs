@@ -306,6 +306,161 @@ impl StateStore for RedbStore {
     }
 }
 
+/// A redb-backed append/keyed blob log - the modern-engine replacement for the
+/// node's auxiliary `sled::Db` logs (transfer receipts, worker batches, staking
+/// events, DAG certificates, epoch committees). Same measured motivation as
+/// `RedbStore`: under a write burst sled 0.34 retains multi-GB it never reclaims
+/// (the receipt log alone measured 721MB on disk for a 6000-tx flood, driving
+/// RSS), whereas redb reclaims freed pages for reuse so the file tracks the live
+/// working set.
+///
+/// Mirrors just the slice of sled's `Db` API these logs use: `generate_id`
+/// (monotonic key, so receipt/staking iteration stays oldest-first), `insert`,
+/// `get`, `remove`, `iter`, `len`, `flush`. **Write model** (same as `RedbStore`,
+/// so per-insert `fsync` doesn't tank throughput): writes buffer in `pending` and
+/// commit in one transaction on `flush()`; `get` consults `pending` (last write
+/// wins) before redb. `iter`/`len` read committed state and are only used at boot
+/// (pending empty) and right after a `flush` (prune), never mid-round. Best-effort
+/// like the sled logs it replaces: a commit failure is logged, the entries stay
+/// pending and retry on the next flush.
+/// One buffered write: `(key, Some(value))` is an upsert, `(key, None)` a delete.
+type PendingWrite = (Vec<u8>, Option<Vec<u8>>);
+
+pub struct RedbLog {
+    db: redb::Database,
+    pending: std::sync::Mutex<Vec<PendingWrite>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+const REDB_LOG_TABLE: redb::TableDefinition<'static, &'static [u8], &'static [u8]> = redb::TableDefinition::new("log");
+
+impl RedbLog {
+    /// Opens (creating if absent) a redb log at `path`. Initializes the monotonic
+    /// id counter past the largest existing 8-byte key so `generate_id` never
+    /// collides with a reloaded entry.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let db = redb::Database::create(path).map_err(|e| anyhow::anyhow!("opening the redb log at {} failed: {e}", path.display()))?;
+        let mut max_id = 0u64;
+        let rtx = db.begin_read().map_err(|e| anyhow::anyhow!("reading the redb log at {} failed: {e}", path.display()))?;
+        if let Ok(table) = rtx.open_table(REDB_LOG_TABLE) {
+            use redb::ReadableTable;
+            let iter = table.iter().map_err(|e| anyhow::anyhow!("iterating the redb log at {} failed: {e}", path.display()))?;
+            for entry in iter {
+                let (k, _v) = entry.map_err(|e| anyhow::anyhow!("reading the redb log at {} failed: {e}", path.display()))?;
+                let kb = k.value();
+                if kb.len() == 8 {
+                    let id = u64::from_be_bytes(kb.try_into().expect("length checked to be 8"));
+                    if id >= max_id {
+                        max_id = id + 1;
+                    }
+                }
+            }
+        }
+        Ok(RedbLog {
+            db,
+            pending: std::sync::Mutex::new(Vec::new()),
+            next_id: std::sync::atomic::AtomicU64::new(max_id),
+        })
+    }
+
+    /// A fresh monotonic id (big-endian), matching sled's `generate_id` role:
+    /// used as the key for receipt/staking entries so iteration is oldest-first.
+    pub fn generate_id(&self) -> [u8; 8] {
+        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_be_bytes()
+    }
+
+    pub fn insert(&self, key: &[u8], value: Vec<u8>) {
+        self.pending.lock().expect("log pending mutex not poisoned").push((key.to_vec(), Some(value)));
+    }
+
+    pub fn remove(&self, key: &[u8]) {
+        self.pending.lock().expect("log pending mutex not poisoned").push((key.to_vec(), None));
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        // Pending writes (most recent last) shadow committed state.
+        {
+            let pending = self.pending.lock().expect("log pending mutex not poisoned");
+            for (k, v) in pending.iter().rev() {
+                if k.as_slice() == key {
+                    return v.clone();
+                }
+            }
+        }
+        let rtx = self.db.begin_read().ok()?;
+        let table = rtx.open_table(REDB_LOG_TABLE).ok()?;
+        table.get(key).ok().flatten().map(|g| g.value().to_vec())
+    }
+
+    /// Number of committed entries. Assumes `pending` was flushed (callers -
+    /// prune - flush first); used only for prune sizing, never a hot path.
+    pub fn len(&self) -> usize {
+        let Ok(rtx) = self.db.begin_read() else { return 0 };
+        let Ok(table) = rtx.open_table(REDB_LOG_TABLE) else { return 0 };
+        use redb::ReadableTableMetadata;
+        table.len().unwrap_or(0) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every committed (key, value), in key order (oldest-first for the u64-keyed
+    /// receipt/staking logs). Used at boot reload and, after a `flush`, by prune.
+    pub fn iter(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Ok(rtx) = self.db.begin_read() else { return out };
+        let Ok(table) = rtx.open_table(REDB_LOG_TABLE) else { return out };
+        use redb::ReadableTable;
+        if let Ok(iter) = table.iter() {
+            for entry in iter.flatten() {
+                out.push((entry.0.value().to_vec(), entry.1.value().to_vec()));
+            }
+        }
+        out
+    }
+
+    /// Reclaim freed pages by rewriting the file to its live working-set size -
+    /// the thing sled 0.34 never does (it retains a burst's pages forever). redb
+    /// grows under a write burst too, but `compact` returns the file to ~the live
+    /// size afterward. Needs exclusive access (no open transactions), so the node
+    /// calls it at boot (before serving) - transient flood growth is reclaimed on
+    /// the next restart, and steady-state stays bounded. Returns whether it ran.
+    pub fn compact(&mut self) -> bool {
+        self.db.compact().unwrap_or(false)
+    }
+
+    /// Commit all buffered writes in one transaction, then clear the buffer.
+    pub fn flush(&self) {
+        let mut pending = self.pending.lock().expect("log pending mutex not poisoned");
+        if pending.is_empty() {
+            return;
+        }
+        let commit = || -> anyhow::Result<()> {
+            let wtx = self.db.begin_write()?;
+            {
+                let mut table = wtx.open_table(REDB_LOG_TABLE)?;
+                for (k, v) in pending.iter() {
+                    match v {
+                        Some(val) => {
+                            table.insert(k.as_slice(), val.as_slice())?;
+                        }
+                        None => {
+                            table.remove(k.as_slice())?;
+                        }
+                    }
+                }
+            }
+            wtx.commit()?;
+            Ok(())
+        };
+        match commit() {
+            Ok(()) => pending.clear(),
+            Err(e) => eprintln!("warning: failed to flush a redb log: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +659,85 @@ mod tests {
     /// live sled state into redb preserves every balance (and therefore the exact
     /// Merkle root the network agrees on). This is the correctness anchor for the
     /// sled->redb migration path.
+    #[test]
+    fn redb_log_generate_id_insert_get_iter_remove_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RedbLog::open(&dir.path().join("l.redb")).unwrap();
+        // Monotonic ids, oldest-first iteration.
+        let mut keys = Vec::new();
+        for i in 0..10u64 {
+            let id = log.generate_id();
+            log.insert(&id, vec![i as u8; 4]);
+            keys.push(id);
+        }
+        // get() sees a pending (unflushed) write.
+        assert_eq!(log.get(&keys[3]), Some(vec![3u8; 4]));
+        log.flush();
+        // Survives flush + reopen, oldest-first.
+        drop(log);
+        let log = RedbLog::open(&dir.path().join("l.redb")).unwrap();
+        let all = log.iter();
+        assert_eq!(all.len(), 10);
+        assert_eq!(all[0].0, keys[0], "iteration is oldest-first (monotonic key order)");
+        assert_eq!(all[9].0, keys[9]);
+        // generate_id continues past the reloaded max (no collision).
+        let next = log.generate_id();
+        assert_eq!(u64::from_be_bytes(next), 10);
+        // remove + flush drops it.
+        log.remove(&keys[0]);
+        log.flush();
+        assert!(log.get(&keys[0]).is_none());
+        assert_eq!(log.len(), 9);
+    }
+
+    /// THE decisive measure-first check for migrating the node's aux logs: does
+    /// redb stay near the live working-set size under the receipt log's real
+    /// access pattern (append many 32KB entries, flush per "round", prune the
+    /// oldest to a cap), or does it bloat like sled (which retained 721MB on disk
+    /// for this exact workload)? Reports the on-disk file size; ignored by default.
+    #[test]
+    #[ignore]
+    fn bench_redb_log_size_under_receipt_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.redb");
+        let log = RedbLog::open(&path).unwrap();
+        const TOTAL: usize = 6000;
+        const CAP: usize = 5000;
+        const PER_ROUND: usize = 180;
+        let blob = vec![7u8; 32 * 1024]; // ~32KB, like a real receipt (4 Merkle proofs)
+        let mut count = 0usize;
+        for i in 0..TOTAL {
+            let id = log.generate_id();
+            log.insert(&id, blob.clone());
+            count += 1;
+            if (i + 1) % PER_ROUND == 0 {
+                log.flush(); // per-round durability
+                // prune oldest beyond CAP (mirrors prune_log_to_last, post-flush)
+                if count > CAP {
+                    let excess = count - CAP;
+                    let old: Vec<Vec<u8>> = log.iter().into_iter().take(excess).map(|(k, _)| k).collect();
+                    for k in &old {
+                        log.remove(k);
+                    }
+                    log.flush();
+                    count -= excess;
+                }
+            }
+        }
+        log.flush();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut log = log;
+        let ran = log.compact();
+        let size_after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let logical = CAP * 32 * 1024;
+        println!(
+            "redb receipt-log after {TOTAL} inserts (32KB each), pruned to {CAP}: file {:.1} MB; after compact() ({ran}): {:.1} MB (logical working set {:.1} MB); sled retained 721 MB and never shrinks",
+            size as f64 / 1e6,
+            size_after as f64 / 1e6,
+            logical as f64 / 1e6
+        );
+    }
+
     #[test]
     fn redb_and_sled_hold_identical_state_for_the_same_writes() {
         let sdir = tempfile::tempdir().unwrap();
