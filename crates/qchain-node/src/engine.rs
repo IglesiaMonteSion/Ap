@@ -254,6 +254,18 @@ const MAX_STARK_PROOF_RECEIPTS: usize = 500;
 /// stress runs. See `Ledger::cap_receipt_log`.
 pub const MAX_INMEM_RECEIPTS: usize = 5_000;
 
+/// How many recent receipts keep their heavy Merkle proofs (~32 KB each). Only
+/// these can back a `/stark_proof` (the endpoint serves the last `<= 500`), so
+/// a modest margin over `MAX_STARK_PROOF_RECEIPTS` suffices. All older receipts
+/// in the `MAX_INMEM_RECEIPTS` window are kept in their ~0.6 KB "light" form
+/// (addresses/amounts/fee/roots/account snapshots) for `/transfers`. This is the
+/// two-tier split that cuts the receipt log's RAM/disk from ~33 KB/receipt to
+/// ~0.6 KB for the vast majority: the in-memory log drops from ~160 MB to
+/// ~20 MB, and the on-disk `receipts` log (which now stores light receipts)
+/// stops bloating at 32 KB/receipt under a flood - full proofs live only in the
+/// small, separately-bounded `receipts_full` log. See `Ledger::strip_old_receipt_proofs`.
+pub const N_FULL_PROOF_RECEIPTS: usize = 600;
+
 /// Same bound for the staking-activity log (far smaller per entry - no Merkle
 /// proofs - but kept bounded for the same predictable-reload reason).
 pub const MAX_INMEM_STAKING_EVENTS: usize = 5_000;
@@ -729,8 +741,16 @@ pub struct Engine {
     /// makes the transaction *history* (not just balances) survive a restart:
     /// without it, the in-memory receipt `Vec` is empty on every boot and the
     /// dashboard shows no past activity even though the ledger state is intact.
-    /// Best-effort persist, same contract as `cert_log`.
+    /// Best-effort persist, same contract as `cert_log`. Stores the **light**
+    /// (proof-stripped, ~0.6 KB) form of each receipt - enough for `/transfers`
+    /// history - so it stops bloating at 32 KB/receipt under a flood.
     pub receipt_log: Option<sled::Db>,
+    /// On-disk log of the **full** (with-proofs) form of only the most recent
+    /// `N_FULL_PROOF_RECEIPTS` receipts (a `sled` tree at `data_dir/receipts_full`),
+    /// so `/stark_proof` keeps working across a restart. Bounded and small
+    /// (~600 × 32 KB ≈ 20 MB). On boot its proofs are overlaid back onto the
+    /// matching recent light receipts. `None` for an in-memory node.
+    pub receipt_full_log: Option<sled::Db>,
     /// On-disk log of captured `StakingEvent`s (a `sled` tree at
     /// `data_dir/staking`), so staking activity (Delegate/Undelegate/Claim)
     /// survives a restart just like the transfer history. Same best-effort
@@ -779,13 +799,26 @@ impl Engine {
                     return;
                 }
             };
-            match serde_json::to_vec(receipt) {
+            // The main log stores the LIGHT receipt (no ~32 KB proofs) - enough
+            // for `/transfers` and what stops it bloating under a flood.
+            match serde_json::to_vec(&receipt.without_proofs()) {
                 Ok(bytes) => {
                     if let Err(e) = db.insert(key, bytes) {
                         tracing::warn!("failed to persist a transfer receipt: {e}");
                     }
                 }
                 Err(e) => tracing::warn!("failed to encode a transfer receipt for the log: {e}"),
+            }
+        }
+        // The full (with-proofs) receipt goes to the separate, small, bounded
+        // `receipts_full` log so `/stark_proof` survives a restart. Only keyed if
+        // it actually carries proofs (a dust-swept or multi-instruction tx has no
+        // receipt at all, so this is always a real proof-bearing receipt here).
+        if let (Some(full_db), true) = (&self.receipt_full_log, receipt.has_proofs()) {
+            if let Ok(id) = full_db.generate_id() {
+                if let Ok(bytes) = serde_json::to_vec(receipt) {
+                    let _ = full_db.insert(id.to_be_bytes(), bytes);
+                }
             }
         }
     }
@@ -872,6 +905,7 @@ impl Engine {
             ("batches", &self.batch_log),
             ("committees", &self.committee_log),
             ("receipts", &self.receipt_log),
+            ("receipts_full", &self.receipt_full_log),
             ("staking", &self.staking_log),
         ] {
             if let Some(db) = db {
@@ -1705,7 +1739,13 @@ impl Engine {
     pub async fn stark_proof(&self, limit: Option<usize>) -> Result<StarkProofResponse, StarkProofError> {
         let (receipts, compressed): (Vec<qchain_execution::TransferReceipt>, bool) = {
             let state = self.state.lock().await;
-            let all = state.ledger.transfer_receipts();
+            // Only receipts that still carry their Merkle proofs can back a STARK
+            // proof - old receipts have had their proofs stripped to bound RAM
+            // (see `Ledger::strip_old_receipt_proofs`). The full ones are a
+            // contiguous recent suffix (stripping is front-first), so filtering
+            // preserves the root-chain contiguity `verify_batch_bound_to_state`
+            // needs.
+            let all: Vec<&qchain_execution::TransferReceipt> = state.ledger.transfer_receipts().iter().filter(|r| r.has_proofs()).collect();
             // A real, live-measured DoS this closes: `qchain_stark::prove_batch`
             // scales far worse than linearly with receipt count (measured on
             // this same machine: n=100 -> 16.5ms, n=1,000 -> 948ms, n=5,000 ->
@@ -1722,7 +1762,7 @@ impl Engine {
             // principle already used for message size limits and bytecode
             // size caps elsewhere in this codebase.
             let effective_limit = effective_stark_proof_limit(limit, all.len());
-            (all[all.len() - effective_limit..].to_vec(), state.ledger.is_compressed())
+            (all[all.len() - effective_limit..].iter().map(|r| (*r).clone()).collect(), state.ledger.is_compressed())
         };
         if receipts.is_empty() {
             return Err(StarkProofError::NoReceipts);
@@ -1789,10 +1829,12 @@ impl Engine {
                 from_after: r.from_after.clone(),
                 to_before: r.to_before.clone(),
                 to_after: r.to_after.clone(),
-                from_proof_before: r.from_proof_before.clone(),
-                from_proof_after: r.from_proof_after.clone(),
-                to_proof_before: r.to_proof_before.clone(),
-                to_proof_after: r.to_proof_after.clone(),
+                // `has_proofs()` filtered these, so a legacy full receipt's
+                // 256-deep proofs are present.
+                from_proof_before: r.from_proof_before.clone().expect("filtered to receipts with proofs"),
+                from_proof_after: r.from_proof_after.clone().expect("filtered to receipts with proofs"),
+                to_proof_before: r.to_proof_before.clone().expect("filtered to receipts with proofs"),
+                to_proof_after: r.to_proof_after.clone().expect("filtered to receipts with proofs"),
             })
             .collect();
         qchain_stark::verify_batch_bound_to_state(proof.clone(), pub_inputs.clone(), &bindings)
@@ -2797,6 +2839,11 @@ impl Engine {
         // (the next commit re-reads the length fresh). Keeps RAM and boot
         // reload time bounded regardless of chain age (see `MAX_INMEM_RECEIPTS`).
         state.ledger.cap_receipt_log(MAX_INMEM_RECEIPTS);
+        // Drop the heavy Merkle proofs from all but the most recent
+        // `N_FULL_PROOF_RECEIPTS` in-memory receipts - the two-tier split that
+        // keeps the receipt log's RAM at ~20 MB instead of ~160 MB (full proofs
+        // for /stark_proof only for the recent few hundred, light for the rest).
+        state.ledger.strip_old_receipt_proofs(N_FULL_PROOF_RECEIPTS);
         state.ledger.cap_staking_events(MAX_INMEM_STAKING_EVENTS);
 
         // ---- Phase-3.3 rotation ratchet ----
@@ -2967,6 +3014,9 @@ impl Engine {
         // so smallest = oldest). Best-effort, mirroring `persist_receipt`.
         if !to_persist.is_empty() {
             prune_log_to_last(self.receipt_log.as_ref(), MAX_INMEM_RECEIPTS);
+            // The full-proof log is bounded much tighter (only what /stark_proof
+            // needs), so it never grows past ~20 MB.
+            prune_log_to_last(self.receipt_full_log.as_ref(), N_FULL_PROOF_RECEIPTS);
         }
         if !staking_to_persist.is_empty() {
             prune_log_to_last(self.staking_log.as_ref(), MAX_INMEM_STAKING_EVENTS);

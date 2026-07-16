@@ -285,6 +285,25 @@ impl Ledger {
         self.transfer_receipts = receipts;
     }
 
+    /// On restart, replace the light (proof-stripped) reloaded receipts with
+    /// their full (with-proofs) versions where available, so `/stark_proof` works
+    /// on pre-restart transfers again. `full` maps `tx_hash -> full receipt` (the
+    /// recent few hundred kept in the separate `receipts_full` log). Returns how
+    /// many in-memory receipts were upgraded. Order is preserved (only the
+    /// matching entries are swapped in place).
+    pub fn overlay_receipt_proofs(&mut self, full: &std::collections::HashMap<[u8; 32], TransferReceipt>) -> usize {
+        let mut n = 0;
+        for r in &mut self.transfer_receipts {
+            if !r.has_proofs() {
+                if let Some(f) = full.get(&r.tx_hash) {
+                    *r = f.clone();
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Captured staking activity (Delegate/Undelegate/ClaimReward), oldest
     /// first - what the dashboard and the wallet's activity view render so
     /// staking shows up alongside plain transfers.
@@ -318,6 +337,24 @@ impl Ledger {
         let len = self.transfer_receipts.len();
         if len > max {
             self.transfer_receipts.drain(0..len - max);
+        }
+    }
+
+    /// Drops the heavy Merkle proofs from all but the most recent `keep_full`
+    /// in-memory receipts (see `TransferReceipt::strip_proofs`). `/stark_proof`
+    /// only ever needs the last `<= 500`, so keeping full proofs for the last
+    /// few hundred and light copies for the rest cuts the in-memory receipt log
+    /// from ~33KB/receipt to ~0.6KB/receipt for the stripped ones - the dominant
+    /// receipt-RAM term. Called by the node's commit loop after `cap_receipt_log`.
+    pub fn strip_old_receipt_proofs(&mut self, keep_full: usize) {
+        let len = self.transfer_receipts.len();
+        if len <= keep_full {
+            return;
+        }
+        for r in &mut self.transfer_receipts[..len - keep_full] {
+            if r.has_proofs() {
+                r.strip_proofs();
+            }
         }
     }
 
@@ -995,22 +1032,20 @@ impl Ledger {
             let from_after = working.get(&from).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             let to_after = working.get(&to).cloned().unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
             // Route the four captured proofs into either the legacy `MerkleProof`
-            // receipt fields or the compressed `CompressedProofSet` - a receipt
-            // carries exactly one, per the ledger's fixed tree kind. In compressed
-            // mode the four `MerkleProof` fields are unused address-only
-            // placeholders (there is no 256-deep proof to give); the node's
-            // `/stark_proof` builder reads `compressed_proofs` instead.
-            let dummy_merkle = |key: &Pubkey| MerkleProof { key: key.to_bytes(), leaf_value_hash: None, siblings: vec![] };
+            // receipt fields (as `Some`) or the compressed `CompressedProofSet` - a
+            // receipt carries exactly one, per the ledger's fixed tree kind. The
+            // other is `None` (compressed mode has no 256-deep proof; the node's
+            // `/stark_proof` builder reads `compressed_proofs` there).
             let (from_proof_before, from_proof_after, to_proof_before, to_proof_after, compressed_proofs) =
                 match (from_proof_before, from_proof_after, to_proof_before, to_proof_after) {
                     (CapturedProof::Legacy(fb), CapturedProof::Legacy(fa), CapturedProof::Legacy(tb), CapturedProof::Legacy(ta)) => {
-                        (fb, fa, tb, ta, None)
+                        (Some(fb), Some(fa), Some(tb), Some(ta), None)
                     }
                     (CapturedProof::Compressed(fb), CapturedProof::Compressed(fa), CapturedProof::Compressed(tb), CapturedProof::Compressed(ta)) => (
-                        dummy_merkle(&from),
-                        dummy_merkle(&from),
-                        dummy_merkle(&to),
-                        dummy_merkle(&to),
+                        None,
+                        None,
+                        None,
+                        None,
                         Some(CompressedProofSet { from_proof_before: fb, from_proof_after: fa, to_proof_before: tb, to_proof_after: ta }),
                     ),
                     _ => unreachable!("a ledger's tree kind is fixed; all four captured proofs share one variant"),
@@ -1737,10 +1772,10 @@ mod tests {
             from_after: Account::new_wallet(Pubkey::new([1u8; 32])),
             to_before: Account::new_wallet(Pubkey::new([2u8; 32])),
             to_after: Account::new_wallet(Pubkey::new([2u8; 32])),
-            from_proof_before: dummy_proof(),
-            from_proof_after: dummy_proof(),
-            to_proof_before: dummy_proof(),
-            to_proof_after: dummy_proof(),
+            from_proof_before: Some(dummy_proof()),
+            from_proof_after: Some(dummy_proof()),
+            to_proof_before: Some(dummy_proof()),
+            to_proof_after: Some(dummy_proof()),
             compressed_proofs: None,
         };
         let mut ledger = new_test_ledger();
@@ -1752,6 +1787,61 @@ mod tests {
         // Under the cap it's a no-op.
         ledger.cap_receipt_log(10_000);
         assert_eq!(ledger.transfer_receipts().len(), 5_000, "no-op when already within bound");
+    }
+
+    /// Two-tier receipts: stripping keeps proofs only for the most recent
+    /// `keep_full`, and an overlay restores them (the restart path). This is what
+    /// makes the receipt log's RAM/disk ~0.6KB/receipt for the vast majority
+    /// instead of ~33KB, while `/stark_proof` (which needs the recent few
+    /// hundred) still works.
+    #[test]
+    fn strip_and_overlay_receipt_proofs_two_tier() {
+        use crate::receipt::TransferReceipt;
+        use qchain_storage::MerkleProof;
+        let proof = || MerkleProof { key: [0u8; 32], leaf_value_hash: None, siblings: vec![[0u8; 32]; 256] };
+        let mk = |round: u64| TransferReceipt {
+            tx_hash: {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&round.to_be_bytes());
+                h
+            },
+            round,
+            from: Pubkey::new([1u8; 32]),
+            to: Pubkey::new([2u8; 32]),
+            amount: 1,
+            fee: 1,
+            root_before: [0u8; 32],
+            root_after: [0u8; 32],
+            from_before: Account::new_wallet(Pubkey::new([1u8; 32])),
+            from_after: Account::new_wallet(Pubkey::new([1u8; 32])),
+            to_before: Account::new_wallet(Pubkey::new([2u8; 32])),
+            to_after: Account::new_wallet(Pubkey::new([2u8; 32])),
+            from_proof_before: Some(proof()),
+            from_proof_after: Some(proof()),
+            to_proof_before: Some(proof()),
+            to_proof_after: Some(proof()),
+            compressed_proofs: None,
+        };
+        let mut ledger = new_test_ledger();
+        ledger.restore_receipts((0..1000u64).map(mk).collect());
+        // Keep proofs only for the last 100.
+        ledger.strip_old_receipt_proofs(100);
+        let r = ledger.transfer_receipts();
+        assert!(!r[0].has_proofs() && !r[899].has_proofs(), "old receipts are stripped");
+        assert!(r[900].has_proofs() && r[999].has_proofs(), "the last 100 keep their proofs");
+        // Overlay restores proofs for the ones we have full copies of (say the
+        // last 50) - the restart path.
+        let full: std::collections::HashMap<[u8; 32], TransferReceipt> =
+            (950..1000u64).map(|round| (mk(round).tx_hash, mk(round))).collect();
+        let overlaid = ledger.overlay_receipt_proofs(&full);
+        assert_eq!(overlaid, 0, "the last 50 already had proofs (in the kept-100 window), nothing to upgrade");
+        // Strip harder so the overlay has something to restore.
+        ledger.strip_old_receipt_proofs(0);
+        assert!(ledger.transfer_receipts().iter().all(|r| !r.has_proofs()), "all stripped");
+        let overlaid = ledger.overlay_receipt_proofs(&full);
+        assert_eq!(overlaid, 50, "the 50 full copies restore their proofs");
+        let r = ledger.transfer_receipts();
+        assert!(r[950].has_proofs() && r[999].has_proofs() && !r[949].has_proofs());
     }
 
     #[test]
@@ -2297,15 +2387,19 @@ mod tests {
         // claimed roots and hash exactly the claimed Account snapshots -
         // not just plausible-looking placeholders.
         let empty_leaf_hash = qchain_storage::StateTree::new().empty_leaf_hash();
-        assert_eq!(r.from_proof_before.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_before)));
-        assert!(qchain_storage::verify_proof(r.root_before, &r.from_proof_before, empty_leaf_hash));
-        assert_eq!(r.from_proof_after.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_after)));
-        assert!(qchain_storage::verify_proof(r.root_after, &r.from_proof_after, empty_leaf_hash));
+        let fpb = r.from_proof_before.as_ref().expect("a fresh receipt keeps its proofs");
+        let fpa = r.from_proof_after.as_ref().unwrap();
+        let tpb = r.to_proof_before.as_ref().unwrap();
+        let tpa = r.to_proof_after.as_ref().unwrap();
+        assert_eq!(fpb.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_before)));
+        assert!(qchain_storage::verify_proof(r.root_before, fpb, empty_leaf_hash));
+        assert_eq!(fpa.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.from_after)));
+        assert!(qchain_storage::verify_proof(r.root_after, fpa, empty_leaf_hash));
         // Bob didn't exist before this transfer - a real exclusion proof.
-        assert_eq!(r.to_proof_before.leaf_value_hash, None);
-        assert!(qchain_storage::verify_proof(r.root_before, &r.to_proof_before, empty_leaf_hash));
-        assert_eq!(r.to_proof_after.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.to_after)));
-        assert!(qchain_storage::verify_proof(r.root_after, &r.to_proof_after, empty_leaf_hash));
+        assert_eq!(tpb.leaf_value_hash, None);
+        assert!(qchain_storage::verify_proof(r.root_before, tpb, empty_leaf_hash));
+        assert_eq!(tpa.leaf_value_hash, Some(qchain_storage::hash_leaf(&r.to_after)));
+        assert!(qchain_storage::verify_proof(r.root_after, tpa, empty_leaf_hash));
 
         // And the roots themselves must be the real, independently
         // computable roots before/after this exact transaction.
@@ -2379,10 +2473,10 @@ mod tests {
             from_after: r.from_after.clone(),
             to_before: r.to_before.clone(),
             to_after: r.to_after.clone(),
-            from_proof_before: r.from_proof_before.clone(),
-            from_proof_after: r.from_proof_after.clone(),
-            to_proof_before: r.to_proof_before.clone(),
-            to_proof_after: r.to_proof_after.clone(),
+            from_proof_before: r.from_proof_before.clone().unwrap(),
+            from_proof_after: r.from_proof_after.clone().unwrap(),
+            to_proof_before: r.to_proof_before.clone().unwrap(),
+            to_proof_after: r.to_proof_after.clone().unwrap(),
         }];
         let (proof, pub_inputs) = qchain_stark::prove_batch(&steps).unwrap();
         qchain_stark::verify_batch_bound_to_state(proof, pub_inputs, &bindings).expect("the one real captured receipt must still genuinely self-verify");

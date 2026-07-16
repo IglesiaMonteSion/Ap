@@ -119,10 +119,23 @@ pub struct TransferReceipt {
     pub from_after: Account,
     pub to_before: Account,
     pub to_after: Account,
-    pub from_proof_before: MerkleProof,
-    pub from_proof_after: MerkleProof,
-    pub to_proof_before: MerkleProof,
-    pub to_proof_after: MerkleProof,
+    /// The four legacy 256-deep Merkle proofs (each ~8KB = 256 siblings) - the
+    /// heavy part of a receipt (~32KB of the ~33KB total). `Option` so they can
+    /// be STRIPPED for old receipts: `/stark_proof` only ever needs the most
+    /// recent `<= 500`, so the node keeps full proofs for the last few hundred
+    /// and drops them (`None`) for older receipts, which are still fully useful
+    /// for `/transfers` (from/to/amount/fee + before/after account snapshots).
+    /// This is what keeps the receipt log's RAM/disk from tracking chain age at
+    /// 32KB/receipt. `#[serde(default)]` so a receipt persisted with full proofs
+    /// (or none) still deserializes.
+    #[serde(default)]
+    pub from_proof_before: Option<MerkleProof>,
+    #[serde(default)]
+    pub from_proof_after: Option<MerkleProof>,
+    #[serde(default)]
+    pub to_proof_before: Option<MerkleProof>,
+    #[serde(default)]
+    pub to_proof_after: Option<MerkleProof>,
     /// In compressed-state-tree mode, the O(log n) proofs for this transfer
     /// (see `CompressedProofSet`). `None` in legacy mode. `#[serde(default)]` so
     /// receipts persisted before this field existed still deserialize as `None`
@@ -131,4 +144,38 @@ pub struct TransferReceipt {
     /// this instead.
     #[serde(default)]
     pub compressed_proofs: Option<CompressedProofSet>,
+}
+
+impl TransferReceipt {
+    /// Whether this receipt still carries its Merkle proofs (legacy or
+    /// compressed) - i.e. it can back a `/stark_proof`. `false` for an old
+    /// receipt whose proofs were stripped to save RAM/disk (still valid for
+    /// `/transfers`).
+    pub fn has_proofs(&self) -> bool {
+        self.from_proof_before.is_some() || self.compressed_proofs.is_some()
+    }
+
+    /// A copy with the heavy Merkle proofs dropped - the ~600-byte "light" form
+    /// kept for older receipts and persisted for `/transfers` history. Keeps
+    /// everything the explorer needs (addresses, amounts, fee, round, roots,
+    /// before/after account snapshots); drops only the ~32KB of proofs.
+    pub fn without_proofs(&self) -> TransferReceipt {
+        TransferReceipt {
+            from_proof_before: None,
+            from_proof_after: None,
+            to_proof_before: None,
+            to_proof_after: None,
+            compressed_proofs: None,
+            ..self.clone()
+        }
+    }
+
+    /// Drops this receipt's proofs in place (see `without_proofs`).
+    pub fn strip_proofs(&mut self) {
+        self.from_proof_before = None;
+        self.from_proof_after = None;
+        self.to_proof_before = None;
+        self.to_proof_after = None;
+        self.compressed_proofs = None;
+    }
 }

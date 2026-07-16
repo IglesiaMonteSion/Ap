@@ -492,6 +492,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The full-proof log (`data_dir/receipts_full`) holds the most recent
+    // receipts WITH their Merkle proofs, so `/stark_proof` survives a restart.
+    // Overlay each full receipt's proofs onto the matching (by tx_hash) light
+    // receipt just reloaded above - restoring the two-tier state (recent = full,
+    // older = light) exactly as it was before the restart.
+    let receipt_full_log: Option<sled::Db> = match &config.data_dir {
+        Some(dir) => Some(sled::open(dir.join("receipts_full"))?),
+        None => None,
+    };
+    if let Some(db) = &receipt_full_log {
+        let mut full: std::collections::HashMap<[u8; 32], qchain_execution::TransferReceipt> = std::collections::HashMap::new();
+        for entry in db.iter().rev().take(qchain_node::engine::N_FULL_PROOF_RECEIPTS) {
+            let (_seq, bytes) = entry?;
+            if let Ok(r) = serde_json::from_slice::<qchain_execution::TransferReceipt>(&bytes) {
+                full.insert(r.tx_hash, r);
+            }
+        }
+        if !full.is_empty() {
+            let overlaid = ledger.overlay_receipt_proofs(&full);
+            tracing::info!("reloaded {} full-proof receipts (overlaid onto {overlaid} history entries)", full.len());
+        }
+    }
+
     // Same for staking activity (a `sled` tree at `data_dir/staking`) so the
     // dashboard's and wallet's staking history survives a restart.
     let staking_log: Option<sled::Db> = match &config.data_dir {
@@ -548,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         committee_log,
         config_peers,
         receipt_log,
+        receipt_full_log,
         staking_log,
         economics_path,
         round_interval_ms: config.round_interval_ms,
