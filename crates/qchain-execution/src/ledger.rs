@@ -5,7 +5,7 @@
 
 use crate::error::ExecError;
 use crate::ids::{FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
-use crate::params::{next_base_fee, FeeState, FEE_MIN_BASE_FEE_PER_BYTE, FEE_TARGET_BYTES_PER_ROUND};
+use crate::params::{FeeState, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
 use crate::receipt::{StakingEvent, StakingEventKind, TransferReceipt};
@@ -353,6 +353,28 @@ impl Ledger {
             .unwrap_or_default()
     }
 
+    /// The base fee a transaction committed at `current_round` should actually
+    /// pay: the stored `base_fee_per_byte` rolled forward through every elapsed
+    /// (mostly empty) round since the fee epoch last closed - see
+    /// `params::rolled_base_fee`. This is the value used for CHARGING (in
+    /// `apply_transaction`), for ADMISSION (`payer_can_afford_admission`), and
+    /// for DISPLAY (`/status`, `/economics`), so an idle chain's fee visibly
+    /// decays and low-balance wallets are unlocked WITHOUT any state write - the
+    /// stored value only catches up when a transaction commits (STARK-safe, see
+    /// `rolled_base_fee`'s doc). Deterministic: a pure function of `current_round`
+    /// plus the committed `FeeState`/params, so every validator charges the
+    /// identical fee (no fork). If `FEE_STATE_ACCOUNT_ID` doesn't exist yet (no
+    /// transaction since genesis / the dynamic-fee upgrade), there's no epoch to
+    /// roll - return the stored base unchanged, matching `advance_dynamic_fee`'s
+    /// `existing.is_none()` branch.
+    pub fn effective_base_fee_at(&self, current_round: Round) -> u64 {
+        let base = self.current_params().base_fee_per_byte;
+        match self.store.get(&FEE_STATE_ACCOUNT_ID).and_then(|a| FeeState::read_or_legacy(&a.data)) {
+            Some(fs) => crate::params::rolled_base_fee(base, fs.epoch_round, fs.epoch_bytes, current_round, FEE_TARGET_BYTES_PER_ROUND),
+            None => base,
+        }
+    }
+
     /// Advances the EIP-1559-style dynamic base fee. Called once per applied
     /// transaction, INSIDE `apply_transaction` (so every write here lands in the
     /// same committed state transition and the same Merkle root - keeping both
@@ -394,19 +416,18 @@ impl Ledger {
             // a pure function of the committed round span + committed bytes, so
             // every validator computes the identical base fee (no fork).
             let mut params = self.current_params();
-            let mut new_base = next_base_fee(params.base_fee_per_byte, fs.epoch_bytes, FEE_TARGET_BYTES_PER_ROUND);
-            // Rounds `epoch_round+1 ..= current_round-1` were empty. Roll a
-            // zero-byte decay step for each, stopping at the floor:
-            // `next_base_fee(floor, 0, target) == floor`, so further empty
-            // rounds are no-ops. This bounds the loop to O(log(ceiling/floor))
-            // (~116 steps from the hard ceiling) no matter how many rounds
-            // elapsed - a genuinely idle chain of thousands of rounds still
-            // heals in one committed tx without an unbounded loop.
-            let mut empty_rounds = (current_round - fs.epoch_round).saturating_sub(1);
-            while empty_rounds > 0 && new_base > FEE_MIN_BASE_FEE_PER_BYTE {
-                new_base = next_base_fee(new_base, 0, FEE_TARGET_BYTES_PER_ROUND);
-                empty_rounds -= 1;
-            }
+            // The rolled base = the closing round's real traffic + one decay
+            // step per empty round since, early-exiting at the floor. Shared
+            // with `effective_base_fee_at` (the read-time twin) so a committed
+            // transaction always writes exactly the value every reader already
+            // saw for `current_round` - the stored state simply catches up.
+            let new_base = crate::params::rolled_base_fee(
+                params.base_fee_per_byte,
+                fs.epoch_round,
+                fs.epoch_bytes,
+                current_round,
+                FEE_TARGET_BYTES_PER_ROUND,
+            );
             if new_base != params.base_fee_per_byte {
                 params.base_fee_per_byte = new_base;
                 let mut pacct = self
@@ -555,15 +576,25 @@ impl Ledger {
         self.check_registry_status(tx, is_first_transaction_from_this_payer)?;
 
         let params = self.current_params();
-        // `saturating_mul`, not `*`: `base_fee_per_byte` is governance-set
-        // (Low tier, unbounded above), so a near-`u64::MAX` value times a
-        // multi-KB `byte_size` overflows - a plain `*` wraps in release to a
-        // small/garbage fee (trivializing or bricking fee collection). This
-        // matches the sibling trap-billing path, which already uses
-        // `saturating_mul` (`bill_trapped_wasm_fuel`), and the admission-time
-        // check (`payer_can_afford_admission`). Saturation to `u64::MAX` here
-        // means the payer simply can't afford it and the tx is rejected.
-        let byte_fee = params.base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
+        // Charge the EFFECTIVE base fee for this round - the stored
+        // `base_fee_per_byte` rolled forward through every empty round since the
+        // fee epoch last closed (see `effective_base_fee_at`). This is what makes
+        // an idle chain heal on its own: after a flood spikes the fee and traffic
+        // pauses, the effective fee decays round by round on READ, so the next
+        // transaction (from any wallet) is both admitted and charged at the
+        // decayed rate - no funded "unstick" transaction needed. `advance_dynamic_fee`
+        // below writes this exact same rolled value, so the stored state catches
+        // up in this tx's own (STARK-safe) transition.
+        //
+        // `saturating_mul`, not `*`: the base fee is governance-set / dynamic
+        // (bounded above by `MAX_BASE_FEE_PER_BYTE` but still multi-KB `byte_size`
+        // can overflow `u64`), and a plain `*` wraps in release to a small/garbage
+        // fee (trivializing or bricking fee collection). Matches the sibling
+        // trap-billing path (`bill_trapped_wasm_fuel`) and the admission-time
+        // check (`payer_can_afford_admission`). Saturation to `u64::MAX` means the
+        // payer simply can't afford it and the tx is rejected.
+        let effective_base = self.effective_base_fee_at(current_round);
+        let byte_fee = effective_base.saturating_mul(tx.byte_size() as u64);
         // The optional priority-fee tip (see `Message::priority_fee`), charged
         // on top of the base fee and paid 100% to the proposer. Saturating add
         // so a maliciously huge tip can't wrap; the payer simply can't afford it.
@@ -1317,6 +1348,47 @@ mod tests {
             crate::params::FEE_MIN_BASE_FEE_PER_BYTE,
             "a long idle gap must collapse the spiked fee to the floor in ONE committed tx, not one step per tx"
         );
+    }
+
+    #[test]
+    fn effective_fee_decays_on_read_across_idle_rounds_without_writing_state() {
+        // The complete idle-decay fix. A spiked fee must decay as rounds pass
+        // even with NO transactions committing - so an idle chain heals on its
+        // own and a low-balance wallet is unlocked - WITHOUT writing state on
+        // empty rounds (which would break the STARK receipt chain). Model: pin
+        // the stored base fee high with a real fee epoch open at round 0, then
+        // read the effective fee at ever-later rounds. The STORED value must
+        // stay put (no write); the EFFECTIVE value must fall to the floor.
+        let mut ledger = new_test_ledger();
+        let start_fee = 197_766u64;
+        let high = EconomicParams { base_fee_per_byte: start_fee, ..EconomicParams::default() };
+        ledger.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&high).unwrap(), ..Account::new_wallet(Pubkey::new([3u8; 32])) });
+        // Open a fee epoch at round 0 (one committed tx), leaving the stored fee high.
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 5_000_000_000_000);
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+        };
+        ledger.apply_transaction(&Transaction::new_signed(&alice, 0, [0u8; 32], u64::MAX, vec![ix]).unwrap(), &validator, 0).unwrap();
+
+        let stored = ledger.current_params().base_fee_per_byte;
+        assert_eq!(stored, start_fee, "the STORED fee stays high - no idle round wrote state");
+        assert_eq!(ledger.effective_base_fee_at(0), start_fee, "same round: no roll");
+        // Effective fee at later rounds must decay monotonically to the floor,
+        // all WITHOUT any apply_transaction / state write in between.
+        let e10 = ledger.effective_base_fee_at(10);
+        let e100 = ledger.effective_base_fee_at(100);
+        let e5000 = ledger.effective_base_fee_at(5000);
+        assert!(e10 < start_fee, "effective fee decays after 10 idle rounds ({e10} < {start_fee})");
+        assert!(e100 < e10, "and keeps decaying ({e100} < {e10})");
+        assert_eq!(e5000, crate::params::FEE_MIN_BASE_FEE_PER_BYTE, "a long idle gap reaches the floor on read");
+        // Crucially, reading the effective fee wrote nothing: the stored value is
+        // still the spiked one (only a committed tx moves it).
+        assert_eq!(ledger.current_params().base_fee_per_byte, start_fee, "reads never mutate stored state (STARK-chain safe)");
     }
 
     #[test]

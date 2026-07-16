@@ -1109,12 +1109,17 @@ pub enum StarkProofError {
 /// validator's mempool, which is what the demonstrated attack needed.
 fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
     let balance = state.ledger.store().get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
-    // `saturating_mul`, not `*`: `base_fee_per_byte` is governance-settable
-    // (Low tier, no hard upper bound), so a near-`u64::MAX` value times a
-    // multi-KB `byte_size` overflows. A plain `*` would wrap to a small
-    // number in release and wrongly admit; saturating pins it at `u64::MAX`
-    // so an over-large fee simply makes nothing affordable, matching intent.
-    let byte_fee = state.ledger.current_params().base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
+    // Use the EFFECTIVE base fee at the node's current round, not the stale
+    // stored value - the same value `apply_transaction` will actually charge
+    // (see `Ledger::effective_base_fee_at`). This is what unlocks a chain whose
+    // fee spiked during a flood and then went idle: as the effective fee decays
+    // round by round, admission reflects the lower fee, so an ordinary wallet
+    // can get a transaction in again without waiting for a funded "unstick" tx.
+    // `saturating_mul`, not `*`: a multi-KB `byte_size` times a large base fee
+    // overflows `u64`; a plain `*` would wrap to a small number in release and
+    // wrongly admit; saturating pins it at `u64::MAX` so an over-large fee simply
+    // makes nothing affordable, matching intent.
+    let byte_fee = state.ledger.effective_base_fee_at(state.next_round).saturating_mul(tx.byte_size() as u64);
     // Must also cover the declared priority tip, charged up front alongside the
     // base fee (see `Ledger::apply_transaction`).
     balance >= byte_fee.saturating_add(tx.message.priority_fee)
@@ -1548,7 +1553,10 @@ impl Engine {
             executed_transactions: state.executed,
             version: NODE_VERSION.to_string(),
             update_available: state.update_available.clone(),
-            base_fee_per_byte: state.ledger.current_params().base_fee_per_byte,
+            // The EFFECTIVE fee at the current round, not the stale stored value -
+            // so the dashboard shows the fee decaying in real time on an idle
+            // chain (matching what a transaction would actually be charged now).
+            base_fee_per_byte: state.ledger.effective_base_fee_at(state.next_round),
             dust_threshold: state.ledger.current_params().dust_threshold,
             round_interval_ms: self.round_interval_ms,
         }
@@ -1576,7 +1584,8 @@ impl Engine {
             pool_earned: state.ledger.pool_earned,
             reward_pool_balance,
             total_emitted: state.ledger.total_emitted,
-            base_fee_per_byte: params.base_fee_per_byte,
+            // Effective (rolled-to-current-round) fee, matching /status.
+            base_fee_per_byte: state.ledger.effective_base_fee_at(state.next_round),
             dust_threshold: params.dust_threshold,
             staking_commission_bps: params.staking_commission_bps,
             gas_price_per_fuel: params.gas_price_per_fuel,

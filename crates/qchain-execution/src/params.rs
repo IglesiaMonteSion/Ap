@@ -202,6 +202,41 @@ pub fn next_base_fee(current: u64, committed_bytes: u64, target: u64) -> u64 {
     next.clamp(FEE_MIN_BASE_FEE_PER_BYTE, MAX_BASE_FEE_PER_BYTE)
 }
 
+/// The base fee a transaction *committed at* `current_round` should pay, rolling
+/// the stored `base` forward through the fee epoch: the accumulating round's real
+/// `epoch_bytes` (closing it), then one below-target decay step per EMPTY round
+/// up to `current_round - 1`. Pure - no state write.
+///
+/// This is the read-time twin of `Ledger::advance_dynamic_fee`'s epoch close.
+/// Computing the effective fee on *read* (for admission, charging, and `/status`
+/// display) is what makes an idle chain's fee decay WITHOUT a per-round state
+/// write - and a per-round write is exactly what would break the STARK receipt
+/// chain (each transfer receipt's `root_after` must equal the next's
+/// `root_before`; a fee-account write on an empty round between two transfers
+/// would insert an unaccounted root change). So the stored `base_fee_per_byte`
+/// only ever moves inside a committed transaction (folded into that tx's own
+/// state transition, STARK-safe), while every *reader* sees the value already
+/// rolled forward to the current round. `advance_dynamic_fee` writes exactly this
+/// same rolled value, so the stored state catches up to what was charged the
+/// moment any transaction commits.
+///
+/// `current_round <= epoch_round` means we're still inside the accumulating
+/// epoch - no roll yet, return `base` unchanged. Early-exits at the floor
+/// (`next_base_fee(floor, 0, target) == floor`), bounding the loop to
+/// ~O(log(ceiling/floor)) regardless of how many rounds elapsed.
+pub fn rolled_base_fee(base: u64, epoch_round: u64, epoch_bytes: u64, current_round: u64, target: u64) -> u64 {
+    if current_round <= epoch_round {
+        return base;
+    }
+    let mut b = next_base_fee(base, epoch_bytes, target);
+    let mut empty_rounds = (current_round - epoch_round).saturating_sub(1);
+    while empty_rounds > 0 && b > FEE_MIN_BASE_FEE_PER_BYTE {
+        b = next_base_fee(b, 0, target);
+        empty_rounds -= 1;
+    }
+    b
+}
+
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct EconomicParams {
     pub base_fee_per_byte: u64,
@@ -289,6 +324,25 @@ mod tests {
         assert_eq!(next_base_fee(1000, target, target), 1000);
         // A persistently-full network keeps climbing by at least 1.
         assert!(next_base_fee(1, target + 1, target) >= 1);
+    }
+
+    #[test]
+    fn rolled_base_fee_is_identity_within_epoch_and_decays_to_floor_across_empty_rounds() {
+        let target = FEE_TARGET_BYTES_PER_ROUND;
+        let floor = FEE_MIN_BASE_FEE_PER_BYTE;
+        let spiked = 197_766u64;
+        // Still inside the accumulating epoch (current_round <= epoch_round): no roll.
+        assert_eq!(rolled_base_fee(spiked, 5, 0, 5, target), spiked, "same round: identity");
+        assert_eq!(rolled_base_fee(spiked, 5, 999_999, 3, target), spiked, "earlier round: identity");
+        // One round later, an empty closing round decays exactly one step.
+        assert_eq!(rolled_base_fee(spiked, 0, 0, 1, target), next_base_fee(spiked, 0, target));
+        // A long idle gap collapses to the floor (early-exit keeps it bounded).
+        assert_eq!(rolled_base_fee(spiked, 0, 0, 100_000, target), floor, "a long idle gap reaches the floor");
+        // A busy closing round rises first, then empty rounds decay it back down.
+        let after_busy_then_idle = rolled_base_fee(spiked, 0, target * 4, 10_000, target);
+        assert_eq!(after_busy_then_idle, floor, "even a busy closing round is overwhelmed by a long idle tail");
+        // Already at the floor stays at the floor.
+        assert_eq!(rolled_base_fee(floor, 0, 0, 5000, target), floor);
     }
 
     #[test]
