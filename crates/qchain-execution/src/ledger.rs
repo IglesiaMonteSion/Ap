@@ -509,6 +509,21 @@ impl Ledger {
         let priority_fee = tx.message.priority_fee;
         let upfront_fee = byte_fee.saturating_add(priority_fee);
         if payer_account.balance < upfront_fee {
+            // Fee-decay deadlock fix: still TICK the dynamic fee even though this
+            // transaction can't pay it. `advance_dynamic_fee` only closes the fee
+            // epoch (and thus DECAYS the base fee toward the floor on a
+            // below-target round) when it runs - and it used to run only for
+            // transactions that could afford the fee. Under a heavy flood the fee
+            // spikes so high that EVERY queued transaction fails this check, so
+            // `advance_dynamic_fee` never ran and the fee stayed pinned high
+            // forever (a real DoS/robustness gap the stress bot surfaced). Ticking
+            // with 0 bytes closes the round's epoch without counting this
+            // (uncommitted) transaction's bytes, so a round full of unaffordable
+            // transactions reads as below-target and the fee decays back down -
+            // like Ethereum's base fee dropping on an under-full block. Runs on
+            // the identical committed order at every validator, so it stays
+            // deterministic / fork-free.
+            self.advance_dynamic_fee(current_round, 0);
             return Err(ExecError::InsufficientFunds);
         }
         // Real enforcement of a field that used to be signed and
@@ -521,6 +536,11 @@ impl Ledger {
         // declared ceiling from when they signed, not the network's
         // current price, is what should decide whether it still executes.
         if upfront_fee > tx.message.fee_limit {
+            // Same fee-decay tick as the insufficient-funds path above: a
+            // transaction whose (risen) fee now exceeds its declared fee_limit
+            // must still let the round's fee epoch close, or a flood that prices
+            // every queued transaction past its limit would pin the fee forever.
+            self.advance_dynamic_fee(current_round, 0);
             return Err(ExecError::FeeExceedsLimit { actual: upfront_fee, limit: tx.message.fee_limit });
         }
         if payer_account.nonce != tx.message.nonce {
@@ -1159,6 +1179,41 @@ mod tests {
             crate::params::FEE_MIN_BASE_FEE_PER_BYTE,
             "light load must keep the base fee at the floor, never below"
         );
+    }
+
+    #[test]
+    fn the_dynamic_fee_decays_even_when_every_transaction_fails_for_lack_of_funds() {
+        // The fee-decay deadlock fix. Pin the base fee absurdly high (as a heavy
+        // flood does), then submit a transaction every round from a payer who
+        // can't afford it. Before the fix `advance_dynamic_fee` only ran for
+        // affordable transactions, so a run of all-failing rounds left the fee
+        // pinned forever. Now each failing transaction still ticks the epoch, so
+        // the below-target rounds decay the base fee back toward the floor.
+        let mut ledger = new_test_ledger();
+        let start_fee = 100_000u64;
+        let high = EconomicParams { base_fee_per_byte: start_fee, ..EconomicParams::default() };
+        ledger.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&high).unwrap(), ..Account::new_wallet(Pubkey::new([3u8; 32])) });
+
+        let poor = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(poor.pubkey(), 1_000); // nowhere near the ~500M fee at this rate
+        let mk = || {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![poor.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+            };
+            // fee_limit u64::MAX so it fails on affordability, not the fee cap.
+            Transaction::new_signed(&poor, 0, [0u8; 32], u64::MAX, vec![ix]).unwrap()
+        };
+        for round in 0..20u64 {
+            let r = ledger.apply_transaction(&mk(), &validator, round);
+            assert!(matches!(r, Err(ExecError::InsufficientFunds)), "every tx must fail for lack of funds (round {round})");
+        }
+        let after = ledger.current_params().base_fee_per_byte;
+        assert!(after < start_fee, "the base fee must DECAY across all-failing rounds (was {start_fee}, now {after}) - not stay pinned high forever");
+        assert!(after >= crate::params::FEE_MIN_BASE_FEE_PER_BYTE, "but never below the floor");
     }
 
     #[test]
