@@ -5,7 +5,7 @@
 
 use crate::error::ExecError;
 use crate::ids::{FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
-use crate::params::{next_base_fee, FeeState, FEE_TARGET_BYTES_PER_ROUND};
+use crate::params::{next_base_fee, FeeState, FEE_MIN_BASE_FEE_PER_BYTE, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
 use crate::receipt::{StakingEvent, StakingEventKind, TransferReceipt};
@@ -377,9 +377,36 @@ impl Ledger {
             .unwrap_or(FeeState { epoch_round: current_round, epoch_bytes: 0, emission_carry: 0 });
 
         if existing.is_some() && current_round > fs.epoch_round {
-            // Close the previous epoch: adjust the base fee from its traffic.
+            // Close the previous epoch AND roll the fee through every empty
+            // round since it. `advance_dynamic_fee` only runs on a committed
+            // transaction, so before this an idle gap (or a flood that priced
+            // every queued tx out, so none advanced the epoch) never decayed:
+            // the fee froze at its peak and the first tx after the gap saw a
+            // single ~12.5% step instead of the full catch-up. Real deadlock
+            // the stress bot hit and the user saw live - base_fee pinned at
+            // 197766 (~1100x the floor) with rounds advancing but nothing
+            // executing, unrecoverable without a manual repeg. Fix: apply the
+            // closing round's real traffic (`epoch_bytes`), then one
+            // below-target decay step per EMPTY round in between (each had
+            // zero committed bytes, else a tx from it would have advanced the
+            // epoch). EIP-1559's base fee likewise drops on every under-full
+            // block, not only when the next tx happens to land. Deterministic:
+            // a pure function of the committed round span + committed bytes, so
+            // every validator computes the identical base fee (no fork).
             let mut params = self.current_params();
-            let new_base = next_base_fee(params.base_fee_per_byte, fs.epoch_bytes, FEE_TARGET_BYTES_PER_ROUND);
+            let mut new_base = next_base_fee(params.base_fee_per_byte, fs.epoch_bytes, FEE_TARGET_BYTES_PER_ROUND);
+            // Rounds `epoch_round+1 ..= current_round-1` were empty. Roll a
+            // zero-byte decay step for each, stopping at the floor:
+            // `next_base_fee(floor, 0, target) == floor`, so further empty
+            // rounds are no-ops. This bounds the loop to O(log(ceiling/floor))
+            // (~116 steps from the hard ceiling) no matter how many rounds
+            // elapsed - a genuinely idle chain of thousands of rounds still
+            // heals in one committed tx without an unbounded loop.
+            let mut empty_rounds = (current_round - fs.epoch_round).saturating_sub(1);
+            while empty_rounds > 0 && new_base > FEE_MIN_BASE_FEE_PER_BYTE {
+                new_base = next_base_fee(new_base, 0, FEE_TARGET_BYTES_PER_ROUND);
+                empty_rounds -= 1;
+            }
             if new_base != params.base_fee_per_byte {
                 params.base_fee_per_byte = new_base;
                 let mut pacct = self
@@ -1248,6 +1275,48 @@ mod tests {
         let after = ledger.current_params().base_fee_per_byte;
         assert!(after < start_fee, "the base fee must DECAY across all-failing rounds (was {start_fee}, now {after}) - not stay pinned high forever");
         assert!(after >= crate::params::FEE_MIN_BASE_FEE_PER_BYTE, "but never below the floor");
+    }
+
+    #[test]
+    fn a_single_tx_after_a_long_idle_gap_collapses_a_spiked_fee_back_to_the_floor() {
+        // The idle-decay fix. A flood pins the base fee absurdly high, then the
+        // chain goes quiet: rounds keep advancing but no transaction commits, so
+        // `advance_dynamic_fee` never runs and the fee froze at its peak (the
+        // exact live symptom - base_fee 197766, rounds advancing, nothing
+        // executing). The multi-step epoch close now rolls one below-target decay
+        // step per EMPTY round when the next tx finally lands, so a single
+        // committed transaction after a long idle gap heals the fee all the way
+        // to the floor in one shot - not one ~12.5% step per tx (~116 txs).
+        let mut ledger = new_test_ledger();
+        let start_fee = 197_766u64; // the exact pinned value the user saw live
+        let high = EconomicParams { base_fee_per_byte: start_fee, ..EconomicParams::default() };
+        ledger.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&high).unwrap(), ..Account::new_wallet(Pubkey::new([3u8; 32])) });
+
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        // Fund alice enough to afford one tx at the spiked fee (the recovery
+        // path: one wallet with funds unsticks the whole chain).
+        ledger.credit(alice.pubkey(), 5_000_000_000_000);
+        let mk = |nonce: u64| {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+            };
+            Transaction::new_signed(&alice, nonce, [0u8; 32], u64::MAX, vec![ix]).unwrap()
+        };
+        // A first tx at round 0 opens the epoch at round 0 (no close yet).
+        ledger.apply_transaction(&mk(0), &validator, 0).unwrap();
+        assert_eq!(ledger.current_params().base_fee_per_byte, start_fee, "no decay yet - epoch just opened");
+        // Now a single tx 5000 rounds later: the 4999 empty rounds in between
+        // must ALL decay, collapsing the fee to the floor in this one tx.
+        ledger.apply_transaction(&mk(1), &validator, 5000).unwrap();
+        assert_eq!(
+            ledger.current_params().base_fee_per_byte,
+            crate::params::FEE_MIN_BASE_FEE_PER_BYTE,
+            "a long idle gap must collapse the spiked fee to the floor in ONE committed tx, not one step per tx"
+        );
     }
 
     #[test]
