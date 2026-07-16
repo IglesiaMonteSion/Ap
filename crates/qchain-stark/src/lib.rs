@@ -159,6 +159,7 @@
 //!   explicit confirmation, same as this gap itself was until asked for.
 
 use qchain_core::Account;
+use qchain_storage::compressed::{verify_proof as verify_compressed_proof, CompressedProof, Terminal};
 use qchain_storage::{hash_leaf, verify_proof, MerkleProof, StateTree};
 use winterfell::crypto::hashers::Blake3_256;
 use winterfell::crypto::{DefaultRandomCoin, MerkleTree};
@@ -706,6 +707,107 @@ pub fn verify_batch_bound_to_state(proof: Proof, pub_inputs: PublicInputs, bindi
     Ok(())
 }
 
+/// Same as [`RowStateBinding`] but carrying the O(log n) path-compressed
+/// proofs (`qchain_storage::compressed::CompressedProof`) instead of the
+/// 256-deep `MerkleProof`. Used by `verify_batch_bound_to_compressed_state`;
+/// this is the binding shape a node built on the compressed state tree serves.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompressedRowStateBinding {
+    pub root_before: [u8; 32],
+    pub root_after: [u8; 32],
+    pub from_before: Account,
+    pub from_after: Account,
+    pub to_before: Account,
+    pub to_after: Account,
+    pub from_proof_before: CompressedProof,
+    pub from_proof_after: CompressedProof,
+    pub to_proof_before: CompressedProof,
+    pub to_proof_after: CompressedProof,
+}
+
+/// The compressed-tree twin of [`verify_batch_bound_to_state`]: verifies the
+/// STARK proof AND that each row's addresses/balances tie to a real transition
+/// of the **compressed** state tree. Identical soundness checks - balances
+/// match the STARK's public values, each proof's key matches the address the
+/// STARK proved, an inclusion proof's committed value equals `hash_leaf` of the
+/// snapshot, an exclusion proof only ever backs a zero-balance claim, and every
+/// proof verifies against its claimed root - just against `CompressedProof`s.
+/// A `Terminal::Leaf` is inclusion; `Terminal::OtherLeaf`/`Terminal::Empty` are
+/// exclusion (the compressed tree's two ways an absent key can terminate).
+pub fn verify_batch_bound_to_compressed_state(
+    proof: Proof,
+    pub_inputs: PublicInputs,
+    bindings: &[CompressedRowStateBinding],
+) -> Result<(), StateBindingError> {
+    verify_batch(proof, pub_inputs.clone())?;
+
+    let max_rows = pub_inputs.columns[COL_FROM_BEFORE].len();
+    if bindings.len() > max_rows {
+        return Err(StateBindingError::TooManyBindings { max: max_rows, got: bindings.len() });
+    }
+
+    for (row, pair) in bindings.windows(2).enumerate() {
+        if pair[0].root_after != pair[1].root_before {
+            return Err(StateBindingError::RootSequenceMismatch { row });
+        }
+    }
+
+    for (row, binding) in bindings.iter().enumerate() {
+        let from_addr = limbs_to_address(std::array::from_fn(|i| pub_inputs.columns[COL_FROM_ADDRESS + i][row].as_int() as u64));
+        let to_addr = limbs_to_address(std::array::from_fn(|i| pub_inputs.columns[COL_TO_ADDRESS + i][row].as_int() as u64));
+
+        let from_before_pub = pub_inputs.columns[COL_FROM_BEFORE][row].as_int() as u64;
+        let from_after_pub = pub_inputs.columns[COL_FROM_AFTER][row].as_int() as u64;
+        let to_before_pub = pub_inputs.columns[COL_TO_BEFORE][row].as_int() as u64;
+        let to_after_pub = pub_inputs.columns[COL_TO_AFTER][row].as_int() as u64;
+
+        if binding.from_before.balance != from_before_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "from_before" });
+        }
+        if binding.from_after.balance != from_after_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "from_after" });
+        }
+        if binding.to_before.balance != to_before_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "to_before" });
+        }
+        if binding.to_after.balance != to_after_pub {
+            return Err(StateBindingError::BalanceMismatch { row, field: "to_after" });
+        }
+
+        if binding.from_proof_before.key != from_addr || binding.from_proof_after.key != from_addr {
+            return Err(StateBindingError::AddressMismatch { row, field: "from" });
+        }
+        if binding.to_proof_before.key != to_addr || binding.to_proof_after.key != to_addr {
+            return Err(StateBindingError::AddressMismatch { row, field: "to" });
+        }
+
+        let checks: [(&Account, &CompressedProof, [u8; 32], &'static str); 4] = [
+            (&binding.from_before, &binding.from_proof_before, binding.root_before, "from_before"),
+            (&binding.from_after, &binding.from_proof_after, binding.root_after, "from_after"),
+            (&binding.to_before, &binding.to_proof_before, binding.root_before, "to_before"),
+            (&binding.to_after, &binding.to_proof_after, binding.root_after, "to_after"),
+        ];
+        for (account, cproof, root, field) in checks {
+            // Inclusion: the committed value hash must equal the snapshot's
+            // leaf hash. Exclusion (OtherLeaf/Empty): the only soundly
+            // checkable claim against an absent key is a zero balance.
+            match &cproof.terminal {
+                Terminal::Leaf { value_hash } if *value_hash == hash_leaf(account) => {}
+                Terminal::Leaf { .. } => return Err(StateBindingError::MerkleProofFailed { row, field }),
+                Terminal::OtherLeaf { .. } | Terminal::Empty if account.balance == 0 => {}
+                Terminal::OtherLeaf { .. } | Terminal::Empty => {
+                    return Err(StateBindingError::ExclusionProofClaimsNonzeroBalance { row, field })
+                }
+            }
+            if !verify_compressed_proof(root, cproof) {
+                return Err(StateBindingError::MerkleProofFailed { row, field });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1041,122 @@ mod tests {
         };
 
         verify_batch_bound_to_state(proof, pub_inputs, &[binding]).expect("a genuine transfer must bind to the real Merkle root transition");
+    }
+
+    // --- compressed-tree twin of the Merkle tie-in (Phase B) ---
+
+    fn cleaves(store: &InMemoryStore) -> Vec<([u8; 32], [u8; 32])> {
+        store.iter().map(|(pk, a)| (pk.to_bytes(), qchain_storage::hash_leaf(&a))).collect()
+    }
+
+    #[test]
+    fn a_genuine_transfer_binds_to_a_real_compressed_root_transition() {
+        use qchain_storage::compressed::CompressedStateTree;
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+
+        let root_before = CompressedStateTree::root(&cleaves(&store));
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let fpb = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpb = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = CompressedStateTree::root(&cleaves(&store));
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let fpa = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpa = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = CompressedRowStateBinding {
+            root_before, root_after,
+            from_before: alice_before, from_after: alice_after,
+            to_before: bob_before, to_after: bob_after,
+            from_proof_before: fpb, from_proof_after: fpa,
+            to_proof_before: tpb, to_proof_after: tpa,
+        };
+        verify_batch_bound_to_compressed_state(proof, pub_inputs, &[binding])
+            .expect("a genuine transfer must bind to the real compressed root transition");
+    }
+
+    #[test]
+    fn a_transfer_to_a_brand_new_recipient_binds_correctly_compressed() {
+        use qchain_storage::compressed::CompressedStateTree;
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey(); // genuinely new -> exclusion proof for to_before
+        store.set(alice, wallet(1_000));
+
+        let root_before = CompressedStateTree::root(&cleaves(&store));
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = wallet(0); // absent -> zero
+        let fpb = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpb = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+        assert!(!tpb.is_inclusion(), "bob must be absent before -> exclusion proof");
+
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(300));
+        let root_after = CompressedStateTree::root(&cleaves(&store));
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let fpa = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpa = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 0, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+
+        let binding = CompressedRowStateBinding {
+            root_before, root_after,
+            from_before: alice_before, from_after: alice_after,
+            to_before: bob_before, to_after: bob_after,
+            from_proof_before: fpb, from_proof_after: fpa,
+            to_proof_before: tpb, to_proof_after: tpa,
+        };
+        verify_batch_bound_to_compressed_state(proof, pub_inputs, &[binding])
+            .expect("a first-ever transfer to a new recipient must bind (exclusion proof for to_before)");
+    }
+
+    #[test]
+    fn a_tampered_balance_breaks_the_compressed_binding() {
+        use qchain_storage::compressed::CompressedStateTree;
+        let mut store = InMemoryStore::new();
+        let alice = Keypair::generate().unwrap().pubkey();
+        let bob = Keypair::generate().unwrap().pubkey();
+        store.set(alice, wallet(1_000));
+        store.set(bob, wallet(200));
+        let root_before = CompressedStateTree::root(&cleaves(&store));
+        let alice_before = store.get(&alice).unwrap();
+        let bob_before = store.get(&bob).unwrap();
+        let fpb = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpb = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+        store.set(alice, wallet(690));
+        store.set(bob, wallet(500));
+        let root_after = CompressedStateTree::root(&cleaves(&store));
+        let alice_after = store.get(&alice).unwrap();
+        let bob_after = store.get(&bob).unwrap();
+        let fpa = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
+        let tpa = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());
+        let steps = vec![TransferStep::conserving(alice.to_bytes(), bob.to_bytes(), 1_000, 200, 300, 10)];
+        let (proof, pub_inputs) = prove_batch(&steps).unwrap();
+        // Lie about alice's post-balance: claim she kept 999 instead of 690.
+        let binding = CompressedRowStateBinding {
+            root_before, root_after,
+            from_before: alice_before, from_after: wallet(999),
+            to_before: bob_before, to_after: bob_after,
+            from_proof_before: fpb, from_proof_after: fpa,
+            to_proof_before: tpb, to_proof_after: tpa,
+        };
+        assert!(
+            verify_batch_bound_to_compressed_state(proof, pub_inputs, &[binding]).is_err(),
+            "a snapshot balance that disagrees with the STARK/root must be rejected"
+        );
     }
 
     /// Real, non-hypothetical case found via a live 3-node testnet run: the
