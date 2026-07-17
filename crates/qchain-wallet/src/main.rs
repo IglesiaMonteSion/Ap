@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/apple-touch-icon-precomposed.png", get(apple_touch_icon))
         .route("/icon-192.png", get(icon_192))
         .route("/icon-512.png", get(icon_512))
+        .route("/icon-512-maskable.png", get(icon_512_maskable))
         .route("/manifest.webmanifest", get(manifest))
         .route("/api/chain_id", get(chain_id_ep))
         .route("/api/account/:address", get(account_ep))
@@ -405,6 +406,9 @@ async fn icon_192() -> Response {
 }
 async fn icon_512() -> Response {
     static_asset("image/png", Body::from(&include_bytes!("wasm_assets/icon-512.png")[..]))
+}
+async fn icon_512_maskable() -> Response {
+    static_asset("image/png", Body::from(&include_bytes!("wasm_assets/icon-512-maskable.png")[..]))
 }
 async fn manifest() -> Response {
     static_asset("application/manifest+json", Body::from(include_str!("wasm_assets/manifest.webmanifest")))
