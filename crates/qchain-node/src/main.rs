@@ -606,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
             equivocation_evidence: HashMap::new(),
             update_available: None,
             pending_execution: std::collections::VecDeque::new(),
+            pending_availability_votes: HashMap::new(),
         }),
     });
 
@@ -660,6 +661,10 @@ async fn main() -> anyhow::Result<()> {
                 ticker.tick().await;
                 engine.propose_round().await;
                 engine.retry_pending_resync_requests().await;
+                // Backstop: cast any deferred availability-gated votes whose
+                // batches have since arrived (the batch handlers drive this
+                // directly; this catches any missed path). No-op when idle.
+                engine.try_cast_available_votes().await;
                 engine.prune_stale_round_state().await;
             }
         });

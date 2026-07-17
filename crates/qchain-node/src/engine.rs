@@ -645,6 +645,25 @@ pub struct EngineState {
     /// safe BFT behavior (no fork) for a node lagging far enough that a peer
     /// already pruned the batch - snapshot-sync territory (see task #109).
     pub pending_execution: std::collections::VecDeque<Certificate>,
+    /// Vertices this validator has fully validated (author signature,
+    /// structural bounds, round, non-equivocation) but has NOT yet voted for
+    /// because at least one of their worker batches is not locally available.
+    /// Voting is Narwhal's DATA-AVAILABILITY attestation: casting a vote for a
+    /// vertex asserts we hold its batches, so a quorum certificate implies at
+    /// least f+1 honest nodes stored them and the batch is always re-syncable.
+    /// Without this gate a Byzantine proposer could get a vertex CERTIFIED for
+    /// a batch it never gossips; `take_executable_prefix` (blocks-not-skips,
+    /// the anti-fork invariant above) then blocks execution on that certificate
+    /// FOREVER on every honest node - a permanent, network-wide liveness halt
+    /// triggerable at f = 1. Held here (keyed by vertex digest) until the
+    /// missing batches arrive (driven by the `request_missing_batches` already
+    /// issued for the proposal), at which point `try_cast_available_votes`
+    /// casts the deferred vote. `voted_for` is recorded immediately regardless,
+    /// so the equivocation lock still holds; a vertex whose batch never arrives
+    /// simply never earns our vote. Empty in steady state (batches arrive with
+    /// or just after the proposal); vacuously satisfied for an empty (no-tx)
+    /// vertex, so empty rounds still vote immediately. Pruned by round window.
+    pub pending_availability_votes: HashMap<Digest, (Vertex, ValidatorId, Round)>,
 }
 
 /// One row of the validator directory served by `GET /validators`: the
@@ -2280,6 +2299,9 @@ impl Engine {
                 // head of `pending_execution` - drain the queue now instead of
                 // waiting for the next tick (no-op if nothing was blocked).
                 self.try_commit().await;
+                // It may also be the batch a deferred availability-gated vote
+                // was waiting on - cast that vote now (no-op if none pending).
+                self.try_cast_available_votes().await;
             }
             NetMessage::VertexProposal { vertex, author_signature } => {
                 if vertex.author != from {
@@ -2411,28 +2433,28 @@ impl Engine {
                         }
                     }
                 }
-                let sig = match self.keypair.sign(&digest[..]) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("failed to sign vote: {e}");
-                        return;
-                    }
+                // DATA-AVAILABILITY GATE (real Narwhal): only cast the vote once
+                // we actually hold ALL of the vertex's worker batches. A vote is
+                // an availability attestation, so a quorum certificate must imply
+                // >= f+1 honest nodes stored the batch (always re-syncable). If a
+                // batch is missing we DEFER the vote (the `request_missing_batches`
+                // above already began fetching it) and re-drive it from the
+                // worker-batch handlers once the data lands. `voted_for` is already
+                // recorded, so the equivocation lock holds; a vertex whose batch
+                // never arrives (a Byzantine proposer withholding it) simply never
+                // earns our vote -> it can't be certified -> it can't wedge
+                // `take_executable_prefix` network-wide. Vacuously true for an
+                // empty (no-tx) vertex, so empty rounds still vote immediately.
+                let have_all_batches = {
+                    let state = self.state.lock().await;
+                    vertex.batch_digests.iter().all(|(_, d)| state.batches.contains_key(d))
                 };
-                // Registered as outstanding *before* the first send attempt,
-                // regardless of whether that attempt succeeds - see
-                // `retry_pending_resync_requests`'s doc comment for the real
-                // bug this closes: a `Vote` used to be a single-attempt send
-                // with no way to recover if it raced a peer's listener
-                // socket that wasn't bound yet.
-                {
+                if have_all_batches {
+                    self.cast_vote(digest, from).await;
+                } else {
                     let mut state = self.state.lock().await;
-                    let vote_round = state.next_round;
-                    state.pending_votes_to_send.insert(digest, (from, sig.clone(), vote_round));
-                }
-                if let Some(addr) = self.network.addr_of(&from) {
-                    if let Err(e) = self.network.send_to(addr, &NetMessage::Vote { vertex_digest: digest, signature: sig }).await {
-                        tracing::warn!("failed to send vote to {from}: {e}");
-                    }
+                    let r = state.next_round;
+                    state.pending_availability_votes.insert(digest, (vertex.clone(), from, r));
                 }
             }
             NetMessage::Vote { vertex_digest, signature } => {
@@ -2560,9 +2582,15 @@ impl Engine {
                     tracing::warn!("dropping worker-batch response from unknown validator {from}");
                     return;
                 }
-                let mut state = self.state.lock().await;
-                self.persist_batch(&batch.digest(), &batch);
-                cache_batch(&mut state, batch);
+                {
+                    let mut state = self.state.lock().await;
+                    self.persist_batch(&batch.digest(), &batch);
+                    cache_batch(&mut state, batch);
+                }
+                // A re-synced batch may unblock the head of `pending_execution`
+                // and/or satisfy a deferred availability-gated vote.
+                self.try_commit().await;
+                self.try_cast_available_votes().await;
             }
             NetMessage::VersionAnnounce { version } => {
                 // Advisory only (see the message's doc comment). Trust it just
@@ -2667,6 +2695,59 @@ impl Engine {
             if let Err(e) = self.network.send_to(addr, &NetMessage::WorkerBatchRequest { worker_id, digest }).await {
                 tracing::warn!("failed to request missing worker batch {digest:?} (worker {worker_id}) from {from}: {e}");
             }
+        }
+    }
+
+    /// Sign and send this node's vote for `digest` to the vertex author `to`,
+    /// registering it in `pending_votes_to_send` for tick-retry (unlike a
+    /// one-shot send that a not-yet-bound peer listener could drop). The caller
+    /// must have already made the voting decision (`voted_for`) and confirmed
+    /// the vertex's worker batches are locally available (the availability
+    /// gate).
+    async fn cast_vote(&self, digest: Digest, to: ValidatorId) {
+        let sig = match self.keypair.sign(&digest[..]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to sign vote: {e}");
+                return;
+            }
+        };
+        {
+            let mut state = self.state.lock().await;
+            let vote_round = state.next_round;
+            state.pending_votes_to_send.insert(digest, (to, sig.clone(), vote_round));
+        }
+        if let Some(addr) = self.network.addr_of(&to) {
+            if let Err(e) = self.network.send_to(addr, &NetMessage::Vote { vertex_digest: digest, signature: sig }).await {
+                tracing::warn!("failed to send vote to {to}: {e}");
+            }
+        }
+    }
+
+    /// Re-drive any deferred availability-gated votes whose worker batches have
+    /// now arrived locally. Called after a worker batch is cached (and on the
+    /// tick, as a backstop). For each pending vertex all of whose `batch_digests`
+    /// are present, casts the previously-withheld vote and removes it from the
+    /// pending set. A no-op in steady state (nothing deferred).
+    pub async fn try_cast_available_votes(&self) {
+        let ready: Vec<(Digest, ValidatorId)> = {
+            let state = self.state.lock().await;
+            if state.pending_availability_votes.is_empty() {
+                return;
+            }
+            state
+                .pending_availability_votes
+                .iter()
+                .filter(|(_, (v, _, _))| v.batch_digests.iter().all(|(_, d)| state.batches.contains_key(d)))
+                .map(|(&d, (_, from, _))| (d, *from))
+                .collect()
+        };
+        for (digest, to) in ready {
+            {
+                let mut state = self.state.lock().await;
+                state.pending_availability_votes.remove(&digest);
+            }
+            self.cast_vote(digest, to).await;
         }
     }
 
@@ -2888,6 +2969,10 @@ impl Engine {
             state.pending_cert_requests.retain(|_, v| v.1 >= round_horizon);
             state.pending_batch_requests.retain(|_, v| v.1 >= round_horizon);
             state.pending_votes_to_send.retain(|_, v| v.2 >= round_horizon);
+            // Deferred availability-gated votes for old rounds: a batch that
+            // never arrived within the window is unreachable via reactive
+            // resync, so drop the deferred vote (we correctly never voted).
+            state.pending_availability_votes.retain(|_, v| v.2 >= round_horizon);
             // Same round-window bound for the /rounds telemetry (read-only).
             state.round_committed.retain(|&r, _| r >= round_horizon);
         }
@@ -3741,6 +3826,7 @@ mod tests {
             equivocation_evidence: HashMap::new(),
             update_available: None,
             pending_execution: std::collections::VecDeque::new(),
+            pending_availability_votes: HashMap::new(),
         }
     }
 
