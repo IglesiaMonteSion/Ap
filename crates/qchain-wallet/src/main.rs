@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/transfers", get(recent_transfers))
         .route("/api/staking_activity/:address", get(staking_activity))
         .route("/api/validators", get(validators))
+        .route("/api/economics", get(economics))
         .route("/api/faucet", post(faucet_request));
 
     // Protected routes: the custodial wallet (keys held on the server), now at
@@ -643,6 +644,16 @@ async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>
 /// to paste a raw address.
 async fn validators(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let resp = st.http.get(format!("{}/validators", st.rpc)).send().await.map_err(ApiError::internal)?;
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+/// Live network economics (read-only proxy of the node's `/economics`): the
+/// staking view uses `emission_apr_bps` (the reward APR) and
+/// `staking_commission_bps` (the validator commission) to show a real APY and
+/// commission instead of a hard-coded number.
+async fn economics(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let resp = st.http.get(format!("{}/economics", st.rpc)).send().await.map_err(ApiError::internal)?;
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(body))
 }

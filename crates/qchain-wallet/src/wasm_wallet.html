@@ -370,6 +370,46 @@
   .apy-banner .apy-big b{background:linear-gradient(135deg,#c3b3ff,#7aa0ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
   .apy-banner .apy-big span{font-size:16px;font-weight:700;opacity:.75;margin-left:2px}
   .apy-banner .apy-sub{font-size:13px;color:var(--muted);margin-top:4px}
+  /* ---- staking profesional (estilo exchange/Solana) ---- */
+  .stk-hero{border-radius:18px;padding:16px;border:1px solid rgba(140,120,255,.30);
+    background:radial-gradient(130% 150% at 50% 0,rgba(140,120,255,.20),rgba(90,140,255,.05) 62%,transparent)}
+  .stk-hero-apy{text-align:center;padding-bottom:12px;border-bottom:1px solid var(--line)}
+  .stk-apy-num{font-size:34px;font-weight:800;letter-spacing:-.03em;line-height:1;
+    background:linear-gradient(135deg,#c3b3ff,#7aa0ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .stk-apy-lbl{font-size:12px;color:var(--muted);margin-top:5px;text-transform:uppercase;letter-spacing:.08em}
+  .stk-hero-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px;text-align:center}
+  .stk-hero-grid .stk-k{font-size:11px;color:var(--muted)}
+  .stk-hero-grid .stk-v{font-size:14px;font-weight:700;margin-top:3px;overflow-wrap:anywhere;line-height:1.2}
+  .stk-amt-row{display:flex;gap:8px;align-items:stretch}
+  .stk-amt-row input{flex:1;min-width:0}
+  .stk-max{flex:0 0 auto;padding:0 14px;border-radius:12px;border:1px solid rgba(140,120,255,.4);
+    background:rgba(140,120,255,.12);color:var(--accent,#9c86ff);font-weight:800;font-size:12px;cursor:pointer;letter-spacing:.04em}
+  .stk-max:active{transform:scale(.96)}
+  .stk-est{margin-top:9px;font-size:13px;color:var(--muted)}
+  .stk-est b{color:var(--good)}
+  .stk-info{padding:12px 14px}
+  .stk-info-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;color:var(--muted)}
+  .stk-info-row b{color:var(--ink);font-weight:600}
+  /* tarjeta de posición */
+  .pos-card{border:1px solid var(--line);border-radius:16px;padding:14px;margin-top:10px;background:var(--card2,rgba(255,255,255,.02))}
+  .pos-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+  .pos-val{font-weight:700;font-size:15px;line-height:1.2;min-width:0;overflow-wrap:anywhere}
+  .pos-val .pv-addr{font-size:11px;color:var(--muted);font-weight:400;font-family:ui-monospace,monospace;margin-top:2px}
+  .pos-amt{font-weight:800;font-size:16px;text-align:right;white-space:nowrap}
+  .pos-amt small{display:block;font-size:11px;color:var(--muted);font-weight:500}
+  .badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.02em}
+  .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .badge.active{color:var(--good);background:var(--good-bg)}
+  .badge.warm{color:#e0b64a;background:rgba(224,182,74,.12)}
+  .badge.cool{color:#ff9a5a;background:rgba(255,140,80,.12)}
+  .badge.ready{color:#7aa0ff;background:rgba(120,150,255,.12)}
+  .pos-meta{display:flex;justify-content:space-between;align-items:center;margin-top:11px;gap:10px;flex-wrap:wrap}
+  .pos-reward{font-size:13px;color:var(--muted)} .pos-reward b{color:var(--good)}
+  .pos-prog{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:10px}
+  .pos-prog>i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#7c5cff,#4f74ff)}
+  .pos-progtxt{font-size:11px;color:var(--muted);margin-top:5px}
+  .pos-actions{display:flex;gap:8px;margin-top:12px}
+  .pos-actions button{flex:1;padding:9px;font-size:13px;border-radius:11px}
 
   @media (prefers-reduced-motion: reduce){
     .boot-logo,.boot-word,.boot-tag,.boot-badge,.boot-status,.boot-sweep,.boot-halo,.boot-rings i,
@@ -733,33 +773,51 @@
   <section class="view" id="v-staking">
     <button class="backlink nav" data-to="home">← volver</button>
     <h2 class="view-title">Staking</h2>
-    <p class="view-sub">Delegá QCH a un validador para ayudar a asegurar la red y ganar recompensas. Podés reclamar las recompensas o retirar cuando quieras.</p>
 
-    <div class="apy-banner">
-      <div class="apy-big">hasta <b>12%</b> <span>APY</span></div>
-      <div class="apy-sub">Ganá recompensas por asegurar la red. Delegá tu QCH y hacelo crecer.</div>
+    <!-- Panel de resumen (APY / totales) estilo exchange -->
+    <div class="stk-hero">
+      <div class="stk-hero-apy">
+        <div class="stk-apy-num" id="stk-apy">—</div>
+        <div class="stk-apy-lbl">APY estimada</div>
+      </div>
+      <div class="stk-hero-grid">
+        <div><div class="stk-k">En staking</div><div class="stk-v" id="stk-total">—</div></div>
+        <div><div class="stk-k">Recompensas</div><div class="stk-v" id="stk-rewards" style="color:var(--good)">—</div></div>
+        <div><div class="stk-k">Comisión val.</div><div class="stk-v" id="stk-commission">—</div></div>
+      </div>
     </div>
 
-    <div class="card accent" style="margin-top:4px">
-      <div class="section-title" style="margin:0 0 8px">Delegar</div>
-      <label for="st-valselect">Elegí un validador</label>
+    <!-- Delegar -->
+    <div class="card accent" style="margin-top:14px">
+      <div class="section-title" style="margin:0 0 10px">Delegar QCH</div>
+      <label for="st-valselect">Validador</label>
       <select id="st-valselect"><option value="">— cargando validadores… —</option></select>
-      <div class="hint">Elegí de la lista, o pegá una dirección manualmente abajo.</div>
-      <label for="st-validator">Dirección del validador</label>
-      <input id="st-validator" placeholder="dirección del validador" autocomplete="off">
-      <div class="hint" id="st-valhint">Se rellena con el validador que elijas arriba.</div>
-      <label for="st-amount">Monto (QCH)</label>
-      <input id="st-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
-      <button class="btn-block" id="st-delegate" style="margin-top:16px">Delegar</button>
+      <div class="hint" id="st-valhint" style="margin-top:4px">Elegí un validador de la red. También podés pegar una dirección abajo.</div>
+      <input id="st-validator" placeholder="o pegá la dirección del validador" autocomplete="off" style="margin-top:8px">
+      <label for="st-amount" style="margin-top:12px">Monto</label>
+      <div class="stk-amt-row">
+        <input id="st-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
+        <button type="button" class="stk-max" id="st-max">MÁX</button>
+      </div>
+      <div class="hint" id="st-avail" style="margin-top:4px">disponible: —</div>
+      <div class="stk-est" id="st-est" hidden>Ganancia estimada: <b id="st-est-val">—</b> / año</div>
+      <button class="btn-block btn-glow" id="st-delegate" style="margin-top:14px">Delegar</button>
       <div class="msg" id="st-msg"></div>
     </div>
 
-    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
-      <span>Mis delegaciones</span>
+    <!-- Mis posiciones -->
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <span>Tus posiciones</span>
       <button class="btn-sec" id="st-recover" style="padding:6px 10px;font-size:12px">↻ Recuperar</button>
     </div>
-    <div class="card" id="st-list"><div class="empty">todavía no delegaste nada</div></div>
-    <div class="hint" style="margin-top:8px">🔐 Todo se firma en tu navegador. La cuenta de stake se DERIVA de tu semilla, así que tus delegaciones se recuperan al restaurar la wallet en otro dispositivo — tocá <b>Recuperar</b> si no aparecen.</div>
+    <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
+
+    <div class="stk-info card" style="margin-top:14px">
+      <div class="stk-info-row"><span>⏱️ Período de activación</span><b>100 rondas</b></div>
+      <div class="stk-info-row"><span>🎁 Recompensas</span><b>por ronda (emisión)</b></div>
+      <div class="stk-info-row"><span>🔓 Retiro</span><b>instantáneo tras activar</b></div>
+      <div class="hint" style="margin-top:8px">🔐 Todo se firma en tu navegador. La cuenta de stake se DERIVA de tu semilla, así que tus posiciones se recuperan al restaurar la wallet en otro equipo — tocá <b>Recuperar</b> si no aparecen.</div>
+    </div>
   </section>
 
   <!-- ===== CONFIGURACIÓN ===== -->
@@ -2029,87 +2087,117 @@ async function relaySigned(txJson){
 // dirección) para que el usuario elija de una lista en vez de pegar la
 // dirección. Al elegir uno, se rellena el campo de dirección real.
 let validatorListLoaded=false;
+// ---- staking profesional: economía viva (APY/comisión) + mapa de validadores ----
+let STK_ECON=null, STK_VALMAP={}, STK_AVAIL=0n;
+const BONDING_ROUNDS=100;
+function apyPct(){ return STK_ECON ? (STK_ECON.emission_apr_bps||0)/100 : null; }        // % anual de emisión
+function commissionPct(){ return STK_ECON ? (STK_ECON.staking_commission_bps||0)/100 : null; }
+function valName(addr){ const v=STK_VALMAP[addr]; return v&&v.name ? v.name : short(addr); }
+
+async function loadStakingMeta(){
+  try{ STK_ECON=await api("/api/economics"); }catch(e){ STK_ECON=null; }
+  const apy=apyPct(), com=commissionPct();
+  $("stk-apy").textContent = apy!=null ? ("~"+ (Number.isInteger(apy)?apy:apy.toFixed(1)) +"%") : "—";
+  $("stk-commission").textContent = com!=null ? (Number.isInteger(com)?com:com.toFixed(1))+"%" : "—";
+}
 async function loadValidatorList(){
   const sel=$("st-valselect");
   try{
     const vals=await api("/api/validators");
+    STK_VALMAP={}; (Array.isArray(vals)?vals:[]).forEach(v=>{ STK_VALMAP[v.address]={name:v.name,stake:v.stake}; });
     if(!Array.isArray(vals)||!vals.length){ sel.innerHTML='<option value="">— sin validadores —</option>'; return; }
-    // Ordenar: con nombre primero (alfabético), luego el resto por stake desc.
-    vals.sort((a,b)=>{
-      const an=a.name||"", bn=b.name||"";
-      if(an&&!bn) return -1; if(!an&&bn) return 1;
-      if(an&&bn) return an.localeCompare(bn);
-      return (b.stake||0)-(a.stake||0);
-    });
+    vals.sort((a,b)=>{ const an=a.name||"", bn=b.name||""; if(an&&!bn) return -1; if(!an&&bn) return 1; if(an&&bn) return an.localeCompare(bn); return (b.stake||0)-(a.stake||0); });
+    const com=commissionPct();
     const opts=['<option value="">— elegí un validador —</option>'];
     for(const v of vals){
-      const label=(v.name?esc(v.name):esc(short(v.address)))+" · "+esc(qchDisp(v.stake))+" stake";
+      const suffix = com!=null ? (" · comisión "+ (Number.isInteger(com)?com:com.toFixed(1)) +"%") : "";
+      const label=(v.name?esc(v.name):esc(short(v.address)))+" · "+esc(qchDisp(v.stake))+" stake"+esc(suffix);
       opts.push(`<option value="${esc(v.address)}">${label}</option>`);
     }
     sel.innerHTML=opts.join("");
     validatorListLoaded=true;
-    // Si ya hay una dirección puesta y coincide con una opción, seleccionarla.
-    const cur=$("st-validator").value.trim();
-    if(cur) sel.value=cur;
+    const cur=$("st-validator").value.trim(); if(cur) sel.value=cur;
   }catch(e){ sel.innerHTML='<option value="">— no se pudo cargar la lista —</option>'; }
 }
 $("st-valselect").addEventListener("change",e=>{
   const v=e.target.value;
-  if(v){ $("st-validator").value=v; $("st-valhint").textContent="Validador elegido de la lista (podés editar la dirección)."; }
+  if(v){ $("st-validator").value=v; const n=valName(v); $("st-valhint").textContent="Validador: "+n+" (podés editar la dirección)."; }
 });
+// MÁX y estimación de ganancia anual
+function stakeEstimate(){
+  const apy=apyPct(); const est=$("st-est");
+  let amt; try{ amt=qchToUnits($("st-amount").value.trim()); }catch(e){ amt=0n; }
+  if(apy==null || amt<=0n){ est.hidden=true; return; }
+  const yearly = (amt * BigInt(Math.round(apy*100))) / 10000n;   // amt * apy%
+  $("st-est-val").textContent = qchDisp(yearly);
+  est.hidden=false;
+}
+$("st-amount").addEventListener("input", stakeEstimate);
+$("st-max").onclick=()=>{
+  // deja un pequeño margen para el fee de la tx de staking
+  const margin=3000000n; const max = STK_AVAIL>margin ? STK_AVAIL-margin : 0n;
+  $("st-amount").value=unitsToQch(max); stakeEstimate();
+};
+
+function stakeBadge(d){
+  if(!(d&&d.exists)) return {cls:'ready', txt:'Pendiente'};
+  const cur=d.current_round||0;
+  const selfStake=d.owner===d.validator, req=selfStake?d.unbonding_requested_at_round:null;
+  if(selfStake && req!=null && cur<req+BONDING_ROUNDS) return {cls:'cool', txt:'Desactivando'};
+  if(cur < (d.bonding_until_round||0)) return {cls:'warm', txt:'Activando'};
+  const until=Math.max(d.bonding_until_round||0, d.locked_until_round||0);
+  if(cur < until) return {cls:'warm', txt:'Bloqueado (voto)'};
+  return {cls:'active', txt:'Activo'};
+}
 
 async function renderStaking(){
   const addr=myAddress(); if(!addr) return;
-  $("st-msg").className="msg"; $("st-msg").textContent="";
-  $("st-amount").value="";
-  await loadValidatorList();
-  // sugerir el validador del nodo conectado
+  $("st-msg").className="msg"; $("st-msg").textContent=""; $("st-amount").value=""; $("st-est").hidden=true;
+  await Promise.all([loadStakingMeta(), loadValidatorList()]);
+  // saldo disponible para la tarjeta de delegar
+  try{ const acct=await api("/api/account/"+encodeURIComponent(addr)); STK_AVAIL=BigInt(acct.balance||0); $("st-avail").textContent="disponible: "+qchDisp(STK_AVAIL); }catch(e){ $("st-avail").textContent="disponible: —"; }
   if(!$("st-validator").value){
-    try{ const st=await api("/api/node"); if(st.validator){ $("st-validator").value=st.validator; $("st-valhint").textContent="Validador del nodo conectado (podés cambiarlo)."; } }catch(e){}
+    try{ const st=await api("/api/node"); if(st.validator){ $("st-validator").value=st.validator; $("st-valhint").textContent="Sugerido: "+valName(st.validator)+" (el validador del nodo conectado)."; } }catch(e){}
   }
   let stakes=myStakes();
   const list=$("st-list");
-  // Sin posiciones locales (típico tras restaurar en otro dispositivo): intentar
-  // recuperarlas desde la semilla antes de mostrar "no delegaste nada".
-  if(!stakes.length){
-    list.innerHTML='<div class="empty">buscando delegaciones…</div>';
-    try{ await recoverStakes(); }catch(e){}
-    stakes=myStakes();
-  }
-  if(!stakes.length){ list.innerHTML='<div class="empty">todavía no delegaste nada</div>'; return; }
-  // Estado en vivo por posición (recompensa pendiente + si ya se puede retirar).
+  if(!stakes.length){ list.innerHTML='<div class="empty">buscando posiciones…</div>'; try{ await recoverStakes(); }catch(e){} stakes=myStakes(); }
+  if(!stakes.length){ list.innerHTML='<div class="empty">todavía no tenés posiciones de staking</div>'; $("stk-total").textContent="0 QCH"; $("stk-rewards").textContent="0 QCH"; return; }
   const live=await Promise.all(stakes.map(s=>api("/api/stake/"+encodeURIComponent(s.stakeAccount)).catch(()=>null)));
+  let totStake=0n, totReward=0n;
   list.innerHTML=stakes.map((s,i)=>{
     const d=live[i];
-    const amount = (d&&d.exists) ? d.amount : s.amount;      // monto real on-chain si está
-    const reward = (d&&d.exists) ? d.pending_reward : null;
-    // ¿se puede retirar ya? (bonding y lock cumplidos). Si no hay datos, se permite intentar.
-    let ready=true, until=0;
-    if(d&&d.exists){ until=Math.max(d.bonding_until_round||0, d.locked_until_round||0); ready = (d.current_round||0) >= until; }
-    // Self-stake (delegado a la propia dirección): retiro en dos pasos. Mostralo
-    // explícito para que un fondo "atascado" se entienda y se pueda recuperar.
-    const selfStake = d&&d.exists&&d.owner===d.validator;
-    const req = selfStake ? d.unbonding_requested_at_round : null;
-    const rewardLine = reward!==null ? `<div class="hint" style="margin:2px 0 0">recompensa: <b style="color:var(--good)">${esc(qchDisp(reward))}</b></div>` : '';
-    const lockLine = (!ready) ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">se puede retirar en la ronda ${esc(fmt(String(until)))}</div>` : '';
-    const selfLine = selfStake ? (
-      req==null ? `<div class="hint" style="margin:2px 0 0;color:var(--warn,#c90)">self-stake · retiro en 2 pasos (100 rondas)</div>`
-      : ((d.current_round||0) < req+100 ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">unbonding · fondos disponibles en la ronda ${esc(fmt(String(req+100)))}</div>`
-         : `<div class="hint" style="margin:2px 0 0;color:var(--good)">unbonding cumplido · dale a Retirar para recibir los fondos</div>`)
-    ) : '';
-    return `<div class="row-item" style="align-items:flex-start">
-      <div style="min-width:0;flex:1">
-        <div style="font-weight:700">${esc(qchDisp(amount))}</div>
-        <div class="wi-addr mono" style="font-size:11px">a ${esc(short(s.validator))}</div>
-        ${rewardLine}${lockLine}${selfLine}
+    const amount=(d&&d.exists)?d.amount:s.amount;
+    const reward=(d&&d.exists)?d.pending_reward:0;
+    totStake+=BigInt(amount||0); totReward+=BigInt(reward||0);
+    const b=stakeBadge(d);
+    const cur=(d&&d.exists)?(d.current_round||0):0;
+    // ¿se puede retirar? (bonding+lock cumplidos y, si es self-stake en unbonding, pasado el período)
+    let ready=true;
+    if(d&&d.exists){ const until=Math.max(d.bonding_until_round||0,d.locked_until_round||0); ready=cur>=until; if(d.owner===d.validator && d.unbonding_requested_at_round!=null && cur<d.unbonding_requested_at_round+BONDING_ROUNDS) ready=false; }
+    // barra de progreso para "Activando" o "Desactivando"
+    let prog='';
+    if(b.txt==='Activando'){ const end=d.bonding_until_round||0, start=end-BONDING_ROUNDS, pct=Math.max(0,Math.min(100,Math.round((cur-start)/BONDING_ROUNDS*100)));
+      prog=`<div class="pos-prog"><i style="width:${pct}%"></i></div><div class="pos-progtxt">activa en ${esc(fmt(String(Math.max(0,end-cur))))} rondas</div>`; }
+    else if(b.txt==='Desactivando'){ const end=(d.unbonding_requested_at_round||0)+BONDING_ROUNDS, start=end-BONDING_ROUNDS, pct=Math.max(0,Math.min(100,Math.round((cur-start)/BONDING_ROUNDS*100)));
+      prog=`<div class="pos-prog"><i style="width:${pct}%"></i></div><div class="pos-progtxt">fondos disponibles en ${esc(fmt(String(Math.max(0,end-cur))))} rondas</div>`; }
+    const rewardTxt = reward>0 ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(reward))}</b></span>` : `<span class="pos-reward">🎁 sin recompensa aún</span>`;
+    return `<div class="pos-card">
+      <div class="pos-top">
+        <div class="pos-val">${esc(valName(s.validator))}<div class="pv-addr">${esc(short(s.validator))}</div></div>
+        <div class="pos-amt">${esc(qchDisp(amount))}<small>${esc(usdOf(amount))}</small></div>
       </div>
-      <div style="display:flex;flex-direction:column;gap:6px">
-        <button class="btn-sec" data-claim="${i}" style="padding:8px 12px;font-size:13px">Reclamar</button>
-        <button class="btn-sec" data-undel="${i}" ${ready?'':'disabled'} style="padding:8px 12px;font-size:13px">Retirar</button>
+      <div class="pos-meta"><span class="badge ${b.cls}">${esc(b.txt)}</span>${rewardTxt}</div>
+      ${prog}
+      <div class="pos-actions">
+        <button class="btn-sec" data-claim="${i}" ${reward>0?'':'disabled'}>Reclamar</button>
+        <button class="btn-sec" data-undel="${i}" ${ready?'':'disabled'}>Retirar</button>
       </div>
     </div>`;
   }).join("");
-  list.querySelectorAll("button[data-claim]").forEach(b=>b.onclick=()=>stakeAction("claim", stakes[+b.dataset.claim]));
+  $("stk-total").textContent=qchDisp(totStake);
+  $("stk-rewards").textContent=qchDisp(totReward);
+  list.querySelectorAll("button[data-claim]:not([disabled])").forEach(b=>b.onclick=()=>stakeAction("claim", stakes[+b.dataset.claim]));
   list.querySelectorAll("button[data-undel]:not([disabled])").forEach(b=>b.onclick=()=>stakeAction("undelegate", stakes[+b.dataset.undel]));
 }
 
