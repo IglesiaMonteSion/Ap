@@ -109,7 +109,15 @@ impl<'a> Bullshark<'a> {
         // Committee in effect for this round (stage 1: the single base set).
         let validators = self.schedule.for_round(round);
         let quorum = validators.quorum_threshold();
-        let next_round_certs: Vec<&Certificate> = self.dag.certificates_in_round(round + 1).collect();
+        // `saturating_add`, not `+`: completes the project's overflow-safety
+        // policy (the v1.0.5 audit turned on `overflow-checks=true` in release
+        // precisely so a silent wrap can't corrupt consensus - which means a
+        // plain `round + 1` at `u64::MAX` would `panic!` deterministically on
+        // EVERY validator at once = a permanent network halt). `round` is bounded
+        // far below `u64::MAX` by `MAX_ROUND_LOOKAHEAD`, so this is behavior-
+        // identical for every reachable round (the DST proves it); saturating
+        // just makes the unreachable extreme keep the chain alive over halting it.
+        let next_round_certs: Vec<&Certificate> = self.dag.certificates_in_round(round.saturating_add(1)).collect();
         // The upper bound on how much MORE support could still show up for this
         // round's leader from round+1 certificates not yet seen. Round+1's
         // certificates are authored by the committee of round+1's epoch, which
@@ -130,7 +138,7 @@ impl<'a> Bullshark<'a> {
         // (every round+1 author is a current-committee member, so the set of
         // "committee members not yet seen" carries exactly the complementary
         // stake). The membership-change DST proves both directions.
-        let next_committee = self.schedule.for_round(round + 1);
+        let next_committee = self.schedule.for_round(round.saturating_add(1));
         let seen_next_authors: std::collections::HashSet<ValidatorId> = next_round_certs.iter().map(|c| c.vertex.author).collect();
         let unknown_stake: u64 = next_committee
             .ids_sorted()
@@ -146,7 +154,15 @@ impl<'a> Bullshark<'a> {
                     next_round_certs.iter().filter(|c| c.vertex.parents.contains(&leader_digest)).map(|c| validators.stake_of(&c.vertex.author)).sum();
                 if supporting_stake >= quorum {
                     RoundOutcome::Committed(leader_digest)
-                } else if supporting_stake + unknown_stake < quorum {
+                // `saturating_add` for the same overflow-safety reason as the
+                // `round + 1` sites: `supporting_stake` and `unknown_stake` are
+                // disjoint stake subsets so their sum is `<= total_stake` today
+                // (no reachable overflow), but a large token supply pushes stake
+                // near `u64::MAX` (the exact case `quorum_threshold` already
+                // guards in `u128`), and saturating to `u64::MAX` yields the same
+                // verdict this comparison would reach anyway (`>= quorum` -> not
+                // Skipped) without a deterministic panic-halt.
+                } else if supporting_stake.saturating_add(unknown_stake) < quorum {
                     // Even if every still-missing round+1 certificate
                     // turned out to reference this leader, the total
                     // could never reach quorum - permanently ruled out.
@@ -461,7 +477,7 @@ impl<'a> Bullshark<'a> {
         let Some(target) = target else {
             return RoundOutcome::Skipped; // no certificate exists at all locally - nothing to check reachability against
         };
-        let Some(witness_digest) = self.ultimate_witness(round + 1, up_to_round) else {
+        let Some(witness_digest) = self.ultimate_witness(round.saturating_add(1), up_to_round) else {
             return RoundOutcome::Undecided;
         };
         let mut visited = HashSet::new();
@@ -494,7 +510,7 @@ impl<'a> Bullshark<'a> {
         }
         match self.direct_status(round) {
             RoundOutcome::Committed(d) => Some(d),
-            RoundOutcome::Skipped => self.ultimate_witness(round + 1, up_to_round),
+            RoundOutcome::Skipped => self.ultimate_witness(round.saturating_add(1), up_to_round),
             RoundOutcome::Undecided => None,
         }
     }
