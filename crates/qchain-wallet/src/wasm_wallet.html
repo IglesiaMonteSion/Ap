@@ -410,6 +410,25 @@
   .pos-progtxt{font-size:11px;color:var(--muted);margin-top:5px}
   .pos-actions{display:flex;gap:8px;margin-top:12px}
   .pos-actions button{flex:1;padding:9px;font-size:13px;border-radius:11px}
+  /* directorio de validadores */
+  .vd-row{display:flex;align-items:center;gap:11px;border:1px solid var(--line);border-radius:14px;padding:11px 12px;margin-top:9px}
+  .vd-rank{flex:0 0 auto;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:800;
+    background:rgba(140,120,255,.14);color:var(--accent,#9c86ff)}
+  .vd-main{flex:1;min-width:0}
+  .vd-name{font-weight:700;font-size:14px;overflow-wrap:anywhere;line-height:1.2}
+  .vd-sub{font-size:11px;color:var(--muted);margin-top:2px}
+  .vd-share{flex:0 0 auto;text-align:right}
+  .vd-share b{font-size:14px} .vd-share small{display:block;font-size:10px;color:var(--muted)}
+  .vd-pick{flex:0 0 auto;padding:7px 12px;font-size:12px;border-radius:10px;border:1px solid rgba(140,120,255,.4);
+    background:rgba(140,120,255,.12);color:var(--accent,#9c86ff);font-weight:700;cursor:pointer}
+  .vd-pick:active{transform:scale(.96)}
+  .vd-bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:8px}
+  .vd-bar>i{display:block;height:100%;background:linear-gradient(90deg,#7c5cff,#4f74ff)}
+  /* historial de recompensas */
+  .rh-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 4px;border-top:1px solid var(--line)}
+  .rh-row:first-child{border-top:0}
+  .rh-l{min-width:0} .rh-l b{font-size:14px} .rh-l div{font-size:11px;color:var(--muted);margin-top:2px}
+  .rh-amt{font-weight:800;color:var(--good);white-space:nowrap}
 
   @media (prefers-reduced-motion: reduce){
     .boot-logo,.boot-word,.boot-tag,.boot-badge,.boot-status,.boot-sweep,.boot-halo,.boot-rings i,
@@ -805,12 +824,26 @@
       <div class="msg" id="st-msg"></div>
     </div>
 
+    <!-- Directorio / mercado de validadores -->
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <span>Validadores de la red</span>
+      <span class="hint" id="vd-count">—</span>
+    </div>
+    <div id="vd-list"><div class="empty">cargando validadores…</div></div>
+
     <!-- Mis posiciones -->
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
       <span>Tus posiciones</span>
       <button class="btn-sec" id="st-recover" style="padding:6px 10px;font-size:12px">↻ Recuperar</button>
     </div>
     <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
+
+    <!-- Historial de recompensas reclamadas -->
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <span>Recompensas reclamadas</span>
+      <span class="hint" id="rh-total"></span>
+    </div>
+    <div id="rh-list"><div class="empty">todavía no reclamaste recompensas</div></div>
 
     <div class="stk-info card" style="margin-top:14px">
       <div class="stk-info-row"><span>⏱️ Período de activación</span><b>100 rondas</b></div>
@@ -2151,10 +2184,57 @@ function stakeBadge(d){
   return {cls:'active', txt:'Activo'};
 }
 
+// Directorio / mercado de validadores: lista rankeada por stake con % de red,
+// comisión (global hoy) y "Delegar" por fila. Reusa /api/validators + STK_ECON.
+async function renderValidatorDirectory(){
+  const box=$("vd-list");
+  let vals; try{ vals=await api("/api/validators"); }catch(e){ box.innerHTML='<div class="empty">no se pudo cargar el directorio</div>'; return; }
+  if(!Array.isArray(vals)||!vals.length){ box.innerHTML='<div class="empty">sin validadores</div>'; $("vd-count").textContent=""; return; }
+  vals.sort((a,b)=>(b.stake||0)-(a.stake||0));
+  const total=vals.reduce((s,v)=>s+(v.stake||0),0)||1;
+  const com=commissionPct();
+  $("vd-count").textContent=vals.length+(vals.length===1?" validador":" validadores");
+  box.innerHTML=vals.map((v,i)=>{
+    const share=(v.stake||0)/total*100;
+    const comTxt = com!=null ? ` · comisión ${Number.isInteger(com)?com:com.toFixed(1)}%` : "";
+    return `<div class="vd-row">
+      <div class="vd-rank">${i+1}</div>
+      <div class="vd-main">
+        <div class="vd-name">${esc(v.name||short(v.address))}</div>
+        <div class="vd-sub">${esc(short(v.address))}${esc(comTxt)}</div>
+        <div class="vd-bar"><i style="width:${share.toFixed(1)}%"></i></div>
+      </div>
+      <div class="vd-share"><b>${share.toFixed(1)}%</b><small>${esc(qchDisp(v.stake))}</small></div>
+      <button class="vd-pick" data-val="${esc(v.address)}">Delegar</button>
+    </div>`;
+  }).join("");
+  box.querySelectorAll("button[data-val]").forEach(b=>b.onclick=()=>{
+    const a=b.dataset.val; $("st-validator").value=a;
+    const sel=$("st-valselect"); if(sel) sel.value=a;
+    $("st-valhint").textContent="Validador elegido del directorio: "+valName(a);
+    $("st-amount").focus(); $("st-delegate").scrollIntoView({behavior:"smooth",block:"center"});
+  });
+}
+// Historial de recompensas reclamadas (eventos ClaimReward on-chain de esta cuenta).
+async function renderRewardHistory(){
+  const box=$("rh-list"), addr=myAddress(); if(!addr) return;
+  let evs; try{ evs=await api("/api/staking_activity/"+encodeURIComponent(addr)); }catch(e){ box.innerHTML='<div class="empty">no se pudo cargar el historial</div>'; return; }
+  const list=Array.isArray(evs)?evs:(evs&&evs.events)||[];
+  const claims=list.filter(e=>e.kind==="claim_reward").sort((a,b)=>(Number(b.round)||0)-(Number(a.round)||0));
+  if(!claims.length){ box.innerHTML='<div class="empty">todavía no reclamaste recompensas</div>'; $("rh-total").textContent=""; return; }
+  let tot=0n; for(const c of claims) tot+=BigInt(c.amount||0);
+  $("rh-total").textContent="total: "+qchDisp(tot);
+  box.innerHTML=claims.slice(0,20).map(c=>`<div class="rh-row">
+    <div class="rh-l"><b>★ Recompensa reclamada</b><div>validador ${esc(peerLabel(c.validator))} · ronda ${esc(fmt(String(Number(c.round)||0)))}</div></div>
+    <div class="rh-amt">+${esc(qchDisp(c.amount))}</div>
+  </div>`).join("");
+}
+
 async function renderStaking(){
   const addr=myAddress(); if(!addr) return;
   $("st-msg").className="msg"; $("st-msg").textContent=""; $("st-amount").value=""; $("st-est").hidden=true;
   await Promise.all([loadStakingMeta(), loadValidatorList()]);
+  renderValidatorDirectory(); renderRewardHistory();   // tras cargar economía (comisión); pueblan su propio DOM
   // saldo disponible para la tarjeta de delegar
   try{ const acct=await api("/api/account/"+encodeURIComponent(addr)); STK_AVAIL=BigInt(acct.balance||0); $("st-avail").textContent="disponible: "+qchDisp(STK_AVAIL); }catch(e){ $("st-avail").textContent="disponible: —"; }
   if(!$("st-validator").value){
