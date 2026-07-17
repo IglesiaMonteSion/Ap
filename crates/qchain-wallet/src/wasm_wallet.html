@@ -838,6 +838,16 @@
     </div>
     <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
 
+    <!-- Importar una posición vieja por dirección (cuentas de dirección aleatoria, no derivables de la semilla) -->
+    <div class="card" style="margin-top:10px;padding:12px">
+      <div class="hint" style="margin-bottom:8px">¿Tenés una posición vieja que no aparece ni con <b>Recuperar</b>? Pegá la dirección de la cuenta de stake para importarla.</div>
+      <div style="display:flex;gap:8px">
+        <input id="st-import" placeholder="dirección de la cuenta de stake" autocomplete="off" style="flex:1;min-width:0">
+        <button class="btn-sec" id="st-import-btn" style="padding:9px 12px;white-space:nowrap">Importar</button>
+      </div>
+      <div class="msg" id="st-import-msg"></div>
+    </div>
+
     <!-- Historial de recompensas reclamadas -->
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
       <span>Recompensas reclamadas</span>
@@ -2081,6 +2091,23 @@ function allStakes(){ try{ return JSON.parse(localStorage.getItem(STAKES_KEY)||"
 function myStakes(){ const a=myAddress(); return (allStakes()[a]||[]); }
 function saveStake(pos){ const a=myAddress(), all=allStakes(); (all[a]=all[a]||[]).push(pos); localStorage.setItem(STAKES_KEY, JSON.stringify(all)); }
 function dropStake(stakeAccount){ const a=myAddress(), all=allStakes(); all[a]=(all[a]||[]).filter(p=>p.stakeAccount!==stakeAccount); localStorage.setItem(STAKES_KEY, JSON.stringify(all)); }
+// Importar una posición por su dirección de cuenta de stake. Para posiciones de
+// dirección ALEATORIA (creadas antes de la derivación determinista v2.0.5, o en
+// otro dispositivo) que "Recuperar" no puede re-derivar de la semilla. Solo
+// agrega la posición a la lista local si la cuenta on-chain es REALMENTE tuya
+// (owner == tu dirección); el Retirar posterior lo firma tu semilla, como siempre.
+async function importStakeByAddress(){
+  const m=$("st-import-msg"), raw=($("st-import").value||"").trim();
+  m.className="msg"; m.textContent="";
+  if(!raw){ m.className="msg err"; m.textContent="Pegá la dirección de una cuenta de stake."; return; }
+  let d; try{ d=await api("/api/stake/"+encodeURIComponent(raw)); }catch(e){ m.className="msg err"; m.textContent="No se pudo consultar esa dirección."; return; }
+  if(!(d&&d.exists)){ m.className="msg err"; m.textContent="No existe una cuenta de stake en esa dirección."; return; }
+  if(d.owner!==myAddress()){ m.className="msg err"; m.textContent="Esa cuenta de stake no es tuya (el dueño es otra dirección)."; return; }
+  if(myStakes().some(p=>p.stakeAccount===raw)){ m.className="msg ok"; m.textContent="Esa posición ya estaba en tu lista."; renderStaking(); return; }
+  saveStake({ stakeAccount: raw, validator: d.validator, amount: String(d.amount) });
+  m.className="msg ok"; m.textContent="✓ Posición importada. Aparece abajo — tocá Retirar para recuperar tus fondos.";
+  $("st-import").value=""; renderStaking();
+}
 // El próximo índice determinista libre = 1 + el mayor índice ya usado. Nunca se
 // reutiliza un índice (una cuenta de stake ya creada — aunque esté en 0 tras un
 // retiro — haría fallar un Delegate nuevo, que rechaza sobrescribir).
@@ -2297,6 +2324,7 @@ $("st-recover").onclick=async()=>{
     await renderStaking();
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
 };
+$("st-import-btn").onclick=importStakeByAddress;
 
 $("st-delegate").onclick=async()=>{
   const validator=$("st-validator").value.trim(), amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
