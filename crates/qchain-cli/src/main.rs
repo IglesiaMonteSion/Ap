@@ -1624,7 +1624,10 @@ fn main() -> anyhow::Result<()> {
                 // see deploy/reset-testnet-genesis.sh) for a bigger honest queue.
                 // 4x margin covers the dynamic fee rising during the flood.
                 let est_fee_per_tx = base_fee.saturating_mul(6_000).max(1_000_000).saturating_mul(4);
-                let mut pool: Vec<Transaction> = Vec::new();
+                // Phase 1 - PLAN the pool sequentially (cheap: only the per-worker
+                // network fetch of nonce/balance, no signing). Each job records its
+                // worker, its deterministic nonce, and its content seed `gc`.
+                let mut jobs: Vec<(usize, u64, u64)> = Vec::new(); // (worker_index, nonce, gc)
                 let mut gc = 0u64;
                 let mut capped_any = false;
                 for (wi, w) in workers_kp.iter().enumerate() {
@@ -1637,16 +1640,48 @@ fn main() -> anyhow::Result<()> {
                         capped_any = true;
                     }
                     for j in 0..this_worker {
-                        let recipient = workers_kp[(wi + 1) % workers].pubkey();
-                        let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, gc);
+                        jobs.push((wi, start + j as u64, gc));
                         gc += 1;
-                        pool.push(Transaction::new_signed(w, start + j as u64, chain_id, tx_fee_limit, vec![ix])?);
                     }
                 }
                 if capped_any {
-                    println!("aviso: acoté el pool a lo que los workers pueden pagar ({} txs, pediste {}). Fondeá la wallet con más QCH (deploy/reset-testnet-genesis.sh) para una cola más grande.", pool.len(), want_per_worker * workers);
+                    println!("aviso: acoté el pool a lo que los workers pueden pagar ({} txs, pediste {}). Fondeá la wallet con más QCH (deploy/reset-testnet-genesis.sh) para una cola más grande.", jobs.len(), want_per_worker * workers);
                 }
-                println!("fire-and-forget: pre-firmadas {} txs variadas (untimed)...", pool.len());
+                // Phase 2 - SIGN the whole pool IN PARALLEL across every core. PQC
+                // signing (Ed25519 + ML-DSA-65) is the expensive CPU-bound step; the
+                // old code did it on a single core, so pre-signing a large pool left
+                // the rest of the VPS idle. Scoped std threads (no dependency, same
+                // pattern the node uses for parallel verify); order is preserved so
+                // each worker's txs stay in ascending nonce order.
+                let n_jobs = jobs.len();
+                let mut slots: Vec<Option<Transaction>> = (0..n_jobs).map(|_| None).collect();
+                let sign_err = std::sync::atomic::AtomicBool::new(false);
+                if n_jobs > 0 {
+                    let nthreads = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4).clamp(1, n_jobs);
+                    let chunk = n_jobs.div_ceil(nthreads).max(1);
+                    let workers_kp_ref = &workers_kp;
+                    let sign_err_ref = &sign_err;
+                    std::thread::scope(|s| {
+                        for (job_chunk, out_chunk) in jobs.chunks(chunk).zip(slots.chunks_mut(chunk)) {
+                            s.spawn(move || {
+                                for (slot, &(wi, nonce, seed)) in out_chunk.iter_mut().zip(job_chunk) {
+                                    let w = &workers_kp_ref[wi];
+                                    let recipient = workers_kp_ref[(wi + 1) % workers].pubkey();
+                                    let ix = build_stress_ix(w.pubkey(), recipient, program_pk, validator_pk, contract_pct, stake_pct, seed);
+                                    match Transaction::new_signed(w, nonce, chain_id, tx_fee_limit, vec![ix]) {
+                                        Ok(tx) => *slot = Some(tx),
+                                        Err(_) => sign_err_ref.store(true, std::sync::atomic::Ordering::Relaxed),
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+                if sign_err.load(std::sync::atomic::Ordering::Relaxed) {
+                    anyhow::bail!("fallo al pre-firmar alguna transacción del pool");
+                }
+                let pool: Vec<Transaction> = slots.into_iter().flatten().collect();
+                println!("fire-and-forget: pre-firmadas {} txs variadas en paralelo ({} cores, untimed)...", pool.len(), std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1));
                 let baseline = fetch_stress_sample(&rpc).map(|s| s.executed).unwrap_or(0);
                 println!("blasting {} txs at high concurrency (async, no per-response wait)...", pool.len());
                 let (accepted, failed, peak_backlog, peak_fee_bf) = blast_txs_async(&rpc, pool, baseline);
