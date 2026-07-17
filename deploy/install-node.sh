@@ -47,6 +47,11 @@ CON_TUNEL=0
 # Solo aplica al CREAR una red nueva (modo "solo") - todos los nodos de una red
 # deben usar el mismo valor (se pliega en el chain_id). Off por defecto.
 COMPRIMIDO=0
+# Fondear una direccion ADICIONAL en el genesis (ademas de la wallet de prueba),
+# para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
+# red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
+FONDEAR_ADDR=""
+FONDEAR_QCH=""
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -80,6 +85,10 @@ Opciones:
                          (hard fork, ~6x throughput bajo carga, menos RAM/disco).
                          Solo al CREAR la red; todos los nodos deben usarlo. No se
                          puede convertir una cadena ya corriendo (cambia la raíz).
+  --fondear <dir>        (modo "solo") fondear una dirección ADICIONAL en el
+  --fondear-qch <n>      génesis con <n> QCH (además de la wallet de prueba). Para
+                         arrancar tu propia wallet con un balance grande de una.
+                         Ej: --fondear Ahc...Te2y --fondear-qch 10000000
   --con-wallet           Instalar también la wallet web sin preguntar (con --yes
                          te genera y muestra una contraseña fuerte).
   --con-tunel            Instalar también el túnel de Cloudflare (HTTPS público)
@@ -107,6 +116,8 @@ while [ $# -gt 0 ]; do
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
+    --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
+    --fondear-qch) FONDEAR_QCH="${2:-}"; shift 2 ;;
     --con-wallet) CON_WALLET=1; shift ;;
     --con-tunel) CON_TUNEL=1; shift ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
@@ -326,8 +337,17 @@ EOF
 {"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE}
 EOF
       fi
+      GENESIS_ALLOCS="{\"address\": \"$WALLET_DIRECCION\", \"balance\": $FONDO_WALLET_PRUEBA}"
+      if [ -n "$FONDEAR_ADDR" ]; then
+        if ! printf '%s' "$FONDEAR_QCH" | grep -Eq '^[0-9]+$'; then
+          error "--fondear requiere también --fondear-qch <numero de QCH> (recibí: '$FONDEAR_QCH')"
+        fi
+        FONDEAR_UNITS=$(( FONDEAR_QCH * 1000000000 ))
+        GENESIS_ALLOCS="$GENESIS_ALLOCS, {\"address\": \"$FONDEAR_ADDR\", \"balance\": $FONDEAR_UNITS}"
+        decir "  -> fondeando $FONDEAR_ADDR con $FONDEAR_QCH QCH ($FONDEAR_UNITS unidades) en el genesis"
+      fi
       cat > "$QCHAIN_HOME/genesis.json" <<EOF
-[{"address": "$WALLET_DIRECCION", "balance": $FONDO_WALLET_PRUEBA}]
+[$GENESIS_ALLOCS]
 EOF
 
       decir "Armando la configuracion de la red (config.json)"
