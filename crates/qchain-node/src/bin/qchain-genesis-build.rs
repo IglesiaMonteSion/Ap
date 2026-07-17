@@ -57,6 +57,15 @@ struct Cli {
     /// real on-disk persistence (`SledStore`) across restarts.
     #[arg(long, default_value = "data")]
     data_dir_name: String,
+    /// Start the network with the COMPRESSED state tree (`compressed_state_tree:
+    /// true`) instead of the legacy 256-deep tree. This is a network-wide,
+    /// genesis-level hard-fork choice folded into the `chain_id`: EVERY node must
+    /// use the same value, and it can only be chosen when a network is FIRST
+    /// created (you cannot convert a running chain - the state root changes).
+    /// ~6x higher apply throughput and lower RAM/disk under load; see the
+    /// compressed-tree notes. Off by default (the legacy tree).
+    #[arg(long, default_value_t = false)]
+    compressed_state_tree: bool,
 }
 
 #[derive(Deserialize)]
@@ -129,13 +138,14 @@ fn main() -> anyhow::Result<()> {
             validators: validators.clone(),
             genesis: genesis.clone(),
             round_interval_ms: cli.round_interval_ms,
+            // Network-wide genesis choice (folded into chain_id) - same for every node.
+            compressed_state_tree: cli.compressed_state_tree,
             data_dir: Some(PathBuf::from(&cli.data_dir_name)),
             state_sync_peers: Vec::new(),
             state_sync_trusted_root: None,
             state_sync_trusted_round: None,
             validator_rotation: false,
             epoch_rounds: None,
-            compressed_state_tree: false,
             storage_engine: "sled".to_string(),
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));

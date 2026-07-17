@@ -43,6 +43,10 @@ RONDA_MS="${RONDA_MS:-500}"
 FONDO_WALLET_PRUEBA="1000000000000"
 CON_WALLET=0
 CON_TUNEL=0
+# Arrancar la red con el arbol de estado COMPRIMIDO (hard fork, ~6x throughput).
+# Solo aplica al CREAR una red nueva (modo "solo") - todos los nodos de una red
+# deben usar el mismo valor (se pliega en el chain_id). Off por defecto.
+COMPRIMIDO=0
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -72,6 +76,10 @@ Opciones:
                          red multi-nodo. TODOS los nodos deben usar el mismo
                          valor. Ojo: la emisión de staking es por-ronda (retuneá
                          el APR por gobernanza si cambiás esto).
+  --comprimido           (modo "solo") crear la red con el ÁRBOL COMPRIMIDO
+                         (hard fork, ~6x throughput bajo carga, menos RAM/disco).
+                         Solo al CREAR la red; todos los nodos deben usarlo. No se
+                         puede convertir una cadena ya corriendo (cambia la raíz).
   --con-wallet           Instalar también la wallet web sin preguntar (con --yes
                          te genera y muestra una contraseña fuerte).
   --con-tunel            Instalar también el túnel de Cloudflare (HTTPS público)
@@ -98,6 +106,7 @@ while [ $# -gt 0 ]; do
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
+    --comprimido|--compressed) COMPRIMIDO=1; shift ;;
     --con-wallet) CON_WALLET=1; shift ;;
     --con-tunel) CON_TUNEL=1; shift ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
@@ -322,7 +331,12 @@ EOF
 EOF
 
       decir "Armando la configuracion de la red (config.json)"
-      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS"
+      GB_COMPRIMIDO=""
+      if [ "$COMPRIMIDO" = "1" ]; then
+        GB_COMPRIMIDO="--compressed-state-tree"
+        decir "  -> arbol de estado COMPRIMIDO (hard fork, ~6x throughput bajo carga)"
+      fi
+      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO
       cp "$QCHAIN_HOME/out/node1.json" "$QCHAIN_HOME/config.json"
       rm -rf "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out" "$QCHAIN_HOME/genesis.json"
       mkdir -p "$QCHAIN_HOME/data"

@@ -79,6 +79,24 @@ sudo ./deploy/install-node.sh --modo unirse --config /ruta/a/config.json --yes
 Ver todas las opciones (puertos custom, imagen custom, carpeta de
 instalación custom) con `sudo ./deploy/install-node.sh --help`.
 
+### Red con árbol comprimido (`--comprimido`, ~6× throughput)
+
+Para crear una red NUEVA con el **árbol de estado comprimido** (mayor
+throughput de apply y menos RAM/disco bajo carga), agregá `--comprimido` al
+crear la red en modo solo:
+
+```
+sudo ./deploy/install-node.sh --modo solo --comprimido --con-tunel --yes
+```
+
+**Es un hard fork, decidido en el génesis:** cambia la raíz de estado y se
+pliega en el `chain_id`, así que **solo se puede elegir al CREAR la red** — no
+se puede convertir una cadena ya corriendo, y TODOS los nodos de esa red deben
+usar el mismo valor (si no, divergen). Para pasar una red existente a
+comprimido, arrancá una red nueva con `--comprimido` (el estado viejo no se
+migra automáticamente; es una cadena distinta). El beneficio se nota bajo carga
+alta; a tráfico bajo la diferencia es chica.
+
 ## Red de 2 validadores (principal + secundario) en un paso: `deploy/setup-2validators.sh`
 
 Para armar una red NUEVA de dos VPS sin hacer el ida y vuelta de bundles/configs
