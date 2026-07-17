@@ -581,6 +581,7 @@ async fn main() -> anyhow::Result<()> {
         staking_log,
         economics_path,
         round_interval_ms: config.round_interval_ms,
+        disk_size_cache: std::sync::Mutex::new(None),
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,

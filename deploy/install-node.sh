@@ -342,6 +342,18 @@ EOF
         if ! printf '%s' "$FONDEAR_QCH" | grep -Eq '^[0-9]+$'; then
           error "--fondear requiere también --fondear-qch <numero de QCH> (recibí: '$FONDEAR_QCH')"
         fi
+        # Acotar el monto: units = QCH * 1e9 debe caber en u64 (~1.8e19). Cap a
+        # 10.000 millones de QCH (1e19 unidades) - de sobra para cualquier prueba,
+        # y evita que la aritmética i64 de bash desborde SILENCIOSAMENTE a un
+        # balance positivo equivocado (auditoría de seguridad).
+        if [ "$FONDEAR_QCH" -gt 10000000000 ]; then
+          error "--fondear-qch demasiado grande (max 10000000000 QCH); recibí: $FONDEAR_QCH"
+        fi
+        # Validar la dirección como base58 antes de interpolarla en el JSON del
+        # génesis (evita una inyección JSON con una dirección malformada).
+        if ! printf '%s' "$FONDEAR_ADDR" | grep -Eq '^[1-9A-HJ-NP-Za-km-z]{32,44}$'; then
+          error "--fondear: dirección inválida (se espera base58 de 32-44 chars); recibí: '$FONDEAR_ADDR'"
+        fi
         FONDEAR_UNITS=$(( FONDEAR_QCH * 1000000000 ))
         GENESIS_ALLOCS="$GENESIS_ALLOCS, {\"address\": \"$FONDEAR_ADDR\", \"balance\": $FONDEAR_UNITS}"
         decir "  -> fondeando $FONDEAR_ADDR con $FONDEAR_QCH QCH ($FONDEAR_UNITS unidades) en el genesis"

@@ -1251,6 +1251,28 @@ impl Ledger {
         working: &mut HashMap<Pubkey, Account>,
         gas_price_per_fuel: u64,
     ) -> Result<u64, ExecError> {
+        // SECURITY — reject ALIASED accounts (the same pubkey named twice in
+        // `ix.accounts`). The conservation and debit-authorization checks below
+        // sum balances POSITIONALLY over `ix.accounts`, but the commit at the end
+        // writes into the pubkey-keyed `working` map (last-write-wins). A
+        // duplicate pubkey lets an attacker keep the positional sum conserved
+        // while the by-key commit MINTS: with `accounts = [A, A]` a contract
+        // returns `[0, 2*bal]` (positional sum unchanged) but the commit does
+        // `insert(A, 0)` then `insert(A, 2*bal)`, leaving A at 2*bal - value
+        // created from nothing, deterministically on every node. A legitimate
+        // contract never needs to name the same account twice; the native
+        // execution path is naturally immune (it operates directly on the
+        // pubkey-keyed map), so this only has to be closed here on the WASM path.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(ix.accounts.len());
+            for pk in &ix.accounts {
+                if !seen.insert(*pk) {
+                    return Err(ExecError::ProgramError(
+                        "a contract instruction may not name the same account more than once (account aliasing)".into(),
+                    ));
+                }
+            }
+        }
         let accounts: Vec<Account> = ix
             .accounts
             .iter()
@@ -2761,6 +2783,41 @@ mod tests {
         // charged (no mint applied), so the balance never balloons.
         assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive a rejected mint");
         assert!(ledger.get_balance(&attacker.pubkey()) < 1_000_000_000_000, "the minted value must not have been committed");
+    }
+
+    /// Account ALIASING must be rejected on the WASM path. The v2.0.4
+    /// conservation check sums balances POSITIONALLY over `ix.accounts`, but the
+    /// commit writes into a pubkey-keyed map (last-write-wins). Naming the same
+    /// account twice would let a contract return `[0, 2*bal]` (positional sum
+    /// unchanged, so conservation "passes") while the commit does `insert(A, 0)`
+    /// then `insert(A, 2*bal)`, leaving A at `2*bal` - value minted from nothing,
+    /// deterministically on every node. Rejecting duplicate declared accounts
+    /// closes it. (Found by a proactive security audit.)
+    #[test]
+    fn a_wasm_instruction_naming_the_same_account_twice_is_rejected_aliasing_mint() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = deploy_wat(&mut ledger, MINT_WAT, "mint", &deployer, &validator);
+
+        let attacker = Keypair::generate().unwrap();
+        ledger.credit(attacker.pubkey(), 5_000_000);
+        let balance_before = ledger.get_balance(&attacker.pubkey());
+
+        // The instruction names the attacker's account TWICE (aliasing).
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes());
+        let call_ix = Instruction {
+            program_id: program_pk,
+            accounts: vec![attacker.pubkey(), attacker.pubkey()],
+            data: call_data,
+        };
+        let call_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+
+        let result = ledger.apply_transaction(&call_tx, &validator, 0);
+        assert!(result.is_err(), "a WASM instruction naming the same account twice must be rejected (aliasing mint)");
+        assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive the rejected aliasing call");
     }
 
     #[test]

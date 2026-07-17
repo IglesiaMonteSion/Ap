@@ -189,6 +189,19 @@ fn compute_proof(leaves: &[Leaf], depth: usize, target: &[u8; 32], steps: &mut V
 /// the terminal is empty or a DIFFERENT key's leaf. Folding uses only the
 /// branch steps, so it is O(steps) = ~O(log n), never 256.
 pub fn verify_proof(root: [u8; 32], proof: &CompressedProof) -> bool {
+    // A genuine proof has at most one branch step per key-bit depth, so
+    // `steps.len() <= 256` and every `step.depth < 256`. Reject anything else
+    // BEFORE folding: `bit_at` indexes `key[depth / 8]` on a `[u8; 32]`, so a
+    // `step.depth >= 256` (the field is a bare `u16`, attacker-controlled over
+    // the wire when a light client verifies a proof served by an untrusted node)
+    // would panic with an out-of-bounds index - an unauthenticated remote crash
+    // of any verifier / `--cross-check-rpc` client. Bounding `steps.len()` also
+    // closes a CPU/allocation DoS from a multi-million-step vector. A rejected
+    // proof is simply invalid (returns false), never a panic.
+    const MAX_DEPTH: usize = 256; // key is [u8; 32] = 256 bits
+    if proof.steps.len() > MAX_DEPTH || proof.steps.iter().any(|s| (s.depth as usize) >= MAX_DEPTH) {
+        return false;
+    }
     let mut current = match &proof.terminal {
         Terminal::Leaf { value_hash } => leaf_node(&proof.key, value_hash),
         Terminal::OtherLeaf { key, value_hash } => {
@@ -655,6 +668,36 @@ mod tests {
             let p = CompressedStateTree::prove(&leaves, &key(s));
             assert!(p.steps.len() < 32, "a compressed proof over 64 leaves should be <32 steps, got {}", p.steps.len());
         }
+    }
+
+    /// A malicious proof served to a light client must be REJECTED, never
+    /// panic. `verify_proof` folds using `bit_at(key, step.depth)` which indexes
+    /// `key[depth/8]` on a `[u8;32]`; a `step.depth >= 256` (a bare `u16`,
+    /// attacker-controlled over the wire) would index out of bounds and crash
+    /// the verifier. It must return `false` instead. Also rejects an absurdly
+    /// long steps vector (CPU/allocation DoS). (Found by a proactive audit.)
+    #[test]
+    fn verify_proof_rejects_out_of_range_depth_and_overlong_steps_without_panicking() {
+        let poisoned_depth = CompressedProof {
+            key: [7u8; 32],
+            terminal: Terminal::Empty,
+            steps: vec![ProofStep { depth: 256, sibling: [0u8; 32] }],
+        };
+        assert!(!verify_proof([0u8; 32], &poisoned_depth), "an out-of-range step depth must be rejected, not panic");
+
+        let poisoned_depth_max = CompressedProof {
+            key: [7u8; 32],
+            terminal: Terminal::Empty,
+            steps: vec![ProofStep { depth: u16::MAX, sibling: [1u8; 32] }],
+        };
+        assert!(!verify_proof([0u8; 32], &poisoned_depth_max), "depth u16::MAX must be rejected, not panic");
+
+        let overlong = CompressedProof {
+            key: [7u8; 32],
+            terminal: Terminal::Empty,
+            steps: vec![ProofStep { depth: 0, sibling: [0u8; 32] }; 100_000],
+        };
+        assert!(!verify_proof([0u8; 32], &overlong), "an over-long steps vector must be rejected");
     }
 
     fn wide_key(seed: u32) -> [u8; 32] {

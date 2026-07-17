@@ -788,7 +788,18 @@ pub struct Engine {
     /// scale with the real cadence instead of a hardcoded guess - a node run with
     /// a deliberately slow interval otherwise false-positives the stall alert.
     pub round_interval_ms: u64,
+    /// Short-TTL cache of the `data_dir` on-disk size for `GET /resources`, so an
+    /// unauthenticated flood of that endpoint can't make each request do a fresh
+    /// recursive directory walk (hundreds of `stat` syscalls under a load test,
+    /// on the async runtime). The walk runs at most once per `DISK_SIZE_TTL`.
+    pub disk_size_cache: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
 }
+
+/// How long a `/resources` disk-size reading is reused before the `data_dir`
+/// is re-walked. Keeps an unauthenticated `GET /resources` flood from turning
+/// into a per-request recursive `stat` storm, while staying fresh enough for a
+/// stress tool sampling every few hundred ms.
+const DISK_SIZE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Engine {
     /// The committee currently in effect (this epoch) — a cheap `Arc` clone of
@@ -2022,13 +2033,27 @@ impl Engine {
             })
             .unwrap_or(0.0);
         // Disk: sum of file sizes under the data_dir (parent of the economics
-        // snapshot path). 0 for an in-memory node (no data_dir).
-        let disk_bytes = self
-            .economics_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(dir_size_bytes)
-            .unwrap_or(0);
+        // snapshot path). 0 for an in-memory node (no data_dir). Cached with a
+        // short TTL so an unauthenticated `GET /resources` flood can't trigger a
+        // fresh recursive directory walk per request (the data_dir accumulates
+        // hundreds of files under load, so each walk is hundreds of syscalls).
+        let disk_bytes = {
+            let now = std::time::Instant::now();
+            let mut cache = self.disk_size_cache.lock().unwrap_or_else(|e| e.into_inner());
+            match *cache {
+                Some((at, bytes)) if now.duration_since(at) < DISK_SIZE_TTL => bytes,
+                _ => {
+                    let bytes = self
+                        .economics_path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .map(dir_size_bytes)
+                        .unwrap_or(0);
+                    *cache = Some((now, bytes));
+                    bytes
+                }
+            }
+        };
         ResourcesResponse { rss_bytes, cpu_seconds, disk_bytes, num_threads }
     }
 

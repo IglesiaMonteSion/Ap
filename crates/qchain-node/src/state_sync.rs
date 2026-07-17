@@ -127,6 +127,19 @@ async fn try_fetch_snapshot_paginated(client: &reqwest::Client, source: &str) ->
         }
         after = Some(page.accounts.last().expect("page is non-empty").address.to_string());
         accounts.extend(page.accounts);
+        // Bound the download by the count the meta already announced: a
+        // malicious/buggy source peer could otherwise stream distinct fake
+        // accounts forever (each page carrying the same claimed root to pass the
+        // rotation check above), driving this node to OOM BEFORE
+        // `verify_internal_consistency` ever runs. The real snapshot has exactly
+        // `meta.account_count` entries, so anything beyond it is bad input.
+        if accounts.len() > meta.account_count {
+            anyhow::bail!(
+                "state-sync source streamed more accounts ({}) than its snapshot meta announced ({}) - aborting",
+                accounts.len(),
+                meta.account_count
+            );
+        }
     }
     Ok(StateSnapshot { round: meta.round, merkle_root: meta.merkle_root, accounts })
 }
