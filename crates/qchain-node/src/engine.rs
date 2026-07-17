@@ -1170,6 +1170,61 @@ pub struct EconomicsResponse {
     pub peer_count: usize,
 }
 
+/// One entry of the rich list (`GET /holders`): a wallet address and how much
+/// QCH it holds, plus its share of the circulating supply in state.
+fn ser_u128_str<S: serde::Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+fn ser_u64_str<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
+#[derive(Serialize)]
+pub struct HolderEntry {
+    pub address: String,
+    /// Serialized as a decimal string: a rich wallet's balance can exceed
+    /// JS's 2^53 safe-integer range, so the dashboard parses it as a BigInt.
+    #[serde(serialize_with = "ser_u64_str")]
+    pub balance: u64,
+    /// Share of `total_balance` (circulating supply across all accounts), 0..100.
+    pub pct: f64,
+}
+
+/// QCH distribution / rich list (`GET /holders`), for the dashboard's
+/// "distribución" panel. Built from the same TTL-cached point-in-time snapshot
+/// the state-sync path uses, so it never hammers the consensus lock. A "wallet"
+/// is a user account (owner == the System Program); stake/pool/program accounts
+/// are counted separately in `held_in_programs`. Balances are summed in `u128`
+/// (release builds run with `overflow-checks`, so a `u64` sum could panic).
+#[derive(Serialize)]
+pub struct HoldersResponse {
+    /// Every account in state (wallets + stake + program singletons + contracts).
+    pub total_accounts: usize,
+    /// User wallets only (owner == System Program).
+    pub wallet_accounts: usize,
+    /// Sum of ALL account balances - the QCH currently living in state
+    /// (excludes already-burned QCH, which left circulation). String-encoded
+    /// (see `HolderEntry::balance`): a whole-supply sum easily exceeds 2^53.
+    #[serde(serialize_with = "ser_u128_str")]
+    pub total_balance: u128,
+    /// Sum of wallet balances (liquid QCH held directly by users).
+    #[serde(serialize_with = "ser_u128_str")]
+    pub held_in_wallets: u128,
+    /// `total_balance - held_in_wallets`: QCH held by stake accounts, the
+    /// rewards pool, the faucet, contracts, and other program-owned accounts.
+    #[serde(serialize_with = "ser_u128_str")]
+    pub held_in_programs: u128,
+    /// Total QCH burned out of circulation (from the ledger's burn counter),
+    /// so the panel can show circulating vs burned.
+    #[serde(serialize_with = "ser_u64_str")]
+    pub total_burned: u64,
+    /// Round + Merkle root of the snapshot these figures were computed from.
+    pub round: Round,
+    pub merkle_root: String,
+    /// Top wallets by balance, richest first (capped at the requested limit).
+    pub top: Vec<HolderEntry>,
+}
+
 /// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
 /// far-behind peer or a fresh joining validator reads first to learn a
 /// server's current round, account-state Merkle root, and size before
@@ -2020,6 +2075,58 @@ impl Engine {
             executed_transactions: state.executed,
             dag_certificates: state.dag.len(),
             peer_count: self.committee().len().saturating_sub(1),
+        }
+    }
+
+    /// QCH distribution / rich list (`GET /holders`). Computed from the same
+    /// TTL-cached point-in-time snapshot the state-sync path serves, so it never
+    /// hammers the consensus lock even if the dashboard polls it. Sums are done
+    /// in `u128` (release runs `overflow-checks`). `limit` is clamped so an
+    /// unauthenticated caller can't ask for an unbounded list. `total_burned` is
+    /// read once under the lock (a cheap counter), separate from the snapshot.
+    pub async fn holders(&self, limit: usize) -> HoldersResponse {
+        let limit = limit.min(MAX_ACTIVITY_LIMIT);
+        let total_burned = { self.state.lock().await.ledger.total_burned };
+        let cached = self.cached_snapshot().await;
+        let system = qchain_crypto::Pubkey::system_program_id();
+        let mut total_balance: u128 = 0;
+        let mut held_in_wallets: u128 = 0;
+        let mut wallet_accounts = 0usize;
+        // Collect wallet (address, balance) pairs for the rich list; sum every
+        // account's balance for the circulating total.
+        let mut wallets: Vec<(&Pubkey, u64)> = Vec::new();
+        for sa in cached.accounts.iter() {
+            total_balance += sa.account.balance as u128;
+            if sa.account.owner == system {
+                wallet_accounts += 1;
+                held_in_wallets += sa.account.balance as u128;
+                if sa.account.balance > 0 {
+                    wallets.push((&sa.address, sa.account.balance));
+                }
+            }
+        }
+        // Top-N by balance, richest first (tie-break by address for determinism).
+        wallets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_bytes().cmp(&b.0.to_bytes())));
+        let denom = total_balance.max(1) as f64;
+        let top = wallets
+            .into_iter()
+            .take(limit)
+            .map(|(addr, bal)| HolderEntry {
+                address: addr.to_string(),
+                balance: bal,
+                pct: bal as f64 / denom * 100.0,
+            })
+            .collect();
+        HoldersResponse {
+            total_accounts: cached.accounts.len(),
+            wallet_accounts,
+            total_balance,
+            held_in_wallets,
+            held_in_programs: total_balance.saturating_sub(held_in_wallets),
+            total_burned,
+            round: cached.round,
+            merkle_root: cached.merkle_root.clone(),
+            top,
         }
     }
 

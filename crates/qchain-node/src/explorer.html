@@ -366,6 +366,37 @@
       </div>
     </section>
 
+    <section class="panel" id="dist-panel">
+      <div class="panel-header">
+        <h2>🏦 distribución de QCH</h2>
+      </div>
+      <div class="panel-sub">Cuántas wallets existen, cómo está repartido el QCH, y las que más tienen. Calculado en vivo desde el estado de este validador.</div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">wallets (con o sin saldo)</div><div class="stat-value" id="dist-wallets" style="color:#8fb0ff">–</div></div>
+        <div class="stat-card"><div class="stat-label">cuentas totales (incl. staking/programas)</div><div class="stat-value" id="dist-accounts">–</div></div>
+        <div class="stat-card"><div class="stat-label">circulante (en cuentas)</div><div class="stat-value" id="dist-circulating" style="color:#5be3a0">–</div></div>
+        <div class="stat-card"><div class="stat-label">en wallets (líquido)</div><div class="stat-value" id="dist-inwallets" style="color:#5be3a0">–</div></div>
+        <div class="stat-card"><div class="stat-label">en staking / programas</div><div class="stat-value" id="dist-inprograms" style="color:#8fb0ff">–</div></div>
+        <div class="stat-card"><div class="stat-label">quemado (fuera de circulación)</div><div class="stat-value" id="dist-burned" style="color:#ff9a62">–</div></div>
+      </div>
+      <div style="margin:.9rem 0 .3rem;font-size:.85rem;color:var(--muted)">reparto del circulante</div>
+      <div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--line)">
+        <div id="dist-bar-wallets" style="height:100%;background:linear-gradient(90deg,#5be3a0,#39c98f);width:0%"></div>
+        <div id="dist-bar-programs" style="height:100%;background:linear-gradient(90deg,#7c5cff,#4f74ff);width:0%"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:.75rem;color:var(--muted);margin-top:.35rem">
+        <span>🟢 en wallets <b id="dist-pct-wallets">–</b></span>
+        <span>🟣 en staking/programas <b id="dist-pct-programs">–</b></span>
+      </div>
+      <div style="margin:1rem 0 .4rem;font-size:.9rem;font-weight:600">top wallets</div>
+      <div style="overflow-x:auto">
+        <table class="tbl" id="dist-table">
+          <thead><tr><th>#</th><th>wallet</th><th class="amount">QCH</th><th class="amount">% del circulante</th></tr></thead>
+          <tbody id="dist-tbody"><tr><td colspan="4" style="color:var(--muted)">cargando…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-header">
         <h2>🛠️ herramientas del operador</h2>
@@ -1160,14 +1191,43 @@ async function refreshEconomics() {
   } catch (err) { /* mantener últimos valores si el nodo no responde */ }
 }
 
+// ===== distribución de QCH / rich list =====
+async function refreshHolders() {
+  try {
+    const h = await getJson("/holders?limit=25");
+    setText("dist-wallets", fmtNum(h.wallet_accounts));
+    setText("dist-accounts", fmtNum(h.total_accounts));
+    const setQ = (id, u) => { const el = document.getElementById(id); if (el) { el.textContent = qch(u, 2); el.title = qch(u, 9); } };
+    setQ("dist-circulating", h.total_balance);
+    setQ("dist-inwallets", h.held_in_wallets);
+    setQ("dist-inprograms", h.held_in_programs);
+    setQ("dist-burned", h.total_burned);
+    // ratio para la barra (Number es suficiente para un %, aunque los totales sean grandes)
+    const tot = Number(h.total_balance) || 1;
+    const pw = Math.max(0, Math.min(100, Number(h.held_in_wallets) / tot * 100));
+    const pp = Math.max(0, Math.min(100, Number(h.held_in_programs) / tot * 100));
+    document.getElementById("dist-bar-wallets").style.width = pw.toFixed(1) + "%";
+    document.getElementById("dist-bar-programs").style.width = pp.toFixed(1) + "%";
+    setText("dist-pct-wallets", pw.toFixed(1) + "%");
+    setText("dist-pct-programs", pp.toFixed(1) + "%");
+    const tb = document.getElementById("dist-tbody");
+    if (!h.top || !h.top.length) { tb.innerHTML = '<tr><td colspan="4" style="color:var(--muted)">todavía no hay wallets con saldo</td></tr>'; return; }
+    tb.innerHTML = h.top.map((w, i) =>
+      `<tr><td>${i + 1}</td><td class="mono">${short(w.address)}</td><td class="amount">${qch(w.balance, 4)}</td><td class="amount">${w.pct.toFixed(2)} %</td></tr>`
+    ).join("");
+  } catch (err) { /* mantener últimos valores si el nodo no responde */ }
+}
+
 // ===== actividad de staking =====
 refreshStatus();
 refreshChainId();
 refreshEquivocations();
 refreshEconomics();
+refreshHolders();
 loadActivity(true);
 setInterval(refreshStatus, 2000);
 setInterval(refreshEconomics, 2000);
+setInterval(refreshHolders, 15000);
 setInterval(refreshEquivocations, 15000);
 // Auto-refresco de la lista de transacciones (transferencias + staking) sin
 // parpadeo: solo redibuja si la lista cambió de verdad (ver loadActivity).

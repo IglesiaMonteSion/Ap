@@ -2,7 +2,7 @@
 //! wallet/client traffic - what `qchain-cli` talks to. Deliberately small:
 //! submit a transaction, read an account, read node status.
 
-use crate::engine::{Engine, EconomicsResponse, SnapshotMeta, SnapshotPage, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
+use crate::engine::{Engine, EconomicsResponse, HoldersResponse, SnapshotMeta, SnapshotPage, StarkProofError, StarkProofResponse, StateSnapshot, StatusResponse};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -22,6 +22,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/stake/:address", get(get_stake))
         .route("/status", get(status))
         .route("/economics", get(economics))
+        .route("/holders", get(holders))
         .route("/resources", get(resources))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
@@ -165,6 +166,22 @@ async fn status(State(engine): State<Arc<Engine>>) -> Json<StatusResponse> {
 /// current governance parameters. See `EconomicsResponse`.
 async fn economics(State(engine): State<Arc<Engine>>) -> Json<EconomicsResponse> {
     Json(engine.economics().await)
+}
+
+#[derive(serde::Deserialize)]
+struct HoldersQuery {
+    #[serde(default = "default_holders_limit")]
+    limit: usize,
+}
+fn default_holders_limit() -> usize {
+    50
+}
+
+/// `/holders?limit=N` - QCH distribution and the top-holding wallets (rich
+/// list) for the dashboard's "distribución" panel. See `HoldersResponse`.
+/// Read-only; built from the TTL-cached snapshot, so it doesn't slow consensus.
+async fn holders(State(engine): State<Arc<Engine>>, Query(query): Query<HoldersQuery>) -> Json<HoldersResponse> {
+    Json(engine.holders(query.limit).await)
 }
 
 /// `/resources` - the node's own live RAM/CPU/disk/thread usage, so a load tool
