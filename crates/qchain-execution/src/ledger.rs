@@ -436,7 +436,16 @@ impl Ledger {
             return Ok(());
         }
         let commission = (validator_share as u128 * params.staking_commission_bps as u128 / 10_000) as u64;
-        let pool_share = validator_share - commission;
+        // `saturating_sub`, not plain `-`: `pool_share` is only non-negative while
+        // `staking_commission_bps <= 10_000`, an invariant enforced at every
+        // current write (governance `apply_economic_action`, genesis default),
+        // but NOT re-validated by `EconomicParams::read_or_legacy`. With release
+        // `overflow-checks = true` a plain underflow would panic on every node at
+        // once = permanent chain halt (the failure mode this project eliminates
+        // with saturating arithmetic everywhere else). Byte-identical for every
+        // valid `bps`; only a misconfigured/migrated `bps > 10_000` differs, and
+        // then it keeps the network alive instead of halting it.
+        let pool_share = validator_share.saturating_sub(commission);
 
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         if let Some(stats) = self.store.get(&STAKING_STATS_ID) {

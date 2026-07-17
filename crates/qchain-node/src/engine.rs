@@ -365,7 +365,7 @@ const SNAPSHOT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// size (and JSON-decode memory on the client) regardless of total state
 /// size. The client keyset-paginates (`after` the last address it saw) until
 /// it gets a short page.
-const SNAPSHOT_PAGE_SIZE: usize = 1_000;
+pub const SNAPSHOT_PAGE_SIZE: usize = 1_000;
 
 
 /// How many rounds of `(round, author)`-keyed bookkeeping (`voted_for`,
@@ -2927,6 +2927,12 @@ impl Engine {
                     }
                 }
                 tracing::debug!("pruned {} certificates below round {gc_floor} from the DAG", removed.len());
+                // Drop the same pruned digests from consensus `seen` - without
+                // this it grows one digest per committed cert for the node's
+                // whole life (organic, not attacker-accelerable, but real on a
+                // long-lived chain). Safe: those rounds are below `gc_floor` and
+                // never re-walked, so ordering is unchanged.
+                state.consensus.forget_seen(&removed);
             }
             state.consensus.set_gc_floor(gc_floor);
         }
@@ -3063,10 +3069,24 @@ impl Engine {
                 // exactly as `apply_transaction` would have (InvalidSignature is
                 // permanent, so it is never re-queued below); a valid one applies
                 // via the presigned path, which skips only the redundant re-check.
-                let result = if sig_ok[i] {
-                    state.ledger.apply_transaction_presigned(tx, &author, round)
-                } else {
+                //
+                // chain_id is ALSO enforced here, not just at RPC/gossip
+                // admission: a Byzantine proposer (BFT tolerates up to f) can
+                // place a validly-signed tx carrying ANOTHER network's chain_id
+                // directly into a worker-batch it authors, bypassing the admission
+                // edge. Honest nodes verify the signature (it passes - real payer
+                // keys) but must still reject the cross-network replay, or
+                // `Message::chain_id`'s stated defense would hold only at the
+                // honest edge. Deterministic on every node (fixed genesis-derived
+                // `self.chain_id`, `chain_id` committed in the batch) -> no fork;
+                // byte-identical for a network whose txs all carry the right
+                // chain_id. Treated as permanent (not re-queued), like a bad sig.
+                let result = if !sig_ok[i] {
                     Err(qchain_execution::ExecError::InvalidSignature)
+                } else if tx.message.chain_id != self.chain_id {
+                    Err(qchain_execution::ExecError::ProgramError("chain_id does not match this network".into()))
+                } else {
+                    state.ledger.apply_transaction_presigned(tx, &author, round)
                 };
                 match result {
                     Ok(_) => {

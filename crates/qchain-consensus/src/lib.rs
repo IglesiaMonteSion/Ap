@@ -198,6 +198,21 @@ impl ConsensusState {
         }
     }
 
+    /// Forget the given committed-certificate digests from `seen`. The node
+    /// calls this with exactly the digests `DagStore::prune_below` removed, so
+    /// `seen` - which otherwise grows one 32-byte digest per committed
+    /// certificate for the node's entire life - stays bounded to the retained
+    /// window instead of leaking `O(chain length)`. Safe: a certificate below
+    /// `gc_floor` is never consulted again (`walk_causal_history` short-circuits
+    /// at the `gc_floor` barrier before it would ever reach `seen` for those
+    /// rounds), so dropping it cannot change any ordering. A no-op when called
+    /// with an empty slice; callers that never prune (the DST) are unaffected.
+    pub fn forget_seen(&mut self, digests: &[Digest]) {
+        for d in digests {
+            self.seen.remove(d);
+        }
+    }
+
     /// Re-evaluates leader commitment across the whole DAG (cheap at
     /// phase-1/testnet scale - see the `dag-consensus-design` skill for the
     /// tradeoff) and returns any certificate digests newly finalized into

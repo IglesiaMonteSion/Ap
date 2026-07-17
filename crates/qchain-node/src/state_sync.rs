@@ -16,15 +16,36 @@
 //! verified catch-up against a value obtained independently.
 
 use qchain_node::config::NodeConfig;
-use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot};
+use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot, SNAPSHOT_PAGE_SIZE};
 use qchain_storage::compressed::IncrementalCompressedTree;
 use qchain_storage::IncrementalStateTree;
+use std::time::Duration;
+
+/// Absolute ceiling on how many accounts a snapshot may carry, independent of
+/// what the source peer *claims* in `meta.account_count`. The per-page loop
+/// already refuses to accumulate past `meta.account_count`, but that number is
+/// itself attacker-controlled (a malicious configured peer could announce
+/// `usize::MAX` and stream real pages forever, OOMing the syncing node before
+/// verification runs). This hard cap - far above any realistic state size -
+/// is the number the peer cannot inflate. Node-local, no wire/consensus change.
+const MAX_SNAPSHOT_ACCOUNTS: usize = 10_000_000;
+/// A single `/snapshot/page` may carry at most `SNAPSHOT_PAGE_SIZE` accounts
+/// (the server builds pages that size); anything larger is a malformed/hostile
+/// response, rejected before it is accumulated.
+const MAX_ACCOUNTS_PER_PAGE: usize = SNAPSHOT_PAGE_SIZE;
 
 /// Fetch a state snapshot from the configured peers and verify it before the
 /// caller installs it. Returns an error (aborting node startup) rather than
 /// ever installing unverified or forked state.
 pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<StateSnapshot> {
-    let client = reqwest::Client::new();
+    // Bounded HTTP client: without an overall + connect timeout, a configured
+    // peer that accepts the connection and never finishes hangs node startup
+    // forever. Fail fast instead - a stuck peer must not wedge the sync.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // 1. Gather each peer's snapshot header for a cheap fork check.
     let mut metas: Vec<(String, SnapshotMeta)> = Vec::new();
@@ -117,6 +138,12 @@ async fn fetch_snapshot_paginated(client: &reqwest::Client, source: &str) -> any
 
 async fn try_fetch_snapshot_paginated(client: &reqwest::Client, source: &str) -> anyhow::Result<StateSnapshot> {
     let meta: SnapshotMeta = client.get(format!("{source}/snapshot/meta")).send().await?.error_for_status()?.json().await?;
+    // Reject an absurd announced count up front: `meta.account_count` is
+    // attacker-controlled, so cap it against a hard ceiling (not just against
+    // itself) before it is ever used as the download bound below.
+    if meta.account_count > MAX_SNAPSHOT_ACCOUNTS {
+        anyhow::bail!("state-sync: source announced {} accounts, above the {MAX_SNAPSHOT_ACCOUNTS} ceiling", meta.account_count);
+    }
     let mut accounts = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -127,6 +154,11 @@ async fn try_fetch_snapshot_paginated(client: &reqwest::Client, source: &str) ->
         let page: SnapshotPage = client.get(&url).send().await?.error_for_status()?.json().await?;
         if page.merkle_root != meta.merkle_root {
             anyhow::bail!("the server's cached snapshot rotated mid-download (root {} -> {})", meta.merkle_root, page.merkle_root);
+        }
+        // A single page can carry at most `SNAPSHOT_PAGE_SIZE` accounts; a larger
+        // one is a malformed/hostile response - reject before accumulating it.
+        if page.accounts.len() > MAX_ACCOUNTS_PER_PAGE {
+            anyhow::bail!("state-sync: page carried {} accounts, above the per-page cap {MAX_ACCOUNTS_PER_PAGE}", page.accounts.len());
         }
         if page.accounts.is_empty() {
             break;
