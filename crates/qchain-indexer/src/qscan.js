@@ -60,43 +60,72 @@
   function setNav(hash) { document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === hash)); }
 
   // ---------- pages ----------
-  async function home() {
-    setNav("#/");
-    app.innerHTML = loading();
-    let s = {};
-    try { s = await api("/stats"); STATS = s; } catch (e) {}
-    const behind = s.height == null;
-    const cards = [
-      ["Ronda (altura)", fmtNum(s.height), `${fmtNum(s.executed_transactions)} tx ejecutadas`, "◆"],
-      ["En circulación", fmtQch(s.circulating || 0, 0) + " QCH", `${fmtQch(s.held_in_wallets || 0, 0)} en wallets`, "🪙"],
-      ["Quemado", fmtQch(s.total_burned || 0, 0) + " QCH", `${fmtQch(s.total_emitted || 0, 0)} emitido`, "🔥"],
-      ["Fee base / byte", fmtNum(s.base_fee_per_byte), `${fmtNum(s.validators)} validadores · ${fmtNum(s.mempool_transactions)} en cola`, "⛽"],
+  function statCells(s) {
+    return [
+      ["Ronda (altura)", fmtNum(s.height), `${fmtNum(s.executed_transactions)} tx ejecutadas`],
+      ["En circulación", fmtQch(s.circulating || 0, 0) + " QCH", `${fmtQch(s.held_in_wallets || 0, 0)} en wallets`],
+      ["Quemado", fmtQch(s.total_burned || 0, 0) + " QCH", `${fmtQch(s.total_emitted || 0, 0)} emitido`],
+      ["Fee base / byte", fmtNum(s.base_fee_per_byte), `${fmtNum(s.validators)} validadores · ${fmtNum(s.mempool_transactions)} en cola`],
     ];
+  }
+  function blockRowHome(x) {
+    return `<div class="row"><span class="badge">◆</span>
+      <div style="flex:1;min-width:0"><div>${blockLink(x.round)}</div><div class="dim tag">${age(x.ts, x.round)}</div></div>
+      <div class="right"><div>${fmtNum(x.tx_count)} tx</div><div class="dim tag">${fmtQch(x.fees)} QCH fee</div></div></div>`;
+  }
+  function txRowHome(x) {
+    return `<div class="row"><span class="badge">↔</span>
+      <div style="flex:1;min-width:0"><div>${txLink(x.hash)} ${kindPill(x.kind)}</div><div class="dim tag">${addrLink(x.from)} → ${addrLink(x.to)}</div></div>
+      <div class="right"><div>${x.kind === "transfer" || x.kind === "delegate" ? fmtQch(x.amount) + " QCH" : ""}</div><div class="dim tag">${age(x.ts, x.round)}</div></div></div>`;
+  }
+  // Build the home shell ONCE. Data is filled/refreshed in place by loadHomeData()
+  // so the periodic refresh never blanks the page to a spinner (no flicker).
+  function renderHomeShell() {
     app.innerHTML = `
-      <div class="grid stats">
-        ${cards.map((c) => `<div class="card pad stat"><div class="ic">${c[3]}</div><div class="k">${esc(c[0])}</div><div class="v">${c[1]}</div><div class="s">${c[2]}</div></div>`).join("")}
+      <div class="hero">
+        <h1>Explorador de la red Qchain</h1>
+        <div class="hsub">Blockchain L1 post-cuántica · datos en vivo desde un nodo por RPC</div>
       </div>
-      ${behind ? `<div class="banner bad">El indexador aún no pudo contactar al nodo (RPC). Verificá <span class="mono">--node</span>.</div>` : ""}
+      <div class="statpanel" id="statpanel">
+        ${[0, 1, 2, 3].map((i) => `<div class="cell"><div class="k" id="k${i}"></div><div class="v" id="v${i}">—</div><div class="s" id="s${i}"></div></div>`).join("")}
+      </div>
+      <div id="homebanner"></div>
       <div class="grid cols">
         <div class="card"><div class="panel-h"><h3>Últimos bloques (rondas)</h3><a href="#/blocks">Ver todos →</a></div><div id="lb">${loading()}</div></div>
         <div class="card"><div class="panel-h"><h3>Últimas transacciones</h3><a href="#/txs">Ver todas →</a></div><div id="lt">${loading()}</div></div>
       </div>
-      <div class="dim center" style="margin-bottom:24px"><span class="live"><i></i>en vivo</span> · ${fmtNum(s.indexed_txs)} tx / ${fmtNum(s.indexed_blocks)} bloques indexados · ${esc(s.version || "")} · chain ${esc(short(s.chain_id || "—", 8, 6))}</div>`;
-
+      <div class="dim center" id="homefoot" style="margin-bottom:24px"></div>`;
+  }
+  // Fetch and patch only the changed nodes — no full re-render, no spinner blackout.
+  async function loadHomeData() {
+    let s = {};
+    try { s = await api("/stats"); STATS = s; } catch (e) {}
+    if (!$("#statpanel")) return; // navigated away mid-fetch
+    statCells(s).forEach((c, i) => {
+      const k = $("#k" + i), v = $("#v" + i), sub = $("#s" + i);
+      if (k) k.textContent = c[0];
+      if (v) v.textContent = c[1];
+      if (sub) sub.innerHTML = c[2];
+    });
+    const hb = $("#homebanner");
+    if (hb) hb.innerHTML = s.height == null ? `<div class="banner bad">El indexador aún no pudo contactar al nodo (RPC). Verificá <span class="mono">--node</span>.</div>` : "";
+    const hf = $("#homefoot");
+    if (hf) hf.innerHTML = `<span class="live"><i></i>en vivo</span> · ${fmtNum(s.indexed_txs)} tx / ${fmtNum(s.indexed_blocks)} bloques indexados · ${esc(s.version || "")} · chain ${esc(short(s.chain_id || "—", 8, 6))}`;
+    // panels: replace only when the rendered HTML actually changed (avoids reflow/flicker on unchanged data)
+    const put = (el, html) => { if (el && el.innerHTML !== html) el.innerHTML = html; };
     try {
       const b = (await api("/blocks?size=8")).blocks || [];
-      $("#lb").innerHTML = b.length ? b.map((x) => `
-        <div class="row"><span class="badge">◆</span>
-          <div style="flex:1;min-width:0"><div>${blockLink(x.round)}</div><div class="dim tag">${age(x.ts, x.round)}</div></div>
-          <div class="right"><div>${fmtNum(x.tx_count)} tx</div><div class="dim tag">${fmtQch(x.fees)} QCH fee</div></div></div>`).join("") : `<div class="empty">Sin bloques todavía</div>`;
-    } catch (e) { $("#lb").innerHTML = `<div class="empty">—</div>`; }
+      put($("#lb"), b.length ? b.map(blockRowHome).join("") : `<div class="empty">Sin bloques todavía</div>`);
+    } catch (e) { const el = $("#lb"); if (el && el.querySelector(".spin")) el.innerHTML = `<div class="empty">—</div>`; }
     try {
       const t = (await api("/txs?size=8")).txs || [];
-      $("#lt").innerHTML = t.length ? t.map((x) => `
-        <div class="row"><span class="badge">↔</span>
-          <div style="flex:1;min-width:0"><div>${txLink(x.hash)} ${kindPill(x.kind)}</div><div class="dim tag">${addrLink(x.from)} → ${addrLink(x.to)}</div></div>
-          <div class="right"><div>${x.kind === "transfer" || x.kind === "delegate" ? fmtQch(x.amount) + " QCH" : ""}</div><div class="dim tag">${age(x.ts, x.round)}</div></div></div>`).join("") : `<div class="empty">Sin transacciones todavía</div>`;
-    } catch (e) { $("#lt").innerHTML = `<div class="empty">—</div>`; }
+      put($("#lt"), t.length ? t.map(txRowHome).join("") : `<div class="empty">Sin transacciones todavía</div>`);
+    } catch (e) { const el = $("#lt"); if (el && el.querySelector(".spin")) el.innerHTML = `<div class="empty">—</div>`; }
+  }
+  async function home() {
+    setNav("#/");
+    if (!$("#statpanel")) renderHomeShell();
+    await loadHomeData();
   }
 
   function pager(page, hasNext, base) {
@@ -315,6 +344,6 @@
   };
   window.addEventListener("hashchange", route);
   route();
-  // Light auto-refresh of the home page.
-  setInterval(() => { if ((location.hash || "#/") === "#/") home(); }, 8000);
+  // Light auto-refresh of the home page — patches data in place (no page blackout).
+  setInterval(() => { if ((location.hash || "#/") === "#/" && $("#statpanel")) loadHomeData(); }, 10000);
 })();
