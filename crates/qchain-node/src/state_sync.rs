@@ -17,6 +17,7 @@
 
 use qchain_node::config::NodeConfig;
 use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot};
+use qchain_storage::compressed::IncrementalCompressedTree;
 use qchain_storage::IncrementalStateTree;
 
 /// Fetch a state snapshot from the configured peers and verify it before the
@@ -63,8 +64,13 @@ pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<Stat
 
     // 3. Internal consistency: rebuild the real state tree from the accounts
     //    and require it to hash to the claimed root - catches any account
-    //    tampering relative to that root.
-    verify_internal_consistency(&snapshot)?;
+    //    tampering relative to that root. Must use the SAME tree this network
+    //    runs (legacy vs compressed is a genesis-level, network-wide choice
+    //    folded into `chain_id`); rebuilding with the wrong tree would never
+    //    match a peer's claimed root, silently breaking state-sync for a
+    //    compressed-tree deployment. A node only ever syncs into its own
+    //    network, whose mode it knows from its config.
+    verify_internal_consistency(&snapshot, config.compressed_state_tree)?;
 
     // 4. Optional operator trust anchor: exact match turns "trust the source
     //    peer" into a fully verified catch-up. Most useful for a controlled
@@ -146,14 +152,23 @@ async fn try_fetch_snapshot_paginated(client: &reqwest::Client, source: &str) ->
 
 /// Rebuild the real state tree from a snapshot's accounts and require it to
 /// hash to the claimed root - a real proof the accounts are the ones behind
-/// that root, using the exact same `IncrementalStateTree` a live `Ledger`
-/// maintains. Any account tampered relative to the claimed root fails here.
-fn verify_internal_consistency(snapshot: &StateSnapshot) -> anyhow::Result<()> {
-    let mut tree = IncrementalStateTree::new();
-    for acc in &snapshot.accounts {
-        tree.note_set(&acc.address, &acc.account);
-    }
-    let rebuilt = hex::encode(tree.root());
+/// that root, using the exact same tree a live `Ledger` maintains (legacy
+/// 256-deep or path-compressed, per the network's genesis-level choice). Any
+/// account tampered relative to the claimed root fails here.
+fn verify_internal_consistency(snapshot: &StateSnapshot, compressed: bool) -> anyhow::Result<()> {
+    let rebuilt = if compressed {
+        let mut tree = IncrementalCompressedTree::new();
+        for acc in &snapshot.accounts {
+            tree.note_set(&acc.address, &acc.account);
+        }
+        hex::encode(tree.root())
+    } else {
+        let mut tree = IncrementalStateTree::new();
+        for acc in &snapshot.accounts {
+            tree.note_set(&acc.address, &acc.account);
+        }
+        hex::encode(tree.root())
+    };
     if rebuilt != snapshot.merkle_root {
         anyhow::bail!(
             "state-sync: rebuilt Merkle root {rebuilt} does not match the snapshot's claimed root {} - rejecting a tampered or corrupt snapshot",
@@ -171,9 +186,20 @@ mod tests {
     use qchain_node::engine::SnapshotAccount;
 
     fn snapshot_of(accounts: Vec<(Pubkey, u64)>) -> StateSnapshot {
-        // Build the authentic root the same way a real node would, then hand
-        // back a snapshot claiming it.
+        // Build the authentic (legacy) root the same way a real node would,
+        // then hand back a snapshot claiming it.
         let mut tree = IncrementalStateTree::new();
+        let mut snap_accounts = Vec::new();
+        for (pk, balance) in accounts {
+            let account = Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) };
+            tree.note_set(&pk, &account);
+            snap_accounts.push(SnapshotAccount { address: pk, account });
+        }
+        StateSnapshot { round: 42, merkle_root: hex::encode(tree.root()), accounts: snap_accounts }
+    }
+
+    fn compressed_snapshot_of(accounts: Vec<(Pubkey, u64)>) -> StateSnapshot {
+        let mut tree = IncrementalCompressedTree::new();
         let mut snap_accounts = Vec::new();
         for (pk, balance) in accounts {
             let account = Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) };
@@ -186,7 +212,7 @@ mod tests {
     #[test]
     fn a_snapshot_whose_accounts_hash_to_its_claimed_root_verifies() {
         let snap = snapshot_of(vec![(Pubkey::new([1u8; 32]), 100), (Pubkey::new([2u8; 32]), 250)]);
-        assert!(verify_internal_consistency(&snap).is_ok(), "an internally-consistent snapshot must verify");
+        assert!(verify_internal_consistency(&snap, false).is_ok(), "an internally-consistent snapshot must verify");
     }
 
     #[test]
@@ -195,7 +221,7 @@ mod tests {
         // Flip a balance without recomputing the claimed root - exactly what a
         // malicious peer serving forged state would produce.
         snap.accounts[0].account.balance = 999_999;
-        assert!(verify_internal_consistency(&snap).is_err(), "a snapshot whose accounts no longer hash to its claimed root must be rejected");
+        assert!(verify_internal_consistency(&snap, false).is_err(), "a snapshot whose accounts no longer hash to its claimed root must be rejected");
     }
 
     #[test]
@@ -205,6 +231,29 @@ mod tests {
             address: Pubkey::new([9u8; 32]),
             account: Account { balance: 1_000_000, ..Account::new_wallet(Pubkey::system_program_id()) },
         });
-        assert!(verify_internal_consistency(&snap).is_err(), "injecting an account not covered by the claimed root must be rejected");
+        assert!(verify_internal_consistency(&snap, false).is_err(), "injecting an account not covered by the claimed root must be rejected");
+    }
+
+    #[test]
+    fn compressed_mode_verifies_a_compressed_snapshot_and_rejects_a_legacy_one() {
+        // The whole point of finishing compressed state-sync: a snapshot whose
+        // claimed root is the COMPRESSED root must verify under `compressed=true`
+        // (it was silently rejected before, because the verifier always rebuilt
+        // with the legacy tree)...
+        let accs = vec![(Pubkey::new([1u8; 32]), 100), (Pubkey::new([2u8; 32]), 250)];
+        let comp = compressed_snapshot_of(accs.clone());
+        assert!(verify_internal_consistency(&comp, true).is_ok(), "a compressed snapshot must verify in compressed mode");
+        // ...and cross-mode is rejected both ways (a node never syncs a snapshot
+        // from a network running a different tree - the roots can't match).
+        assert!(verify_internal_consistency(&comp, false).is_err(), "a compressed snapshot must not verify as legacy");
+        let legacy = snapshot_of(accs);
+        assert!(verify_internal_consistency(&legacy, true).is_err(), "a legacy snapshot must not verify as compressed");
+    }
+
+    #[test]
+    fn compressed_mode_rejects_a_tampered_compressed_snapshot() {
+        let mut snap = compressed_snapshot_of(vec![(Pubkey::new([1u8; 32]), 100), (Pubkey::new([2u8; 32]), 250)]);
+        snap.accounts[0].account.balance = 999_999;
+        assert!(verify_internal_consistency(&snap, true).is_err(), "a tampered compressed snapshot must be rejected");
     }
 }
