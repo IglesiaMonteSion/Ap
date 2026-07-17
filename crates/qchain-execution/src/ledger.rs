@@ -752,7 +752,14 @@ impl Ledger {
         // check (`payer_can_afford_admission`). Saturation to `u64::MAX` means the
         // payer simply can't afford it and the tx is rejected.
         let effective_base = self.effective_base_fee_at(current_round);
-        let byte_fee = effective_base.saturating_mul(tx.byte_size() as u64);
+        // `byte_size()` serializes the whole ~5.5 KB message with borsh; it's
+        // needed both here (to scale the byte fee) and below (to feed
+        // `advance_dynamic_fee` the committed bytes). Compute it ONCE and reuse -
+        // the value is a pure function of the immutable `tx`, so this is a plain
+        // behavior-identical dedup that removes one full message serialization
+        // from every committed transaction's apply path.
+        let tx_bytes = tx.byte_size() as u64;
+        let byte_fee = effective_base.saturating_mul(tx_bytes);
         // The optional priority-fee tip (see `Message::priority_fee`), charged
         // on top of the base fee and paid 100% to the proposer. Saturating add
         // so a maliciously huge tip can't wrap; the payer simply can't afford it.
@@ -935,7 +942,7 @@ impl Ledger {
         // and before `root_after` is captured - so its on-chain writes are part
         // of THIS transaction's committed state (deterministic across
         // validators, and inside the STARK receipt's root chain).
-        self.advance_dynamic_fee(current_round, tx.byte_size() as u64);
+        self.advance_dynamic_fee(current_round, tx_bytes);
 
         // Working set: the payer is always included (implicit participant,
         // e.g. as CreateAccount's funding source, even when no instruction

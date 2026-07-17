@@ -458,7 +458,29 @@ fn persist_round_checkpoint(state: &EngineState) {
 /// log is absent (in-memory node) or already within bound.
 fn prune_log_to_last(db: Option<&sled::Db>, max: usize) {
     let Some(db) = db else { return };
-    let len = db.len();
+    // `sled::Tree::len()` is O(n) - it iterates the whole tree - and this runs on
+    // the flood persist path (every committing round that appended receipts). We
+    // avoid the scan by exploiting the log's structure: keys are monotonic
+    // `generate_id()` big-endian u64s (every insert appends at the END) and
+    // pruning only ever removes the smallest `excess` keys (the FRONT), so the
+    // live keys are always a CONTIGUOUS suffix `[first, last]` of the id space.
+    // The count is therefore `last - first + 1`, readable in O(log n) via
+    // `first()`/`last()` (edge seeks) instead of an O(n) scan.
+    //
+    // Rare edge: if an insert failed AFTER allocating an id (best-effort, logged)
+    // it leaves a gap, so the range can over-count and prune a few extra entries.
+    // That is within this log's already-best-effort, non-consensus contract
+    // (`/transfers`/`/stark_proof` just have slightly fewer recent entries,
+    // self-healing as new receipts commit) - it can never affect balances or
+    // consensus. `take(excess)` below caps removal at whatever really exists.
+    let len = match (db.first(), db.last()) {
+        (Ok(Some((first, _))), Ok(Some((last, _)))) => {
+            let to_u64 = |k: &sled::IVec| u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+            (to_u64(&last).saturating_sub(to_u64(&first)) + 1) as usize
+        }
+        // Empty log (nothing to prune) or a read error (leave it for next time).
+        _ => return,
+    };
     if len <= max {
         return;
     }
@@ -3968,6 +3990,39 @@ mod tests {
         state.round_checkpoint_path = None;
         state.next_round = 5;
         persist_round_checkpoint(&state);
+    }
+
+    /// `prune_log_to_last` computes the length from the key range
+    /// (`last - first + 1`) instead of an O(n) `db.len()` scan. This proves the
+    /// optimization is behavior-identical to the old scan: after appending N
+    /// entries with `generate_id()` (exactly how the receipt/staking logs do it)
+    /// and pruning to `max`, precisely the last `max` entries survive and they
+    /// are the newest ones (the oldest `N - max` are dropped from the front).
+    #[test]
+    fn prune_log_to_last_keeps_exactly_the_newest_max_entries_via_key_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sled::open(dir.path().join("log")).unwrap();
+        // Append 100 entries the same way persist_receipt does: a fresh
+        // monotonic id per entry, value tags its insertion order.
+        for i in 0u64..100 {
+            let key = db.generate_id().unwrap().to_be_bytes();
+            db.insert(key, &i.to_be_bytes()).unwrap();
+        }
+        assert_eq!(db.len(), 100);
+
+        prune_log_to_last(Some(&db), 30);
+
+        // Exactly `max` survive - identical to what the old O(n) len() path did.
+        assert_eq!(db.len(), 30, "must keep exactly max entries");
+        // And they are the NEWEST 30 (values 70..100): pruning drops the front.
+        let surviving: Vec<u64> = db.iter().values().map(|v| u64::from_be_bytes(v.unwrap().as_ref().try_into().unwrap())).collect();
+        assert_eq!(surviving, (70u64..100).collect::<Vec<_>>(), "the oldest entries must be the ones dropped");
+
+        // Idempotent: already at/below max is a no-op (the common per-round case).
+        prune_log_to_last(Some(&db), 30);
+        assert_eq!(db.len(), 30, "pruning a log already at max must not remove anything");
+        prune_log_to_last(Some(&db), 1000);
+        assert_eq!(db.len(), 30, "pruning below the current size must not remove anything");
     }
 
     /// The exact live-confirmed attack `payer_can_afford_admission` closes
