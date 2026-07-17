@@ -66,7 +66,12 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let state = api::ApiState { store, node: args.node.clone(), http };
+    let state = api::ApiState {
+        store,
+        node: args.node.clone(),
+        http,
+        node_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
     let app = api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

@@ -434,7 +434,33 @@ pub fn write_keypair_file(keypair: &Keypair, path: &std::path::Path) -> anyhow::
         fields.push(slh_dsa.public_key_bytes());
     }
     let encoded = encode_length_prefixed(&fields);
-    std::fs::write(path, serde_json::to_vec(&encoded)?)?;
+    let bytes = serde_json::to_vec(&encoded)?;
+    // This file holds the RAW secret keys (Ed25519 + ML-DSA-65 + optional
+    // SLH-DSA). `std::fs::write` would create it 0644 (world-readable under the
+    // usual umask), leaking the private key to any local user / co-located
+    // service / container-mount reader. Write it 0600 atomically in the shared
+    // primitive so EVERY caller (CLI keygen, faucet keygen, the custodial web
+    // wallet) is covered, not just the three files the installer chmods after
+    // the fact (which also left a create->chmod race).
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(&bytes)?;
+        // `mode(0o600)` only applies on creation; force it for an overwrite of
+        // a pre-existing (possibly 0644) file too.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &bytes)?;
+    }
     Ok(())
 }
 

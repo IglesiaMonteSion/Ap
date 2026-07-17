@@ -39,7 +39,11 @@ impl ValidatorSet {
     /// mathematically unreachable even with every validator voting.
     pub fn new(validators: Vec<ValidatorInfo>) -> Self {
         let validators: HashMap<ValidatorId, ValidatorInfo> = validators.into_iter().map(|v| (v.id, v)).collect();
-        let total_stake = validators.values().map(|v| v.stake).sum();
+        // Saturating fold (not `.sum()`, which panics on overflow under
+        // release overflow-checks). Unreachable for genesis (operator-set) and
+        // rotation (self-stakes << u64::MAX), but removes even the theoretical
+        // panic-halt for an attacker-adjacent accumulator under rotation.
+        let total_stake = validators.values().fold(0u64, |acc, v| acc.saturating_add(v.stake));
         ValidatorSet { validators, total_stake }
     }
 

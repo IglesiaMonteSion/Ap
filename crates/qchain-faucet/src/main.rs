@@ -68,16 +68,19 @@ struct FaucetState {
     /// transaction had actually executed read the same stale nonce and
     /// collided with it - confirmed live via real `nonce mismatch`
     /// execution failures under nothing more adversarial than plain
-    /// sequential requests. Safe to track locally because `Ledger::
-    /// apply_transaction` commits a transaction's nonce increment
-    /// unconditionally once it reaches execution (this project's existing
-    /// "you pay for attempted execution" behavior), regardless of whether
-    /// the `Transfer` instruction itself later succeeds - and the mutex
-    /// already held across this whole handler (see `faucet`'s own comment)
-    /// is exactly what makes a single local counter authoritative, the
-    /// same "single signer, serialize everything" reasoning the module
-    /// docs already state for concurrent requests. `None` until the first
-    /// request, which still fetches the real starting value once.
+    /// sequential requests. The mutex held across this whole handler (see
+    /// `faucet`'s own comment) makes a single local counter authoritative
+    /// under the "single signer, serialize everything" model. IMPORTANT:
+    /// the counter is only advanced AFTER the payout is confirmed executed
+    /// on chain, and is reset to `None` (forcing a re-fetch) on any
+    /// admission failure or confirmation timeout. This matters because
+    /// admission does NOT guarantee the nonce is consumed: a transaction
+    /// admitted at a low dynamic fee can hit `FeeExceedsLimit`/
+    /// `InsufficientFunds` when it later executes at a risen fee and return
+    /// BEFORE the on-chain nonce bump - so a naive "advance on admission"
+    /// counter would desync and permanently brick the faucet (signing
+    /// nonces the chain never reaches). `None` until the first request,
+    /// which fetches the real starting value once.
     next_nonce: Option<u64>,
 }
 
@@ -162,16 +165,14 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
 
     let resp = client.post(format!("{}/tx", state.rpc)).json(&tx).send().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
+        // Admission failed: this nonce was NOT consumed on chain. Reset the
+        // tracked nonce so the next request re-fetches the true value instead
+        // of carrying a stale local counter forward.
+        state.next_nonce = None;
         let body = resp.text().await.unwrap_or_default();
         return Err((StatusCode::BAD_GATEWAY, format!("node rejected the faucet transaction: {body}")));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    // Safe to advance the tracked nonce now, without waiting for the
-    // confirmation poll below - see `FaucetState::next_nonce`'s doc
-    // comment for why admission alone already guarantees this nonce is
-    // consumed once execution runs, regardless of whether the transfer
-    // itself later succeeds.
-    state.next_nonce = Some(nonce + 1);
 
     // Don't report success until the payout is actually confirmed on
     // chain - see `CONFIRMATION_TIMEOUT`'s doc comment for the real bug
@@ -183,6 +184,14 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
             break;
         }
         if std::time::Instant::now() >= deadline {
+            // Admitted but never executed. Admission does NOT guarantee the
+            // nonce is consumed: under a risen dynamic fee (EIP-1559) the tx can
+            // hit FeeExceedsLimit/InsufficientFunds and return BEFORE the
+            // on-chain nonce bump, leaving the chain at `nonce`. If we trusted an
+            // advanced local counter the faucet would sign nonce+1, nonce+2, ...
+            // forever (all NonceTooHigh, never executing) and be permanently
+            // bricked until restart. Reset so the next request re-syncs.
+            state.next_nonce = None;
             return Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("submitted but never confirmed executing within {CONFIRMATION_TIMEOUT:?} - the faucet wallet may be out of funds, or the network may be stalled"),
@@ -191,7 +200,16 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
         tokio::time::sleep(CONFIRMATION_POLL_INTERVAL).await;
     }
 
-    state.last_claim.insert(to, Instant::now());
+    // Confirmed executed on chain -> the on-chain nonce really did bump, so it
+    // is now safe to advance the tracked nonce for the next request.
+    state.next_nonce = Some(nonce + 1);
+    // Bound the cooldown map: drop entries older than the cooldown window
+    // (they can no longer rate-limit anything) so a Sybil stream of fresh
+    // addresses can't grow it without bound.
+    let now = Instant::now();
+    let cooldown = state.cooldown; // copy out before the &mut borrow in retain
+    state.last_claim.retain(|_, t| now.duration_since(*t) < cooldown);
+    state.last_claim.insert(to, now);
     Ok(Json(json!({ "funded": req.address, "amount": state.amount, "tx": body })))
 }
 

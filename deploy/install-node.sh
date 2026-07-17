@@ -342,12 +342,14 @@ EOF
         if ! printf '%s' "$FONDEAR_QCH" | grep -Eq '^[0-9]+$'; then
           error "--fondear requiere también --fondear-qch <numero de QCH> (recibí: '$FONDEAR_QCH')"
         fi
-        # Acotar el monto: units = QCH * 1e9 debe caber en u64 (~1.8e19). Cap a
-        # 10.000 millones de QCH (1e19 unidades) - de sobra para cualquier prueba,
-        # y evita que la aritmética i64 de bash desborde SILENCIOSAMENTE a un
-        # balance positivo equivocado (auditoría de seguridad).
-        if [ "$FONDEAR_QCH" -gt 10000000000 ]; then
-          error "--fondear-qch demasiado grande (max 10000000000 QCH); recibí: $FONDEAR_QCH"
+        # Acotar el monto: units = QCH * 1e9 se calcula abajo con aritmética de
+        # bash, que es i64 con signo (max 9223372036854775807). El cap debe ser
+        # i64max/1e9 = 9223372036 QCH; con un cap más alto (el 1e10 anterior)
+        # units = 1e19 DESBORDA i64 y wrapea SILENCIOSAMENTE a un negativo, que
+        # el u64 de GenesisAllocation luego rechaza (falla segura, pero el guard
+        # estaba mal). 9.2e9 QCH es de sobra para cualquier prueba.
+        if [ "$FONDEAR_QCH" -gt 9223372036 ]; then
+          error "--fondear-qch demasiado grande (max 9223372036 QCH); recibí: $FONDEAR_QCH"
         fi
         # Validar la dirección como base58 antes de interpolarla en el JSON del
         # génesis (evita una inyección JSON con una dirección malformada).

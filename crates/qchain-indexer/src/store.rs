@@ -348,6 +348,20 @@ impl Store {
             out.sort_by_key(|r: &TxRecord| r.seq);
             return out;
         }
+        // Authoritative empty-round short-circuit: if this round is a KNOWN block
+        // whose node-reported `tx_count` is 0, it provably had no transactions at
+        // all, so skip the tail-scan fallback entirely and return empty. This is
+        // safe (uses the node's authoritative count, not the index) and cuts the
+        // common empty-round case, which would otherwise deserialize up to
+        // ROUND_FALLBACK_SCAN records per request. Rounds with a non-zero
+        // tx_count but no round-index entries (pre-index data, or contract-only
+        // rounds with no indexed transfers) still fall through to the bounded
+        // scan below.
+        if let Some(b) = self.get_block(round) {
+            if b.tx_count == 0 {
+                return Vec::new();
+            }
+        }
         // Fallback for rounds ingested BEFORE the round index existed: a bounded
         // tail scan (small cap so it can't be turned into a CPU-DoS by querying
         // many old/low rounds). New rounds always take the fast path above.

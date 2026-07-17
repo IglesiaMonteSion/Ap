@@ -593,7 +593,7 @@ $("s-btn").onclick=async()=>{
   $("s-btn").disabled=true; msg.className="msg"; msg.style.display="block"; msg.textContent="enviando…";
   try{
     const r=await api("/api/transfer",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from:w.name,to,amount})});
-    msg.className="msg ok"; msg.innerHTML=`✓ Enviaste ${amt} QCH`;
+    msg.className="msg ok"; msg.innerHTML=`✓ Enviaste ${esc(amt)} QCH`;
     $("s-amount").value=""; $("s-to").value="";
     setTimeout(async()=>{ await loadWallets(); }, 1500);
     setTimeout(()=>showView("home"), 1800);

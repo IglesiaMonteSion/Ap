@@ -43,7 +43,14 @@ pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool
             continue;
         };
         if qchain_crypto::verify(&info.pubkey_bundle, &digest[..], sig) {
-            signer_stake += info.stake;
+            // saturating_add for policy consistency (release builds run with
+            // overflow-checks=true, where a plain `+` overflow is a
+            // deterministic panic-halt). Unreachable here - this sums a subset
+            // of distinct validators' stakes, bounded by total_stake <= u64::MAX
+            // - so it is byte-identical for every reachable input; saturating
+            // only keeps the network alive at the unreachable extreme instead
+            // of halting, matching every other stake accumulator in consensus.
+            signer_stake = signer_stake.saturating_add(info.stake);
         }
     }
     signer_stake >= validators.quorum_threshold()

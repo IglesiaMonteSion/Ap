@@ -44,7 +44,7 @@
 //! else's stake is put at risk by another party's misbehavior.
 
 use crate::error::ExecError;
-use crate::ids::{STAKING_PROGRAM_ID, STAKING_STATS_ID};
+use crate::ids::{STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 use crate::native::NativeProgram;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, EquivocationEvidence, Instruction, Round};
@@ -308,6 +308,21 @@ impl NativeProgram for StakingProgram {
                 if stats_pk != STAKING_STATS_ID {
                     return Err(ExecError::Unauthorized("Delegate must name the canonical staking-stats account".into()));
                 }
+                // Pin the reward-pool singleton. `reward_debt` (the "already
+                // accrued, not owed to me" watermark) is seeded from THIS
+                // account's `acc_reward_per_share`. Without the pin, an attacker
+                // names a fresh/unused pubkey as accounts[3] -> the `None => 0`
+                // branch below sets `reward_debt = 0`, which is an entitlement
+                // to the ENTIRE pool accrual that happened before they staked;
+                // a subsequent `ClaimReward` then drains the real pool (and,
+                // once the pool floors at 0, mints from nothing). Pinning makes
+                // the seed always the real accumulator. Byte-identical for
+                // honest traffic (CLI/wallet always pass STAKING_REWARDS_POOL_ID);
+                // the legitimate first-ever-delegator case (pool not yet created)
+                // still correctly yields acc = 0 via the `None` branch below.
+                if pool_pk != STAKING_REWARDS_POOL_ID {
+                    return Err(ExecError::Unauthorized("Delegate must name the canonical reward pool".into()));
+                }
 
                 if staker != *payer {
                     return Err(ExecError::Unauthorized("Delegate's funding account must be the transaction payer".into()));
@@ -355,6 +370,13 @@ impl NativeProgram for StakingProgram {
                 // Delegate) - the write side of the `total_staked` invariant.
                 if stats_pk != STAKING_STATS_ID {
                     return Err(ExecError::Unauthorized("Undelegate must name the canonical staking-stats account".into()));
+                }
+                // Pin the reward-pool singleton (defense-in-depth, matches
+                // Delegate). Not independently exploitable here (naming a
+                // bogus pool only forfeits one's own reward), but consistent
+                // with the project-wide singleton-pinning discipline.
+                if pool_pk != STAKING_REWARDS_POOL_ID {
+                    return Err(ExecError::Unauthorized("Undelegate must name the canonical reward pool".into()));
                 }
 
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
@@ -438,6 +460,12 @@ impl NativeProgram for StakingProgram {
             StakingInstruction::ClaimReward => {
                 let stake_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("ClaimReward requires accounts[0]".into()))?;
                 let pool_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("ClaimReward requires accounts[1]".into()))?;
+                // Pin the reward-pool singleton (defense-in-depth, matches
+                // Delegate). A correct `reward_debt` makes a bogus-pool claim
+                // self-harm rather than an exploit, but pin for consistency.
+                if pool_pk != STAKING_REWARDS_POOL_ID {
+                    return Err(ExecError::Unauthorized("ClaimReward must name the canonical reward pool".into()));
+                }
 
                 let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
                 let mut data = StakeAccountData::try_from_slice(&stake_account.data)
@@ -722,6 +750,51 @@ mod tests {
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
         assert!(StakingProgram.process(&mut accounts, &un, &staker, 0).is_err(), "Undelegate must reject a non-canonical stats account");
+    }
+
+    #[test]
+    fn delegate_rejects_a_non_canonical_reward_pool_that_would_zero_reward_debt() {
+        // CRITICAL audit finding C-1: Delegate seeds a new position's
+        // `reward_debt` (the "already accrued, not owed to me" watermark) from
+        // the NAMED pool's `acc_reward_per_share`. With the pool unpinned, an
+        // attacker names a fresh/unused pubkey -> the `None => 0` branch sets
+        // `reward_debt = 0` -> an entitlement to the ENTIRE accrual that
+        // happened before they staked -> a later ClaimReward drains the real
+        // pool (and mints once it floors at 0). The pin must reject it.
+        let staker = Pubkey::new([22u8; 32]);
+        let stake_pk = Pubkey::new([20u8; 32]);
+        let validator = Pubkey::new([21u8; 32]);
+        let bogus_pool = Pubkey::new([99u8; 32]); // deliberately not in the map
+        // The real pool has already accrued (acc_reward_per_share > 0).
+        let mut pd = RewardPoolData::default();
+        pd.acc_reward_per_share = PRECISION; // 1 unit-per-share
+        let real_pool = Account { data: borsh::to_vec(&pd).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) };
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, real_pool),
+        ]);
+
+        let attack = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker, stake_pk, STAKING_STATS_ID, bogus_pool],
+            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+        };
+        let result = StakingProgram.process(&mut accounts, &attack, &staker, 0);
+        assert!(matches!(result, Err(ExecError::Unauthorized(_))), "Delegate must reject a non-canonical reward pool");
+        assert!(!accounts.contains_key(&stake_pk), "no position may be created by the rejected attack");
+
+        // Naming the REAL pool seeds reward_debt from its accumulator (not 0),
+        // so there is no retroactive claim.
+        let ok = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+        };
+        StakingProgram.process(&mut accounts, &ok, &staker, 0).unwrap();
+        let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
+        assert_eq!(data.reward_debt, settled_reward_debt(4_000, PRECISION), "reward_debt must come from the real accumulator, not 0");
+        assert!(data.reward_debt > 0);
     }
 
     #[test]

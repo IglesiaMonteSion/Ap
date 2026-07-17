@@ -6,20 +6,34 @@
 //! pure read replica, so exposing it publicly can never affect consensus.
 
 use crate::store::{decode_addr, Store};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse};
+use axum::middleware::Next;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Short read-through TTL for live node lookups. The node RPC (127.0.0.1) is
+/// reachable only through this public read replica, so an unauthenticated flood
+/// of `/api/address`/`/api/tx` would otherwise amplify onto the validator's
+/// consensus `state` lock (each node hit takes it). Caching collapses a flood
+/// to at most one node hit per key per TTL.
+const NODE_CACHE_TTL: Duration = Duration::from_millis(1500);
+/// Bound the distinct-key growth of the node cache (addresses are attacker-
+/// chosen); cleared wholesale past this size rather than tracking per-entry LRU.
+const NODE_CACHE_MAX: usize = 20_000;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Arc<Store>,
     pub node: String,
     pub http: reqwest::Client,
+    pub node_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -37,7 +51,30 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/holders", get(holders))
         .route("/api/search", get(search))
         .route("/api/health", get(health))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Security headers on the internet-facing explorer (parity with the wallet).
+/// The SPA loads only same-origin external JS (`/qscan.js`, no inline scripts or
+/// event handlers) and talks only to `/api/*`, so a strict CSP fits; inline
+/// styles need `style-src 'unsafe-inline'`. Defense-in-depth backstop under the
+/// per-value `esc()` escaping, plus anti-framing/anti-sniff.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+             frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 // ---- frontend assets ----
@@ -133,14 +170,10 @@ async fn tx_detail(State(st): State<ApiState>, Path(hash): Path<String>) -> Resu
         return Err((StatusCode::BAD_REQUEST, "not a valid transaction hash".into()));
     }
     let rec = st.store.get_tx_by_hash(&hash);
-    let full = {
-        let url = format!("{}/transfers/{}", st.node.trim_end_matches('/'), hash);
-        st.http.get(&url).send().await.ok().and_then(|r| if r.status().is_success() { Some(r) } else { None })
-    };
-    let full_json: Option<Value> = match full {
-        Some(r) => r.json().await.ok(),
-        None => None,
-    };
+    // Route through the cached fetch (same amplification protection as the
+    // address page); a Null result means the node had no such receipt.
+    let full = fetch_node(&st, &format!("/transfers/{}", hash)).await;
+    let full_json: Option<Value> = if full.is_null() { None } else { Some(full) };
     if rec.is_none() && full_json.is_none() {
         return Err((StatusCode::NOT_FOUND, "transaction not found in index".into()));
     }
@@ -236,9 +269,28 @@ async fn search(State(st): State<ApiState>, Query(sq): Query<SearchQ>) -> Json<V
 /// Fetch a JSON value from the node, `null` on any failure (used for the live
 /// account/stake lookups an address page shows).
 async fn fetch_node(st: &ApiState, path: &str) -> Value {
+    // Serve from the short-TTL cache if fresh (never hold the std Mutex across
+    // the .await below).
+    {
+        let cache = st.node_cache.lock().unwrap();
+        if let Some((t, v)) = cache.get(path) {
+            if t.elapsed() < NODE_CACHE_TTL {
+                return v.clone();
+            }
+        }
+    }
     let url = format!("{}{}", st.node.trim_end_matches('/'), path);
-    match st.http.get(&url).send().await {
+    let val = match st.http.get(&url).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
         _ => Value::Null,
+    };
+    // Cache only successful lookups (don't pin a transient failure).
+    if !val.is_null() {
+        let mut cache = st.node_cache.lock().unwrap();
+        if cache.len() >= NODE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(path.to_string(), (Instant::now(), val.clone()));
     }
+    val
 }

@@ -2498,6 +2498,18 @@ impl Engine {
                 self.try_commit().await;
             }
             NetMessage::CertificateRequest { digest } => {
+                // Gate on a known-validator sender BEFORE touching the global
+                // consensus `state` mutex. Without this, any unauthenticated
+                // host could flood tiny CertificateRequests and each one would
+                // acquire the same lock `try_commit`/`propose_round` need,
+                // starving consensus. The `addr_of` reply guard below only
+                // bounds the RESPONSE target, not the lock cost. (A `from`-
+                // spoofing attacker naming a real validator still passes; the
+                // full fix for that is transport authentication - this closes
+                // the trivial unauthenticated case and matches the gossip arms.)
+                if !self.schedule().is_known_in_any_committee(&from) {
+                    return;
+                }
                 let found = {
                     let state = self.state.lock().await;
                     state.dag.get(&digest).cloned()
@@ -2525,6 +2537,11 @@ impl Engine {
                 self.try_commit().await;
             }
             NetMessage::WorkerBatchRequest { worker_id, digest } => {
+                // Same pre-lock sender gate as CertificateRequest (above):
+                // reject a non-validator before acquiring the consensus mutex.
+                if !self.schedule().is_known_in_any_committee(&from) {
+                    return;
+                }
                 let found = {
                     let state = self.state.lock().await;
                     state.batches.get(&digest).cloned()

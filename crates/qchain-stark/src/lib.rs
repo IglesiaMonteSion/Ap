@@ -527,6 +527,20 @@ fn is_valid_u64(value: BaseElement) -> bool {
 /// non-negative `u64` - closes the range-check gap described in the
 /// module docs without an in-circuit bit-decomposition gadget.
 pub fn verify_batch(proof: Proof, pub_inputs: PublicInputs) -> Result<(), VerifyError> {
+    // Local invariant: all public-input columns share one length (the row
+    // count). The wire boundary (`Deserialize`) already rejects ragged columns,
+    // but `PublicInputs.columns` is a `pub` field, so an in-process caller
+    // handing this fn a hand-built ragged value would otherwise panic
+    // out-of-bounds in the conservation/range loops below (which index other
+    // columns by column-0's length) - and those loops are NOT under the
+    // `catch_unwind` above. Assert it here so the invariant is guaranteed by
+    // the function itself, not by every caller having gone through Deserialize.
+    if let Some(first) = pub_inputs.columns.first() {
+        let rows = first.len();
+        if pub_inputs.columns.iter().any(|c| c.len() != rows) {
+            return Err(VerifyError::Malformed);
+        }
+    }
     let min_opts = winterfell::AcceptableOptions::MinConjecturedSecurity(95);
     // `catch_unwind`: `winterfell::verify` reconstructs the AIR from the
     // *proof's own* trace metadata, and `TransferAir::new` asserts a fixed
