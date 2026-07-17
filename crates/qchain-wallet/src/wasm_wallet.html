@@ -28,10 +28,8 @@
     -webkit-font-smoothing:antialiased}
   .app{max-width:460px;margin:0 auto;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;position:relative;
     background:
-      radial-gradient(900px 420px at 50% -8%, rgba(124,92,255,.20), transparent 62%),
-      radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.12), transparent 60%),
-      radial-gradient(600px 500px at 0% 100%, rgba(90,80,220,.10), transparent 60%),
-      #070912;}
+      radial-gradient(680px 360px at 50% -14%, rgba(124,92,255,.14), transparent 60%),
+      #080b14;}
   /* dvh = alto REAL del viewport en móvil (descuenta la barra del navegador),
      así el contenido no queda "empujado" abajo del área visible como con vh. */
   .view{display:none;flex-direction:column;flex:1;min-height:0;position:relative;z-index:1;
@@ -442,6 +440,83 @@
     .boot-logo,.boot-word,.boot-tag,.boot-badge,.boot-status,.boot-sweep,.boot-halo,.boot-rings i,
     .welcome .cta .btn-block,.btn-glow::after,.stake-promo{animation:none !important;opacity:1 !important;transform:none !important}
   }
+
+  /* ============================================================
+     HOME rediseñada estilo Trust Wallet — limpia, centrada, moderna
+     (v6.1.0). Clases nuevas, aisladas; los hooks de JS son por id.
+     ============================================================ */
+  #v-home{padding-top:calc(12px + env(safe-area-inset-top));gap:0}
+  #v-home .hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+  .hd-brand{display:flex;align-items:center;gap:8px;font-weight:800;font-size:15px;letter-spacing:.03em;color:var(--ink)}
+  .hd-logo{width:26px;height:26px}
+  .hd-ic{display:flex;align-items:center;gap:8px}
+  .gic{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:rgba(255,255,255,.05);
+    border:1px solid var(--line);color:var(--muted);box-shadow:none;padding:0;position:relative}
+  .gic:hover{color:var(--ink);border-color:rgba(140,120,255,.4)}
+  .gic svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .bdot{display:none;position:absolute;top:7px;right:8px;width:8px;height:8px;border-radius:50%;background:var(--bad)}
+
+  .hero{display:flex;flex-direction:column;align-items:center;text-align:center;margin:18px 0 24px}
+  .acct-sel{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.05);border:1px solid var(--line);
+    color:var(--ink);border-radius:999px;padding:7px 15px;font-size:14px;font-weight:600;box-shadow:none}
+  .acct-sel:hover{border-color:rgba(140,120,255,.45)}
+  .acct-sel .chev{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;opacity:.7}
+  .big-bal{display:flex;align-items:baseline;justify-content:center;gap:9px;margin-top:18px;max-width:100%;padding:0 4px}
+  .big-bal .amt{font-size:clamp(20px,6vw,32px);font-weight:800;letter-spacing:-.025em;line-height:1.06;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .big-bal .eye-btn{font-size:16px;color:var(--muted);opacity:.85;flex:0 0 auto}
+  .usd{color:var(--muted);font-size:15px;font-weight:600;margin-top:8px}
+  .addr-chip{display:inline-flex;align-items:center;gap:8px;margin-top:16px;background:rgba(255,255,255,.05);
+    border:1px solid var(--line);border-radius:999px;padding:8px 14px;color:var(--muted);font-size:13px;box-shadow:none;max-width:82%}
+  .addr-chip .mono{font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .addr-chip svg{width:14px;height:14px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:2}
+  .addr-chip:hover{color:var(--ink);border-color:rgba(140,120,255,.4)}
+
+  .acts{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:4px}
+  .qa{display:flex;flex-direction:column;align-items:center;gap:9px;background:none;border:0;box-shadow:none;
+    padding:4px 0;color:var(--ink);font-size:13px;font-weight:600}
+  .qa-ic{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;
+    background:rgba(124,110,255,.13);border:1px solid rgba(140,120,255,.22);transition:background .12s,transform .08s}
+  .qa-ic svg{width:22px;height:22px;fill:none;stroke:var(--brand1);stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+  .qa:hover .qa-ic{background:rgba(124,110,255,.22)} .qa:active .qa-ic{transform:scale(.93)}
+
+  .lst-h{display:flex;align-items:center;justify-content:space-between;margin:24px 4px 11px;font-size:13px;font-weight:700;color:var(--muted)}
+  .lst-more{color:var(--brand2);font-weight:600;cursor:pointer}
+
+  .tok-card{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:20px;overflow:hidden}
+  .tok{width:100%;display:flex;align-items:center;gap:13px;background:none;border:0;box-shadow:none;padding:15px 16px;text-align:left}
+  .tok:hover,.tok-stake:hover,.tok-more:hover{background:rgba(255,255,255,.03)}
+  .tok-ic{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
+    background:linear-gradient(150deg,var(--brand1),var(--brand2));box-shadow:0 6px 16px rgba(70,110,255,.3)}
+  .tok-ic svg{width:24px;height:24px}
+  .tok-meta{display:flex;flex-direction:column;flex:1;min-width:0}
+  .tok-name{font-weight:700;font-size:16px}
+  .tok-net{color:var(--muted);font-size:12px}
+  .tok-right{display:flex;flex-direction:column;align-items:flex-end;text-align:right;min-width:0}
+  .tok-bal{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+  .tok-usd{color:var(--muted);font-size:12px;margin-top:2px}
+  .tok-div{height:1px;background:var(--line);margin:0 16px}
+  .tok-stake{width:100%;display:flex;align-items:center;justify-content:space-between;background:none;border:0;box-shadow:none;
+    padding:12px 16px;color:var(--muted);font-size:13px;font-weight:600}
+  .ts-lock{font-size:12px}
+  .ts-amt{color:var(--ink);font-weight:700}
+  .ts-usd{color:var(--muted);font-weight:500;margin-left:4px}
+  .tok-more{width:100%;display:flex;align-items:center;justify-content:space-between;background:none;border:0;box-shadow:none;
+    border-top:1px solid var(--line);padding:14px 16px;color:var(--brand2);font-weight:600;font-size:14px}
+  .chev-r{font-size:19px;opacity:.85}
+
+  .promo{width:100%;display:flex;align-items:center;gap:13px;margin-top:14px;padding:15px 16px;text-align:left;
+    background:linear-gradient(135deg,rgba(124,110,255,.16),rgba(60,110,255,.07));border:1px solid rgba(140,120,255,.24);
+    border-radius:18px;box-shadow:none;color:var(--ink)}
+  .promo:active{transform:scale(.99)}
+  .promo-ic{width:40px;height:40px;flex:0 0 auto;border-radius:12px;display:grid;place-items:center;
+    background:linear-gradient(150deg,var(--brand1),var(--brand2));color:#fff}
+  .promo-ic svg{width:18px;height:18px}
+  .promo-tx{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.3}
+  .promo-tx b{font-size:15px} .promo-tx span{font-size:12px;color:var(--muted)}
+  .promo-ar{flex:0 0 auto;color:var(--brand1)}
+  .promo-ar svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+
 </style>
 </head>
 <body>
@@ -595,91 +670,73 @@
 
   <!-- ===== HOME ===== -->
   <section class="view" id="v-home">
-    <div class="topbar">
-      <div class="brand-row">
-        <svg class="logo" viewBox="0 0 64 64"><use href="#qlogo"/></svg>
-        <span class="brand-name">QCHAIN <span class="grad">Wallet</span></span>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <button class="icon-btn box" id="h-scan" title="escanear para pagar" aria-label="escanear QR">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
+    <!-- barra superior minima -->
+    <div class="hd">
+      <div class="hd-brand"><svg class="hd-logo" viewBox="0 0 64 64"><use href="#qlogo"/></svg><span>QCHAIN</span></div>
+      <div class="hd-ic">
+        <button class="gic" id="h-scan" title="escanear para pagar" aria-label="escanear QR">
+          <svg viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
         </button>
-        <button class="icon-btn box" id="h-bell" title="notificaciones" aria-label="notificaciones" style="position:relative">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
-          <span id="bell-dot" style="display:none;position:absolute;top:6px;right:7px;width:8px;height:8px;border-radius:50%;background:var(--bad)"></span>
+        <button class="gic" id="h-bell" title="notificaciones" aria-label="notificaciones">
+          <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          <span id="bell-dot" class="bdot"></span>
         </button>
-        <button class="icon-btn box nav" data-to="settings" title="configuración" aria-label="configuración">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H10a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V10a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        <button class="gic nav" data-to="settings" title="configuración" aria-label="configuración">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H10a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V10a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
         </button>
       </div>
     </div>
 
-    <!-- Zona de saldo estilo Trust Wallet: saldo sobre fondo plano, con el logo
-         brillando en un círculo a la derecha -->
-    <div class="bal-zone">
-      <div class="bal-main">
-        <button id="h-acct" class="acct-pill nav" data-to="accounts">
-          <span id="h-acct-name">Cuenta principal</span> <span style="opacity:.7">▾</span>
-        </button>
-        <div class="bal-amt-row">
-          <span class="amt" id="h-balance">—</span>
-          <button class="eye-btn" id="h-eye" title="ocultar/mostrar saldo" aria-label="ocultar saldo">👁</button>
-        </div>
-        <div class="bal-usd" id="h-usd">—</div>
-        <button class="addr-pill" id="h-copy" title="copiar dirección">
-          <span class="mono" id="h-addr">—</span>
-          <svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
-        </button>
+    <!-- saldo centrado, estilo Trust Wallet -->
+    <div class="hero">
+      <button class="acct-sel nav" id="h-acct" data-to="accounts">
+        <span id="h-acct-name">Cuenta principal</span>
+        <svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="big-bal">
+        <span class="amt" id="h-balance">&mdash;</span>
+        <button class="eye-btn" id="h-eye" title="ocultar/mostrar saldo" aria-label="ocultar saldo">&#128065;</button>
       </div>
-      <div class="bal-badge"><svg viewBox="0 0 64 64"><use href="#qlogo"/></svg></div>
+      <div class="usd" id="h-usd">&mdash;</div>
+      <button class="addr-chip" id="h-copy" title="copiar dirección">
+        <span class="mono" id="h-addr">&mdash;</span>
+        <svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
     </div>
 
-    <div class="actions">
-      <button class="act nav" data-to="send"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span>Enviar</button>
-      <button class="act nav" data-to="receive"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></span>Recibir</button>
-      <button class="act nav" data-to="buy"><span class="ic"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg></span>Comprar</button>
-      <button class="act nav" data-to="staking"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg></span>Staking</button>
+    <!-- acciones rapidas -->
+    <div class="acts">
+      <button class="qa nav" data-to="send"><span class="qa-ic"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span><span class="qa-l">Enviar</span></button>
+      <button class="qa nav" data-to="receive"><span class="qa-ic"><svg viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></span><span class="qa-l">Recibir</span></button>
+      <button class="qa nav" data-to="buy"><span class="qa-ic"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg></span><span class="qa-l">Comprar</span></button>
+      <button class="qa nav" data-to="staking"><span class="qa-ic"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg></span><span class="qa-l">Staking</span></button>
     </div>
 
-    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between">
-      <span>Activos</span>
-      <span style="display:inline-flex;align-items:center;gap:6px;color:var(--muted);text-transform:none;letter-spacing:0;font-size:13px;font-weight:600">Ordenar
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg>
-      </span>
-    </div>
-    <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-        <div class="asset-row">
-          <div class="asset-ic"><svg viewBox="0 0 64 64" width="28" height="28"><use href="#qlogo-w"/></svg></div>
-          <div>
-            <div class="asset-name">QCH</div>
-            <div class="asset-sub">QCHAIN</div>
-          </div>
-        </div>
-        <div style="text-align:right;min-width:0">
-          <div style="font-weight:700;font-size:15px;line-height:1.2" id="as-bal">—</div>
-          <div class="asset-usd" id="as-usd">—</div>
-        </div>
-        <div class="asset-stake nav" data-to="staking" style="cursor:pointer">
-          <div class="k">En staking 🔒</div>
-          <div style="font-weight:700" id="as-stake">—</div>
-          <div class="asset-usd" id="as-stake-usd">—</div>
-        </div>
-      </div>
-      <div class="row-sep"></div>
-      <div class="link-row nav" data-to="accounts"><span>Ver todas tus cuentas</span><span>›</span></div>
+    <!-- activos -->
+    <div class="lst-h"><span>Activos</span></div>
+    <div class="tok-card">
+      <button class="tok nav" data-to="accounts">
+        <span class="tok-ic"><svg viewBox="0 0 64 64"><use href="#qlogo-w"/></svg></span>
+        <span class="tok-meta"><span class="tok-name">QCH</span><span class="tok-net">QCHAIN</span></span>
+        <span class="tok-right"><span class="tok-bal" id="as-bal">&mdash;</span><span class="tok-usd" id="as-usd">&mdash;</span></span>
+      </button>
+      <div class="tok-div"></div>
+      <button class="tok-stake nav" data-to="staking">
+        <span class="ts-l"><span class="ts-lock">&#128274;</span> En staking</span>
+        <span class="ts-r"><span class="ts-amt" id="as-stake">&mdash;</span> <span class="ts-usd" id="as-stake-usd">&mdash;</span></span>
+      </button>
+      <button class="tok-more nav" data-to="accounts"><span>Ver todas tus cuentas</span><span class="chev-r">&rsaquo;</span></button>
     </div>
 
-    <div class="stake-promo nav" data-to="staking">
-      <div class="sp-ic">◆</div>
-      <div class="sp-txt"><b>Ganá hasta 12% APY</b><span>Delegá tu QCH y hacelo crecer asegurando la red</span></div>
-      <div class="sp-arrow">→</div>
-    </div>
+    <!-- promo staking -->
+    <button class="promo nav" data-to="staking">
+      <span class="promo-ic"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2l7 10-7 10-7-10z"/></svg></span>
+      <span class="promo-tx"><b>Ganá hasta 12% APY</b><span>Delegá tu QCH y hacelo crecer asegurando la red</span></span>
+      <span class="promo-ar"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </button>
 
-    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between">
-      <span>Actividad</span>
-      <span class="nav" data-to="activity-all" style="color:var(--brand2);cursor:pointer;text-transform:none;letter-spacing:0;font-size:13px">Ver todo</span>
-    </div>
+    <!-- actividad -->
+    <div class="lst-h"><span>Actividad</span><span class="lst-more nav" data-to="activity-all">Ver todo</span></div>
     <div class="card" id="activity"><div class="empty">sin movimientos todavía</div></div>
   </section>
 
