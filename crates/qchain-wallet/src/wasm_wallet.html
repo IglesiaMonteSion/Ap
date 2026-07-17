@@ -1529,6 +1529,7 @@ async function buildActivityRows(addr){
     let title, sub, cls, ic, sign;
     if(s.kind==="delegate"){ title="Delegación a staking"; sub="validador "+esc(peerLabel(s.validator)); cls="out"; ic="🔒"; sign="−"; }
     else if(s.kind==="undelegate"){ title="Retiro de staking"; sub="validador "+esc(peerLabel(s.validator)); cls="in"; ic="🔓"; sign="+"; }
+    else if(s.kind==="unbonding_started"){ title="Unbonding iniciado (self-stake)"; sub="los fondos SIGUEN en staking · retirá de nuevo tras 100 rondas"; cls="neutral"; ic="⏳"; sign=""; }
     else { title="Recompensa de staking"; sub="reclamada"; cls="in"; ic="★"; sign="+"; }
     const rnd=Number(s.round)||0, amt=esc(qchDisp(s.amount));
     rows.push({round:rnd, key:"s"+s.tx_hash, html:`<div class="tx">

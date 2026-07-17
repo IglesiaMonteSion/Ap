@@ -286,6 +286,7 @@ impl From<&qchain_execution::StakingEvent> for StakingSummary {
         let kind = match e.kind {
             qchain_execution::StakingEventKind::Delegate => "delegate",
             qchain_execution::StakingEventKind::Undelegate => "undelegate",
+            qchain_execution::StakingEventKind::UnbondingStarted => "unbonding_started",
             qchain_execution::StakingEventKind::ClaimReward => "claim_reward",
         };
         StakingSummary {

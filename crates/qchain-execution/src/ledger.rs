@@ -882,14 +882,27 @@ impl Ledger {
                 Ok(crate::staking::StakingInstruction::Undelegate) => {
                     let stake_account = ix.accounts.first().copied().unwrap_or(sys);
                     let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::try_from_slice(&a.data).ok());
-                    sad.map(|s| StakingEvent {
-                        tx_hash,
-                        kind: StakingEventKind::Undelegate,
-                        staker: s.owner,
-                        validator: s.validator,
-                        stake_account,
-                        amount: s.amount,
-                        round: current_round,
+                    sad.map(|s| {
+                        // A self-stake (owner == validator) withdraws in TWO steps:
+                        // the FIRST Undelegate only starts a 100-round unbonding
+                        // clock and returns NO funds; only a second Undelegate after
+                        // the period actually pays out. Record that first step as
+                        // `UnbondingStarted`, not `Undelegate`, so the activity log
+                        // never falsely shows the principal as withdrawn when it only
+                        // entered unbonding - the exact confusion a real user hit
+                        // ("it said I withdrew but the money never came back"). A
+                        // normal delegator, and the self-stake's completing second
+                        // step, return funds and stay `Undelegate`.
+                        let is_unbonding_start = s.owner == s.validator && s.unbonding_requested_at_round.is_none();
+                        StakingEvent {
+                            tx_hash,
+                            kind: if is_unbonding_start { StakingEventKind::UnbondingStarted } else { StakingEventKind::Undelegate },
+                            staker: s.owner,
+                            validator: s.validator,
+                            stake_account,
+                            amount: s.amount,
+                            round: current_round,
+                        }
                     })
                 }
                 Ok(crate::staking::StakingInstruction::ClaimReward) => {

@@ -68,8 +68,15 @@ pub enum StakingEventKind {
     /// "transfers to staking" the block explorer's transfer list can't show,
     /// because staking instructions never produce a `TransferReceipt`.
     Delegate,
-    /// A withdrawal request/closure of a stake position.
+    /// A withdrawal request/closure of a stake position that actually returned
+    /// funds (a normal delegator, or a self-stake's completing second step).
     Undelegate,
+    /// The FIRST step of a self-stake (owner == validator) withdrawal: it only
+    /// starts the 100-round unbonding clock and returns NO funds yet - a second
+    /// `Undelegate` after the period actually withdraws. Recorded distinctly so
+    /// the activity log never misleadingly claims the principal came back when
+    /// it only entered unbonding (the exact confusion a real user hit).
+    UnbondingStarted,
     /// A claim of accrued staking rewards.
     ClaimReward,
 }
