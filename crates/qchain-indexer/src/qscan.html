@@ -79,7 +79,8 @@ nav a.on{color:var(--txt);background:var(--card2)}
 .pill.ub{background:rgba(255,138,61,.16);color:#ffb587}
 
 /* tables */
-table{width:100%;border-collapse:collapse}
+.card:has(> table){overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;min-width:640px;border-collapse:collapse}
 th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;text-align:left;
   padding:11px 14px;border-bottom:1px solid var(--line);font-weight:700}
 td{padding:12px 14px;border-bottom:1px solid rgba(30,42,77,.5);vertical-align:middle}
@@ -112,6 +113,31 @@ footer{color:var(--dim);text-align:center;padding:30px 0;font-size:12px}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(56,211,159,.5)}70%{box-shadow:0 0 0 7px rgba(56,211,159,0)}100%{box-shadow:0 0 0 0 rgba(56,211,159,0)}}
 .banner{margin:14px 0;padding:12px 16px;border-radius:12px;font-weight:600}
 .banner.bad{background:rgba(255,92,122,.12);border:1px solid rgba(255,92,122,.4);color:#ffb0c0}
+
+/* ---- responsive: phones / small tablets ---- */
+@media(max-width:820px){
+  .wrap{padding:0 12px}
+  .hd{flex-wrap:wrap;gap:10px;padding:10px 0}
+  .brand{font-size:16px;gap:8px}
+  .brand svg{width:26px;height:26px}
+  /* brand + nav share the first row, search drops full-width below */
+  nav{order:2;margin-left:auto;gap:4px;flex-wrap:nowrap;overflow-x:auto;max-width:100%;
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  nav a{padding:6px 10px;font-size:13px;white-space:nowrap}
+  .searchbar{order:3;flex:1 0 100%;max-width:none;min-width:0}
+  .searchbar input{font-size:16px;padding:10px 12px} /* 16px avoids iOS zoom-on-focus */
+  .searchbar button{padding:0 14px}
+  h2.title{font-size:18px;margin:18px 0 12px}
+  .stat .v{font-size:20px}
+  .card.pad{padding:14px}
+  .kv>div{padding:11px 14px}
+}
+@media(max-width:420px){
+  .brand small{display:none} /* keep the header compact on very small phones */
+  .stat .v{font-size:19px}
+  th,td{padding:10px 11px}
+}
 </style>
 </head>
 <body>
