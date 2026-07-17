@@ -660,7 +660,21 @@ fn fetch_and_verify_stark_proof(rpc: &str, limit: Option<usize>) -> anyhow::Resu
     if !resp.status().is_success() {
         anyhow::bail!("node refused to serve a proof: {}", resp.text()?);
     }
-    let wire: StarkProofWire = resp.json()?;
+    // Cap the response body BEFORE parsing. The node we're verifying is UNTRUSTED
+    // (that's the whole point of a light client), and a malicious one could stream
+    // a multi-hundred-MB `/stark_proof` body (e.g. a `PublicInputs` with millions
+    // of rows) that OOM-kills us during `serde` materialization, before any check
+    // runs - defeating the `--cross-check-rpc` availability guarantee. An honest
+    // proof is capped at `MAX_STARK_PROOF_RECEIPTS`=500 receipts (~512 trace rows)
+    // and measures well under a few MB, so a 32 MiB ceiling rejects nothing real.
+    const MAX_PROOF_BODY_BYTES: u64 = 32 * 1024 * 1024;
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    resp.take(MAX_PROOF_BODY_BYTES).read_to_end(&mut body)?;
+    if body.len() as u64 == MAX_PROOF_BODY_BYTES {
+        anyhow::bail!("node's /stark_proof response exceeds the {MAX_PROOF_BODY_BYTES}-byte safety cap - refusing to parse (possible malicious node)");
+    }
+    let wire: StarkProofWire = serde_json::from_slice(&body)?;
 
     let proof_bytes = hex::decode(&wire.proof)?;
     let proof = qchain_stark::Proof::from_bytes(&proof_bytes).map_err(|e| anyhow::anyhow!("malformed proof bytes: {e}"))?;

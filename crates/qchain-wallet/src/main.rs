@@ -195,7 +195,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/export-encrypted", post(export_encrypted))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
 
-    let app = public.merge(protected).with_state(state);
+    let app = public
+        .merge(protected)
+        .layer(axum::middleware::from_fn(security_headers))
+        .with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -213,6 +216,34 @@ async fn main() -> anyhow::Result<()> {
     }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Baseline security headers on every response. This wallet holds the user's
+/// seed in browser memory + an encrypted blob in localStorage and is often
+/// exposed publicly (Cloudflare tunnel), so the only barrier between any future
+/// injection and total seed theft is the hand-rolled `esc()` - CSP is the
+/// backstop if one were ever missed. `'unsafe-inline'` + `'wasm-unsafe-eval'`
+/// are required (the whole app is inline JS/CSS + a WASM signer), so the CSP is
+/// weaker than ideal, but `object-src 'none'`/`base-uri 'none'`/`frame-ancestors
+/// 'none'` still cut the main injection-escalation and framing vectors. The
+/// three simple headers are unconditionally safe: every handler sets an explicit
+/// Content-Type (nosniff), the wallet is never meant to be framed (clickjacking
+/// the send/confirm flow), and the URL/path shouldn't leak outward (no-referrer).
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; \
+             object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 /// HTTP Basic auth gate. If a password is configured, every request (the page

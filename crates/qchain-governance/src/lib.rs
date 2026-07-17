@@ -181,10 +181,18 @@ impl Proposal {
         if self.voted_stake_accounts.contains(&stake_account) {
             return false;
         }
+        // saturating_add for overflow-safety discipline (release runs with
+        // overflow-checks=true, so a plain `+` that overflows panics
+        // deterministically on every node = a network halt). Unreachable at
+        // realistic supply (yes_stake <= total_staked << u64::MAX), but the
+        // v4.0.0 emission model grows supply over time, so this no longer rests
+        // on a static invariant. `Proposal::evaluate` already uses saturating/u128
+        // math; this makes record_vote consistent. Byte-identical for all
+        // reachable values.
         match choice {
-            VoteChoice::Yes => self.yes_stake += weight,
-            VoteChoice::No => self.no_stake += weight,
-            VoteChoice::Abstain => self.abstain_stake += weight,
+            VoteChoice::Yes => self.yes_stake = self.yes_stake.saturating_add(weight),
+            VoteChoice::No => self.no_stake = self.no_stake.saturating_add(weight),
+            VoteChoice::Abstain => self.abstain_stake = self.abstain_stake.saturating_add(weight),
         }
         self.voted_stake_accounts.push(stake_account);
         true

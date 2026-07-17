@@ -1155,10 +1155,11 @@ impl Ledger {
             // `working` - e.g. it was also the payer - the existing entry is
             // reused and this share is simply added on top) preserves the
             // real balance in both cases.
-            working
+            let fc = working
                 .entry(*fee_collector)
-                .or_insert_with(|| self.store.get(fee_collector).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())))
-                .balance += gas_validator_share;
+                .or_insert_with(|| self.store.get(fee_collector).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())));
+            // saturating_add: overflow-safety discipline (see governance::record_vote).
+            fc.balance = fc.balance.saturating_add(gas_validator_share);
         }
 
         for (pk, mut account) in working {

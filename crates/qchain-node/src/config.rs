@@ -147,7 +147,14 @@ fn default_round_interval_ms() -> u64 {
 impl NodeConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let cfg: NodeConfig = serde_json::from_slice(&bytes)?;
+        // Reject a self-inflicted misconfig early with a clear message instead of
+        // a cryptic panic later: `tokio::time::interval(Duration::from_millis(0))`
+        // panics ("interval period must be non-zero") at node startup.
+        if cfg.round_interval_ms == 0 {
+            anyhow::bail!("round_interval_ms must be greater than 0");
+        }
+        Ok(cfg)
     }
 
     /// A real, live-confirmed cross-network replay gap this closes (see

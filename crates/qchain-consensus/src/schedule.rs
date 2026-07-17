@@ -109,6 +109,18 @@ impl ValidatorSchedule {
         self.frontier_epoch
     }
 
+    /// Whether `id` is a member of ANY installed committee (any epoch). Used by
+    /// the node to authenticate the sender of an unauthenticated worker-batch
+    /// gossip/response: legitimate batches only ever originate from validators,
+    /// so a non-validator flooding junk batches can be rejected before it costs
+    /// any RAM/disk. Checking *all* installed committees (not just the current
+    /// one) keeps a batch from a just-departed or adjacent-epoch validator
+    /// acceptable, preserving resync liveness under rotation. For a `single`
+    /// schedule this is exactly the one fixed committee.
+    pub fn is_known_in_any_committee(&self, id: &qchain_core::ValidatorId) -> bool {
+        self.committees.values().any(|c| c.get(id).is_some())
+    }
+
     /// Raise the resolvable frontier to `epoch` (monotonic; a lower value is
     /// ignored). **Caller obligation:** only raise the frontier to `epoch` after
     /// installing `epoch`'s committee, which must be a deterministic function of

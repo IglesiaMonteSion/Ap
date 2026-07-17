@@ -330,6 +330,21 @@ impl<'de> serde::Deserialize<'de> for PublicInputs {
                 raw[bad].len()
             )));
         }
+        // Defense-in-depth: bound the row count. An honest proof is capped at
+        // `MAX_STARK_PROOF_RECEIPTS`=500 receipts -> a 512-row padded trace, so a
+        // legitimate `PublicInputs` never exceeds ~512 rows. A malicious node has
+        // no such limit; a huge column count drives O(rows) work inside
+        // `winterfell::verify` (`to_elements`/`get_assertions`) and, before that,
+        // a large allocation - a light-client DoS. `MAX_PUBLIC_INPUT_ROWS` gives
+        // 16x headroom over the honest max, so it rejects nothing legitimate.
+        // (The CLI light client also caps the raw response body; this protects
+        // any other in-process caller and gives a clear error.)
+        const MAX_PUBLIC_INPUT_ROWS: usize = 8192;
+        if expected_rows > MAX_PUBLIC_INPUT_ROWS {
+            return Err(serde::de::Error::custom(format!(
+                "PublicInputs has {expected_rows} rows, exceeding the maximum {MAX_PUBLIC_INPUT_ROWS}"
+            )));
+        }
         let mut columns: [Vec<BaseElement>; TRACE_WIDTH] = Default::default();
         for (col, raw_col) in columns.iter_mut().zip(raw) {
             *col = raw_col.into_iter().map(BaseElement::new).collect();

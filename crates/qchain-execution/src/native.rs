@@ -73,10 +73,11 @@ impl SystemProgram {
             return Err(ExecError::InsufficientFunds);
         }
         accounts.get_mut(from).unwrap().balance = from_balance - amount;
-        accounts
-            .entry(*to)
-            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()))
-            .balance += amount;
+        // saturating_add: overflow-safety discipline (see qchain-governance::record_vote).
+        // Unreachable at realistic supply, but a plain `+` overflow would panic-halt
+        // every node in release (overflow-checks=true). Byte-identical for real values.
+        let to_acct = accounts.entry(*to).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+        to_acct.balance = to_acct.balance.saturating_add(amount);
         Ok(())
     }
 }

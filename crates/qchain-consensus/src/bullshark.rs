@@ -505,14 +505,24 @@ impl<'a> Bullshark<'a> {
     /// who each manage to compute a non-`None` result, regardless of how
     /// much data either had at the time.
     fn ultimate_witness(&self, round: Round, up_to_round: Round) -> Option<Digest> {
-        if round > up_to_round {
-            return None;
+        // Iterative, not recursive: a long run of consecutive provably-`Skipped`
+        // rounds (sustained certificate loss / an adversarial partition producing
+        // many confirmed-absent leaders in a row) could otherwise recurse thousands
+        // of frames deep - and since this is a pure function of the replicated DAG,
+        // every honest node would overflow its stack at the same depth = a
+        // deterministic simultaneous panic-halt. A loop is byte-identical in verdict
+        // (same three-way walk, same landing digest) with O(1) native stack. This
+        // mirrors the earlier recursion->iteration rewrites of `walk_causal_history`
+        // and `reaches`, which left this the last recursive walk.
+        let mut round = round;
+        while round <= up_to_round {
+            match self.direct_status(round) {
+                RoundOutcome::Committed(d) => return Some(d),
+                RoundOutcome::Skipped => round = round.saturating_add(1),
+                RoundOutcome::Undecided => return None,
+            }
         }
-        match self.direct_status(round) {
-            RoundOutcome::Committed(d) => Some(d),
-            RoundOutcome::Skipped => self.ultimate_witness(round.saturating_add(1), up_to_round),
-            RoundOutcome::Undecided => None,
-        }
+        None
     }
 
     /// Whether `target` is reachable from `from` by following parent

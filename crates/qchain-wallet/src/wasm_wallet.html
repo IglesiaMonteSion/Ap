@@ -214,6 +214,13 @@
       radial-gradient(700px 380px at 100% 8%, rgba(60,120,255,.08), transparent 60%),
       #eef0f7;}
   :root[data-theme="light"] input::placeholder,:root[data-theme="light"] textarea::placeholder{color:#9aa1b5}
+  /* Contraste en tema claro: varios textos usan colores fijos afinados para
+     fondo oscuro (#c3c9e0/#c9c2ff/#9aa2bd) que se lavan sobre un fondo claro.
+     Se re-mapean a los tokens de tinta/apagado del tema. */
+  :root[data-theme="light"] .balance-card .lbl,
+  :root[data-theme="light"] .balance-card .acct{color:#2a3350}
+  :root[data-theme="light"] .badge{color:#5b45d6;border-color:rgba(120,100,230,.35)}
+  :root[data-theme="light"] .hint a{color:#5b45d6}
 
   .icon-btn{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;padding:0;font-size:18px;
     background:var(--card);border:1px solid var(--line);color:var(--ink);box-shadow:none;backdrop-filter:blur(8px)}
@@ -419,7 +426,7 @@
   .vd-sub{font-size:11px;color:var(--muted);margin-top:2px}
   .vd-share{flex:0 0 auto;text-align:right}
   .vd-share b{font-size:14px} .vd-share small{display:block;font-size:10px;color:var(--muted)}
-  .vd-pick{flex:0 0 auto;padding:7px 12px;font-size:12px;border-radius:10px;border:1px solid rgba(140,120,255,.4);
+  .vd-pick{flex:0 0 auto;min-height:44px;padding:8px 14px;font-size:12px;border-radius:10px;border:1px solid rgba(140,120,255,.4);
     background:rgba(140,120,255,.12);color:var(--accent,#9c86ff);font-weight:700;cursor:pointer}
   .vd-pick:active{transform:scale(.96)}
   .vd-bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:8px}
@@ -824,29 +831,30 @@
       <div class="msg" id="st-msg"></div>
     </div>
 
-    <!-- Directorio / mercado de validadores -->
+    <!-- Mis posiciones -->
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <span>Tus posiciones</span>
+      <button class="btn-sec" id="st-recover" style="min-height:40px;padding:6px 12px;font-size:12px">↻ Recuperar</button>
+    </div>
+    <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
+
+    <!-- Importar una posición vieja por dirección (cuentas de dirección aleatoria, no derivables de la semilla) -->
+    <div class="section-title" style="margin-top:20px">Importar posición</div>
+    <div class="card" style="margin-top:8px;padding:12px">
+      <div class="hint" style="margin-bottom:8px">¿Tenés una posición vieja que no aparece ni con <b>Recuperar</b>? Pegá la dirección de la cuenta de stake para importarla.</div>
+      <div style="display:flex;gap:8px">
+        <input id="st-import" placeholder="dirección de la cuenta de stake" autocomplete="off" style="flex:1;min-width:0">
+        <button class="btn-sec" id="st-import-btn" style="min-height:40px;padding:9px 14px;white-space:nowrap">Importar</button>
+      </div>
+      <div class="msg" id="st-import-msg"></div>
+    </div>
+
+    <!-- Directorio / mercado de validadores (debajo de las posiciones propias: el usuario ve SU stake primero) -->
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
       <span>Validadores de la red</span>
       <span class="hint" id="vd-count">—</span>
     </div>
     <div id="vd-list"><div class="empty">cargando validadores…</div></div>
-
-    <!-- Mis posiciones -->
-    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
-      <span>Tus posiciones</span>
-      <button class="btn-sec" id="st-recover" style="padding:6px 10px;font-size:12px">↻ Recuperar</button>
-    </div>
-    <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
-
-    <!-- Importar una posición vieja por dirección (cuentas de dirección aleatoria, no derivables de la semilla) -->
-    <div class="card" style="margin-top:10px;padding:12px">
-      <div class="hint" style="margin-bottom:8px">¿Tenés una posición vieja que no aparece ni con <b>Recuperar</b>? Pegá la dirección de la cuenta de stake para importarla.</div>
-      <div style="display:flex;gap:8px">
-        <input id="st-import" placeholder="dirección de la cuenta de stake" autocomplete="off" style="flex:1;min-width:0">
-        <button class="btn-sec" id="st-import-btn" style="padding:9px 12px;white-space:nowrap">Importar</button>
-      </div>
-      <div class="msg" id="st-import-msg"></div>
-    </div>
 
     <!-- Historial de recompensas reclamadas -->
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">

@@ -2085,6 +2085,11 @@ impl Engine {
     /// unauthenticated caller can't ask for an unbounded list. `total_burned` is
     /// read once under the lock (a cheap counter), separate from the snapshot.
     pub async fn holders(&self, limit: usize) -> HoldersResponse {
+        // Bound concurrency: the O(accounts) scan + O(wallets·log wallets) sort is
+        // cheap at testnet scale but, on a large state, a flood of unauthenticated
+        // `GET /holders` would otherwise pin every tokio worker. Same permit the
+        // (comparably-sized) `/snapshot` scan already uses.
+        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
         let limit = limit.min(MAX_ACTIVITY_LIMIT);
         let total_burned = { self.state.lock().await.ledger.total_burned };
         let cached = self.cached_snapshot().await;
@@ -2221,6 +2226,20 @@ impl Engine {
                 // broadcast already reached every peer in one hop.
             }
             NetMessage::WorkerBatchGossip { worker_id: _, batch } => {
+                // Authenticate the sender. Legitimate worker batches only ever
+                // originate from validators (workers are lanes inside validator
+                // processes). Without this check, ANY host reaching the P2P port
+                // could flood distinct junk `WorkerBatchGossip` messages - each a
+                // new `state.batches` RAM entry AND a new `persist_batch` disk
+                // write - evicted only by the ~1024-round window, so unbounded in
+                // count within it: an unauthenticated RAM+disk amplification.
+                // `WorkerBatchGossip`/`WorkerBatchResponse` were the only two
+                // NetMessage arms lacking the sender-is-a-validator check that
+                // VertexProposal/Vote/CertificateBroadcast/VersionAnnounce enforce.
+                if !self.schedule().is_known_in_any_committee(&from) {
+                    tracing::warn!("dropping worker-batch gossip from unknown validator {from}");
+                    return;
+                }
                 {
                     let mut state = self.state.lock().await;
                     self.persist_batch(&batch.digest(), &batch);
@@ -2486,6 +2505,13 @@ impl Engine {
                 }
             }
             NetMessage::WorkerBatchResponse { worker_id: _, batch } => {
+                // Same sender authentication as WorkerBatchGossip (above): only a
+                // validator ever legitimately serves a batch we requested, so a
+                // non-validator can't use a response to flood the cache/disk.
+                if !self.schedule().is_known_in_any_committee(&from) {
+                    tracing::warn!("dropping worker-batch response from unknown validator {from}");
+                    return;
+                }
                 let mut state = self.state.lock().await;
                 self.persist_batch(&batch.digest(), &batch);
                 cache_batch(&mut state, batch);
