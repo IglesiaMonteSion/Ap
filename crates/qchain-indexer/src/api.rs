@@ -126,6 +126,12 @@ async fn txs(State(st): State<ApiState>, Query(q): Query<Page>) -> Json<Value> {
 /// proofs when it's still in the node's window.
 async fn tx_detail(State(st): State<ApiState>, Path(hash): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
     let hash = hash.trim().to_lowercase();
+    // Only a real 64-hex tx hash is ever a valid lookup; reject anything else
+    // before it reaches the store or is interpolated into the node URL (avoids
+    // path/query injection via a crafted :hash segment).
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "not a valid transaction hash".into()));
+    }
     let rec = st.store.get_tx_by_hash(&hash);
     let full = {
         let url = format!("{}/transfers/{}", st.node.trim_end_matches('/'), hash);

@@ -40,7 +40,10 @@
     const h = Math.floor(m / 60); if (h < 24) return h + " h";
     const d = Math.floor(h / 24); return d + " d";
   }
-  function copyBtn(v) { return `<span class="copy" title="Copiar" onclick="QScan.copy('${esc(v)}',event)">⧉</span>`; }
+  // Use a data attribute (HTML-escaped) + a delegated handler instead of an
+  // inline onclick that embeds the value in a JS-string context — avoids the
+  // fragile HTML-entity-vs-JS-string escaping mismatch.
+  function copyBtn(v) { return `<span class="copy" title="Copiar" data-copy="${esc(v)}">⧉</span>`; }
   const addrLink = (a) => a ? `<a class="mono" href="#/address/${esc(a)}">${esc(short(a, 10, 8))}</a>` : "<span class=dim>—</span>";
   const txLink = (h) => `<a class="mono hashlink" href="#/tx/${esc(h)}">${esc(short(h, 12, 8))}</a>`;
   const blockLink = (r) => `<a href="#/block/${esc(r)}">${fmtNum(r)}</a>`;
@@ -340,8 +343,15 @@
   window.QScan = {
     doSearch,
     go: (hash) => { location.hash = hash; },
-    copy: (v, ev) => { if (ev) ev.stopPropagation(); navigator.clipboard && navigator.clipboard.writeText(v); },
   };
+  // Delegated copy-to-clipboard: reads the value from data-copy (no inline JS).
+  document.addEventListener("click", (e) => {
+    const c = e.target.closest && e.target.closest(".copy");
+    if (!c) return;
+    e.stopPropagation();
+    const v = c.getAttribute("data-copy") || "";
+    if (navigator.clipboard) navigator.clipboard.writeText(v);
+  });
   window.addEventListener("hashchange", route);
   route();
   // Light auto-refresh of the home page — patches data in place (no page blackout).

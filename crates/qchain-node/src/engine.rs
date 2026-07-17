@@ -1081,6 +1081,26 @@ pub struct ResourcesResponse {
 /// dashboard's old client-side estimate (transfer count x a flat byte guess,
 /// which never saw contract-call txs and so under-reported fill as ~85%), this
 /// counts EVERY transaction actually committed in the round's batches. `fill_pct`
+/// A light projection of a `TransferReceipt` — just the scalar fields the
+/// `/transfers` list serialises, WITHOUT the ~33KB of Merkle proofs each recent
+/// receipt carries. `Engine::list_transfers` builds these inside the consensus
+/// lock so it never clones (or holds the lock through) the heavy proof payload.
+#[derive(Clone)]
+pub struct TransferSummaryLite {
+    pub tx_hash: [u8; 32],
+    pub from: Pubkey,
+    pub to: Pubkey,
+    pub amount: u64,
+    pub fee: u64,
+    pub round: u64,
+}
+
+impl From<&qchain_execution::TransferReceipt> for TransferSummaryLite {
+    fn from(r: &qchain_execution::TransferReceipt) -> Self {
+        Self { tx_hash: r.tx_hash, from: r.from, to: r.to, amount: r.amount, fee: r.fee, round: r.round }
+    }
+}
+
 /// is against the real per-round inclusion cap `FEE_MAX_BYTES_PER_ROUND`.
 #[derive(Serialize)]
 pub struct RoundFill {
@@ -1680,16 +1700,18 @@ impl Engine {
     /// transaction regardless of whether this one later includes it in a
     /// worker batch.
     pub async fn submit_transaction(&self, tx: Transaction) -> anyhow::Result<[u8; 32]> {
-        if !tx.verify_signature() {
-            anyhow::bail!("invalid transaction signature");
-        }
-        // Real, live-confirmed cross-network replay gap closed here - see
-        // `qchain_core::Message::chain_id`'s doc comment for the full
-        // reproduction (one signed transfer, replayed verbatim across two
-        // genuinely separate testnet processes, executed identically on
-        // both).
+        // Cheap plaintext field compare FIRST, before the ~150µs hybrid PQC
+        // verify: a wrong-network transaction is rejected either way, so this is
+        // behaviour-identical, but it means junk aimed at another chain_id can't
+        // pin a core on signature verification. Real, live-confirmed
+        // cross-network replay gap - see `qchain_core::Message::chain_id`'s doc
+        // comment for the full reproduction (one signed transfer, replayed
+        // verbatim across two separate testnets, executed identically on both).
         if tx.message.chain_id != self.chain_id {
             anyhow::bail!("transaction's chain_id does not match this network");
+        }
+        if !tx.verify_signature() {
+            anyhow::bail!("invalid transaction signature");
         }
         let hash = tx.hash();
         {
@@ -1791,12 +1813,19 @@ impl Engine {
     /// already keeps for `/stark_proof` (see `qchain-execution::receipt`'s
     /// module docs on that limitation) - this endpoint doesn't add any
     /// new persistence, just a paginated read of what was already there.
-    pub async fn list_transfers(&self, limit: usize, offset: usize) -> Vec<qchain_execution::TransferReceipt> {
+    // (see `TransferSummaryLite` below for why this returns a light struct)
+    pub async fn list_transfers(&self, limit: usize, offset: usize) -> Vec<TransferSummaryLite> {
         // Clamp the caller-supplied limit: the receipt log is unbounded and now
         // reloaded in full on restart, so an unauthenticated `?limit=<u64::MAX>`
-        // would clone the ENTIRE history under the global consensus lock - a real
+        // would touch the ENTIRE history under the global consensus lock - a real
         // liveness DoS proportional to chain age. `MAX_ACTIVITY_LIMIT` caps one
         // response; a client paginates with `offset` for more.
+        //
+        // Build the LIGHT summary (a handful of scalar fields) inside the lock
+        // instead of cloning the full `TransferReceipt`s: the recent ones each
+        // carry ~33KB of Merkle proofs that the wire type (`TransferSummary`)
+        // discards anyway, so cloning them would hold the consensus lock through a
+        // ~20MB copy and amplify memory for nothing. Behaviour-identical output.
         let limit = limit.min(MAX_ACTIVITY_LIMIT);
         let state = self.state.lock().await;
         let all = state.ledger.transfer_receipts();
@@ -1805,7 +1834,7 @@ impl Engine {
         }
         let end = all.len() - offset;
         let start = end.saturating_sub(limit);
-        all[start..end].iter().rev().cloned().collect()
+        all[start..end].iter().rev().map(TransferSummaryLite::from).collect()
     }
 
     /// The real committed size of the most recent `limit` rounds (newest first) -
@@ -2199,12 +2228,14 @@ impl Engine {
                 // only ever gossips what it already checked - the same
                 // posture `submit_transaction` already has for its own
                 // RPC-submitted transactions.
-                if !tx.verify_signature() {
-                    tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
-                    return;
-                }
+                // Cheap chain_id compare before the ~150µs PQC verify (same
+                // reject either way, just cheaper for wrong-network junk).
                 if tx.message.chain_id != self.chain_id {
                     tracing::warn!("dropping gossiped transaction from {from} with a mismatched chain_id");
+                    return;
+                }
+                if !tx.verify_signature() {
+                    tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
                     return;
                 }
                 let mut state = self.state.lock().await;

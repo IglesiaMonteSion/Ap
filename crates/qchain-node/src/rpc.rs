@@ -231,8 +231,8 @@ struct TransferSummary {
     round: u64,
 }
 
-impl From<&TransferReceipt> for TransferSummary {
-    fn from(r: &TransferReceipt) -> Self {
+impl From<&crate::engine::TransferSummaryLite> for TransferSummary {
+    fn from(r: &crate::engine::TransferSummaryLite) -> Self {
         TransferSummary { tx_hash: hex::encode(r.tx_hash), from: r.from, to: r.to, amount: r.amount, fee: r.fee, round: r.round }
     }
 }

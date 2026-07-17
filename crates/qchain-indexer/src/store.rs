@@ -64,6 +64,17 @@ pub struct BlockRecord {
     pub ts: u64,
 }
 
+/// Hard cap on how deep an unauthenticated `/api/txs` page request can reach.
+/// Beyond this the endpoint returns empty instead of skip-scanning the whole
+/// tree (the SPA only pages a handful of pages; this just bounds a DoS).
+const MAX_TX_OFFSET: usize = 100_000;
+/// Cap on records examined by a `kind`-filtered `/api/txs` scan (a rare/absent
+/// kind would otherwise deserialize the entire tree looking for matches).
+const MAX_KIND_SCAN: usize = 100_000;
+/// Cap on the fallback tail-scan of `txs_in_round` for rounds ingested before
+/// the `round` index existed (recent old data only; new rounds hit the index).
+const ROUND_FALLBACK_SCAN: usize = 5_000;
+
 #[derive(Clone)]
 pub struct Store {
     /// Kept to hold the database open for the process lifetime (the trees are
@@ -73,6 +84,9 @@ pub struct Store {
     tx: sled::Tree,
     hash2seq: sled::Tree,
     addr: sled::Tree,
+    /// `be(round) ++ be(seq)` -> `[]` : prefix-scan a round's txs in O(round size)
+    /// instead of scanning the global log (kills the /api/block/:round DoS).
+    round: sled::Tree,
     blocks: sled::Tree,
     meta: sled::Tree,
 }
@@ -88,6 +102,7 @@ impl Store {
             tx: db.open_tree("tx")?,
             hash2seq: db.open_tree("hash2seq")?,
             addr: db.open_tree("addr")?,
+            round: db.open_tree("round")?,
             blocks: db.open_tree("blocks")?,
             meta: db.open_tree("meta")?,
             db,
@@ -109,12 +124,30 @@ impl Store {
         let _ = self.meta.insert("last_seq", &be(seq));
     }
 
+    /// O(1): `seq` is a gap-free monotonic counter that never decreases (no
+    /// deletions), so the last assigned seq IS the number of txs — no `len()`
+    /// tree walk on every /api/stats and /api/txs.
     pub fn total_txs(&self) -> u64 {
-        self.tx.len() as u64
+        self.last_seq()
     }
 
+    /// O(1) via a cached counter in `meta` (lazily initialised from `len()`
+    /// once), bumped only when a genuinely new round is first inserted.
     pub fn total_blocks(&self) -> u64 {
-        self.blocks.len() as u64
+        match self
+            .meta
+            .get("block_count")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_ref().try_into().ok().map(u64::from_be_bytes))
+        {
+            Some(c) => c,
+            None => {
+                let n = self.blocks.len() as u64;
+                let _ = self.meta.insert("block_count", &be(n));
+                n
+            }
+        }
     }
 
     pub fn set_meta_json(&self, key: &str, value: &serde_json::Value) {
@@ -155,6 +188,11 @@ impl Store {
                 self.addr.insert(key, &[])?;
             }
         }
+        // round index: be(round) ++ be(seq) -> [] (prefix-scan a round's txs)
+        let mut rkey = [0u8; 16];
+        rkey[..8].copy_from_slice(&be(rec.round));
+        rkey[8..].copy_from_slice(&be(seq));
+        self.round.insert(rkey, &[])?;
         self.hash2seq.insert(rec.hash.as_bytes(), &be(seq))?;
         let body = serde_json::to_vec(&rec)?;
         self.tx.insert(be(seq), body)?;
@@ -171,24 +209,42 @@ impl Store {
     /// Newest-first page of the global tx list, optionally filtered by `kind`.
     /// `kind == None` returns everything.
     pub fn list_txs(&self, page: usize, size: usize, kind: Option<&str>) -> Vec<TxRecord> {
-        let mut out = Vec::with_capacity(size);
-        let mut skipped = 0usize;
         let skip = page.saturating_mul(size);
-        for item in self.tx.iter().rev() {
-            let Ok((_, v)) = item else { continue };
-            let Ok(rec) = serde_json::from_slice::<TxRecord>(&v) else { continue };
-            if let Some(k) = kind {
-                if rec.kind != k {
-                    continue;
+        // Bound how deep an unauthenticated request can page (avoids a full-tree
+        // skip-scan on a huge `page`; the SPA only pages a handful of pages).
+        if skip > MAX_TX_OFFSET {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(size);
+        match kind {
+            // Unfiltered: skip WITHOUT deserializing, then decode only the page —
+            // O(skip) cheap key-iteration + O(size) decodes, not O(tree).
+            None => {
+                for (_, v) in self.tx.iter().rev().skip(skip).take(size).flatten() {
+                    if let Ok(rec) = serde_json::from_slice::<TxRecord>(&v) {
+                        out.push(rec);
+                    }
                 }
             }
-            if skipped < skip {
-                skipped += 1;
-                continue;
-            }
-            out.push(rec);
-            if out.len() >= size {
-                break;
+            // Filtered: must decode to test `kind`; cap total records examined so a
+            // rare/absent kind can't force a whole-tree deserialization.
+            Some(k) => {
+                let mut skipped = 0usize;
+                for item in self.tx.iter().rev().take(MAX_KIND_SCAN) {
+                    let Ok((_, v)) = item else { continue };
+                    let Ok(rec) = serde_json::from_slice::<TxRecord>(&v) else { continue };
+                    if rec.kind != k {
+                        continue;
+                    }
+                    if skipped < skip {
+                        skipped += 1;
+                        continue;
+                    }
+                    out.push(rec);
+                    if out.len() >= size {
+                        break;
+                    }
+                }
             }
         }
         out
@@ -226,6 +282,7 @@ impl Store {
     pub fn upsert_block(&self, rec: BlockRecord) -> Result<()> {
         // Preserve the first-seen ts if the block already exists.
         let existing = self.get_block(rec.round);
+        let is_new = existing.is_none();
         let mut rec = rec;
         if let Some(prev) = existing {
             if prev.ts != 0 {
@@ -233,6 +290,21 @@ impl Store {
             }
         }
         self.blocks.insert(be(rec.round), serde_json::to_vec(&rec)?)?;
+        if is_new {
+            // keep the O(1) block counter in sync (lazy-init from len() if absent,
+            // which already counts the block we just inserted)
+            let next = match self
+                .meta
+                .get("block_count")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_ref().try_into().ok().map(u64::from_be_bytes))
+            {
+                Some(c) => c + 1,
+                None => self.blocks.len() as u64,
+            };
+            let _ = self.meta.insert("block_count", &be(next));
+        }
         Ok(())
     }
 
@@ -253,23 +325,39 @@ impl Store {
     }
 
     pub fn txs_in_round(&self, round: u64) -> Vec<TxRecord> {
-        // Scan the tail of the tx log (rounds are near-monotonic with seq, so
-        // the newest few hundred entries cover any recent round); fall back to a
-        // bounded scan. For a specific round we walk from newest and collect
-        // matches until we pass below the round.
-        let mut out = Vec::new();
-        let mut scanned = 0usize;
-        for item in self.tx.iter().rev() {
-            if scanned > 200_000 {
-                break;
+        // Primary path: the `round` index — a bounded prefix scan of exactly this
+        // round's txs (no whole-log walk). Populated for every tx ingested since
+        // the index was added.
+        let mut seqs: Vec<u64> = Vec::new();
+        for (k, _) in self.round.scan_prefix(be(round)).take(10_000).flatten() {
+            if k.len() == 16 {
+                if let Ok(s) = k[8..].try_into() {
+                    seqs.push(u64::from_be_bytes(s));
+                }
             }
-            scanned += 1;
+        }
+        if !seqs.is_empty() {
+            let mut out = Vec::with_capacity(seqs.len());
+            for s in seqs {
+                if let Some(raw) = self.tx.get(be(s)).ok().flatten() {
+                    if let Ok(rec) = serde_json::from_slice::<TxRecord>(&raw) {
+                        out.push(rec);
+                    }
+                }
+            }
+            out.sort_by_key(|r: &TxRecord| r.seq);
+            return out;
+        }
+        // Fallback for rounds ingested BEFORE the round index existed: a bounded
+        // tail scan (small cap so it can't be turned into a CPU-DoS by querying
+        // many old/low rounds). New rounds always take the fast path above.
+        let mut out = Vec::new();
+        for (i, item) in self.tx.iter().rev().take(ROUND_FALLBACK_SCAN).enumerate() {
             let Ok((_, v)) = item else { continue };
             let Ok(rec) = serde_json::from_slice::<TxRecord>(&v) else { continue };
             if rec.round == round {
                 out.push(rec);
-            } else if rec.round < round && scanned > 50 {
-                // We've walked past the target round's window; stop.
+            } else if rec.round < round && i > 50 {
                 break;
             }
         }

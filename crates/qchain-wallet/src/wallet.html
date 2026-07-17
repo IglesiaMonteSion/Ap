@@ -368,6 +368,10 @@ let active = localStorage.getItem("qchain_active") || null;
 let lastListSig = "";
 
 function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); setTimeout(()=>e.classList.remove("show"),1300); }
+// HTML-escape before folding node/user data into innerHTML. A no-op for base58
+// addresses and [A-Za-z0-9_-] server-sanitised wallet names (they contain none
+// of these chars), so display is unchanged for all real data — defense-in-depth.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s||""); }
 function copy(t){ navigator.clipboard.writeText(t).then(()=>toast("copiado")); }
 function initials(n){ return (n||"?").slice(0,2).toUpperCase(); }
@@ -467,8 +471,8 @@ function renderHome(){
     lastListSig=listSig;
     box.innerHTML = WALLETS.map(x=>`
       <div class="wallet-item" data-name="${x.name}">
-        <div class="wi-ic">${initials(x.name)}</div>
-        <div class="wi-main"><div class="wi-name">${x.name}</div><div class="wi-addr">${short(x.address)}</div></div>
+        <div class="wi-ic">${esc(initials(x.name))}</div>
+        <div class="wi-main"><div class="wi-name">${esc(x.name)}</div><div class="wi-addr">${esc(short(x.address))}</div></div>
         <div class="wi-bal">${qchDisp(x.balance)} ${x.name===active?'<span class="wi-check">✓</span>':''}</div>
       </div>`).join("");
     box.querySelectorAll(".wallet-item").forEach(el=>el.onclick=()=>{
@@ -495,7 +499,7 @@ async function renderActivity(addr){
     return `<div class="tx">
       <div class="tx-ic ${inc?'tx-in':'tx-out'}">${inc?'↓':'↑'}</div>
       <div class="tx-main"><div class="tx-t">${inc?'Recibido':'Enviado'}</div>
-        <div class="tx-s">${inc?'de '+short(t.from):'a '+short(t.to)}</div></div>
+        <div class="tx-s">${inc?'de '+esc(short(t.from)):'a '+esc(short(t.to))}</div></div>
       <div class="tx-amt ${inc?'in':'out'}">${inc?'+':'−'}${qchDisp(t.amount)}</div>
     </div>`;
   }).join("");
@@ -515,7 +519,7 @@ function renderSend(){
   $("s-fee").textContent="El fee de red se calcula solo al enviar.";
   $("s-amount").value=""; $("s-to").value="";
   const pick=$("s-to-pick");
-  pick.innerHTML=`<option value="">— o elegí una de mis wallets —</option>`+WALLETS.filter(x=>x.name!==w.name).map(x=>`<option value="${x.address}">${x.name} — ${short(x.address)}</option>`).join("");
+  pick.innerHTML=`<option value="">— o elegí una de mis wallets —</option>`+WALLETS.filter(x=>x.name!==w.name).map(x=>`<option value="${esc(x.address)}">${esc(x.name)} — ${esc(short(x.address))}</option>`).join("");
   const msg=$("s-msg"); msg.className="msg"; msg.textContent="";
 }
 $("s-to-pick").onchange=e=>{ if(e.target.value) $("s-to").value=e.target.value; };
