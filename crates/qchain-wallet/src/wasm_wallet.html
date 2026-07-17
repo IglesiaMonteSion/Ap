@@ -2086,13 +2086,22 @@ async function renderStaking(){
     // ¿se puede retirar ya? (bonding y lock cumplidos). Si no hay datos, se permite intentar.
     let ready=true, until=0;
     if(d&&d.exists){ until=Math.max(d.bonding_until_round||0, d.locked_until_round||0); ready = (d.current_round||0) >= until; }
+    // Self-stake (delegado a la propia dirección): retiro en dos pasos. Mostralo
+    // explícito para que un fondo "atascado" se entienda y se pueda recuperar.
+    const selfStake = d&&d.exists&&d.owner===d.validator;
+    const req = selfStake ? d.unbonding_requested_at_round : null;
     const rewardLine = reward!==null ? `<div class="hint" style="margin:2px 0 0">recompensa: <b style="color:var(--good)">${esc(qchDisp(reward))}</b></div>` : '';
     const lockLine = (!ready) ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">se puede retirar en la ronda ${esc(fmt(String(until)))}</div>` : '';
+    const selfLine = selfStake ? (
+      req==null ? `<div class="hint" style="margin:2px 0 0;color:var(--warn,#c90)">self-stake · retiro en 2 pasos (100 rondas)</div>`
+      : ((d.current_round||0) < req+100 ? `<div class="hint" style="margin:2px 0 0;color:var(--bad)">unbonding · fondos disponibles en la ronda ${esc(fmt(String(req+100)))}</div>`
+         : `<div class="hint" style="margin:2px 0 0;color:var(--good)">unbonding cumplido · dale a Retirar para recibir los fondos</div>`)
+    ) : '';
     return `<div class="row-item" style="align-items:flex-start">
       <div style="min-width:0;flex:1">
         <div style="font-weight:700">${esc(qchDisp(amount))}</div>
         <div class="wi-addr mono" style="font-size:11px">a ${esc(short(s.validator))}</div>
-        ${rewardLine}${lockLine}
+        ${rewardLine}${lockLine}${selfLine}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px">
         <button class="btn-sec" data-claim="${i}" style="padding:8px 12px;font-size:13px">Reclamar</button>
@@ -2123,6 +2132,12 @@ $("st-recover").onclick=async()=>{
 $("st-delegate").onclick=async()=>{
   const validator=$("st-validator").value.trim(), amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
   if(!validator){ msg.className="msg err"; msg.textContent="poné la dirección del validador"; return; }
+  // Bloqueá delegar a tu PROPIA dirección de wallet: eso crea un "self-stake"
+  // (owner == validator) cuyo retiro on-chain es un proceso de DOS pasos de 100
+  // rondas (protección anti-slash pensada para validadores reales, no para un
+  // usuario común) - la trampa exacta que dejaba fondos "atascados" con un
+  // "retiro enviado" que no devolvía nada. Elegí un validador de la lista.
+  if(validator===myAddress()){ msg.className="msg err"; msg.textContent="no podés delegar a tu propia dirección de wallet — elegí un validador de la lista de abajo."; return; }
   let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
   $("st-delegate").disabled=true; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
   try{
@@ -2151,12 +2166,23 @@ $("st-delegate").onclick=async()=>{
 async function stakeAction(kind, pos){
   const msg=$("st-msg"); msg.className="msg"; msg.style.display="block";
   try{
-    // Pre-chequeo real contra la cadena para no enviar una tx que la ejecución
-    // rechazaría (bonding/lock) - así el "enviado" no miente.
+    // Estado real ANTES de firmar, para (a) no enviar una tx que la ejecución
+    // rechazaría y (b) comparar contra el estado DESPUÉS para reportar lo que de
+    // verdad pasó (no solo que se admitió al mempool - el bug que hacía que
+    // "retiro enviado" mintiera).
     const d=await api("/api/stake/"+encodeURIComponent(pos.stakeAccount)).catch(()=>null);
     if(kind==="undelegate" && d && d.exists){
       const until=Math.max(d.bonding_until_round||0, d.locked_until_round||0);
       if((d.current_round||0) < until){ msg.className="msg err"; msg.textContent=`todavía no podés retirar — disponible en la ronda ${until} (vas por la ${d.current_round})`; return; }
+      const selfStake = d.owner===d.validator;
+      if(selfStake){
+        const req=d.unbonding_requested_at_round;
+        if(req==null){
+          if(!confirm("Esta posición es un self-stake (delegaste a tu propia dirección). El retiro es en DOS pasos: este paso inicia un unbonding de 100 rondas y NO devuelve los fondos todavía; pasadas esas rondas tenés que darle a Retirar OTRA vez para recibirlos. ¿Continuar?")){ msg.textContent=""; msg.style.display="none"; return; }
+        } else if((d.current_round||0) < req+100){
+          msg.className="msg err"; msg.textContent=`self-stake en unbonding — vas a poder retirar los fondos en la ronda ${req+100} (vas por la ${d.current_round})`; return;
+        }
+      }
     }
     if(kind==="claim" && d && d.exists && Number(d.pending_reward)===0){ msg.className="msg err"; msg.textContent="no hay recompensa pendiente para reclamar todavía"; return; }
     msg.className="msg"; msg.textContent=(kind==="claim"?"reclamando":"retirando")+" (firmando en tu navegador)…";
@@ -2165,16 +2191,32 @@ async function stakeAction(kind, pos){
       ? signClaimReward(SEED, pos.stakeAccount, nonce, chainId, 10000000n)
       : signUndelegate(SEED, pos.stakeAccount, nonce, chainId, 10000000n);
     await relaySigned(txJson);
-    msg.className="msg ok"; msg.textContent = kind==="claim" ? "✓ Recompensa reclamada" : "✓ Retiro enviado";
-    // La posición se quita cuando la cadena confirma amount 0 (renderStaking lo
-    // relee); si en unas consultas sigue en cero, se poda.
-    setTimeout(async()=>{
+    msg.className="msg"; msg.textContent="confirmando en la cadena…";
+    // Confirmación REAL: sondear el estado on-chain unos segundos y reportar el
+    // resultado verdadero, en vez de decir "hecho" apenas se admite al mempool.
+    const beforeReq = d && d.exists ? d.unbonding_requested_at_round : null;
+    const beforePending = d && d.exists ? Number(d.pending_reward||0) : 0;
+    let outcome=null;
+    for(let i=0;i<12 && !outcome;i++){
+      await new Promise(r=>setTimeout(r,700));
+      const a=await api("/api/stake/"+encodeURIComponent(pos.stakeAccount)).catch(()=>null);
       if(kind==="undelegate"){
-        const after=await api("/api/stake/"+encodeURIComponent(pos.stakeAccount)).catch(()=>null);
-        if(after && after.exists && Number(after.amount)===0) dropStake(pos.stakeAccount);
+        if(!a || !a.exists || Number(a.amount)===0){ outcome={done:true}; }
+        else if(a.unbonding_requested_at_round!=null && beforeReq==null){ outcome={unbonding:a.unbonding_requested_at_round}; }
+      } else { // claim: se acreditó si la recompensa pendiente cayó
+        if(a && a.exists && Number(a.pending_reward) < beforePending){ outcome={done:true}; }
+        else if(!a || !a.exists){ outcome={done:true}; }
       }
-      renderStaking();
-    }, 1800);
+    }
+    if(kind==="undelegate"){
+      if(outcome && outcome.done){ msg.className="msg ok"; msg.textContent="✓ Retiro completado — recibiste tus fondos"; dropStake(pos.stakeAccount); }
+      else if(outcome && outcome.unbonding!=null){ msg.className="msg ok"; msg.textContent=`Unbonding iniciado (self-stake). Volvé a darle a Retirar en la ronda ${outcome.unbonding+100} para recibir los fondos.`; }
+      else { msg.className="msg err"; msg.textContent="el retiro no se aplicó (probable bonding/lock aún vigente). Revisá el estado y reintentá."; }
+    } else {
+      if(outcome && outcome.done){ msg.className="msg ok"; msg.textContent="✓ Recompensa reclamada"; }
+      else { msg.className="msg err"; msg.textContent="la recompensa no se acreditó todavía — reintentá en unos segundos."; }
+    }
+    renderStaking();
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
 }
 
