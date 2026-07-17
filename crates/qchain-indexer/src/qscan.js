@@ -224,7 +224,7 @@
     }
     rows += `</div>`;
     app.innerHTML = `<h2 class="title">Transacción</h2><div class="card">${rows}</div>
-      ${r ? `<div class="dim center" style="margin:14px 0">Incluye pruebas Merkle verificables (light client). Consultá <span class="mono">GET /transfers/${esc(base.hash || hash)}</span> en el nodo para el recibo STARK completo.</div>` : ""}`;
+      ${r ? `<div class="dim center note" style="margin:14px 0">Incluye pruebas Merkle verificables por un light client. El recibo STARK completo (balances antes/después + pruebas) está disponible en el nodo vía <span class="mono">GET /transfers/&lt;hash&gt;</span>.</div>` : ""}`;
   }
 
   async function addressPage(addr, page) {
@@ -344,13 +344,20 @@
     doSearch,
     go: (hash) => { location.hash = hash; },
   };
-  // Delegated copy-to-clipboard: reads the value from data-copy (no inline JS).
+  // Delegated copy-to-clipboard: reads the value from data-copy (no inline JS),
+  // with a brief ✓ confirmation like Etherscan.
   document.addEventListener("click", (e) => {
     const c = e.target.closest && e.target.closest(".copy");
     if (!c) return;
     e.stopPropagation();
     const v = c.getAttribute("data-copy") || "";
     if (navigator.clipboard) navigator.clipboard.writeText(v);
+    if (c.dataset.busy) return;
+    c.dataset.busy = "1";
+    const prev = c.textContent;
+    c.textContent = "✓";
+    c.classList.add("ok");
+    setTimeout(() => { c.textContent = prev; c.classList.remove("ok"); delete c.dataset.busy; }, 1000);
   });
   window.addEventListener("hashchange", route);
   route();

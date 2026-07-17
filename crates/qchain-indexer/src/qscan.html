@@ -121,10 +121,14 @@ h2.title::before{content:"";width:4px;height:20px;border-radius:3px;background:v
 .pager button{background:#fff;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 12px;cursor:pointer;font-weight:600}
 .pager button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
 .pager button:disabled{opacity:.45;cursor:default}
-.copy{cursor:pointer;color:var(--dim);margin-left:6px}
+.copy{cursor:pointer;color:var(--dim);margin-left:6px;user-select:none}
 .copy:hover{color:var(--acc)}
+.copy.ok{color:var(--ok)}
 .tag{font-size:11px;color:var(--dim)}
 .empty{padding:34px;text-align:center;color:var(--muted)}
+/* long unbreakable strings (hashes, roots) must wrap, never widen the page */
+main .center{overflow-wrap:anywhere}
+.note{max-width:720px;margin-left:auto;margin-right:auto;line-height:1.6;font-size:13px}
 .bar{height:6px;border-radius:4px;background:#eef1f7;overflow:hidden;min-width:70px}
 .bar>i{display:block;height:100%;background:var(--acc)}
 footer{color:var(--dim);text-align:center;padding:30px 0;font-size:12px}
