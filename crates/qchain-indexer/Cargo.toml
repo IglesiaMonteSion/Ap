@@ -1,0 +1,22 @@
+[package]
+name = "qchain-indexer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "qchain-indexer"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sled = "0.34"
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+bs58.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -43,4 +43,23 @@ else
   decir "No hay servicio de wallet instalado en esta VPS — solo se actualizó el nodo."
 fi
 
+# 3. Explorador QScan, si está instalado — mismo patrón (reiniciar contra la imagen ya fresca)
+INDEXER_SERVICE="qchain-indexer"
+if systemctl list-unit-files "$INDEXER_SERVICE.service" >/dev/null 2>&1 && systemctl cat "$INDEXER_SERVICE" >/dev/null 2>&1; then
+  decir "Reiniciando el explorador QScan contra la imagen recién construida (sin reconstruir)"
+  systemctl restart "$INDEXER_SERVICE"
+  IDX_PORT="$(systemctl show "$INDEXER_SERVICE" -p ExecStart --value 2>/dev/null | grep -oP -- '--bind[= ][^ ]*:\K[0-9]+' | head -1 || true)"
+  IDX_PORT="${IDX_PORT:-9200}"
+  OK=0
+  for _ in $(seq 1 12); do
+    sleep 1
+    if systemctl is-active --quiet "$INDEXER_SERVICE" && curl -fsSL --max-time 3 "http://127.0.0.1:$IDX_PORT/api/health" >/dev/null 2>&1; then OK=1; break; fi
+  done
+  if [ "$OK" -eq 1 ]; then
+    echo "Explorador QScan reiniciado y respondiendo en el puerto $IDX_PORT."
+  else
+    echo "ADVERTENCIA: el explorador no respondió tras reiniciar. Revisá: journalctl -u $INDEXER_SERVICE -e --no-pager"
+  fi
+fi
+
 decir "Todo listo."

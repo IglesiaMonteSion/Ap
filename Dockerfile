@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Builds all qchain binaries (qchain-node, qchain-genesis-build, qchain the
-# wallet CLI, qchain-faucet, qchain-wallet the web wallet) into one runtime
+# wallet CLI, qchain-faucet, qchain-wallet the web wallet, qchain-indexer the
+# QScan explorer) into one runtime
 # image. `oqs`'s "vendored" feature builds liboqs from C source bundled inside
 # the crate itself (no network access needed at build time) via cmake + a C/C++
 # compiler; bindgen (also used by oqs-sys) needs libclang.
@@ -30,13 +31,14 @@ COPY . .
 # in CLAUDE.md). A committed lock that builds locally now always builds here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --locked --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet && \
+    cargo build --locked --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer && \
     mkdir -p /out && \
     cp target/release/qchain-node \
        target/release/qchain-genesis-build \
        target/release/qchain \
        target/release/qchain-faucet \
-       target/release/qchain-wallet /out/
+       target/release/qchain-wallet \
+       target/release/qchain-indexer /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -47,6 +49,7 @@ COPY --from=builder /out/qchain-genesis-build /usr/local/bin/qchain-genesis-buil
 COPY --from=builder /out/qchain /usr/local/bin/qchain
 COPY --from=builder /out/qchain-faucet /usr/local/bin/qchain-faucet
 COPY --from=builder /out/qchain-wallet /usr/local/bin/qchain-wallet
+COPY --from=builder /out/qchain-indexer /usr/local/bin/qchain-indexer
 
 # No fixed ENTRYPOINT/CMD - this image bundles several binaries (validator,
 # coordinator tool, wallet CLI, faucet, web wallet), each meant to be invoked

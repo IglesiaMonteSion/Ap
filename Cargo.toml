@@ -14,6 +14,7 @@ members = [
     "crates/qchain-cli",
     "crates/qchain-faucet",
     "crates/qchain-wallet",
+    "crates/qchain-indexer",
 ]
 # Built separately for wasm32 (browser self-custody signing). Kept out of the
 # workspace so `cargo build --workspace` never unifies its `pure` crypto
@@ -22,7 +23,7 @@ members = [
 exclude = ["crates/qchain-wasm"]
 
 [workspace.package]
-version = "5.8.1"
+version = "6.0.0"
 edition = "2021"
 
 # Defense-in-depth for a ledger: catch integer overflow/underflow as a loud

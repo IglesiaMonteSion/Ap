@@ -79,6 +79,51 @@ sudo ./deploy/install-node.sh --modo unirse --config /ruta/a/config.json --yes
 Ver todas las opciones (puertos custom, imagen custom, carpeta de
 instalación custom) con `sudo ./deploy/install-node.sh --help`.
 
+## Explorador QScan (`deploy/install-indexer.sh`)
+
+QScan es el explorador de bloques de la red, estilo Etherscan — un servicio
+**aparte** del validador. Un validador guarda solo lo que necesita para
+validar (estado + DAG reciente + sus claves) y sirve una ventana rodante de
+las últimas transacciones; **QScan** (`qchain-indexer`) sigue al nodo por RPC
+y construye su **propio índice durable y completo** más el sitio web:
+inicio con últimos bloques/transacciones, búsqueda (por dirección, hash de tx
+o número de ronda), páginas de bloque, de transacción (con balances
+antes/después), de dirección (historial completo), de validadores y de
+holders (rich list). Es exactamente cómo Ethereum separa un validador de
+Etherscan.
+
+**Es de SOLO LECTURA** — no toca claves ni el consenso —, así que exponerlo
+en público es seguro (a diferencia del RPC o la wallet). Se puede correr en
+la misma VPS que el nodo o en otra máquina apuntando `--rpc-port`/`--node` al
+RPC del nodo.
+
+Instalarlo como servicio systemd (un comando, en la VPS, dentro del repo):
+
+```
+sudo ./deploy/install-indexer.sh --yes
+# explorador en http://<ip>:9200  (seguí al nodo local en RPC :8080)
+```
+
+Opciones: `--port` (puerto del explorador, 9200), `--rpc-port` (RPC del nodo a
+seguir, 8080), `--poll-ms` (sondeo, 1000). Bajarlo sin borrar el índice:
+`sudo ./deploy/install-indexer.sh --uninstall`. `deploy/update.sh` lo reinicia
+solo contra la imagen recién construida si está instalado.
+
+**Correrlo a mano** (sin systemd, p. ej. para probar local):
+
+```
+qchain-indexer --node http://127.0.0.1:8080 --bind 0.0.0.0:9200 \
+    --data ./qscan-data --poll-ms 1000
+```
+
+El índice es durable (sled) y sobrevive reinicios; si arranca con el índice
+vacío, se rellena solo desde la ventana del nodo. Para exponerlo por HTTPS,
+un túnel de Cloudflare apuntando al puerto del explorador funciona igual que
+para la wallet (ver `deploy/install-tunnel.sh`). Límite honesto: QScan indexa
+transferencias de una instrucción y actividad de staking (lo que el nodo
+expone en `/transfers` y `/staking_activity`); su vista de holders/economía es
+la foto point-in-time del nodo que sigue.
+
 ### Red con árbol comprimido (`--comprimido`, ~6× throughput)
 
 Para crear una red NUEVA con el **árbol de estado comprimido** (mayor

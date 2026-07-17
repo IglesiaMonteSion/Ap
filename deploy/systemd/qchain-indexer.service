@@ -1,0 +1,26 @@
+[Unit]
+Description=QScan explorer/indexer for qchain
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+# The QScan explorer follows a validator over RPC and serves a full block
+# explorer + its own durable index. It is READ-ONLY (never touches keys or
+# consensus), so exposing --bind publicly is safe. --network host so
+# --bind lands directly on the machine's interface. Its own database lives
+# under /opt/qchain/qscan-data. Ports are the defaults (node RPC 8080,
+# explorer 9200); install-indexer.sh rewrites them if you chose others.
+Type=simple
+WorkingDirectory=/opt/qchain
+ExecStartPre=-/usr/bin/docker rm -f qchain-indexer
+ExecStart=/usr/bin/docker run --rm --name qchain-indexer \
+  --network host \
+  -v /opt/qchain/qscan-data:/qscan-data -w /qchain \
+  qchain:latest qchain-indexer --node http://127.0.0.1:8080 --bind 0.0.0.0:9200 --data /qscan-data --poll-ms 1000
+ExecStop=/usr/bin/docker stop qchain-indexer
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
