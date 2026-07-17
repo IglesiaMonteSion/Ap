@@ -38,6 +38,9 @@ fn transfer_instruction_data(amount: u64) -> Vec<u8> {
 // same reason as the instruction encodings above.
 const STAKING_PROGRAM_ID: [u8; 32] = [1u8; 32];
 const STAKING_STATS_ID: [u8; 32] = [2u8; 32];
+const GOVERNANCE_PROGRAM_ID: [u8; 32] = [3u8; 32];
+const REGISTRY_ACCOUNT_ID: [u8; 32] = [4u8; 32];
+const PARAMS_ACCOUNT_ID: [u8; 32] = [5u8; 32];
 const STAKING_REWARDS_POOL_ID: [u8; 32] = [6u8; 32];
 
 /// `StakingInstruction` Borsh encodings (variant order in
@@ -175,6 +178,84 @@ pub fn sign_claim_reward_json(
         program_id: Pubkey::new(STAKING_PROGRAM_ID),
         accounts: vec![stake_pk, Pubkey::new(STAKING_REWARDS_POOL_ID)],
         data: vec![2u8],
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// Governance `Vote` (`GovernanceInstruction` discriminant `1`), weighted by a
+/// stake account you own. accounts match the CLI: [proposal, stake_account];
+/// `choice` is 0=Yes, 1=No, 2=Abstain (`VoteChoice` Borsh order, guarded by
+/// `governance_instruction_encoding_is_stable` in qchain-execution). The stake
+/// account's stored `owner` must equal this payer, so only positions you
+/// control can vote.
+pub fn sign_vote_json(
+    seed: &[u8; 32],
+    proposal: &str,
+    stake_account: &str,
+    choice: u8,
+    nonce: u64,
+    chain_id: &[u8; 32],
+    fee_limit: u64,
+) -> anyhow::Result<String> {
+    if choice > 2 {
+        anyhow::bail!("vote choice must be 0=Yes, 1=No, or 2=Abstain");
+    }
+    let payer = Keypair::generate_from_seed(seed)?;
+    let proposal_pk: Pubkey = proposal.trim().parse().map_err(|e| anyhow::anyhow!("proposal address invalid: {e}"))?;
+    let stake_pk: Pubkey = stake_account.trim().parse().map_err(|e| anyhow::anyhow!("stake account address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(GOVERNANCE_PROGRAM_ID),
+        accounts: vec![proposal_pk, stake_pk],
+        data: vec![1u8, choice],
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// Governance `Finalize` (`GovernanceInstruction` discriminant `2`, data `[2]`),
+/// permissionless once voting ends. accounts match the CLI: [proposal,
+/// staking-stats singleton].
+pub fn sign_finalize_json(
+    seed: &[u8; 32],
+    proposal: &str,
+    nonce: u64,
+    chain_id: &[u8; 32],
+    fee_limit: u64,
+) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let proposal_pk: Pubkey = proposal.trim().parse().map_err(|e| anyhow::anyhow!("proposal address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(GOVERNANCE_PROGRAM_ID),
+        accounts: vec![proposal_pk, Pubkey::new(STAKING_STATS_ID)],
+        data: vec![2u8],
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// Governance `Execute` (`GovernanceInstruction` discriminant `3`, data `[3]`),
+/// permissionless once a passed proposal's timelock has elapsed. accounts match
+/// the CLI: [proposal, target-singleton]. The target is the economic-params
+/// account for a Low-tier action or the registry account for a Registry-tier
+/// action - the caller passes `registry=true` for the latter. The node
+/// enforces the correct singleton per the proposal's real tier, so a wrong
+/// choice is rejected, never mis-applied.
+pub fn sign_execute_json(
+    seed: &[u8; 32],
+    proposal: &str,
+    registry: bool,
+    nonce: u64,
+    chain_id: &[u8; 32],
+    fee_limit: u64,
+) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let proposal_pk: Pubkey = proposal.trim().parse().map_err(|e| anyhow::anyhow!("proposal address invalid: {e}"))?;
+    let target = if registry { REGISTRY_ACCOUNT_ID } else { PARAMS_ACCOUNT_ID };
+    let ix = Instruction {
+        program_id: Pubkey::new(GOVERNANCE_PROGRAM_ID),
+        accounts: vec![proposal_pk, Pubkey::new(target)],
+        data: vec![3u8],
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
@@ -345,6 +426,53 @@ mod wasm {
         fee_limit: u64,
     ) -> Result<String, JsValue> {
         super::sign_claim_reward_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signVote(seed, proposal, stakeAccount, choice, nonce, chainId, feeLimit) -> string`
+    /// choice: 0=Yes, 1=No, 2=Abstain.
+    #[wasm_bindgen(js_name = signVote)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_vote(
+        seed: &[u8],
+        proposal: &str,
+        stake_account: &str,
+        choice: u8,
+        nonce: u64,
+        chain_id: &[u8],
+        fee_limit: u64,
+    ) -> Result<String, JsValue> {
+        super::sign_vote_json(&as32(seed, "seed")?, proposal, stake_account, choice, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signFinalize(seed, proposal, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signFinalize)]
+    pub fn sign_finalize(
+        seed: &[u8],
+        proposal: &str,
+        nonce: u64,
+        chain_id: &[u8],
+        fee_limit: u64,
+    ) -> Result<String, JsValue> {
+        super::sign_finalize_json(&as32(seed, "seed")?, proposal, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signExecute(seed, proposal, registry, nonce, chainId, feeLimit) -> string`
+    /// `registry`=true targets the algorithm-registry singleton (Registry tier);
+    /// false targets the economic-params singleton (Low tier).
+    #[wasm_bindgen(js_name = signExecute)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_execute(
+        seed: &[u8],
+        proposal: &str,
+        registry: bool,
+        nonce: u64,
+        chain_id: &[u8],
+        fee_limit: u64,
+    ) -> Result<String, JsValue> {
+        super::sign_execute_json(&as32(seed, "seed")?, proposal, registry, nonce, &as32(chain_id, "chain_id")?, fee_limit)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

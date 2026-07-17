@@ -35,7 +35,28 @@ fn main() -> anyhow::Result<()> {
             let fee_limit: u64 = args[7].parse()?;
             print!("{}", qchain_wasm::sign_transfer_json(&s, to, amount, nonce, &chain_id, fee_limit)?);
         }
-        _ => anyhow::bail!("usage: qchain-wasm-signer address <seed_hex> | sign <seed_hex> <to> <amount> <nonce> <chain_id_hex> <fee_limit>"),
+        // Governance-path helpers, exercising the exact browser signing code.
+        Some("delegate") => {
+            // delegate <seed> <validator> <amount> <stake_account> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_delegate_json(&s, &args[3], args[4].parse()?, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+        }
+        Some("vote") => {
+            // vote <seed> <proposal> <stake_account> <choice 0|1|2> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_vote_json(&s, &args[3], &args[4], args[5].parse()?, args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+        }
+        Some("finalize") => {
+            // finalize <seed> <proposal> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_finalize_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
+        }
+        Some("execute") => {
+            // execute <seed> <proposal> <registry 0|1> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_execute_json(&s, &args[3], args[4] != "0", args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+        }
+        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute ..."),
     }
     Ok(())
 }

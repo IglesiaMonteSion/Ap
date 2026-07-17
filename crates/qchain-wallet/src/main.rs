@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/transfers", get(recent_transfers))
         .route("/api/staking_activity/:address", get(staking_activity))
         .route("/api/validators", get(validators))
+        .route("/api/proposal/:address", get(proposal_ep))
         .route("/api/economics", get(economics))
         .route("/api/faucet", post(faucet_request));
 
@@ -478,6 +479,47 @@ async fn stake_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) 
     let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
     let val: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(val))
+}
+
+/// Decoded governance proposal, proxied from the node's `/account/:addr` and
+/// deserialized here (the browser can't decode Borsh). Read-only, no keys.
+/// Powers the wallet governance panel: the tally, the current status, and -
+/// crucially - the risk tier, which tells the browser which singleton to name
+/// as `Execute`'s target account (params vs registry). The node still enforces
+/// the correct singleton for the proposal's real tier, so this is a UX aid,
+/// never a trust boundary.
+async fn proposal_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    use qchain_governance::{Proposal, ProposalAction, RiskTier};
+    let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección de propuesta inválida: {e}")))?;
+    let acct = fetch_account(&st, &pk).await.map_err(ApiError::internal)?;
+    let acct = acct.ok_or_else(|| ApiError::bad("la propuesta no existe".into()))?;
+    let p: Proposal = borsh::from_slice(&acct.data).map_err(|e| ApiError::bad(format!("esa cuenta no es una propuesta de gobernanza: {e}")))?;
+    let tier = p.action.risk_tier();
+    let action_label = match &p.action {
+        ProposalAction::SetBaseFeePerByte(v) => format!("Fijar fee base por byte = {v}"),
+        ProposalAction::SetDustThreshold(v) => format!("Fijar umbral de polvo = {v}"),
+        ProposalAction::SetGasPricePerFuel(v) => format!("Fijar precio de gas por fuel = {v}"),
+        ProposalAction::SetStakingCommissionBps(v) => format!("Fijar comisión de staking = {v} bps"),
+        ProposalAction::SetEmissionApr(v) => format!("Fijar emisión (APR) = {v} bps"),
+        ProposalAction::ActivateAlgorithm(e) => format!("Activar algoritmo {} (id {})", e.name, e.id.0),
+        ProposalAction::DeprecateAlgorithm { id, .. } => format!("Deprecar algoritmo id {}", id.0),
+        ProposalAction::RetireAlgorithm { id } => format!("Retirar algoritmo id {}", id.0),
+    };
+    Ok(Json(json!({
+        "address": pk.to_string(),
+        "id": p.id,
+        "proposer": p.proposer.to_string(),
+        "action": action_label,
+        "tier": match tier { RiskTier::Low => "low", RiskTier::Registry => "registry" },
+        "registry": matches!(tier, RiskTier::Registry),
+        "status": format!("{:?}", p.status),
+        "created_round": p.created_round,
+        "voting_ends_round": p.voting_ends_round,
+        "yes_stake": p.yes_stake.to_string(),
+        "no_stake": p.no_stake.to_string(),
+        "abstain_stake": p.abstain_stake.to_string(),
+        "votes": p.voted_stake_accounts.len(),
+    })))
 }
 
 /// Relay a browser-signed transaction (raw signed-Transaction JSON) to the

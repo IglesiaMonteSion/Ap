@@ -398,6 +398,19 @@ mod tests {
     const STAKE_PK: Pubkey = Pubkey::new([31u8; 32]);
     const OTHER_STAKE_PK: Pubkey = Pubkey::new([32u8; 32]);
 
+    #[test]
+    fn governance_instruction_encoding_is_stable() {
+        // The WASM wallet (crates/qchain-wasm) hand-rolls these encodings to
+        // avoid depending on this crate (which pulls wasmtime, no wasm target).
+        // If GovernanceInstruction/VoteChoice ever change, this guard fails so
+        // the wallet's sign_vote/finalize/execute are updated in lock-step.
+        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::Yes }).unwrap(), vec![1u8, 0], "wasm Vote(Yes) encoding out of sync");
+        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::No }).unwrap(), vec![1u8, 1], "wasm Vote(No) encoding out of sync");
+        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::Abstain }).unwrap(), vec![1u8, 2], "wasm Vote(Abstain) encoding out of sync");
+        assert_eq!(borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(), vec![2u8], "wasm Finalize encoding out of sync");
+        assert_eq!(borsh::to_vec(&GovernanceInstruction::Execute).unwrap(), vec![3u8], "wasm Execute encoding out of sync");
+    }
+
     fn wallet(balance: u64) -> Account {
         Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) }
     }

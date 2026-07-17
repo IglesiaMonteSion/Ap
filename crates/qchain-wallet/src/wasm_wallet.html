@@ -896,6 +896,14 @@
       </div>
     </div>
 
+    <div class="section-title">Gobernanza</div>
+    <div class="card">
+      <div class="row-item nav" data-to="gov" style="cursor:pointer">
+        <div><div style="font-weight:600">🗳️ Votar propuestas</div><div class="hint" style="margin:0">Votá con tu stake, y finalizá/ejecutá propuestas</div></div>
+        <span style="color:var(--brand2);font-size:20px">›</span>
+      </div>
+    </div>
+
     <div class="section-title">Respaldo</div>
     <div class="card accent">
       <div style="font-weight:700">Respaldo de recuperación</div>
@@ -953,6 +961,53 @@
     </div>
   </section>
 
+  <!-- ===== GOBERNANZA ===== -->
+  <section class="view" id="v-gov">
+    <button class="backlink nav" data-to="settings">← volver</button>
+    <h2 class="view-title">Gobernanza</h2>
+    <p class="view-sub">Participá en las decisiones de la red. Pegá la dirección de una propuesta (te la comparte quien la creó) para ver su estado, votar con una de tus posiciones de staking, y —cuando corresponda— finalizarla o ejecutarla. Todo se firma en tu navegador.</p>
+
+    <div class="card">
+      <label>Dirección de la propuesta</label>
+      <input id="gov-addr" placeholder="pegá la dirección de la propuesta" autocomplete="off">
+      <button class="btn-block btn-sec" id="gov-load" style="margin-top:12px">Consultar propuesta</button>
+      <div class="msg" id="gov-msg"></div>
+    </div>
+
+    <div id="gov-detail" style="display:none">
+      <div class="card accent">
+        <div style="font-weight:700" id="gov-action">—</div>
+        <div class="hint" id="gov-tier" style="margin:2px 0 10px">—</div>
+        <div class="row-item"><span class="hint" style="margin:0">Estado</span><span id="gov-status" style="font-weight:600">—</span></div>
+        <div class="row-item"><span class="hint" style="margin:0">Cierra la votación en la ronda</span><span id="gov-ends">—</span></div>
+        <div class="row-item"><span class="hint" style="margin:0">A favor (Sí)</span><span id="gov-yes" style="color:var(--ok,#3ddc84)">—</span></div>
+        <div class="row-item"><span class="hint" style="margin:0">En contra (No)</span><span id="gov-no" style="color:#ff6b6b">—</span></div>
+        <div class="row-item"><span class="hint" style="margin:0">Abstenciones</span><span id="gov-abs">—</span></div>
+        <div class="row-item"><span class="hint" style="margin:0">Votos emitidos</span><span id="gov-votes">—</span></div>
+      </div>
+
+      <div class="section-title">Votar</div>
+      <div class="card">
+        <label>Con esta posición de staking</label>
+        <select id="gov-stake"></select>
+        <div class="hint" id="gov-stakehint" style="margin-top:6px">El peso de tu voto es el stake de la posición elegida. Solo podés votar con posiciones tuyas.</div>
+        <div class="seg" id="gov-choice" style="margin-top:12px">
+          <button data-choice="0" class="on">Sí</button>
+          <button data-choice="1">No</button>
+          <button data-choice="2">Abstención</button>
+        </div>
+        <button class="btn-block" id="gov-vote" style="margin-top:14px">Votar</button>
+      </div>
+
+      <div class="section-title">Cerrar la propuesta</div>
+      <div class="card">
+        <p class="hint" style="margin:0 0 10px">Cualquiera puede hacer estos pasos (son permissionless). <b>Finalizar</b> cuenta los votos una vez que termina el período; <b>Ejecutar</b> aplica el cambio si la propuesta pasó (tras el time-lock, si aplica).</p>
+        <button class="btn-block btn-sec" id="gov-finalize">Finalizar (contar votos)</button>
+        <button class="btn-block btn-outline" id="gov-execute" style="margin-top:10px">Ejecutar (aplicar el cambio)</button>
+      </div>
+    </div>
+  </section>
+
   <!-- ===== Barra de navegación inferior ===== -->
   <nav class="tabbar" id="tabbar" style="display:none">
     <button class="tab" data-tab="home" data-to="home"><svg viewBox="0 0 24 24"><path d="M3 10.5L12 3l9 7.5M5 9.5V21h14V9.5"/></svg>Inicio</button>
@@ -996,7 +1051,7 @@
 </div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, stakeAddressFromSeed, deriveAccountSeed } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -2333,6 +2388,83 @@ $("st-recover").onclick=async()=>{
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
 };
 $("st-import-btn").onclick=importStakeByAddress;
+
+// ===================== GOBERNANZA =====================
+// Firma Vote/Finalize/Execute en el navegador (signVote/signFinalize/signExecute
+// de qchain-wasm) y relaya por /api/relay-tx, igual que staking. El estado de la
+// propuesta se lee de /api/proposal/:addr (decodificado por el server, read-only).
+let GOV_PROP=null, GOV_CHOICE=0;
+document.querySelectorAll('#gov-choice button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#gov-choice button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); GOV_CHOICE=+b.dataset.choice;
+});
+function govStakeOptions(){
+  const sel=$("gov-stake"), list=myStakes();
+  if(!list.length){ sel.innerHTML='<option value="">— no tenés posiciones de staking —</option>'; return; }
+  sel.innerHTML=list.map(p=>`<option value="${esc(p.stakeAccount)}">${esc(short(p.stakeAccount))} · ${esc(qchDisp(p.amount))}</option>`).join("");
+}
+async function govLoad(){
+  const raw=$("gov-addr").value.trim(), msg=$("gov-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="";
+  if(!raw){ msg.className="msg err"; msg.textContent="pegá la dirección de una propuesta"; return; }
+  msg.textContent="consultando…";
+  let p; try{ p=await api("/api/proposal/"+encodeURIComponent(raw)); }
+  catch(e){ msg.className="msg err"; msg.textContent=e.message||"no se pudo consultar la propuesta"; $("gov-detail").style.display="none"; return; }
+  GOV_PROP=p; msg.style.display="none";
+  $("gov-action").textContent=p.action||"—";
+  $("gov-tier").textContent = (p.tier==="registry"?"Registro de algoritmos (supermayoría + time-lock)":"Parámetro económico (mayoría simple, sin time-lock)");
+  const statusMap={Voting:"En votación",Passed:"Aprobada",Rejected:"Rechazada",Executed:"Ejecutada"};
+  $("gov-status").textContent=statusMap[p.status]||p.status;
+  $("gov-ends").textContent=p.voting_ends_round;
+  $("gov-yes").textContent="+"+qchDisp(p.yes_stake);
+  $("gov-no").textContent="+"+qchDisp(p.no_stake);
+  $("gov-abs").textContent=qchDisp(p.abstain_stake);
+  $("gov-votes").textContent=p.votes;
+  govStakeOptions();
+  $("gov-detail").style.display="block";
+}
+$("gov-load").onclick=govLoad;
+$("gov-vote").onclick=async()=>{
+  const msg=$("gov-msg"); msg.className="msg"; msg.style.display="block";
+  const proposal=$("gov-addr").value.trim(), stake=$("gov-stake").value;
+  if(!proposal){ msg.className="msg err"; msg.textContent="consultá primero una propuesta"; return; }
+  if(!stake){ msg.className="msg err"; msg.textContent="necesitás una posición de staking para votar (delegá primero)"; return; }
+  msg.textContent="firmando tu voto en el navegador…";
+  try{
+    const {nonce,chainId}=await stakeCtx();
+    const txJson=signVote(SEED, proposal, stake, GOV_CHOICE, nonce, chainId, 10000000n);
+    await relaySigned(txJson);
+    const label=["Sí","No","Abstención"][GOV_CHOICE];
+    msg.className="msg ok"; msg.textContent="✓ Voto enviado: "+label;
+    setTimeout(govLoad, 1600);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+};
+$("gov-finalize").onclick=async()=>{
+  const msg=$("gov-msg"); msg.className="msg"; msg.style.display="block";
+  const proposal=$("gov-addr").value.trim(); if(!proposal){ msg.className="msg err"; msg.textContent="consultá primero una propuesta"; return; }
+  msg.textContent="finalizando (firmando en el navegador)…";
+  try{
+    const {nonce,chainId}=await stakeCtx();
+    const txJson=signFinalize(SEED, proposal, nonce, chainId, 10000000n);
+    await relaySigned(txJson);
+    msg.className="msg ok"; msg.textContent="✓ Finalización enviada — los votos se cuentan al ejecutarse";
+    setTimeout(govLoad, 1600);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+};
+$("gov-execute").onclick=async()=>{
+  const msg=$("gov-msg"); msg.className="msg"; msg.style.display="block";
+  const proposal=$("gov-addr").value.trim(); if(!proposal){ msg.className="msg err"; msg.textContent="consultá primero una propuesta"; return; }
+  // El tier decide qué cuenta singleton nombra Execute (params vs registro). Lo
+  // sabemos por /api/proposal; el nodo igual rechaza el singleton equivocado.
+  const registry = !!(GOV_PROP && GOV_PROP.registry);
+  msg.textContent="ejecutando (firmando en el navegador)…";
+  try{
+    const {nonce,chainId}=await stakeCtx();
+    const txJson=signExecute(SEED, proposal, registry, nonce, chainId, 10000000n);
+    await relaySigned(txJson);
+    msg.className="msg ok"; msg.textContent="✓ Ejecución enviada — si la propuesta pasó, el cambio se aplica";
+    setTimeout(govLoad, 1600);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+};
 
 $("st-delegate").onclick=async()=>{
   const validator=$("st-validator").value.trim(), amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
