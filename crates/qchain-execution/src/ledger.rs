@@ -4,7 +4,7 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::{FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+use crate::ids::{ADMIN_FEE_WALLET, FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_FEE_POOL_ID};
 use crate::params::{FeeState, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
@@ -565,6 +565,32 @@ impl Ledger {
         Ok(())
     }
 
+    /// v7 fee routing (economics_v7 on): the 45% validators / 45% burn / 10%
+    /// admin split that REPLACES the v6 50/50 burn/validator split. Burns 45%
+    /// (counter), pools 45% into `VALIDATOR_FEE_POOL_ID` (split 1/N among the
+    /// eligible validators at the quanto close - step 4), and credits 10% to
+    /// `ADMIN_FEE_WALLET` (liquid, spendable with a normal transfer). The v6
+    /// `staking_commission_bps` mechanism is NOT consulted - v7 removes the
+    /// direct-proposer commission entirely (the proposer collects its share
+    /// through the pool's 1/N distribution, not per-block). Writes directly to
+    /// the store like `credit_validator_share`; both singletons are seeded at
+    /// v7 genesis so `credit` preserves the fee pool's program-owner (dust-sweep
+    /// immune, §12) and the admin wallet's system-owner. The counters keep
+    /// `fee_burned` honest and route the validator share to `pool_earned` (the
+    /// pool, not a per-proposer credit). Mirrors `fees_v7::route_fee` exactly.
+    fn route_fee_v7(&mut self, fee: u64) {
+        let split = crate::fees_v7::fee_split(fee);
+        self.total_burned = self.total_burned.saturating_add(split.burn);
+        self.fee_burned = self.fee_burned.saturating_add(split.burn);
+        if split.validator > 0 {
+            self.credit(VALIDATOR_FEE_POOL_ID, split.validator);
+            self.pool_earned = self.pool_earned.saturating_add(split.validator);
+        }
+        if split.admin > 0 {
+            self.credit(ADMIN_FEE_WALLET, split.admin);
+        }
+    }
+
     /// The economic parameters currently in effect - read live from
     /// `PARAMS_ACCOUNT_ID` (governable via a `Low`-tier proposal, see
     /// `governance.rs`), falling back to `EconomicParams::default()` if
@@ -1042,14 +1068,20 @@ impl Ledger {
         payer_account.nonce += 1;
         self.write_account(tx.message.payer, payer_account.clone());
 
-        // Only the BASE (byte) fee is split 50/50 burn/validators. The priority
-        // tip is NOT burned: it goes 100% to the proposer, as the whole point
-        // is to reward the validator that included a congested transaction.
-        let burn_share = byte_fee / 2;
-        let validator_share = byte_fee - burn_share;
-        self.total_burned = self.total_burned.saturating_add(burn_share);
-        self.fee_burned = self.fee_burned.saturating_add(burn_share);
-        self.credit_validator_share(*fee_collector, validator_share, &params)?;
+        // Base (byte) fee split. Under v7 (`economics_v7` on) it's the 45/45/10
+        // route (burn / pool / admin), replacing the v6 50/50 burn/validators
+        // split and dropping `staking_commission_bps`. The priority tip is NOT
+        // burned in either mode: it goes 100% to the proposer, as the whole
+        // point is to reward the validator that included a congested tx.
+        if self.economics_v7 {
+            self.route_fee_v7(byte_fee);
+        } else {
+            let burn_share = byte_fee / 2;
+            let validator_share = byte_fee - burn_share;
+            self.total_burned = self.total_burned.saturating_add(burn_share);
+            self.fee_burned = self.fee_burned.saturating_add(burn_share);
+            self.credit_validator_share(*fee_collector, validator_share, &params)?;
+        }
         if priority_fee > 0 {
             // 100% of the tip to the proposer's own account (liquid commission,
             // tracked like the base commission so the dashboard reflects it).
@@ -1240,6 +1272,14 @@ impl Ledger {
                 return Err(ExecError::InsufficientFunds);
             }
             payer_after.balance -= total_gas_fee;
+            if self.economics_v7 {
+                // v7: same 45/45/10 route as the byte fee. The pool/admin
+                // singletons aren't in `working` (a normal contract call never
+                // names them), so crediting them directly via the store - as
+                // `route_fee_v7` does - is correct and won't be clobbered by
+                // the working-map commit below.
+                self.route_fee_v7(total_gas_fee);
+            } else {
             self.total_burned = self.total_burned.saturating_add(total_gas_fee / 2);
             self.fee_burned = self.fee_burned.saturating_add(total_gas_fee / 2);
             let gas_validator_share = total_gas_fee - total_gas_fee / 2;
@@ -1268,6 +1308,7 @@ impl Ledger {
                 .or_insert_with(|| self.store.get(fee_collector).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())));
             // saturating_add: overflow-safety discipline (see governance::record_vote).
             fc.balance = fc.balance.saturating_add(gas_validator_share);
+            }
         }
 
         for (pk, mut account) in working {
@@ -1353,6 +1394,10 @@ impl Ledger {
                     let charge = trap_fee.min(payer_account.balance);
                     payer_account.balance -= charge;
                     self.write_account(*payer, payer_account);
+                    if self.economics_v7 {
+                        // v7: 45/45/10 route (same as the byte/gas paths).
+                        self.route_fee_v7(charge);
+                    } else {
                     let burn_share = charge / 2;
                     let validator_share = charge - burn_share;
                     self.total_burned = self.total_burned.saturating_add(burn_share);
@@ -1365,6 +1410,7 @@ impl Ledger {
                     // than the original trap, but the trap is what the
                     // caller actually asked about, so it still wins.
                     let _ = self.credit_validator_share(*fee_collector, validator_share, &params);
+                    }
                 }
             }
         }
@@ -1618,6 +1664,63 @@ mod tests {
         // is untouched by the validator flow (the bond went to the escrow, not the
         // reserve — strict pool separation §12).
         assert_eq!(l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance, 100 * qchain_core::UNITS_PER_QCH);
+    }
+
+    /// Node-wiring step 3: under economics_v7 the base (byte) fee is routed
+    /// 45% validators (pool) / 45% burn / 10% admin — the v7 split REPLACES the
+    /// v6 50/50 burn/validator split, and `staking_commission_bps` plays no
+    /// part (the proposer collects nothing directly; its share pools for the
+    /// quanto-close 1/N). A default (v6) ledger keeps the 50/50 split, proving
+    /// the flag is what flips the behavior.
+    #[test]
+    fn v7_fee_charging_routes_45_45_10_and_v6_stays_50_50() {
+        use crate::fees_v7::fee_split;
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+
+        // --- v7 ledger: the 45/45/10 route ---
+        let mut l = new_test_ledger_v7(1024);
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let before = l.get_balance(&alice.pubkey());
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        l.apply_transaction(&tx, &proposer, 0).unwrap();
+
+        // Total fee actually charged = alice's debit minus the transferred amount
+        // (no priority tip on `new_signed`). It's the byte fee, split 45/45/10.
+        let total_fee = before - l.get_balance(&alice.pubkey()) - 5 * qchain_core::UNITS_PER_QCH;
+        let split = fee_split(total_fee);
+        assert!(total_fee > 0, "a real fee was charged");
+        assert_eq!(split.validator + split.burn + split.admin, total_fee, "45/45/10 conserves");
+        assert_eq!(l.fee_burned, split.burn, "45% burned (counter)");
+        assert_eq!(l.store.get(&VALIDATOR_FEE_POOL_ID).map(|a| a.balance).unwrap_or(0), split.validator, "45% pooled to the fee pool (1/N at quanto close)");
+        assert_eq!(l.store.get(&ADMIN_FEE_WALLET).map(|a| a.balance).unwrap_or(0), split.admin, "10% to the admin wallet (liquid)");
+        // The proposer collected NOTHING directly (v6 commission path is off).
+        assert_eq!(l.get_balance(&proposer), 0, "no direct proposer commission under v7");
+        assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH, "recipient credited");
+
+        // --- v6 ledger (default): the 50/50 split, proposer keeps its half ---
+        let mut l6 = new_test_ledger();
+        l6.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let before6 = l6.get_balance(&alice.pubkey());
+        let transfer6 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx6 = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![transfer6]).unwrap();
+        l6.apply_transaction(&tx6, &proposer, 0).unwrap();
+        let fee6 = before6 - l6.get_balance(&alice.pubkey()) - 5 * qchain_core::UNITS_PER_QCH;
+        // No delegators → the proposer keeps the whole non-burned half (v6), and
+        // the v7 pool/admin singletons are never credited.
+        assert_eq!(l6.get_balance(&proposer), fee6 - fee6 / 2, "v6: proposer keeps the validator half");
+        assert_eq!(l6.store.get(&VALIDATOR_FEE_POOL_ID).map(|a| a.balance).unwrap_or(0), 0, "v6 never touches the v7 fee pool");
+        assert_eq!(l6.store.get(&ADMIN_FEE_WALLET).map(|a| a.balance).unwrap_or(0), 0, "v6 never touches the admin wallet");
     }
 
     #[test]
