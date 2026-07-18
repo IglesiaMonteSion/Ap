@@ -1,0 +1,76 @@
+name: CI de seguridad
+
+# Corre en cada push y pull request. La suite de tests del workspace ya incluye
+# el arsenal de seguridad de este proyecto — el DST de consenso (9/9, prueba
+# safety+liveness bajo pérdida de certificados y un validador equivocador), los
+# ataques WASM (acuñación/robo en el borde del ledger, memory-bomb, bypass de
+# gas), la soundness del STARK/Merkle, y todas las regresiones de seguridad
+# documentadas — así que correrlos en CI convierte "no romper seguridad" en algo
+# automático en vez de manual.
+
+on:
+  push:
+  pull_request:
+
+# Cancela una corrida vieja del mismo ref si llega un push nuevo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # overflow-checks=true ya está en el perfil release del proyecto; en CI
+  # corremos debug (los tests), que también los tiene por defecto.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: build + clippy + tests (incl. DST y ataques WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # liboqs (firmas post-cuánticas) se compila desde fuente vía la crate oqs:
+      # necesita cmake + un compilador C/C++, y bindgen necesita libclang.
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Toolchain de Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Cachea el registro de cargo + target para que las corridas siguientes no
+      # recompilen liboqs/Winterfell desde cero.
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Build reproducible desde el Cargo.lock committeado (falla ruidoso si el
+      # lock quedó inconsistente, en vez de re-resolver a otra versión).
+      - name: Build (--locked)
+        run: cargo build --workspace --locked
+
+      # clippy como puerta: cualquier warning nuevo tumba el CI.
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # La suite completa: incluye el DST de consenso, los tests adversariales de
+      # WASM, la soundness del STARK y todas las regresiones de seguridad.
+      - name: Tests del workspace
+        run: cargo test --workspace --locked
+
+  audit:
+    name: cargo-audit (advisories de dependencias)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain de Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Instalar cargo-audit
+        run: cargo install cargo-audit --locked
+      # Escanea el Cargo.lock contra la base de advisories de RustSec (RUSTSEC).
+      # Falla si hay una vulnerabilidad conocida en una dependencia.
+      - name: cargo audit
+        run: cargo audit

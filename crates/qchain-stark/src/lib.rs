@@ -1168,7 +1168,8 @@ mod tests {
         store.set(alice, wallet(690));
         store.set(bob, wallet(500));
         let root_after = CompressedStateTree::root(&cleaves(&store));
-        let alice_after = store.get(&alice).unwrap();
+        // alice's real post-balance is intentionally unused: this negative test
+        // LIES about it (claims 999) to prove the binding rejects the mismatch.
         let bob_after = store.get(&bob).unwrap();
         let fpa = CompressedStateTree::prove(&cleaves(&store), &alice.to_bytes());
         let tpa = CompressedStateTree::prove(&cleaves(&store), &bob.to_bytes());

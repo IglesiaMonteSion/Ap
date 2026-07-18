@@ -766,8 +766,7 @@ mod tests {
         let validator = Pubkey::new([21u8; 32]);
         let bogus_pool = Pubkey::new([99u8; 32]); // deliberately not in the map
         // The real pool has already accrued (acc_reward_per_share > 0).
-        let mut pd = RewardPoolData::default();
-        pd.acc_reward_per_share = PRECISION; // 1 unit-per-share
+        let pd = RewardPoolData { acc_reward_per_share: PRECISION }; // 1 unit-per-share
         let real_pool = Account { data: borsh::to_vec(&pd).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) };
         let mut accounts = HashMap::from([
             (staker, wallet_with(10_000)),
