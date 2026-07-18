@@ -9,6 +9,7 @@ pub mod receipt;
 pub mod staking;
 pub mod staking_v7;
 pub mod validator_registry;
+pub mod validator_v7;
 pub mod wasm;
 
 pub use error::ExecError;
