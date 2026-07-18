@@ -3,11 +3,15 @@
 //! nothing wires it into `Ledger` yet (the fee-charging change + the quanto-close
 //! hook go with the node wiring), so a v6 node is byte-identical.
 //!
-//! Per fee: `burn = ceil(fee/2)`, `validator = floor(fee/2)` — so the burned
-//! share is never below 50% and `fee == burn + validator` always. The validator
-//! half accumulates in `VALIDATOR_FEE_POOL_ID` during a quanto and is split
-//! **equally** among the ELIGIBLE validators at the close; the remainder stays in
-//! the pool for the next quanto (never burned, never given to the proposer).
+//! Per fee the split is **45% validators / 45% burn / 10% admin**: `admin =
+//! floor(fee/10)`, then the remaining 90% is split with the burn taking the extra
+//! unit (`burn = ceil(rest/2)`, `validator = floor(rest/2)`), so burn is never
+//! below the validator share (a deflationary bias) and `fee == validator + burn +
+//! admin` always. The validator share accumulates in `VALIDATOR_FEE_POOL_ID`
+//! during a quanto and is split **equally** among the ELIGIBLE validators at the
+//! close; the remainder stays in the pool for the next quanto (never burned,
+//! never given to the proposer). The admin 10% credits `ADMIN_FEE_WALLET`
+//! directly (liquid, spendable — administrative expenses).
 //!
 //! Eligibility (SPEC §11): a validator must be `Active`, past its activation
 //! quanto, not jailed/slashed, and meet `VALIDATOR_MIN_PARTICIPATION_BPS`. A node
@@ -20,19 +24,32 @@
 //! separate claim — matching "la comisión directa se acredita al balance".
 
 use crate::economics_v7::VALIDATOR_MIN_PARTICIPATION_BPS;
-use crate::ids::{STAKING_PROGRAM_ID, VALIDATOR_FEE_POOL_ID};
+use crate::ids::{ADMIN_FEE_WALLET, STAKING_PROGRAM_ID, VALIDATOR_FEE_POOL_ID};
 use crate::validator_v7::{ValidatorV7Entry, ValidatorV7Registry, ValidatorV7State};
 use qchain_core::Account;
 use qchain_crypto::Pubkey;
 use std::collections::HashMap;
 
-/// Split a fee into `(burn, validator_share)`. `burn = ceil(fee/2)` so the burned
-/// fraction is never below 50% on an odd amount; `validator_share = floor(fee/2)`.
-/// Invariant: `fee == burn + validator_share`.
-pub fn fee_split(fee: u64) -> (u64, u64) {
-    let burn = fee.div_ceil(2);
-    let validator_share = fee - burn;
-    (burn, validator_share)
+/// The three-way split of one fee: `validator` (pooled and shared 1/N),
+/// `burn` (leaves circulation), `admin` (to `ADMIN_FEE_WALLET`, liquid).
+/// Invariant: `validator + burn + admin == fee`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSplit {
+    pub validator: u64,
+    pub burn: u64,
+    pub admin: u64,
+}
+
+/// Split a fee **45% validators / 45% burn / 10% admin** with integer arithmetic,
+/// the burn absorbing the sub-unit remainder so `burn >= validator` (deflationary)
+/// and `validator + burn + admin == fee` always. `admin = floor(fee/10)`; the
+/// remaining 90% splits `burn = ceil(rest/2)`, `validator = floor(rest/2)`.
+pub fn fee_split(fee: u64) -> FeeSplit {
+    let admin = fee / 10; // floor(10%)
+    let rest = fee - admin; // 90%
+    let burn = rest.div_ceil(2); // ceil(45%) — burn takes the extra unit
+    let validator = rest - burn; // floor(45%)
+    FeeSplit { validator, burn, admin }
 }
 
 /// Whether `entry` is eligible for `quanto`'s fee share.
@@ -78,17 +95,24 @@ pub fn distribute_fee_pool(accounts: &mut HashMap<Pubkey, Account>, registry: &V
     (reward, eligible.len(), remainder)
 }
 
-/// Route a just-charged fee under v7: burn `ceil(fee/2)` (leaves circulation) and
-/// send `floor(fee/2)` to `VALIDATOR_FEE_POOL_ID`. Returns `(burned, to_pool)`.
-/// (The ledger calls this in place of the v6 fee split when economics_v7 is on;
-/// `burned` is added to the burn counter, `to_pool` credited to the fee pool.)
-pub fn route_fee(accounts: &mut HashMap<Pubkey, Account>, fee: u64) -> (u64, u64) {
-    let (burn, validator_share) = fee_split(fee);
-    if validator_share > 0 {
+/// Route a just-charged fee under v7: burn 45% (leaves circulation), send 45% to
+/// `VALIDATOR_FEE_POOL_ID` (split 1/N at the quanto close), and credit 10%
+/// directly to `ADMIN_FEE_WALLET` (liquid — administrative expenses). Returns the
+/// `FeeSplit`. (The ledger calls this in place of the v6 fee split when
+/// economics_v7 is on; `split.burn` is added to the burn counter, `split.validator`
+/// is left in the fee pool, `split.admin` lands in the admin wallet.) The admin
+/// share crediting `ADMIN_FEE_WALLET` here is what keeps `validator + burn + admin
+/// == fee` a true conservation statement over the accounts touched + the counter.
+pub fn route_fee(accounts: &mut HashMap<Pubkey, Account>, fee: u64) -> FeeSplit {
+    let split = fee_split(fee);
+    if split.validator > 0 {
         let acct = accounts.entry(VALIDATOR_FEE_POOL_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
-        acct.balance = acct.balance.saturating_add(validator_share);
+        acct.balance = acct.balance.saturating_add(split.validator);
     }
-    (burn, validator_share)
+    if split.admin > 0 {
+        credit(accounts, &ADMIN_FEE_WALLET, split.admin);
+    }
+    split
 }
 
 #[cfg(test)]
@@ -118,17 +142,22 @@ mod tests {
     }
 
     #[test]
-    fn fee_split_burns_at_least_half_and_conserves() {
-        for fee in [0u64, 1, 2, 3, 100, 101, 1_000_000, 1_002_780, u64::MAX] {
-            let (burn, val) = fee_split(fee);
-            assert_eq!(burn + val, fee, "fee = burn + validator (conservation)");
-            assert!(burn >= val, "burn is never below 50% (fee={fee})");
+    fn fee_split_45_45_10_conserves_and_burn_is_never_below_validator() {
+        for fee in [0u64, 1, 2, 3, 9, 10, 11, 100, 101, 1_000_000, 1_002_780, u64::MAX] {
+            let s = fee_split(fee);
+            assert_eq!(s.validator + s.burn + s.admin, fee, "validator+burn+admin==fee (conservation), fee={fee}");
+            assert!(s.burn >= s.validator, "burn never below the validator share (fee={fee})");
+            assert_eq!(s.admin, fee / 10, "admin is exactly floor(10%) (fee={fee})");
         }
-        // Odd amount: burn takes the extra unit.
-        assert_eq!(fee_split(3), (2, 1));
-        assert_eq!(fee_split(101), (51, 50));
-        // Even amount: exact halves.
-        assert_eq!(fee_split(100), (50, 50));
+        // Clean split on a multiple of 20 → exact 45/45/10.
+        assert_eq!(fee_split(100), FeeSplit { validator: 45, burn: 45, admin: 10 });
+        // The calibrated single-transfer fee: 10% admin, 45%/45% with burn +1 on the odd 90%.
+        let s = fee_split(1_002_780);
+        assert_eq!(s, FeeSplit { validator: 451_251, burn: 451_251, admin: 100_278 });
+        assert_eq!(s.validator + s.burn + s.admin, 1_002_780);
+        // Tiny amounts: admin floors to 0, burn absorbs the odd unit.
+        assert_eq!(fee_split(3), FeeSplit { validator: 1, burn: 2, admin: 0 });
+        assert_eq!(fee_split(10), FeeSplit { validator: 4, burn: 5, admin: 1 });
     }
 
     #[test]
@@ -192,17 +221,26 @@ mod tests {
     }
 
     #[test]
-    fn route_fee_burns_half_and_pools_half() {
+    fn route_fee_pools_validator_share_burns_and_credits_admin_wallet() {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
-        let (burned, to_pool) = route_fee(&mut accounts, 1_002_780);
-        assert_eq!(burned + to_pool, 1_002_780);
-        assert_eq!(burned, 501_390);
-        assert_eq!(to_pool, 501_390);
-        assert_eq!(accounts.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance, to_pool);
-        // Odd fee: burn takes the extra unit, pool never over-credited.
-        let (b2, p2) = route_fee(&mut accounts, 3);
-        assert_eq!((b2, p2), (2, 1));
-        assert_eq!(accounts.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance, 501_390 + 1);
+        let s = route_fee(&mut accounts, 1_002_780);
+        assert_eq!(s.validator + s.burn + s.admin, 1_002_780, "conservation over the split");
+        assert_eq!(s, FeeSplit { validator: 451_251, burn: 451_251, admin: 100_278 });
+        // Validator share is left in the fee pool; admin share lands in the admin wallet.
+        assert_eq!(accounts.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance, s.validator);
+        assert_eq!(accounts.get(&ADMIN_FEE_WALLET).unwrap().balance, s.admin);
+        // The only funds moved into accounts are validator+admin; the burn is a
+        // counter the ledger applies, not credited anywhere.
+        assert_eq!(
+            accounts.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance + accounts.get(&ADMIN_FEE_WALLET).unwrap().balance,
+            1_002_780 - s.burn,
+            "credited accounts hold exactly the non-burned portion"
+        );
+        // A second fee accumulates in both destinations.
+        let s2 = route_fee(&mut accounts, 100);
+        assert_eq!(s2, FeeSplit { validator: 45, burn: 45, admin: 10 });
+        assert_eq!(accounts.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance, 451_251 + 45);
+        assert_eq!(accounts.get(&ADMIN_FEE_WALLET).unwrap().balance, 100_278 + 10);
     }
 
     #[test]

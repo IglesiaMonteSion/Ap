@@ -88,3 +88,14 @@ pub const VALIDATOR_UNBONDING_POOL_ID: Pubkey = Pubkey::new([14u8; 32]);
 /// `current_quanto`, `last_settled_quanto` — everything the O(1) per-quanto
 /// close needs (see `economics_v7`). No funds; bookkeeping only.
 pub const STAKING_GLOBAL_ID: Pubkey = Pubkey::new([15u8; 32]);
+
+/// Administrative-expenses wallet: receives 10% of every fee under the v7 split
+/// (45% validators / 45% burn / 10% admin — SPEC §11). Unlike the sentinel pool
+/// IDs above this is a REAL operator-controlled wallet (base58
+/// `AhcJAnfV3g7w9BpPVTbPzMMoEpGgBQBSb9vPm8B5Te2y`), so its share is liquid and
+/// spendable with a normal signed transfer — no claim, no pool. Provided by the
+/// operator; change these bytes to re-point administrative revenue.
+pub const ADMIN_FEE_WALLET: Pubkey = Pubkey::new([
+    144, 32, 82, 243, 147, 55, 160, 242, 118, 129, 105, 137, 140, 206, 47, 83, 87, 91, 106, 239,
+    138, 12, 249, 6, 33, 130, 72, 75, 174, 92, 140, 246,
+]);
