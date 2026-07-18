@@ -110,6 +110,51 @@ sirve RPC). Qué pasa después depende de la red:
   Para que sea validador con rotación off, el operador debe incluir tu bundle en
   el génesis y hacer un redeploy coordinado (ver la sección de rotación más abajo).
 
+## Endurecimiento / hardening (aislamiento de servicios y RPC privado)
+
+El instalador aplica varias defensas por defecto — no hay que configurar nada,
+pero conviene entender el modelo para no aflojarlo por accidente.
+
+**RPC privado por defecto.** El JSON-RPC del nodo (`rpc_addr`) bindea a
+`127.0.0.1`, así que **solo es accesible desde la propia máquina** (o por un
+túnel SSH). El instalador **no abre su puerto en el firewall** cuando detecta
+que es local. El RPC no tiene autenticación (como el RPC de cualquier nodo:
+Ethereum, Solana, etc.), así que exponerlo en internet dejaría que cualquiera
+envíe transacciones y consulte estado sin límite — por eso queda privado.
+Lo que SÍ se expone al público es:
+
+- el **puerto P2P** (`listen_addr`, 9000 por defecto) — necesario para que los
+  validadores se hablen entre sí; y
+- el **explorador QScan** (solo-lectura, seguro de exponer) y la **wallet web**
+  (por túnel HTTPS), que son servicios aparte con su propio puerto.
+
+Si de verdad necesitás el RPC accesible desde afuera (un exchange, un
+indexador remoto), corré el instalador con `--rpc-public` (bindea a `0.0.0.0` y
+abre el puerto), o en una instalación existente editá `rpc_addr` en
+`config.json` a `0.0.0.0:<puerto>`, abrí el puerto en el firewall y reiniciá.
+Lo recomendado sigue siendo **no** exponerlo: para acceso remoto puntual usá un
+túnel SSH (`ssh -L 8080:127.0.0.1:8080 usuario@vps`).
+
+**Aislamiento de claves entre servicios.** Cada servicio ve solo el directorio
+que necesita, montado por volumen en su contenedor:
+
+- el **validador** monta `/opt/qchain` (su `keypair.json` — la clave que firma
+  bloques);
+- la **wallet** monta solo `/opt/qchain/wallets` (nunca ve la clave del
+  validador);
+- el **indexador/QScan** monta solo `qscan-data` (es solo-lectura, no tiene
+  ninguna clave);
+- el **faucet** monta solo `/opt/qchain-faucet` (su propia clave caliente).
+
+Ningún servicio expuesto a internet (QScan, wallet, faucet) tiene acceso a la
+clave del validador.
+
+**Endurecimiento del contenedor.** Los cuatro servicios systemd corren con
+`--security-opt no-new-privileges` (un proceso dentro del contenedor no puede
+ganar privilegios vía setuid) y `--cap-drop ALL` (se le quitan todas las
+capabilities de Linux — el nodo no necesita ninguna). Si editás una unidad a
+mano, no quites estas dos líneas.
+
 ## Explorador QScan (`deploy/install-indexer.sh`)
 
 QScan es el explorador de bloques de la red, estilo Etherscan — un servicio

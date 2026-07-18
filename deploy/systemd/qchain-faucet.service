@@ -20,6 +20,8 @@ WorkingDirectory=/opt/qchain-faucet
 ExecStartPre=-/usr/bin/docker rm -f qchain-faucet
 ExecStart=/usr/bin/docker run --rm --name qchain-faucet \
   --network host \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
   -v /opt/qchain-faucet:/qchain -w /qchain \
   qchain:latest qchain-faucet \
     --rpc http://127.0.0.1:8080 \

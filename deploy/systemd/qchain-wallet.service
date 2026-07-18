@@ -18,6 +18,8 @@ EnvironmentFile=/opt/qchain/wallet.env
 ExecStartPre=-/usr/bin/docker rm -f qchain-wallet
 ExecStart=/usr/bin/docker run --rm --name qchain-wallet \
   --network host \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
   -e QCHAIN_WALLET_PASSWORD \
   -v /opt/qchain/wallets:/wallets -w /qchain \
   qchain:latest qchain-wallet --rpc http://127.0.0.1:8080 --wallets-dir /wallets --bind 0.0.0.0 --port 8090

@@ -33,6 +33,7 @@ CONFIG_ORIGEN=""
 LISTEN_PORT_ARG=""
 RPC_PORT_ARG=""
 SYNC_PEERS=""   # (modo unirse) RPCs de nodos vivos para sincronizar (state-sync), uno por línea
+RPC_PUBLIC=0    # 0 = RPC del nodo bindea a 127.0.0.1 (privado, seguro por defecto); 1 = 0.0.0.0 (público)
 # Milisegundos entre rondas de consenso. 500 (2 rondas/s) es el default seguro.
 # Bajarlo (p.ej. 250) sube el techo de TPS en una red multi-nodo limitada por
 # latencia de consenso - es config node-local, sin fork (un tick demasiado
@@ -76,6 +77,11 @@ Opciones:
   --sync-peer <url>      (modo unirse, repetible) RPC de un nodo VIVO desde el
                          que sincronizar el estado, ej: http://1.2.3.4:8080.
                          Poné al menos uno para que tu nodo se ponga al día solo.
+  --rpc-public           Bindear el JSON-RPC del nodo a 0.0.0.0 (público). POR
+                         DEFECTO el RPC es PRIVADO (127.0.0.1): no está
+                         autenticado, así que lo público correcto es el
+                         explorador QScan + la wallet por túnel, no el RPC crudo.
+                         Usá esto solo si sabés lo que hacés.
   --image <nombre>       Imagen Docker a usar (por defecto qchain:latest).
   --home <ruta>          Carpeta de instalación (por defecto /opt/qchain,
                          también configurable con la variable QCHAIN_HOME).
@@ -118,6 +124,7 @@ while [ $# -gt 0 ]; do
     --config|--red-config) CONFIG_ORIGEN="${2:-}"; shift 2 ;;
     --sync-peer) SYNC_PEERS="${SYNC_PEERS}${2:-}
 "; shift 2 ;;
+    --rpc-public) RPC_PUBLIC=1; shift ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
@@ -304,7 +311,13 @@ if [ "$SALTAR_CONFIGURACION" -eq 0 ]; then
   case "$MODO" in
     solo)
       LISTEN_ADDR="0.0.0.0:${LISTEN_PORT_ARG:-9000}"
-      RPC_ADDR="0.0.0.0:${RPC_PORT_ARG:-8080}"
+      # RPC PRIVADO por defecto (127.0.0.1): el JSON-RPC del nodo no está
+      # autenticado, así que exponerlo a internet deja a cualquiera consultar y
+      # enviar tx (no robar, pero sí saturar) y sirve el dashboard. Lo público
+      # correcto es el explorador QScan (réplica de lectura) + la wallet por
+      # túnel HTTPS, no el RPC crudo. --rpc-public lo abre a 0.0.0.0 a propósito.
+      if [ "$RPC_PUBLIC" -eq 1 ]; then RPC_HOST="0.0.0.0"; else RPC_HOST="127.0.0.1"; fi
+      RPC_ADDR="${RPC_HOST}:${RPC_PORT_ARG:-8080}"
       STAKE="1000000000"
 
       if [ ! -f "$QCHAIN_HOME/keypair.json" ]; then
@@ -422,7 +435,8 @@ EOF
       # Así el operador de un nodo existente solo comparte su config.json público
       # y el recién llegado lo usa tal cual, sin coordinación manual.
       UNIR_LISTEN="0.0.0.0:${LISTEN_PORT_ARG:-9000}"
-      UNIR_RPC="0.0.0.0:${RPC_PORT_ARG:-8080}"
+      if [ "$RPC_PUBLIC" -eq 1 ]; then RPC_HOST="0.0.0.0"; else RPC_HOST="127.0.0.1"; fi
+      UNIR_RPC="${RPC_HOST}:${RPC_PORT_ARG:-8080}"
       if command -v python3 >/dev/null 2>&1; then
         SYNC_PEERS="$SYNC_PEERS" LISTEN_ADDR="$UNIR_LISTEN" RPC_ADDR="$UNIR_RPC" \
           python3 - "$QCHAIN_HOME/config.json" <<'PY' || error "no pude adaptar el config.json de la red (¿es JSON válido?)"
@@ -475,15 +489,28 @@ chmod 600 "$QCHAIN_HOME/keypair.json" "$QCHAIN_HOME/config.json" 2>/dev/null || 
 decir "Abriendo puertos"
 LISTEN_PORT="$(grep -oP '"listen_addr"\s*:\s*"[^"]*:\K[0-9]+' "$QCHAIN_HOME/config.json" | head -1 || true)"
 RPC_PORT="$(grep -oP '"rpc_addr"\s*:\s*"[^"]*:\K[0-9]+' "$QCHAIN_HOME/config.json" | head -1 || true)"
+# ¿El RPC bindea a localhost? Si sí, NO abrimos su puerto en el firewall (queda
+# solo accesible desde la propia máquina - la postura segura por defecto).
+RPC_BIND_HOST="$(grep -oP '"rpc_addr"\s*:\s*"\K[^:"]+' "$QCHAIN_HOME/config.json" | head -1 || true)"
 LISTEN_PORT="${LISTEN_PORT:-9000}"
 RPC_PORT="${RPC_PORT:-8080}"
+RPC_ES_LOCAL=0
+case "$RPC_BIND_HOST" in 127.0.0.1|localhost) RPC_ES_LOCAL=1 ;; esac
 if command -v ufw >/dev/null 2>&1; then
   ufw allow OpenSSH || true
   ufw allow "${LISTEN_PORT}/tcp" comment 'qchain p2p' || true
-  ufw allow "${RPC_PORT}/tcp" comment 'qchain rpc' || true
+  if [ "$RPC_ES_LOCAL" -eq 1 ]; then
+    echo "  RPC ($RPC_PORT) bindeado a 127.0.0.1 (privado): NO se abre en el firewall."
+  else
+    ufw allow "${RPC_PORT}/tcp" comment 'qchain rpc' || true
+  fi
   ufw --force enable || true
 else
-  echo "ufw no esta disponible - si tu proveedor usa un firewall aparte (ej. grupo de seguridad de la nube), abri los puertos $LISTEN_PORT y $RPC_PORT manualmente."
+  if [ "$RPC_ES_LOCAL" -eq 1 ]; then
+    echo "ufw no esta disponible - abri solo el puerto P2P $LISTEN_PORT en tu firewall (el RPC es privado, no lo abras)."
+  else
+    echo "ufw no esta disponible - si tu proveedor usa un firewall aparte (ej. grupo de seguridad de la nube), abri los puertos $LISTEN_PORT y $RPC_PORT manualmente."
+  fi
 fi
 
 if command -v timedatectl >/dev/null 2>&1; then
@@ -516,11 +543,16 @@ log "instalación finalizada, servicio activo=$NODO_OK"
 
 decir "Listo"
 IP_PUBLICA="$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || echo '<tu-ip>')"
+if [ "$RPC_ES_LOCAL" -eq 1 ]; then
+  DASH_URL="http://127.0.0.1:$RPC_PORT/  (privado: desde la propia máquina, o por túnel SSH)"
+else
+  DASH_URL="http://$IP_PUBLICA:$RPC_PORT/"
+fi
 cat <<EOF
 
 Tu nodo esta corriendo.
 
-  Estado de la red (pagina web):  http://$IP_PUBLICA:$RPC_PORT/
+  Estado de la red (pagina web):  $DASH_URL
   Ver que esta haciendo el nodo:  journalctl -u qchain-validator -f
   Parar el nodo:                  systemctl stop qchain-validator
   Volver a prenderlo:              systemctl start qchain-validator

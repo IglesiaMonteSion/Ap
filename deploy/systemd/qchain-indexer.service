@@ -16,6 +16,8 @@ WorkingDirectory=/opt/qchain
 ExecStartPre=-/usr/bin/docker rm -f qchain-indexer
 ExecStart=/usr/bin/docker run --rm --name qchain-indexer \
   --network host \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
   -v /opt/qchain/qscan-data:/qscan-data -w /qchain \
   qchain:latest qchain-indexer --node http://127.0.0.1:8080 --bind 0.0.0.0:9200 --data /qscan-data --poll-ms 1000
 ExecStop=/usr/bin/docker stop qchain-indexer
