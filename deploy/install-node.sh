@@ -192,9 +192,22 @@ if ! command -v docker >/dev/null 2>&1; then
     else error "no encontré curl ni un gestor de paquetes conocido (apt/dnf/yum) para instalarlo. Instalá Docker a mano y volvé a correr el script."
     fi
   fi
-  if ! curl -fsSL https://get.docker.com | sh; then
+  # Endurecimiento: en vez de un pipe-to-shell a ciegas (curl ... | sh, que
+  # ejecuta lo que sea que devuelva el server sin poder mirarlo), bajamos el
+  # script oficial a un archivo, lo dejamos disponible para inspección, y recién
+  # ahí lo corremos. Se puede fijar la versión de Docker con
+  # QCHAIN_DOCKER_VERSION=<ver> (get.docker.com respeta la env VERSION).
+  GET_DOCKER="$(mktemp /tmp/get-docker.XXXXXX.sh)"
+  if ! curl -fsSL https://get.docker.com -o "$GET_DOCKER"; then
+    rm -f "$GET_DOCKER"
+    error "no se pudo descargar el instalador de Docker. Instalalo a mano (https://docs.docker.com/engine/install/) y volvé a correr este script."
+  fi
+  echo "Instalador de Docker descargado en $GET_DOCKER (podés revisarlo antes de que corra)."
+  if ! VERSION="${QCHAIN_DOCKER_VERSION:-}" sh "$GET_DOCKER"; then
+    rm -f "$GET_DOCKER"
     error "no se pudo instalar Docker automáticamente. Instalalo a mano (https://docs.docker.com/engine/install/) y volvé a correr este script - al detectar que Docker ya está, se saltea este paso."
   fi
+  rm -f "$GET_DOCKER"
   systemctl enable --now docker 2>/dev/null || true
 else
   echo "Docker ya esta instalado."

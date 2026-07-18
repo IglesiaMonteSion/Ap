@@ -25,6 +25,10 @@ set -Eeuo pipefail
 
 WALLET_PORT="8090"
 MODE="install"
+# Versión de cloudflared a instalar (pin reproducible; ver el bloque de descarga
+# más abajo). `latest` = la última (tag mutable). Overridable por env o flag.
+CF_VERSION="${CF_VERSION:-2024.12.2}"
+CF_SHA256="${CF_SHA256:-}"
 
 error() { echo "ERROR: $*" >&2; exit 1; }
 trap 'error "falló en la línea $LINENO. Revisá el mensaje de arriba."' ERR
@@ -32,6 +36,8 @@ trap 'error "falló en la línea $LINENO. Revisá el mensaje de arriba."' ERR
 while [ $# -gt 0 ]; do
   case "$1" in
     --wallet-port) WALLET_PORT="${2:-}"; shift 2 ;;
+    --cf-version) CF_VERSION="${2:-}"; shift 2 ;;
+    --cf-sha256) CF_SHA256="${2:-}"; shift 2 ;;
     --url) MODE="url"; shift ;;
     --uninstall) MODE="uninstall"; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,26p'; exit 0 ;;
@@ -68,7 +74,19 @@ if [ "$MODE" = "uninstall" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Instalar cloudflared si falta (binario oficial, detecta arquitectura)
+# Instalar cloudflared si falta (binario oficial, detecta arquitectura).
+#
+# PIN DE VERSIÓN (endurecimiento): descargamos una versión FIJA
+# (CF_VERSION), no el tag mutable `latest`, así el binario es reproducible y no
+# cambia bajo tus pies entre instalaciones. Overridable con --cf-version <tag>
+# o CF_VERSION=... (o `latest` explícito si querés la última).
+#
+# VERIFICACIÓN DE INTEGRIDAD: tras descargar, SIEMPRE imprimimos y guardamos el
+# SHA-256 del binario (en /usr/local/bin/cloudflared.sha256), para que tengas un
+# registro y puedas compararlo entre máquinas o contra el checksum publicado por
+# Cloudflare. Si pasás --cf-sha256 <hex> (o CF_SHA256=...), se EXIGE que coincida
+# y se aborta si no. No hardcodeamos un hash porque cambia con cada versión —
+# obtenelo de la página de releases de Cloudflare y pasalo si querés el gate.
 # ---------------------------------------------------------------------------
 if ! command -v cloudflared >/dev/null 2>&1; then
   echo "Instalando cloudflared..."
@@ -79,10 +97,29 @@ if ! command -v cloudflared >/dev/null 2>&1; then
     armv7l) CF_ARCH="arm" ;;
     *) error "arquitectura no soportada: $ARCH" ;;
   esac
-  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+  if [ "$CF_VERSION" = "latest" ]; then
+    URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+    echo "AVISO: usando el tag mutable 'latest' (no fijo). Para reproducibilidad pasá --cf-version <tag>."
+  else
+    URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/cloudflared-linux-${CF_ARCH}"
+  fi
   echo "Descargando $URL"
-  curl -fsSL "$URL" -o /usr/local/bin/cloudflared || error "no pude descargar cloudflared (¿salida a internet?)."
-  chmod +x /usr/local/bin/cloudflared
+  TMP_CF="$(mktemp)"
+  curl -fsSL "$URL" -o "$TMP_CF" || error "no pude descargar cloudflared (¿salida a internet? ¿existe la versión '$CF_VERSION'?)."
+  # Verificación de integridad
+  GOT_SHA="$(sha256sum "$TMP_CF" 2>/dev/null | cut -d' ' -f1 || true)"
+  if [ -n "$CF_SHA256" ]; then
+    [ "$GOT_SHA" = "$CF_SHA256" ] || { rm -f "$TMP_CF"; error "checksum de cloudflared NO coincide. esperado=$CF_SHA256 obtenido=$GOT_SHA — descarga abortada."; }
+    echo "checksum verificado OK ($GOT_SHA)."
+  else
+    echo "SHA-256 del binario descargado: $GOT_SHA"
+    echo "  (para exigirlo la próxima vez: --cf-sha256 $GOT_SHA)"
+  fi
+  install -m 0755 "$TMP_CF" /usr/local/bin/cloudflared
+  rm -f "$TMP_CF"
+  printf '%s  cloudflared-linux-%s (%s)\n' "$GOT_SHA" "$CF_ARCH" "$CF_VERSION" > /usr/local/bin/cloudflared.sha256
+  # sanity: el binario corre y es la arquitectura correcta
+  /usr/local/bin/cloudflared --version >/dev/null 2>&1 || error "el cloudflared descargado no ejecuta (¿arquitectura equivocada o descarga corrupta?)."
 fi
 echo "cloudflared: $(cloudflared --version 2>&1 | head -1)"
 

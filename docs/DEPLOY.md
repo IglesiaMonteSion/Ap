@@ -155,6 +155,61 @@ ganar privilegios vía setuid) y `--cap-drop ALL` (se le quitan todas las
 capabilities de Linux — el nodo no necesita ninguna). Si editás una unidad a
 mano, no quites estas dos líneas.
 
+**Pin de descargas.** El túnel (`install-tunnel.sh`) baja `cloudflared` de una
+versión FIJA (no del tag mutable `latest`), imprime el SHA-256 del binario
+descargado, y con `--cf-sha256 <hex>` lo EXIGE (aborta si no coincide). El
+instalador del nodo baja el script oficial de Docker a un archivo y recién ahí
+lo corre (en vez de un `curl | sh` a ciegas), y respeta `QCHAIN_DOCKER_VERSION`
+para fijar la versión de Docker.
+
+## Respaldos automáticos (`deploy/backup-node.sh`)
+
+Lo ÚNICO irreemplazable de un validador es su `keypair.json` (la clave que firma
+bloques): si la perdés, tu validador deja de existir. El estado (`data/`) es
+re-sincronizable de los pares, y el `config.json` es público. Así que el respaldo
+se enfoca en las CLAVES + el config, siempre **cifrado** (AES-256, PBKDF2).
+
+```
+# definir una contraseña de cifrado UNA vez (guardala FUERA de la VPS)
+echo 'UNA-CONTRASEÑA-FUERTE' | sudo tee /opt/qchain/backup.pass >/dev/null
+sudo chmod 600 /opt/qchain/backup.pass
+
+# un respaldo ahora
+sudo ./deploy/backup-node.sh
+
+# respaldo diario automático (timer systemd, ~03:30)
+sudo ./deploy/backup-node.sh --install
+
+# copiar cada respaldo FUERA de la máquina (durabilidad real si la VPS muere)
+sudo ./deploy/backup-node.sh --install --remote usuario@otro-host:/backups
+
+# restaurar
+sudo ./deploy/backup-node.sh --restore /opt/qchain-backups/qchain-backup-XXX.tar.gz.enc --into /tmp/rec
+```
+
+El respaldo NUNCA se escribe en texto plano (sin contraseña, se niega a correr).
+Rota los últimos 14 por defecto (`--keep N`). **Sin la contraseña no hay forma de
+descifrar el respaldo — guardala en un lugar seguro y separado de la VPS.**
+
+## Monitoreo externo con aviso (`deploy/monitor-node.sh`)
+
+Como el RPC ahora es privado (127.0.0.1), el chequeo corre EN la máquina y
+EMPUJA un aviso hacia afuera (a tu teléfono/chat) si el nodo se cae o el consenso
+se congela. Detecta dos cosas: (1) el RPC no responde (nodo caído), y (2) las
+rondas no avanzan por más de `--stall-secs` (consenso congelado). Avisa una sola
+vez por transición (no spamea) y avisa también cuando se recupera.
+
+```
+# elegí un canal: ntfy (lo más simple para el celular), Discord, Slack o webhook
+sudo ./deploy/monitor-node.sh --ntfy https://ntfy.sh/mi-canal-secreto --test     # probar el aviso
+sudo ./deploy/monitor-node.sh --ntfy https://ntfy.sh/mi-canal-secreto --install  # chequeo cada 2 min
+```
+
+Con ntfy: instalá la app ntfy en el teléfono y suscribite al mismo canal — los
+avisos llegan como notificación push, sin cuenta ni servidor propio. También:
+`--discord <webhook>`, `--slack <webhook>`, o `--webhook <url>` (POST JSON
+`{"text": "..."}`). Quitar el monitor: `sudo ./deploy/monitor-node.sh --uninstall`.
+
 ## Explorador QScan (`deploy/install-indexer.sh`)
 
 QScan es el explorador de bloques de la red, estilo Etherscan — un servicio
@@ -295,6 +350,12 @@ la página de estado.
   (`Restart=on-failure`) para que el validador/faucet sobrevivan un
   crash o un reinicio de la máquina sin intervención manual, en vez de
   depender de `docker run -d` corriendo a mano en una sesión de shell.
+- `deploy/backup-node.sh` — respaldo CIFRADO (AES-256) de las claves + config,
+  con rotación, copia remota opcional (scp) y timer diario. Ver "Respaldos
+  automáticos" arriba.
+- `deploy/monitor-node.sh` — monitoreo de salud (RPC vivo + rondas avanzando)
+  con aviso EXTERNO (ntfy/Discord/Slack/webhook) y timer cada 2 min. Ver
+  "Monitoreo externo con aviso" arriba.
 - Página de estado en `GET /` de cualquier validador (ver más abajo).
 
 ## Paso 0 — smoke test local (recomendado antes de gastar en servidores)
