@@ -134,6 +134,32 @@ pub struct NodeConfig {
     /// set must be identical), keeping the sled files as a backup.
     #[serde(default = "default_storage_engine")]
     pub storage_engine: String,
+    /// v7 economics (shares+index staking, per-quanto emission, the 45/45/10 fee
+    /// split, the 500 QCH validator bond). `false` (default, every existing
+    /// network) is the v6 economics — byte-identical, zero change. `true` is a
+    /// genesis-level, network-wide HARD FORK (folded into `chain_id` below): a v7
+    /// network needs a fresh genesis and every node must set this identically (a
+    /// mismatched node computes a different `chain_id` and its transactions are
+    /// rejected rather than silently forking). See `docs/ECONOMIC-REDESIGN.md` and
+    /// `qchain-execution`'s `economics_v7`/`staking_v7`/`fees_v7`/`validator_v7`.
+    #[serde(default)]
+    pub economics_v7: bool,
+    /// Per-quanto compounding rate in `QUANTO_RATE_SCALE` (1e18) fixed point,
+    /// baked at genesis. Only read when `economics_v7` is on; part of the network
+    /// config hash. When omitted the node derives it from the compiled-in
+    /// `STAKING_TARGET_APY_BPS`/`DEFAULT_QUANTOS_PER_YEAR` — fine for a
+    /// same-platform test network, but a production genesis should bake the exact
+    /// integer here (via genesis-build), because the derivation uses f64 (`powf`)
+    /// which is not bit-identical across platforms, and the chain only ever runs
+    /// the integer `advance_staking_index`.
+    #[serde(default)]
+    pub quanto_rate_fp: Option<u128>,
+    /// Rounds per reward quanto (`economics_v7::DEFAULT_ROUNDS_PER_QUANTO` when
+    /// omitted). Only read when `economics_v7` is on; part of the network config
+    /// hash. Exposed so a test network can use a small value to cross a quanto
+    /// boundary quickly.
+    #[serde(default)]
+    pub rounds_per_quanto: Option<u64>,
 }
 
 fn default_storage_engine() -> String {
@@ -180,7 +206,38 @@ impl NodeConfig {
         if self.compressed_state_tree {
             bytes.extend_from_slice(b"compressed-state-tree-v1");
         }
+        // Same "fold in only when enabled" discipline: a v6 (default, `false`)
+        // network's chain_id is byte-identical to before this field existed. A v7
+        // network gets a distinct chain_id — it is a genuinely separate,
+        // hard-forked network (fresh genesis, §15), and a v6 node must not accept
+        // its transactions or vice versa. The resolved rate + rounds are folded in
+        // too (SPEC §17: the economic parameters are part of the network config
+        // hash), so a 12%-APY network and an 8%-APY one are distinct chains.
+        if self.economics_v7 {
+            bytes.extend_from_slice(b"economics-v7-45-45-10");
+            bytes.extend_from_slice(&self.quanto_rate_fp().to_le_bytes());
+            bytes.extend_from_slice(&self.rounds_per_quanto().to_le_bytes());
+        }
         Sha3_256::digest(bytes).into()
+    }
+
+    /// The resolved per-quanto compounding rate: the genesis-baked config value,
+    /// or (when omitted) derived from the compiled-in APY target. The derivation
+    /// is off-chain (f64); see `quanto_rate_fp`'s field doc for the determinism
+    /// caveat. Only meaningful when `economics_v7` is on.
+    pub fn quanto_rate_fp(&self) -> u128 {
+        self.quanto_rate_fp.unwrap_or_else(|| {
+            qchain_execution::economics_v7::derive_quanto_rate_fp(
+                qchain_execution::economics_v7::STAKING_TARGET_APY_BPS,
+                qchain_execution::economics_v7::DEFAULT_QUANTOS_PER_YEAR,
+            )
+        })
+    }
+
+    /// The resolved rounds-per-quanto (config override or the standard default).
+    /// Only meaningful when `economics_v7` is on.
+    pub fn rounds_per_quanto(&self) -> u64 {
+        self.rounds_per_quanto.unwrap_or(qchain_execution::economics_v7::DEFAULT_ROUNDS_PER_QUANTO)
     }
 
     /// Rounds per epoch for validator rotation (the config override, or the
@@ -212,6 +269,9 @@ mod tests {
             epoch_rounds: None,
             compressed_state_tree: false,
             storage_engine: "sled".to_string(),
+            economics_v7: false,
+            quanto_rate_fp: None,
+            rounds_per_quanto: None,
         }
     }
 
@@ -234,6 +294,31 @@ mod tests {
         b.listen_addr = "127.0.0.1:35009".parse().unwrap();
 
         assert_eq!(a.chain_id(), b.chain_id(), "same genesis data must produce the same chain_id regardless of per-validator network config");
+    }
+
+    /// `economics_v7` folds into `chain_id` ONLY when enabled, so a v6 (default,
+    /// `false`) network's chain_id is byte-identical to before the field existed —
+    /// its live transactions keep verifying. A v7 network gets a distinct chain_id
+    /// (a genuinely separate, hard-forked network), and two v7 networks with
+    /// different reward rates are distinct chains too.
+    #[test]
+    fn economics_v7_folds_into_chain_id_only_when_enabled() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
+        let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
+
+        let v6 = config_with(validators.clone(), genesis.clone());
+        let mut v7 = config_with(validators.clone(), genesis.clone());
+        v7.economics_v7 = true;
+        // v6 default is byte-identical to a config from before the field existed.
+        assert_eq!(v6.chain_id(), config_with(validators.clone(), genesis.clone()).chain_id(), "v6 default unchanged");
+        // v7 is a distinct network.
+        assert_ne!(v6.chain_id(), v7.chain_id(), "a v7 network has a distinct chain_id");
+        // Two v7 networks with different rounds_per_quanto are distinct chains.
+        let mut v7_fast = config_with(validators, genesis);
+        v7_fast.economics_v7 = true;
+        v7_fast.rounds_per_quanto = Some(8);
+        assert_ne!(v7.chain_id(), v7_fast.chain_id(), "economic params are part of the config hash");
     }
 
     /// The real, live-confirmed gap this closes (see

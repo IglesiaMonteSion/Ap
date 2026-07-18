@@ -66,6 +66,19 @@ struct Cli {
     /// compressed-tree notes. Off by default (the legacy tree).
     #[arg(long, default_value_t = false)]
     compressed_state_tree: bool,
+    /// Start the network with the v7 ECONOMICS (`economics_v7: true`): shares+index
+    /// staking, per-quanto emission, the 45/45/10 fee split, the 500 QCH validator
+    /// bond. Like `--compressed-state-tree` this is a network-wide, genesis-level
+    /// hard-fork choice folded into the `chain_id`: EVERY node must use the same
+    /// value, and it can only be chosen when a network is FIRST created. Off by
+    /// default (the v6 economics).
+    #[arg(long, default_value_t = false)]
+    economics_v7: bool,
+    /// Rounds per reward quanto for a v7 network (`rounds_per_quanto`). Omitted
+    /// uses the standard default; exposed so a test network can use a small value
+    /// to cross a quanto boundary quickly. Only meaningful with `--economics-v7`.
+    #[arg(long)]
+    rounds_per_quanto: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +160,9 @@ fn main() -> anyhow::Result<()> {
             validator_rotation: false,
             epoch_rounds: None,
             storage_engine: "sled".to_string(),
+            economics_v7: cli.economics_v7,
+            quanto_rate_fp: None,
+            rounds_per_quanto: cli.rounds_per_quanto,
         };
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;

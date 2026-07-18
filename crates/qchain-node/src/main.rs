@@ -210,12 +210,35 @@ async fn main() -> anyhow::Result<()> {
     // `compressed_state_tree` is a genesis-level, network-wide choice (folded
     // into chain_id); default false = the legacy 256-deep tree, byte-identical
     // to every existing network.
-    let mut ledger = Ledger::new_with_tree(store, config.compressed_state_tree)?;
+    // `economics_v7` and `compressed_state_tree` are both genesis-level,
+    // network-wide choices folded into `chain_id`; both default false = the v6
+    // economics + legacy tree, byte-identical to every existing network.
+    let mut ledger = Ledger::new_with_config(
+        store,
+        config.compressed_state_tree,
+        config.economics_v7,
+        config.quanto_rate_fp(),
+        config.rounds_per_quanto(),
+    )?;
     if config.compressed_state_tree {
         tracing::info!("state tree: COMPRESSED (O(log n)) - a hard-forked network; /stark_proof light-client serves compressed bindings");
     }
+    if config.economics_v7 {
+        tracing::info!(
+            "economics: v7 ENABLED (shares+index staking, per-quanto emission, 45/45/10 fee split, 500 QCH bond) - a hard-forked network; rounds_per_quanto={}",
+            config.rounds_per_quanto()
+        );
+    }
     ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
-    ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
+    // v7 replaces the v6 shares-per-reward staking program with the shares+index
+    // `StakingV7Program` under the same well-known id. (Dispatching the v7
+    // validator instructions — `ValidatorV7Program`, whose id collides — is the
+    // next wiring sub-step.)
+    if config.economics_v7 {
+        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(qchain_execution::staking_v7::StakingV7Program)));
+    } else {
+        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
+    }
     ledger.register_program(GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(GovernanceProgram)));
     if is_fresh {
         for alloc in &config.genesis {
@@ -278,6 +301,36 @@ async fn main() -> anyhow::Result<()> {
                 ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
             },
         );
+        // v7 genesis (SPEC §15 + §12 strict pool separation): the six separate
+        // economic pools start empty (or at their genesis state for the global
+        // staking singleton), and the admin-fee wallet is a real system-owned
+        // wallet ready to receive the 10% admin share once fee routing is wired.
+        // The founder's 10M allocation is a normal `genesis` entry the operator
+        // sets (handled by the credit loop above), not hardcoded here. Seeded only
+        // for a v7 network, so a v6 genesis state root is byte-identical.
+        if config.economics_v7 {
+            use qchain_execution::ids::{
+                ADMIN_FEE_WALLET, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_FEE_POOL_ID, VALIDATOR_UNBONDING_POOL_ID,
+            };
+            // Global staking singleton: MUST seed with `genesis()` (index = 1.0),
+            // never `Default` (index = 0) — the per-quanto close reads this.
+            ledger.seed_account(
+                STAKING_GLOBAL_ID,
+                qchain_core::Account {
+                    data: borsh::to_vec(&qchain_execution::staking_v7::GlobalStakingState::genesis())?,
+                    ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            );
+            // The five fund pools start empty; each is program-owned so the dust
+            // sweep never touches it and no source subsidizes another (§12).
+            for pool in [STAKING_RESERVE_ID, VALIDATOR_FEE_POOL_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID] {
+                ledger.seed_account(pool, qchain_core::Account::new_wallet(STAKING_PROGRAM_ID));
+            }
+            // Admin-fee wallet: a REAL system-owned wallet (the operator spends it
+            // with a normal signed transfer). Seeded empty; the 10% admin share
+            // credits here once v7 fee routing is wired.
+            ledger.seed_account(ADMIN_FEE_WALLET, qchain_core::Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+        }
     } else {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");
     }
