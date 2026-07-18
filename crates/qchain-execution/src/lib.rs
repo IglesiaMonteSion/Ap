@@ -1,5 +1,6 @@
 pub mod economics_v7;
 pub mod error;
+pub mod fees_v7;
 pub mod governance;
 pub mod ids;
 pub mod ledger;

@@ -86,6 +86,26 @@ pub struct ValidatorV7Entry {
     /// Quanto the bond becomes withdrawable (past the unbonding + evidence
     /// window). 0 until exit.
     pub bond_release_quanto: u64,
+    /// Participation this quanto: events where the validator did its job. The
+    /// node increments this + `participation_opportunities` per round (what
+    /// exactly counts as an "event" is finalized in the node phase — SPEC §21.2);
+    /// the fee eligibility (1e) reads the ratio, and the quanto close resets both.
+    pub participation_credits: u64,
+    /// Total participation events this quanto (the denominator).
+    pub participation_opportunities: u64,
+}
+
+impl ValidatorV7Entry {
+    /// Participation this quanto, in basis points. No recorded opportunities yet
+    /// → treated as full (10000): a freshly-activated validator the node hasn't
+    /// scored is not penalized. Once real data accrues the ratio gates eligibility.
+    pub fn participation_bps(&self) -> u16 {
+        if self.participation_opportunities == 0 {
+            return 10_000;
+        }
+        let bps = (self.participation_credits as u128 * 10_000 / self.participation_opportunities as u128).min(10_000);
+        bps as u16
+    }
 }
 
 /// The v7 validator registry singleton (`VALIDATOR_REGISTRY_ACCOUNT_ID.data`).
@@ -221,6 +241,8 @@ impl ValidatorV7Program {
             activation_quanto: q.saturating_add(1),
             exit_requested_quanto: 0,
             bond_release_quanto: 0,
+            participation_credits: 0,
+            participation_opportunities: 0,
         };
         match reg.find(payer) {
             Some(idx) => reg.validators[idx] = entry, // re-register a Removed slot
