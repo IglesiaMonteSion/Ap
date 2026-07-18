@@ -58,16 +58,20 @@ un testnet en vivo, y la red arranca de cero con las reglas nuevas. Bump MAYOR
   fees NO alimentan el pool de staking (van a los validadores). Así el
   rendimiento del staker es 12% por construcción, ni un punto más.
 
-### Quién gana qué, por período (el nombre del período: ver más abajo)
+### Quién gana qué, por **CUANTO** (el período de recompensas)
 | Rol | Ingreso | Fuente |
 |---|---|---|
-| Staker común | ≤ 12%/año sobre su stake, **compuesto** (D4 A) | Emisión (acuñación) |
-| Validador | **1/N de los fees** (partes iguales) | Fees |
-| Validador que además stakea | lo de arriba + 12% sobre ESE stake extra | Fees + emisión |
+| Staker común (no validador) | ≤ 12%/año sobre su stake, **compuesto** (D4 A) | Emisión (acuñación) |
+| Validador | **1/N de los fees** (partes iguales), y NADA MÁS | Fees |
 
-Nota: el bono de 500 QCH del validador NO cuenta como stake ni entra al cálculo
-de emisión — es colateral puro. La emisión = 12% anual del total realmente
-**delegado** (staking), no de los bonos.
+**Roles separados, sin doble-dipping (D13):** un validador **NO puede stakear** —
+gana SOLO por las comisiones/fees. Su bono de 500 QCH es colateral puro (no gana).
+Un staker común no corre nodo; solo pone QCH y cobra el 12%. Regla on-chain: una
+dirección registrada como validador no puede abrir una posición de staking (y
+para registrarse como validador no debe tener staking activo).
+
+Nota: ni el bono del validador ni el propio validador entran al 12%. La emisión =
+12% anual del total realmente **stakeado por stakers comunes**, no de los bonos.
 
 ### Detalles cerrados en esta ronda
 - **D4 A** — la recompensa de staking se **compone** al principal. Con el
@@ -98,17 +102,34 @@ de emisión — es colateral puro. La emisión = 12% anual del total realmente
 - Claim manual de recompensas → distribución automática por época (el claim
   puede quedar como opción, ver detalles abiertos).
 
-## Nombre del período de recompensas (NO "época" — a elegir)
-Candidatos con tema cuántico/físico (la marca del proyecto), sin copiar a Solana:
-- **Cuanto** — un "cuanto" es literalmente el paquete discreto e indivisible de
-  algo; un cuanto de tiempo. Máximo on-brand para una cadena post-cuántica.
-- **Pulso** — rítmico, energético: "cada pulso se pagan las recompensas".
-- **Órbita** — orbital atómico (el logo/tema); "cada órbita".
-- **Fase** — fase cuántica.
-- **Ciclo** — simple y claro, universal.
-(Decisión pendiente del usuario.)
+## Nombre del período de recompensas: **CUANTO** (cerrado)
+El período se llama **cuanto** (un "cuanto" = el paquete discreto e indivisible de
+algo; un cuanto de tiempo — máximo on-brand para una cadena post-cuántica, y no
+suena copiado de Solana). En el código reemplaza a "epoch/época" para el período
+de recompensas. Dura ≈ 1 día en producción (configurable; corto en pruebas).
 
-## Detalles abiertos que quedan
+## Estado del diseño: CERRADO ✅ — listo para construir
+Todas las decisiones (1A/2A/3A, D4–D13, nombre) están tomadas. El modelo es
+coherente e internamente consistente. Próximo paso: construir por fases con DST +
+verificación en vivo, y un génesis nuevo.
+
+### Fases de construcción (borrador)
+1. **Ejecución/economía** (`qchain-execution`): bono de 500 vs delegación,
+   `MIN_VALIDATOR_STAKE`=500 QCH, validador no puede stakear, emisión = 12% del
+   stakeado sin bonos, quitar `staking_commission_bps`, pool de fees por-cuanto
+   + reparto 1/N, distribución por-cuanto (acumulador, compound perezoso).
+   Tests + DST.
+2. **Nodo** (`qchain-node`): borde de cuanto (correr aunque rotación off),
+   nombre on-chain en el registro, reparto de fees en el borde, `ROUNDS_PER_YEAR`
+   consistente. Verificación en vivo (testnet nuevo).
+3. **CLI + `become-validator`**: pedir nombre, exigir ≥500 QCH, bono + register;
+   quitar `--validator` del staking (pool global).
+4. **Wallet + explorador**: quitar el selector de validador, mostrar el 12%
+   compuesto por cuanto, historial; panel del validador con su 1/N de fees.
+5. **Génesis + docs**: génesis nuevo con las reglas nuevas, `become-validator.sh`,
+   actualizar `ARCHITECTURE.md`/`DEPLOY.md`. Bump v7.0.0.
+
+## Detalles ya resueltos (referencia)
 - **D4 — Recompensa de staking: ¿líquida o compuesta al stake?**
   (auto-compound al principal vs acreditada como saldo gastable cada época).
 - **D5 — Largo de la época** en tiempo real (cadencia de pago). Solana ≈ 2 días.
