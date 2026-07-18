@@ -24,6 +24,23 @@ Es un cambio económico/consenso determinista. Se construye, se prueba con DST +
 un testnet en vivo, y la red arranca de cero con las reglas nuevas. Bump MAYOR
 (v7.0.0).
 
+**Génesis: Política A (reinicio total) — CERRADO.**
+La red v7 arranca **de cero**: NO se migran saldos, posiciones ni validadores de
+v6. Elegido porque la v6 actual es un testnet (el QCH no tiene valor de mercado;
+los saldos son de prueba), así que migrar no aporta y sí agrega riesgo. Un
+snapshot/migración (Política B) recién tendría sentido en un futuro mainnet con
+usuarios y fondos reales.
+- **Asignación de génesis: 10.000.000 QCH a la dirección FUNDADORA (solo en el
+  génesis).** Es el único saldo inicial de la cadena; desde ahí el fundador
+  distribuye (transferencias, faucet). El suministro luego crece por la emisión
+  de staking (≤12% APY de lo stakeado por stakers comunes).
+- **Los nodos/validadores que se sumen después NO llevan saldo** — arrancan en 0
+  (traen su clave sin fondos, como hoy). Para ser validador necesitan conseguir
+  los 500 QCH del bono (por transferencia/faucet) antes de registrarse.
+- Requiere igual: `chain_id` nuevo, hash de génesis nuevo, dominio de firma
+  nuevo, protección anti-replay v6↔v7, versión mínima obligatoria, rechazo de
+  peers con génesis distinto, y corte documentado.
+
 ## El modelo unificado
 
 ### Validadores (nodos)
