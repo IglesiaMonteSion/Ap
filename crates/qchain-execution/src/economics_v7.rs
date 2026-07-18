@@ -123,12 +123,14 @@ pub fn shares_for_deposit(amount: u64, index: u128) -> u128 {
 }
 
 /// QCH to mint into the staking reserve when the index moves `old_index →
-/// new_index` for `total_shares` outstanding: the increase in total position
-/// value. Equals `position_value(total_shares, new) − position_value(.., old)`
-/// (modulo one flooring), i.e. exactly what auto-compounding every position adds.
+/// new_index` for `total_shares` outstanding: EXACTLY the increase in total
+/// FLOORED position value, `position_value(total, new) − position_value(total,
+/// old)`. Using the floored value-delta (not `total × Δindex / SCALE`, which can
+/// differ by 1 from it) is what keeps `reserve.balance == total position value`
+/// an EXACT invariant after minting — the property the quanto close and the DST
+/// depend on. Economically identical (it is the value auto-compounding adds).
 pub fn emission_for_quanto(total_shares: u128, old_index: u128, new_index: u128) -> u128 {
-    let grown = new_index.saturating_sub(old_index);
-    total_shares.saturating_mul(grown) / INDEX_SCALE
+    position_value(total_shares, new_index).saturating_sub(position_value(total_shares, old_index))
 }
 
 // ---------------------------------------------------------------------------

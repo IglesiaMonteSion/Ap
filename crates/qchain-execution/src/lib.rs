@@ -7,6 +7,7 @@ pub mod native;
 pub mod params;
 pub mod receipt;
 pub mod staking;
+pub mod staking_v7;
 pub mod validator_registry;
 pub mod wasm;
 
