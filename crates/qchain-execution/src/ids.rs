@@ -59,3 +59,32 @@ pub const FEE_STATE_ACCOUNT_ID: Pubkey = Pubkey::new([8u8; 32]);
 /// consensus yet; the active-set-by-stake selection and epoch rotation that
 /// wire it into `qchain-consensus` are the following increments.
 pub const VALIDATOR_REGISTRY_ACCOUNT_ID: Pubkey = Pubkey::new([9u8; 32]);
+
+// ---------------------------------------------------------------------------
+// v7 economic pools (SPEC: docs/ECONOMIC-REDESIGN.md §12 — strict separation of
+// economic sources). Additive sentinel addresses; INERT until the v7 execution
+// phases wire them. Kept separate so no source ever subsidizes another (bonds
+// never pay rewards, fees never pay staking, emission never pays validators),
+// which is what the mandatory supply/pool invariants (§13) check.
+// ---------------------------------------------------------------------------
+
+/// Escrow holding every validator's 500 QCH bond (collateral; earns nothing).
+/// `Σ bonds in the registry == this account's balance` is an invariant.
+pub const VALIDATOR_BOND_ESCROW_ID: Pubkey = Pubkey::new([10u8; 32]);
+/// Reserve backing staker rewards. Emission is minted here each quanto; a
+/// withdrawal pays out from here. Distinct from the v6 `STAKING_REWARDS_POOL_ID`
+/// (the old reward-per-share pool) because v7 uses the shares/index model.
+pub const STAKING_RESERVE_ID: Pubkey = Pubkey::new([11u8; 32]);
+/// Pool accumulating the non-burned half of fees during a quanto, split 1/N
+/// among eligible validators at the close (remainder kept for the next quanto).
+pub const VALIDATOR_FEE_POOL_ID: Pubkey = Pubkey::new([12u8; 32]);
+/// Holds common-staking principal that is in its unbonding window (no longer
+/// earning) until it becomes withdrawable.
+pub const STAKING_UNBONDING_POOL_ID: Pubkey = Pubkey::new([13u8; 32]);
+/// Holds a validator bond that is unbonding after a valid exit (still slashable
+/// until the evidence window closes) until it can be withdrawn.
+pub const VALIDATOR_UNBONDING_POOL_ID: Pubkey = Pubkey::new([14u8; 32]);
+/// Global staking state singleton: the `staking_index`, `total_staking_shares`,
+/// `current_quanto`, `last_settled_quanto` — everything the O(1) per-quanto
+/// close needs (see `economics_v7`). No funds; bookkeeping only.
+pub const STAKING_GLOBAL_ID: Pubkey = Pubkey::new([15u8; 32]);
