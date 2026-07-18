@@ -236,6 +236,13 @@ async fn main() -> anyhow::Result<()> {
     // next wiring sub-step.)
     if config.economics_v7 {
         ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(qchain_execution::staking_v7::StakingV7Program)));
+        // The v7 validator program lives under its OWN id (both v7 instruction
+        // enums start at discriminant 0, so they can't share one id — see
+        // `VALIDATOR_V7_PROGRAM_ID`).
+        ledger.register_program(
+            qchain_execution::ids::VALIDATOR_V7_PROGRAM_ID,
+            Program::Native(Box::new(qchain_execution::validator_v7::ValidatorV7Program)),
+        );
     } else {
         ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
     }
@@ -330,6 +337,19 @@ async fn main() -> anyhow::Result<()> {
             // with a normal signed transfer). Seeded empty; the 10% admin share
             // credits here once v7 fee routing is wired.
             ledger.seed_account(ADMIN_FEE_WALLET, qchain_core::Account::new_wallet(qchain_crypto::Pubkey::system_program_id()));
+            // The validator registry account ([9;32]) was seeded above in the
+            // phase-3 (`validator_registry`) format; a v7 network instead uses the
+            // `validator_v7::ValidatorV7Registry` format at the SAME id (SPEC §7).
+            // Re-seed it EMPTY in the v7 format so `BondAndRegister` (dispatched to
+            // `VALIDATOR_V7_PROGRAM_ID`) reads/writes a well-defined registry from
+            // genesis rather than transiently holding the wrong format.
+            ledger.seed_account(
+                VALIDATOR_REGISTRY_ACCOUNT_ID,
+                qchain_core::Account {
+                    data: borsh::to_vec(&qchain_execution::validator_v7::ValidatorV7Registry::default())?,
+                    ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            );
         }
     } else {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");

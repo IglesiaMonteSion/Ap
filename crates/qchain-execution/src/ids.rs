@@ -89,6 +89,14 @@ pub const VALIDATOR_UNBONDING_POOL_ID: Pubkey = Pubkey::new([14u8; 32]);
 /// close needs (see `economics_v7`). No funds; bookkeeping only.
 pub const STAKING_GLOBAL_ID: Pubkey = Pubkey::new([15u8; 32]);
 
+/// v7 validator program: processes `ValidatorV7Instruction` (BondAndRegister /
+/// BeginExit / WithdrawBond / ReportEquivocation). A DISTINCT id from
+/// `STAKING_PROGRAM_ID` (which in a v7 network runs `StakingV7Program`): both v7
+/// instruction enums start at discriminant 0, so a single-id dispatcher could not
+/// disambiguate them — the node registers each program under its own id. Only
+/// registered when `economics_v7` is on.
+pub const VALIDATOR_V7_PROGRAM_ID: Pubkey = Pubkey::new([16u8; 32]);
+
 /// Administrative-expenses wallet: receives 10% of every fee under the v7 split
 /// (45% validators / 45% burn / 10% admin — SPEC §11). Unlike the sentinel pool
 /// IDs above this is a REAL operator-controlled wallet (base58

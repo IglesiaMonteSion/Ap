@@ -1548,6 +1548,9 @@ mod tests {
         let mut ledger = Ledger::new_with_config(Box::new(InMemoryStore::new()), false, true, rate, rounds_per_quanto).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(crate::staking_v7::StakingV7Program)));
+        // v7 validator program under its OWN id (distinct from staking — both v7
+        // instruction enums start at discriminant 0, so they cannot share an id).
+        ledger.register_program(crate::ids::VALIDATOR_V7_PROGRAM_ID, Program::Native(Box::new(crate::validator_v7::ValidatorV7Program)));
         ledger
     }
 
@@ -1558,6 +1561,63 @@ mod tests {
             data: borsh::to_vec(&crate::staking_v7::StakingV7Instruction::Stake { amount }).unwrap(),
         };
         Transaction::new_signed(staker, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+    }
+
+    /// Node-wiring step 2: the v7 staking and validator programs run under
+    /// DISTINCT ids, so both dispatch correctly with no collision (their
+    /// instruction enums both start at discriminant 0 — exactly why a single
+    /// shared id would be ambiguous). A `Stake` addressed to `STAKING_PROGRAM_ID`
+    /// reaches `StakingV7Program`; a `BondAndRegister` addressed to
+    /// `VALIDATOR_V7_PROGRAM_ID` reaches `ValidatorV7Program`.
+    #[test]
+    fn v7_staking_and_validator_programs_dispatch_under_distinct_ids() {
+        let mut l = new_test_ledger_v7(1024);
+        let proposer = Keypair::generate().unwrap().pubkey();
+
+        // A staker stakes via STAKING_PROGRAM_ID → StakingV7Program.
+        let staker = Keypair::generate().unwrap();
+        let position = Keypair::generate().unwrap().pubkey();
+        l.credit(staker.pubkey(), 300 * qchain_core::UNITS_PER_QCH);
+        l.apply_transaction(&v7_stake_tx(&staker, 0, position, 100 * qchain_core::UNITS_PER_QCH), &proposer, 0).unwrap();
+        assert_eq!(
+            l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance,
+            100 * qchain_core::UNITS_PER_QCH,
+            "staking reached StakingV7Program (reserve funded)"
+        );
+
+        // A different account bonds+registers via VALIDATOR_V7_PROGRAM_ID → ValidatorV7Program.
+        let v = Keypair::generate().unwrap();
+        l.credit(v.pubkey(), 600 * qchain_core::UNITS_PER_QCH); // 500 bond + fee headroom
+        let ix = Instruction {
+            program_id: crate::ids::VALIDATOR_V7_PROGRAM_ID,
+            accounts: vec![v.pubkey(), crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, crate::ids::VALIDATOR_BOND_ESCROW_ID, crate::ids::STAKING_GLOBAL_ID],
+            data: borsh::to_vec(&crate::validator_v7::ValidatorV7Instruction::BondAndRegister {
+                moniker: "alice".into(),
+                pubkey_bundle: v.public_key_bundle(),
+                p2p_address: "1.2.3.4:9000".into(),
+            })
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed(&v, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+        l.apply_transaction(&tx, &proposer, 0).unwrap();
+
+        // The bond escrow holds exactly the 500 QCH bond, and the v7 registry has
+        // the validator — proving the validator instruction reached its program.
+        assert_eq!(
+            l.store.get(&crate::ids::VALIDATOR_BOND_ESCROW_ID).unwrap().balance,
+            crate::economics_v7::VALIDATOR_BOND_ATOMS,
+            "bond reached the escrow via ValidatorV7Program"
+        );
+        let reg: crate::validator_v7::ValidatorV7Registry =
+            borsh::from_slice(&l.store.get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data).unwrap();
+        assert_eq!(reg.validators.len(), 1);
+        assert_eq!(reg.validators[0].address, v.pubkey());
+        assert_eq!(reg.validators[0].moniker, "alice");
+
+        // And staking still works independently (no cross-collision): the reserve
+        // is untouched by the validator flow (the bond went to the escrow, not the
+        // reserve — strict pool separation §12).
+        assert_eq!(l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance, 100 * qchain_core::UNITS_PER_QCH);
     }
 
     #[test]
