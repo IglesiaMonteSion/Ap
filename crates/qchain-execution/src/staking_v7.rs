@@ -141,10 +141,24 @@ fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, owner_if_new: Pu
     acct.balance = acct.balance.saturating_add(amount);
 }
 
+/// Read the global staking state from a working set (or `genesis()` if absent).
+/// Public so the ledger's quanto-close hook can read `current_quanto`.
+pub fn global_state(accounts: &HashMap<Pubkey, Account>) -> GlobalStakingState {
+    read_global(accounts)
+}
+
+impl crate::native::NativeProgram for StakingV7Program {
+    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, _current_round: qchain_core::Round) -> Result<(), ExecError> {
+        // v7 staking has no notion of "round" — its clock is the quanto, read
+        // from the global state — so `current_round` is ignored.
+        StakingV7Program::execute(accounts, instruction, payer)
+    }
+}
+
 impl StakingV7Program {
     /// Apply a v7 staking instruction to the working set. Pure over `accounts`
     /// (+ the pinned singletons), same contract as `StakingProgram::process`.
-    pub fn process(accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey) -> Result<(), ExecError> {
+    pub fn execute(accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey) -> Result<(), ExecError> {
         let instr = StakingV7Instruction::try_from_slice(&instruction.data)
             .map_err(|e| ExecError::ProgramError(format!("bad v7 staking instruction: {e}")))?;
         match instr {
@@ -395,7 +409,7 @@ mod tests {
         accounts.insert(staker, wallet(10 * UNITS_PER_QCH));
 
         let amount = 5 * UNITS_PER_QCH;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
 
         assert_eq!(accounts.get(&staker).unwrap().balance, 5 * UNITS_PER_QCH);
         assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, amount);
@@ -415,7 +429,7 @@ mod tests {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
         let amount = 100 * UNITS_PER_QCH;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
 
         // Close one quanto per day for a protocol year.
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
@@ -439,7 +453,7 @@ mod tests {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         let staker = pk(50);
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: 100 * UNITS_PER_QCH }, vec![staker, pk(60), STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: 100 * UNITS_PER_QCH }, vec![staker, pk(60), STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         let m1 = settle_quanto(&mut accounts, 0, rate).unwrap();
         let idx1 = read_global(&accounts).index;
         // Re-settling the SAME quanto mints nothing and doesn't move the index.
@@ -457,13 +471,13 @@ mod tests {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(200 * UNITS_PER_QCH));
         let amount = 100 * UNITS_PER_QCH;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         let shares0 = read_position(&accounts, &position).unwrap().active_shares;
         // Grow the index a full year, then add the same principal again.
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
             settle_quanto(&mut accounts, q, rate).unwrap();
         }
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::IncreaseStake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::IncreaseStake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         let pos = read_position(&accounts, &position).unwrap();
         let added_shares = pos.active_shares - shares0;
         assert!(added_shares < shares0, "the same principal mints fewer shares once the index grew");
@@ -478,24 +492,24 @@ mod tests {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
         let amount = 40 * UNITS_PER_QCH;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
 
         // Unstake half.
         let half = 20 * UNITS_PER_QCH;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::BeginUnstake { amount: half }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::BeginUnstake { amount: half }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
         assert_eq!(accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance, half);
         assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, amount - half);
         reserve_value_invariant(&accounts);
 
         // Withdraw before the window closes → rejected.
-        let e = StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker);
+        let e = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker);
         assert!(e.is_err(), "cannot withdraw before the unbonding window elapses");
 
         // Advance a quanto (settle) so current_quanto reaches the ready quanto.
         let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         settle_quanto(&mut accounts, 0, rate).unwrap(); // current_quanto -> 1 >= ready (0+1)
         let before = accounts.get(&staker).unwrap().balance;
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
         assert_eq!(accounts.get(&staker).unwrap().balance, before + half, "the unbonded funds are paid out");
         assert_eq!(accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance, 0);
         // Still has the other half active.
@@ -511,14 +525,14 @@ mod tests {
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
         accounts.insert(attacker, wallet(100 * UNITS_PER_QCH));
         // Wrong global singleton → rejected.
-        let bad = StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, pk(99), STAKING_RESERVE_ID]), &staker);
+        let bad = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, pk(99), STAKING_RESERVE_ID]), &staker);
         assert!(bad.is_err());
         // funding account != payer → rejected.
-        let bad2 = StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &attacker);
+        let bad2 = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &attacker);
         assert!(bad2.is_err());
         // Open a real position, then attacker tries to unstake it → rejected.
-        StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
-        let bad3 = StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::BeginUnstake { amount: UNITS_PER_QCH }, vec![attacker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID]), &attacker);
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: UNITS_PER_QCH }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        let bad3 = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::BeginUnstake { amount: UNITS_PER_QCH }, vec![attacker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID]), &attacker);
         assert!(bad3.is_err(), "only the owner can unstake");
     }
 
@@ -533,7 +547,7 @@ mod tests {
             let staker = pk(60 + i as u8);
             accounts.insert(staker, wallet(1000 * UNITS_PER_QCH));
             let amt = (i as u64 + 1) * 10 * UNITS_PER_QCH;
-            StakingV7Program::process(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: amt }, vec![staker, *p, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+            StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: amt }, vec![staker, *p, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         }
         // Some quantos pass.
         for q in 0..30 {

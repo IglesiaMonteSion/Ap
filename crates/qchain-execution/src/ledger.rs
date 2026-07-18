@@ -175,7 +175,26 @@ pub struct Ledger {
     /// address; bounded by the validator-set size. Persisted by `qchain-node`
     /// via `export_economics`/`import_economics` so it survives restarts.
     validator_commissions: std::collections::BTreeMap<Pubkey, u64>,
+    /// v7 economics gate (SPEC: `docs/ECONOMIC-REDESIGN.md`). When true this
+    /// ledger runs the shares+index staking (the caller registers
+    /// `StakingV7Program` under `STAKING_PROGRAM_ID` in place of the v6
+    /// `StakingProgram`) and closes a reward "quanto" every `rounds_per_quanto`
+    /// rounds, minting emission into `STAKING_RESERVE_ID`. Default `false` →
+    /// byte-identical v6 behavior. A fresh-genesis v7 flag (folded into
+    /// `chain_id` by the node), never toggled on a live v6 chain.
+    economics_v7: bool,
+    /// Genesis-baked per-quanto compounding rate (`economics_v7::derive_quanto_rate_fp`).
+    /// Only read when `economics_v7` is on.
+    quanto_rate_fp: u128,
+    /// Rounds per reward quanto (`economics_v7::DEFAULT_ROUNDS_PER_QUANTO`). Only
+    /// read when `economics_v7` is on; 0 disables the quanto close.
+    rounds_per_quanto: u64,
 }
+
+/// Defensive per-transaction cap on how many elapsed quantos one apply closes in
+/// a single pass (a long idle gap then a burst). Emission is never lost — the
+/// next transaction continues the catch-up; this only bounds per-tx work.
+const MAX_QUANTO_CATCHUP_PER_TX: u64 = 4096;
 
 impl Ledger {
     /// The legacy (256-deep tree) ledger - the default every existing network
@@ -217,7 +236,79 @@ impl Ledger {
             transfer_receipts: Vec::new(),
             staking_events: Vec::new(),
             validator_commissions: std::collections::BTreeMap::new(),
+            economics_v7: false,
+            quanto_rate_fp: 0,
+            rounds_per_quanto: 0,
         })
+    }
+
+    /// v7-economics ledger: shares+index staking + per-quanto emission. The
+    /// caller must ALSO register `StakingV7Program` under `STAKING_PROGRAM_ID`
+    /// (in place of the v6 `StakingProgram`). `quanto_rate_fp`/`rounds_per_quanto`
+    /// are genesis parameters (`economics_v7::derive_quanto_rate_fp` /
+    /// `DEFAULT_ROUNDS_PER_QUANTO`), part of the network config hash.
+    pub fn new_with_config(store: Box<dyn StateStore>, compressed: bool, economics_v7: bool, quanto_rate_fp: u128, rounds_per_quanto: u64) -> anyhow::Result<Self> {
+        let mut l = Self::new_with_tree(store, compressed)?;
+        l.economics_v7 = economics_v7;
+        l.quanto_rate_fp = quanto_rate_fp;
+        l.rounds_per_quanto = rounds_per_quanto;
+        Ok(l)
+    }
+
+    /// Whether this ledger runs the v7 economics (shares+index staking + quanto
+    /// emission). The node reads this to register the right staking program and
+    /// seed the v7 genesis singletons.
+    pub fn is_economics_v7(&self) -> bool {
+        self.economics_v7
+    }
+
+    /// Close every reward quanto that has fully elapsed by `current_round`,
+    /// deterministically folding the state change into the current transaction
+    /// (same STARK-safe pattern as `advance_dynamic_fee`: it only touches the
+    /// global-staking + reserve singletons, never a transfer's from/to leaves, so
+    /// a transfer receipt captured this tx stays valid). Idempotent: each quanto
+    /// settles exactly once (`settle_quanto`'s `current_quanto` anchor), so
+    /// running this at the start of every apply is a no-op after the quanto's
+    /// first transaction. No-op entirely when `economics_v7` is off.
+    fn close_due_quantos(&mut self, current_round: Round) {
+        if !self.economics_v7 || self.rounds_per_quanto == 0 {
+            return;
+        }
+        let target_quanto = current_round / self.rounds_per_quanto;
+        let mut map: HashMap<Pubkey, Account> = HashMap::new();
+        if let Some(g) = self.store.get(&crate::ids::STAKING_GLOBAL_ID) {
+            map.insert(crate::ids::STAKING_GLOBAL_ID, g);
+        }
+        if let Some(r) = self.store.get(&crate::ids::STAKING_RESERVE_ID) {
+            map.insert(crate::ids::STAKING_RESERVE_ID, r);
+        }
+        let mut settled_any = false;
+        let mut guard = 0u64;
+        loop {
+            let cur = crate::staking_v7::global_state(&map).current_quanto;
+            if cur >= target_quanto {
+                break;
+            }
+            match crate::staking_v7::settle_quanto(&mut map, cur, self.quanto_rate_fp) {
+                Ok(minted) => {
+                    self.total_emitted = self.total_emitted.saturating_add(minted);
+                    settled_any = true;
+                }
+                Err(_) => break, // never abort the tx on a settle hiccup
+            }
+            guard += 1;
+            if guard >= MAX_QUANTO_CATCHUP_PER_TX {
+                break; // the next tx continues the catch-up; no emission lost
+            }
+        }
+        if settled_any {
+            if let Some(g) = map.remove(&crate::ids::STAKING_GLOBAL_ID) {
+                self.write_account(crate::ids::STAKING_GLOBAL_ID, g);
+            }
+            if let Some(r) = map.remove(&crate::ids::STAKING_RESERVE_ID) {
+                self.write_account(crate::ids::STAKING_RESERVE_ID, r);
+            }
+        }
     }
 
     pub fn register_program(&mut self, id: Pubkey, program: Program) {
@@ -742,6 +833,13 @@ impl Ledger {
         let is_first_transaction_from_this_payer = payer_account.nonce == 0;
         self.check_registry_status(tx, is_first_transaction_from_this_payer)?;
 
+        // v7: close every reward quanto that has fully elapsed by this round,
+        // BEFORE capturing any receipt root — so a transfer receipt captured this
+        // tx sees the close in both root_before and root_after (its transition
+        // reflects only the transfer, STARK-safe). Idempotent + deterministic +
+        // no-op when economics_v7 is off.
+        self.close_due_quantos(current_round);
+
         let params = self.current_params();
         // Charge the EFFECTIVE base fee for this round - the stored
         // `base_fee_per_byte` rolled forward through every empty round since the
@@ -872,7 +970,8 @@ impl Ledger {
         // instruction runs), and only record it at the end if the whole
         // transaction commits. Scoped to single-instruction staking txs - the
         // exact shape the CLI/wallet build. See `receipt::StakingEvent`.
-        let pre_staking: Option<StakingEvent> = if tx.message.instructions.len() == 1
+        let pre_staking: Option<StakingEvent> = if !self.economics_v7
+            && tx.message.instructions.len() == 1
             && tx.message.instructions[0].program_id == STAKING_PROGRAM_ID
         {
             let ix = &tx.message.instructions[0];
@@ -1437,6 +1536,132 @@ mod tests {
         let mut ledger = Ledger::new_with_tree(Box::new(InMemoryStore::new()), true).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    /// A v7-economics ledger: shares+index staking (StakingV7Program) + quanto
+    /// emission. Tiny `rounds_per_quanto` so a few rounds cross a boundary.
+    fn new_test_ledger_v7(rounds_per_quanto: u64) -> Ledger {
+        let rate = crate::economics_v7::derive_quanto_rate_fp(
+            crate::economics_v7::STAKING_TARGET_APY_BPS,
+            crate::economics_v7::DEFAULT_QUANTOS_PER_YEAR,
+        );
+        let mut ledger = Ledger::new_with_config(Box::new(InMemoryStore::new()), false, true, rate, rounds_per_quanto).unwrap();
+        ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
+        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(crate::staking_v7::StakingV7Program)));
+        ledger
+    }
+
+    fn v7_stake_tx(staker: &Keypair, nonce: u64, position: Pubkey, amount: u64) -> Transaction {
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![staker.pubkey(), position, crate::ids::STAKING_GLOBAL_ID, crate::ids::STAKING_RESERVE_ID],
+            data: borsh::to_vec(&crate::staking_v7::StakingV7Instruction::Stake { amount }).unwrap(),
+        };
+        Transaction::new_signed(staker, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+    }
+
+    #[test]
+    fn v7_stake_then_a_year_of_quanto_closes_compounds_and_mints_emission() {
+        let rpq = 4;
+        let mut l = new_test_ledger_v7(rpq);
+        let validator = Keypair::generate().unwrap().pubkey();
+        let staker = Keypair::generate().unwrap();
+        let position = Keypair::generate().unwrap().pubkey();
+        l.credit(staker.pubkey(), 300 * qchain_core::UNITS_PER_QCH);
+
+        let amount = 100 * qchain_core::UNITS_PER_QCH;
+        l.apply_transaction(&v7_stake_tx(&staker, 0, position, amount), &validator, 0).unwrap();
+        let reserve0 = l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance;
+        assert_eq!(reserve0, amount, "stake funds the reserve");
+        assert_eq!(l.total_emitted, 0);
+
+        // Trigger the quanto close by applying a tx a full protocol year later.
+        // (365 quantos × rpq rounds/quanto.)
+        let round_one_year = rpq * crate::economics_v7::DEFAULT_QUANTOS_PER_YEAR;
+        let bob = Keypair::generate().unwrap().pubkey();
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![staker.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&staker, 1, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        l.apply_transaction(&tx, &validator, round_one_year).unwrap();
+
+        // The index advanced ~12% and emission was minted into the reserve.
+        let g = crate::staking_v7::global_state(&{
+            let mut m = HashMap::new();
+            m.insert(crate::ids::STAKING_GLOBAL_ID, l.store.get(&crate::ids::STAKING_GLOBAL_ID).unwrap());
+            m
+        });
+        assert!(g.current_quanto >= crate::economics_v7::DEFAULT_QUANTOS_PER_YEAR, "a year of quantos closed: {}", g.current_quanto);
+        assert!(l.total_emitted > 0, "emission was minted");
+        let reserve1 = l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance;
+        // Reserve grew by ~12% of the staked principal (never more), matching emission.
+        assert!(reserve1 > reserve0, "reserve grew with emission");
+        assert!(reserve1 <= reserve0 + amount * 12 / 100 + 2, "growth never exceeds 12% APY");
+        assert!(reserve1 >= reserve0 + amount * 119 / 1000, "growth is close to 12% (>=11.9%)");
+        assert_eq!(l.total_emitted, reserve1 - reserve0, "total_emitted tracks the reserve growth");
+    }
+
+    #[test]
+    fn v7_quanto_close_is_idempotent_within_a_round_and_deterministic_across_ledgers() {
+        let rpq = 4;
+        let validator = Keypair::generate().unwrap().pubkey();
+        // Two independent v7 ledgers apply the SAME tx sequence → identical root.
+        let mut a = new_test_ledger_v7(rpq);
+        let mut b = new_test_ledger_v7(rpq);
+        let staker = Keypair::generate().unwrap();
+        let position = Keypair::generate().unwrap().pubkey();
+        for l in [&mut a, &mut b] {
+            l.credit(staker.pubkey(), 300 * qchain_core::UNITS_PER_QCH);
+            l.apply_transaction(&v7_stake_tx(&staker, 0, position, 100 * qchain_core::UNITS_PER_QCH), &validator, 0).unwrap();
+        }
+        // Two transfers in the SAME later round: the first triggers the quanto
+        // catch-up, the second's close is a no-op (idempotent). Both ledgers agree.
+        let round = rpq * 10; // 10 quantos elapsed
+        let bob = Keypair::generate().unwrap().pubkey();
+        // Apply two transfers in the SAME later round on each ledger.
+        for l in [&mut a, &mut b] {
+            let mut emitted_after_first = 0u64;
+            for n in 1..=2u64 {
+                let t = Instruction {
+                    program_id: Pubkey::system_program_id(),
+                    accounts: vec![staker.pubkey(), bob],
+                    data: borsh::to_vec(&SystemInstruction::Transfer { amount: qchain_core::UNITS_PER_QCH }).unwrap(),
+                };
+                let tx = Transaction::new_signed(&staker, n, [0u8; 32], 50_000_000, vec![t]).unwrap();
+                l.apply_transaction(&tx, &validator, round).unwrap();
+                if n == 1 {
+                    emitted_after_first = l.total_emitted;
+                } else {
+                    // Second tx in the same round closed no new quanto.
+                    assert_eq!(l.total_emitted, emitted_after_first, "second tx in the round mints no extra emission (idempotent)");
+                }
+            }
+        }
+        assert_eq!(a.merkle_root(), b.merkle_root(), "two v7 ledgers on the same tx sequence agree (no fork)");
+        assert!(a.total_emitted > 0);
+    }
+
+    #[test]
+    fn v7_off_by_default_is_byte_identical_v6_staking_path_untouched() {
+        // A default ledger (economics_v7 off) never runs the quanto close and
+        // keeps total_emitted at 0 for a plain transfer — the v6 path.
+        let mut l = new_test_ledger();
+        assert!(!l.is_economics_v7());
+        let validator = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        l.credit(alice.pubkey(), 50 * qchain_core::UNITS_PER_QCH);
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+        l.apply_transaction(&tx, &validator, 1_000_000).unwrap();
+        assert_eq!(l.total_emitted, 0, "v6 default path: no v7 quanto emission");
+        assert!(l.store.get(&crate::ids::STAKING_GLOBAL_ID).is_none(), "v7 global state never created when off");
     }
 
     /// Phase C correctness anchor: a compressed-tree ledger and a legacy-tree
