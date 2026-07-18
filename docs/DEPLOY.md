@@ -79,6 +79,37 @@ sudo ./deploy/install-node.sh --modo unirse --config /ruta/a/config.json --yes
 Ver todas las opciones (puertos custom, imagen custom, carpeta de
 instalación custom) con `sudo ./deploy/install-node.sh --help`.
 
+### Sumar un nodo SECUNDARIO a una red que ya existe (en un comando)
+
+En la VPS nueva, traé el repo y corré:
+
+```
+sudo ./deploy/install-node.sh --modo unirse \
+     --red-config config-de-la-red.json \
+     --sync-peer http://<ip-de-un-nodo-vivo>:8080
+```
+
+- `--red-config` es el `config.json` **público** que te pasa **cualquier** nodo
+  que ya esté corriendo (tiene `validators`+`genesis`, **no** tiene ninguna clave
+  privada). El instalador lo adapta solo: le pone **tu** clave, **tus** puertos y
+  el `state_sync_peers`, dejando `validators`/`genesis`/rotación **igual** (eso es
+  la identidad de la red, el `chain_id`). No hace falta que nadie te devuelva un
+  config a medida ni compartir ninguna clave privada.
+- `--sync-peer` es el RPC de un nodo vivo desde el que ponerse al día (state-sync).
+
+Tu nodo arranca, **se sincroniza solo** y ya es parte de la red (sigue la cadena y
+sirve RPC). Qué pasa después depende de la red:
+
+- **Si la red tiene rotación dinámica ON** (`validator_rotation: true`): el
+  instalador te imprime los **dos comandos exactos** para volverte VALIDADOR en
+  caliente — bloquear tu self-stake (`stake-delegate` a tu propia dirección,
+  ≥ 10.000.000 unidades = 0,01 QCH) y `register-validator` con tu IP pública. En el
+  próximo borde de época entrás al comité **sin que ningún otro nodo reinicie**.
+- **Si la red tiene rotación OFF** (el default): tu nodo corre como **seguidor**
+  (sincroniza, sirve RPC/balances, no propone) — útil como réplica de lectura.
+  Para que sea validador con rotación off, el operador debe incluir tu bundle en
+  el génesis y hacer un redeploy coordinado (ver la sección de rotación más abajo).
+
 ## Explorador QScan (`deploy/install-indexer.sh`)
 
 QScan es el explorador de bloques de la red, estilo Etherscan — un servicio

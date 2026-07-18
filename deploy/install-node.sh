@@ -32,6 +32,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_ORIGEN=""
 LISTEN_PORT_ARG=""
 RPC_PORT_ARG=""
+SYNC_PEERS=""   # (modo unirse) RPCs de nodos vivos para sincronizar (state-sync), uno por línea
 # Milisegundos entre rondas de consenso. 500 (2 rondas/s) es el default seguro.
 # Bajarlo (p.ej. 250) sube el techo de TPS en una red multi-nodo limitada por
 # latencia de consenso - es config node-local, sin fork (un tick demasiado
@@ -67,8 +68,14 @@ Opciones:
   --modo solo|unirse     Elige el modo sin preguntar interactivamente.
                          "solo": crea tu propia red de prueba de un nodo.
                          "unirse": te unís a una red que ya existe.
-  --config <archivo>     (con --modo unirse) copia este config.json en vez
-                         de esperar a que lo pongas vos manualmente.
+  --config <archivo>     (con --modo unirse) el config.json PÚBLICO de la red
+  --red-config <archivo> (validators+genesis, sin claves privadas) que te pasa
+                         cualquier nodo existente. El instalador lo adapta solo:
+                         le pone TU clave, TUS puertos y los peers de sync. No
+                         necesitás que nadie te devuelva un config a medida.
+  --sync-peer <url>      (modo unirse, repetible) RPC de un nodo VIVO desde el
+                         que sincronizar el estado, ej: http://1.2.3.4:8080.
+                         Poné al menos uno para que tu nodo se ponga al día solo.
   --image <nombre>       Imagen Docker a usar (por defecto qchain:latest).
   --home <ruta>          Carpeta de instalación (por defecto /opt/qchain,
                          también configurable con la variable QCHAIN_HOME).
@@ -108,7 +115,9 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --modo) MODO="${2:-}"; shift 2 ;;
-    --config) CONFIG_ORIGEN="${2:-}"; shift 2 ;;
+    --config|--red-config) CONFIG_ORIGEN="${2:-}"; shift 2 ;;
+    --sync-peer) SYNC_PEERS="${SYNC_PEERS}${2:-}
+"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
@@ -392,20 +401,59 @@ EOF
       fi
 
       if [ ! -f "$QCHAIN_HOME/config.json" ]; then
-        decir "Necesitas un archivo config.json de quien coordina la red"
-        echo "Enviale a esa persona:"
-        echo "  - tu direccion de IP publica"
-        echo "  - este bundle (clave publica, no es secreta):"
-        echo "$BUNDLE_JSON"
+        decir "Falta el config.json PÚBLICO de la red"
+        echo "Pedile a CUALQUIER nodo que ya esté corriendo su archivo config.json"
+        echo "(es público: tiene validators+genesis, NO tiene ninguna clave privada)."
+        echo "y su IP:puerto-RPC para sincronizar. Después corré:"
         echo
-        echo "Cuando te devuelvan tu config.json, copialo a $QCHAIN_HOME/config.json"
-        echo "(o volvé a correr: sudo ./install-node.sh --modo unirse --config <archivo>)"
-        echo "y volve a correr este script."
-        log "modo unirse: esperando config.json del coordinador (validador $MI_DIRECCION)"
+        echo "  sudo ./install-node.sh --modo unirse \\"
+        echo "       --red-config config-de-la-red.json \\"
+        echo "       --sync-peer http://<ip-de-un-nodo>:8080"
+        echo
+        echo "El instalador lo adapta solo (tu clave, tus puertos, tus peers de sync)."
+        echo "No necesitás que nadie te devuelva un config a medida ni compartir tu clave."
+        log "modo unirse: falta config.json público de la red (validador $MI_DIRECCION)"
         exit 0
       fi
+
+      # Adaptar el config PÚBLICO de la red a ESTE nodo: ponerle nuestra clave,
+      # nuestros puertos y los peers de state-sync, sin tocar validators/genesis/
+      # rotation (eso define la identidad de la red y debe quedar igual en todos).
+      # Así el operador de un nodo existente solo comparte su config.json público
+      # y el recién llegado lo usa tal cual, sin coordinación manual.
+      UNIR_LISTEN="0.0.0.0:${LISTEN_PORT_ARG:-9000}"
+      UNIR_RPC="0.0.0.0:${RPC_PORT_ARG:-8080}"
+      if command -v python3 >/dev/null 2>&1; then
+        SYNC_PEERS="$SYNC_PEERS" LISTEN_ADDR="$UNIR_LISTEN" RPC_ADDR="$UNIR_RPC" \
+          python3 - "$QCHAIN_HOME/config.json" <<'PY' || error "no pude adaptar el config.json de la red (¿es JSON válido?)"
+import json, os, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["keypair_path"] = "keypair.json"          # ESTE nodo firma con SU propia clave
+c["listen_addr"]  = os.environ["LISTEN_ADDR"]
+c["rpc_addr"]     = os.environ["RPC_ADDR"]
+peers = [x.strip() for x in os.environ.get("SYNC_PEERS", "").splitlines() if x.strip()]
+if peers:
+    c["state_sync_peers"] = peers            # ponerse al día solo desde un nodo vivo
+# validators / genesis / validator_rotation / epoch_rounds / round_interval_ms /
+# compressed_state_tree se dejan TAL CUAL: son la identidad de la red (chain_id).
+json.dump(c, open(p, "w"), indent=2)
+PY
+        RED_ROTA="$(python3 -c "import json;print(json.load(open('$QCHAIN_HOME/config.json')).get('validator_rotation') is True)" 2>/dev/null || echo False)"
+        if [ -z "$SYNC_PEERS" ]; then
+          echo "AVISO: no pasaste --sync-peer. Tu nodo intentará ponerse al día por"
+          echo "  la vía reactiva (lenta si la cadena ya avanzó mucho). Recomiendo"
+          echo "  correr de nuevo con --sync-peer http://<ip-de-un-nodo>:8080."
+        fi
+      else
+        RED_ROTA="False"
+        echo "AVISO: no encontré python3, uso el config.json tal cual vino."
+        echo "  Asegurate de que tenga tu keypair_path/listen_addr/rpc_addr correctos"
+        echo "  (instalá python3 con 'apt install -y python3' para que lo haga solo)."
+      fi
+
       mkdir -p "$QCHAIN_HOME/data"
-      log "modo unirse: config.json presente, validador $MI_DIRECCION"
+      log "modo unirse: config.json adaptado, validador $MI_DIRECCION, rotacion=$RED_ROTA"
       ;;
     *)
       error "modo inválido: '$MODO' (usá 'solo' o 'unirse')"
@@ -484,6 +532,46 @@ Tus archivos importantes estan en $QCHAIN_HOME (permisos restringidos a root):
   data/          -> el estado de la cadena (balances, etc), sobrevive reinicios
   install.log    -> registro de esta instalación, útil para soporte
 EOF
+
+# Guía de "nodo secundario": qué es tu nodo ahora y cómo (si la red lo permite)
+# volverte validador en caliente, sin que nadie más reinicie.
+if [ "$MODO" = "unirse" ]; then
+  MI_DIR_UNIR="${MI_DIRECCION:-<tu-direccion-de-validador>}"
+  MI_LISTEN_PORT="${LISTEN_PORT_ARG:-9000}"
+  decir "Tu nodo se está uniendo a la red"
+  echo "Ya es parte de la red: sigue la cadena y sirve RPC. Para verlo ponerse al día:"
+  echo "  journalctl -u qchain-validator -f     (buscá 'state-synced ... at round')"
+  echo
+  if [ "${RED_ROTA:-False}" = "True" ]; then
+    echo "Esta red tiene ROTACIÓN DINÁMICA: podés volverte VALIDADOR en caliente,"
+    echo "sin que ningún otro nodo reinicie. Una vez sincronizado y con QCH en tu"
+    echo "cuenta de validador ($MI_DIR_UNIR), corré estos dos pasos:"
+    echo
+    echo "  # 1) bloqueá tu self-stake (>= 10.000.000 unidades = 0,01 QCH):"
+    echo "  docker run --rm -v $QCHAIN_HOME:/qchain -w /qchain $IMAGE \\"
+    echo "    qchain stake-delegate --rpc http://127.0.0.1:$RPC_PORT --keypair keypair.json \\"
+    echo "    --validator $MI_DIR_UNIR --amount 10000000"
+    echo "    # anotá la 'stake account:' que imprime"
+    echo
+    echo "  # 2) registrate on-chain (con tu IP PÚBLICA + tu puerto P2P $MI_LISTEN_PORT):"
+    echo "  docker run --rm -v $QCHAIN_HOME:/qchain -w /qchain $IMAGE \\"
+    echo "    qchain register-validator --rpc http://127.0.0.1:$RPC_PORT --keypair keypair.json \\"
+    echo "    --stake-account <stake-account-del-paso-1> --address <TU-IP-PUBLICA>:$MI_LISTEN_PORT"
+    echo
+    echo "En el próximo borde de época entrás al comité solo. (Para tener QCH: pedilo"
+    echo "al faucet de la red, o que alguien te transfiera a $MI_DIR_UNIR.)"
+  else
+    echo "Esta red tiene la rotación APAGADA (lo normal por ahora), así que tu nodo"
+    echo "corre como SEGUIDOR: sincroniza, sirve RPC y balances, pero no propone."
+    echo "Un seguidor ya es útil (réplica de lectura para wallets/explorador sin"
+    echo "cargar al validador). Para que sea VALIDADOR con la rotación apagada, el"
+    echo "operador debe incluir tu bundle público en el génesis y hacer un"
+    echo "redespliegue coordinado de todos los nodos. Tu bundle (público) es:"
+    echo "$BUNDLE_JSON"
+  fi
+  echo
+fi
+
 if [ -f "$QCHAIN_HOME/wallet.json" ]; then
 cat <<EOF
 
