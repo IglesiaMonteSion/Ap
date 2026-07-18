@@ -1,169 +1,427 @@
-# Rediseño económico de qchain (v7 — en DISEÑO, todavía no construido)
+# Rediseño económico de qchain (v7 — SPEC DEFINITIVA, en DISEÑO, todavía no construido)
 
-> Documento vivo. Captura el modelo económico nuevo pedido por el usuario.
-> Nada de esto está implementado aún: es la especificación que vamos a construir
-> una vez cerrados los detalles. Es un cambio de consenso/economía → génesis
-> nuevo, todos los nodos con la misma versión, DST + testnet en vivo antes de
-> darlo por bueno.
+> Documento vivo y **spec oficial** del modelo económico v7. Consolida el diseño
+> cerrado con el usuario + el complemento técnico. Nada está implementado aún: es
+> lo que se va a construir por fases, cada una con DST + testnet en vivo, y un
+> **génesis nuevo** al final. Es un cambio de consenso/economía → todos los nodos
+> con la misma versión, bump MAYOR (v7.0.0).
 
-## Decisiones ya cerradas
+---
 
-**1A — Staking = solo recompensas (no DPoS).**
-El stake de la gente NO afecta el poder de consenso de los validadores; solo da
-rendimiento. Los validadores pesan en el consenso por su propio bond. (Es lo que
-ya hay: el peso BFT está desacoplado del staking, y el pool de recompensas es
-global.)
+## 0. El modelo en una frase
 
-**2A — Pago por época vía acumulador auto-compuesto (O(1)).**
-La recompensa se acredita/compone al final de cada época sin recorrer todas las
-cuentas (reward-per-share tipo Synthetix/MasterChef, ya implementado). Misma
-experiencia que Solana (aparece cada época), pero escala a millones de stakers.
+QChain v7 separa por completo las dos actividades económicas:
 
-**3A — Génesis nuevo + coordinado.**
-Es un cambio económico/consenso determinista. Se construye, se prueba con DST +
-un testnet en vivo, y la red arranca de cero con las reglas nuevas. Bump MAYOR
-(v7.0.0).
+- **Staker** — no corre nodo; deposita QCH en un pool global; recibe **hasta 12%
+  APY de protocolo** por emisión, **compuesto** vía un índice global; no elige
+  validador, no paga comisión, no comparte su recompensa.
+- **Validador** — deposita **exactamente 500 QCH** como bono (colateral, NO gana
+  rendimiento), corre consenso, y cobra **una parte igual de la mitad no quemada
+  de los fees**; puede perder el bono completo por equivocación BFT demostrable.
+- **Protocolo** — quema ≥50% de cada fee, manda el resto al pool de validadores,
+  acuña SOLO las recompensas de los stakers, y cierra la economía cada **cuanto**
+  de forma determinista e idempotente, conservando invariantes verificables.
 
-**Génesis: Política A (reinicio total) — CERRADO.**
-La red v7 arranca **de cero**: NO se migran saldos, posiciones ni validadores de
-v6. Elegido porque la v6 actual es un testnet (el QCH no tiene valor de mercado;
-los saldos son de prueba), así que migrar no aporta y sí agrega riesgo. Un
-snapshot/migración (Política B) recién tendría sentido en un futuro mainnet con
-usuarios y fondos reales.
-- **Asignación de génesis: 10.000.000 QCH a la dirección FUNDADORA (solo en el
-  génesis).** Es el único saldo inicial de la cadena; desde ahí el fundador
-  distribuye (transferencias, faucet). El suministro luego crece por la emisión
-  de staking (≤12% APY de lo stakeado por stakers comunes).
-- **Los nodos/validadores que se sumen después NO llevan saldo** — arrancan en 0
-  (traen su clave sin fondos, como hoy). Para ser validador necesitan conseguir
-  los 500 QCH del bono (por transferencia/faucet) antes de registrarse.
-- Requiere igual: `chain_id` nuevo, hash de génesis nuevo, dominio de firma
-  nuevo, protección anti-replay v6↔v7, versión mínima obligatoria, rechazo de
-  peers con génesis distinto, y corte documentado.
+---
 
-## El modelo unificado
+## 1. Decisiones cerradas
 
-### Validadores (nodos)
-- **Nombre (moniker) on-chain**: al registrarse, el validador da un nombre que
-  queda en el registro on-chain (hoy `RegisteredValidator` no tiene nombre →
-  campo nuevo). El instalador/`become-validator` lo pide.
-- **Bono de entrada = 500 QCH EXACTOS (D6 B)** — un COLATERAL bloqueado, **NO es
-  stake y NO gana recompensas**. Solo queda trabado como garantía (anti-Sybil +
-  para poder slashearlo si el validador equivoca). Congelado mientras valida,
-  recuperable al salir tras el unbonding. Sin esos 500 QCH depositados no se
-  puede registrar el validador.
-  - A nivel de cuentas: se distingue **bono** (colateral del validador, no gana)
-    de **delegación** (staking normal, gana 12%). El registro crea un bono; un
-    validador que además quiera rendir stakea aparte como cualquier staker.
-  - `MIN_VALIDATOR_STAKE` (el umbral de registro) pasa a 500 QCH; el bono es
-    fijo en 500 exactos.
-- **Ingreso de los validadores = fees, EN PARTES IGUALES.**
-  De cada fee: 50% se quema, 50% va a los validadores, dividido **1/N entre
-  todos los validadores activos de la época**, pagado por época. (Hoy se lo
-  queda el proponente del bloque → cambia a reparto parejo por época.)
-  - Se elimina `staking_commission_bps` (los validadores ya no cobran comisión
-    del staking; cobran por fees).
+- **1A — Staking = solo recompensas (no DPoS).** El stake de la gente no afecta el
+  poder de consenso; solo da rendimiento. Los validadores pesan por su bono.
+- **2A — Pago por cuanto vía índice global O(1).** El valor de cada posición sube
+  solo al avanzar el índice; no se recorren las cuentas (escala a millones).
+- **3A — Génesis nuevo + coordinado.** Bump MAYOR (v7.0.0).
+- **Génesis: Política A (reinicio total).** No se migra nada de v6 (es un testnet;
+  el QCH no tiene valor de mercado). **10.000.000 QCH al génesis, solo a la
+  dirección FUNDADORA** — único saldo inicial; desde ahí distribuye el fundador.
+  Los nodos que se sumen después arrancan en **0**. Ver §9.
+- **Economía fee-only del validador: ACEPTADA conscientemente.** El validador gana
+  SOLO fees; con poca actividad de red el ingreso puede ser ~0 y los 500 QCH no
+  rinden. Es consecuencia elegida del modelo; la wallet NO promete rentabilidad
+  fija (muestra estimación por fees reales). Ver §16.
+- **Nombre del período = `cuanto`** (paquete discreto de tiempo; on-brand
+  post-cuántico, no suena a Solana). ≈ 1 día en producción, corto en pruebas.
 
-### Staking (para toda la gente, incluidos los validadores con su bond)
-- **Sin elegir validador.** Un solo pool global; el rendimiento es proporcional
-  al stake, sin favoritismo. Se quita el selector de la wallet (se deja el
-  historial de recompensas).
-- **Recompensa = emisión, tope 12% anual** de lo stakeado, distribuida
-  automáticamente cada época (acumulador, 2A).
-- **Cómo se garantiza el ≤12% exacto:** la emisión por época = 12% anual del
-  total stakeado, y va **100% a los stakers** (sin comisión que la recorte). Los
-  fees NO alimentan el pool de staking (van a los validadores). Así el
-  rendimiento del staker es 12% por construcción, ni un punto más.
+---
 
-### Quién gana qué, por **CUANTO** (el período de recompensas)
-| Rol | Ingreso | Fuente |
-|---|---|---|
-| Staker común (no validador) | ≤ 12%/año sobre su stake, **compuesto** (D4 A) | Emisión (acuñación) |
-| Validador | **1/N de los fees** (partes iguales), y NADA MÁS | Fees |
+## 2. Staking — representación O(1) por shares + índice
 
-**Roles separados, sin doble-dipping (D13):** un validador **NO puede stakear** —
-gana SOLO por las comisiones/fees. Su bono de 500 QCH es colateral puro (no gana).
-Un staker común no corre nodo; solo pone QCH y cobra el 12%. Regla on-chain: una
-dirección registrada como validador no puede abrir una posición de staking (y
-para registrarse como validador no debe tener staking activo).
+Las posiciones NO se guardan como cantidades nominales de QCH, sino como **shares**.
+El índice global creciendo ES la composición de TODAS las posiciones a la vez.
 
-Nota: ni el bono del validador ni el propio validador entran al 12%. La emisión =
-12% anual del total realmente **stakeado por stakers comunes**, no de los bonos.
+**Estado global mínimo:** `total_staking_shares`, `staking_index`,
+`staking_reward_reserve`, `current_quanto`, `last_settled_quanto`.
 
-### Detalles cerrados en esta ronda
-- **D4 A** — la recompensa de staking se **compone** al principal. Con el
-  acumulador O(1) (2A), esto es compound "perezoso": la recompensa se acumula
-  virtual cada período (visible en vivo como "pendiente") y se pliega al
-  principal cuando la posición se toca (claim/re-stake). La wallet muestra el
-  saldo creciendo cada período; no hace falta recorrer todas las cuentas.
-- **D5 A** — período ≈ 1 día en producción (configurable; corto en el testnet de
-  pruebas para ver los pagos rápido). El NOMBRE del período NO es "época" (ver
-  sección de nombre).
-- **D6 B** — bono fijo de 500 QCH, colateral, no gana (arriba).
-- **D7 C** — todo FIJO por ahora (12% APR, fee split, bono de 500): constantes en
-  código, nada gobernable todavía.
-- **D8 (confirmado)** — `become-validator` pide nombre, exige ≥500 QCH en la
-  wallet del nodo (si no, corta y explica cómo conseguirlos), y hace
-  bono(500) + register(nombre).
-- **D9** — la equivocación quema el bono completo (500).
-- **D10** — unbonding del bono ≈ 1 período al salir.
-- **D11** — cuenta singleton nueva junta la mitad-no-quemada de los fees durante
-  el período y la reparte 1/N en el borde.
-- **D12** — `ROUNDS_PER_YEAR` se recalcula según `round_interval_ms` real para
-  que el 12% sea 12% de reloj.
+**Estado por posición:** `owner`, `shares`, `created_quanto`, `last_modified_quanto`,
+`net_deposited`, `estado`.
 
-## Lo que este modelo REEMPLAZA del diseño actual
-- Selector de validador en la wallet (v5.6.0) → se quita.
-- Comisión de staking al proponente (`staking_commission_bps`) → a 0 / eliminada.
-- Fee del proponente = "se lo queda quien propone" → reparto parejo 1/N por época.
-- Claim manual de recompensas → distribución automática por época (el claim
-  puede quedar como opción, ver detalles abiertos).
+**Valor de una posición:** `position_value = shares × staking_index / INDEX_SCALE`.
 
-## Nombre del período de recompensas: **CUANTO** (cerrado)
-El período se llama **cuanto** (un "cuanto" = el paquete discreto e indivisible de
-algo; un cuanto de tiempo — máximo on-brand para una cadena post-cuántica, y no
-suena copiado de Solana). En el código reemplaza a "epoch/época" para el período
-de recompensas. Dura ≈ 1 día en producción (configurable; corto en pruebas).
+**Al cerrar un cuanto** (O(1), sin tocar posiciones):
+1. Se calcula `rate_per_quanto` (constante, ver §3).
+2. `new_index = old_index + floor(old_index × rate_per_quanto)`.
+3. `reward_minted = floor(total_shares × (new_index − old_index) / INDEX_SCALE)`.
+4. `reward_minted` se acuña en `staking_reward_reserve`.
+5. No se recorren ni modifican las posiciones.
 
-## Estado del diseño: CERRADO ✅ — listo para construir
-Todas las decisiones (1A/2A/3A, D4–D13, nombre) están tomadas. El modelo es
-coherente e internamente consistente. Próximo paso: construir por fases con DST +
-verificación en vivo, y un génesis nuevo.
+Cuando un usuario retira, los QCH salen de `staking_reward_reserve`.
 
-### Fases de construcción (borrador)
-1. **Ejecución/economía** (`qchain-execution`): bono de 500 vs delegación,
-   `MIN_VALIDATOR_STAKE`=500 QCH, validador no puede stakear, emisión = 12% del
-   stakeado sin bonos, quitar `staking_commission_bps`, pool de fees por-cuanto
-   + reparto 1/N, distribución por-cuanto (acumulador, compound perezoso).
-   Tests + DST.
-2. **Nodo** (`qchain-node`): borde de cuanto (correr aunque rotación off),
-   nombre on-chain en el registro, reparto de fees en el borde, `ROUNDS_PER_YEAR`
-   consistente. Verificación en vivo (testnet nuevo).
-3. **CLI + `become-validator`**: pedir nombre, exigir ≥500 QCH, bono + register;
-   quitar `--validator` del staking (pool global).
-4. **Wallet + explorador**: quitar el selector de validador, mostrar el 12%
-   compuesto por cuanto, historial; panel del validador con su 1/N de fees.
-5. **Génesis + docs**: génesis nuevo con las reglas nuevas, `become-validator.sh`,
-   actualizar `ARCHITECTURE.md`/`DEPLOY.md`. Bump v7.0.0.
+**Precisión:** `INDEX_SCALE` amplio (a definir en build, ver §14). Toda multiplicación
+que pueda exceder el entero nativo usa aritmética segura (u256 o staging en u128).
+**Todo redondeo va hacia abajo** → el rendimiento real es ≤ 12%, nunca más.
 
-## Detalles ya resueltos (referencia)
-- **D4 — Recompensa de staking: ¿líquida o compuesta al stake?**
-  (auto-compound al principal vs acreditada como saldo gastable cada época).
-- **D5 — Largo de la época** en tiempo real (cadencia de pago). Solana ≈ 2 días.
-- **D6 — 500 QCH: ¿bond fijo o mínimo** (un validador puede stakear más como
-  staker común y ganar 12% sobre el extra)?
-- **D7 — ¿Qué params son gobernables** (12% APR, fee split, bond de 500)?
-- **D8 — `become-validator`**: pide nombre + exige ≥500 QCH en la wallet +
-  self-stake(500) + register(nombre). El "no se crea sin 500 QCH" es un gate en
-  el flujo.
-- **D9 — Slashing**: la equivocación quema el bond completo (500). Confirmar.
-- **D10 — Unbonding del bond** al salir (hoy 2 pasos, 100 rondas). ¿Alinear a
-  época?
-- **D11 — Acumulación de fees para el reparto 1/N**: cuenta singleton nueva que
-  junta la mitad-no-quemada durante la época y se reparte en el borde.
-- **D12 — ROUNDS_PER_YEAR** consistente con el `round_interval_ms` real (el 12%
-  nominal por-ronda debe coincidir con el año de reloj).
+---
 
-## Estado de construcción
-Nada construido todavía. Próximo paso: cerrar D4–D12, luego implementar por fases
-con DST + verificación en vivo, y documentar el génesis nuevo.
+## 3. Tasa de staking — APY (no APR), ≤12% de protocolo
+
+El objetivo es que un staker **nunca reciba más del 12% efectivo anual**.
+
+- Constante: **`STAKING_TARGET_APY_BPS = 1200`** (12%). Se llama **APY**, no APR,
+  porque compone automáticamente.
+- La tasa por cuanto se calcula ANTES del lanzamiento, en aritmética de precisión
+  fija, y queda fija en el génesis/constantes de consenso:
+
+  `rate_per_quanto = (1 + 0.12)^(1 / QUANTOS_PER_YEAR) − 1`
+
+  Para 365 cuantos/año ≈ **0,0310538%** por cuanto (NO `12%/365 ≈ 0,0328767%`, que
+  daría ~12,7475% efectivo — el bug del diseño previo).
+- **12% de PROTOCOLO, no de reloj.** El APY se define sobre el calendario de
+  protocolo (`ROUND_INTERVAL_MS`, `ROUNDS_PER_QUANTO`, `QUANTOS_PER_YEAR`,
+  `YEAR_MS`). Si la red se frena o produce rondas más lento, el rendimiento por
+  reloj será **menor** al 12%, nunca mayor. Garantía honesta: *"QChain distribuye
+  como máximo 12% APY según el calendario de protocolo del génesis"*.
+- Cambiar `ROUND_INTERVAL_MS`, `ROUNDS_PER_QUANTO` o la duración del año económico
+  obliga a recalcular la tasa y **es un cambio de consenso**.
+
+---
+
+## 4. Claim y auto-compound
+
+No hay claim obligatorio: las recompensas YA son parte del valor de la posición
+(el índice). Operaciones: `stake(amount)`, `increase_stake(amount)`,
+`begin_unstake(amount)`, `withdraw_unbonded()`.
+
+"Retirar recompensas" en la wallet = un **retiro parcial** del valor acumulado, NO
+una segunda fuente de recompensa. No existe operación que duplique una recompensa
+ya incorporada al índice. La UI puede separar visualmente capital neto / recompensa
+acumulada / valor total, pero económicamente es UNA sola posición en shares.
+
+**Historial:** no se emite un registro on-chain por usuario por cuanto (mataría el
+O(1)). En cada cierre se emite un evento global **`QuantoClosed`** con: nº de cuanto,
+índice anterior/nuevo, shares totales, stake efectivo total, emisión acuñada, fees
+acumulados/quemados/a-validadores, nº de validadores elegibles, residuos de redondeo.
+La wallet/explorador **reconstruyen** el historial individual a partir de los eventos
+globales + los movimientos de shares + depósitos/retiros del usuario (derivado e
+indexado, no una transferencia diaria por cuenta).
+
+---
+
+## 5. Estados de una posición de staking
+
+`Active` → `Unbonding` → `Withdrawable` → `Closed`.
+
+- Solo el valor **Active** recibe recompensas.
+- Al iniciar unstake, esas shares dejan de recibir recompensas de inmediato y salen
+  de `total_active_stake`.
+- Hay un **período de unbonding de staking** (`STAKING_UNBONDING_QUANTOS`),
+  **independiente** del unbonding del bono del validador.
+- Una dirección de validador (registrado / en salida / en unbonding del bono) NO
+  puede abrir staking. Solo puede volverse staker tras retirar el bono por completo
+  y salir del registro.
+
+---
+
+## 6. Bono del validador
+
+Constante: **`VALIDATOR_BOND = 500 QCH` EXACTOS** (ni 499,999999 ni 500,000001).
+
+El bono: se bloquea en un escrow de protocolo; **no** se convierte en shares, **no**
+participa en staking, **no** recibe emisión ni rendimiento; puede quemarse por
+slashing; se recupera tras una salida válida + su unbonding. Una dirección puede
+tener exactamente un bono activo.
+
+**Poder de consenso:** como todos los bonos valen lo mismo, cada validador activo =
+una unidad de poder. No se compra más poder depositando más de 500. Un actor con más
+capital puede registrar **varios** validadores (500 c/u) → el bono es una **barrera
+económica lineal contra Sybil, no una eliminación absoluta** (documentarlo así).
+
+**Anti-doble-dipping — alcance honesto:** la regla on-chain garantiza que *una
+dirección registrada como validador no puede tener staking activo* (y viceversa: hay
+que cerrar el staking antes de registrarse). NO puede impedir que un mismo actor use
+**dos direcciones distintas** (una para el bono, otra para stakear) — eso requeriría
+identidad/KYC, que rompería el carácter permissionless. La doc dice "por dirección
+registrada", nunca "por persona".
+
+---
+
+## 7. Registro y moniker on-chain
+
+El registro del validador contiene, como mínimo: dirección operadora, clave de
+consenso, moniker, ronda/cuanto de activación, estado, bono bloqueado, cuanto de
+solicitud de salida, cuanto de liberación, info de slashing, contadores de
+participación.
+
+**Reglas del moniker** (deterministas entre implementaciones): 3–32 chars;
+`[a-z0-9_-]`; comparación case-insensitive; sin espacios al borde; **único mientras
+el registro esté activo**; palabras reservadas bloqueadas; inmutable mientras el
+validador esté registrado. (Un nombre visual Unicode puede guardarse aparte como
+campo informativo; el identificador de consenso queda normalizado y simple.) El
+moniker no prueba identidad legal ni propiedad del nodo.
+
+---
+
+## 8. Flujo `become-validator` (con crash-safety)
+
+1. Pedir el moniker; validar formato localmente.
+2. Consultar saldo confirmado de la wallet del nodo.
+3. Comprobar que la dirección **no** tenga staking activo.
+4. Comprobar que no haya bono/registro anterior sin cerrar.
+5. Exigir ≥ 500 QCH **más** los fees de las transacciones (no mandar el saldo
+   completo como bono — reservar para pagar tx).
+6. `bond_validator(500 QCH)` → esperar confirmación/finalidad.
+7. `register_validator(moniker, consensus_key)` → verificar on-chain que quedó.
+8. Mostrar el cuanto en que el validador será elegible.
+
+**Falla a mitad** (bono depositado pero registro no): debe existir una operación
+segura para **completar el registro** o **recuperar el bono tras expiración**. El
+bono nunca queda bloqueado indefinidamente por una instalación interrumpida.
+
+---
+
+## 9. Ciclo de vida del validador
+
+`BondedPending` → `Active` → (`Jailed`) → `Exiting` → `Unbonding` → `Withdrawable`
+→ (`Slashed`) → `Removed`.
+
+- **Activación:** un validador registrado durante un cuanto entra al conjunto activo
+  al **inicio del cuanto siguiente** (no se registra 5s antes del cierre y cobra
+  igual que los que trabajaron todo el período).
+- **Salida:** solicitud en el cuanto Q → permanece hasta el cierre, sale del conjunto
+  en el borde siguiente, arranca el unbonding del bono, se libera tras un cuanto
+  completo **si no hay evidencia de slashing pendiente**. No puede stakear en
+  `Exiting` ni `Unbonding`.
+- **Reingreso:** tras retirar el bono puede quedar como cuenta común, abrir staking, o
+  re-registrarse con un bono nuevo. Un validador slasheado deposita un bono completo
+  nuevo para volver (con posible período de espera).
+
+---
+
+## 10. Slashing — definición precisa
+
+**Quema del bono completo (500) SOLO ante evidencia criptográfica determinista** de
+falta grave: firmar dos bloques incompatibles para la misma altura/ronda; votos
+contradictorios para la misma etapa de consenso; firmar estados incompatibles; o
+evidencia deliberadamente falsa probable on-chain.
+
+**NUNCA se quema el bono por** desconexión temporal, latencia, reinicio, pérdida
+momentánea de conectividad, no proponer un bloque, o unas pocas rondas sin firmar.
+Esas faltas de **disponibilidad** producen: pérdida del derecho a fees del cuanto,
+**jailing** temporal, y posible expulsión por reincidencia. (Así una falla de VPS no
+destruye los 500 QCH.)
+
+**Evidencia durante el unbonding:** una salida no borra la responsabilidad por faltas
+cometidas mientras estaba activo. El bono solo se libera cuando terminó el unbonding,
+venció la **ventana de evidencia** (`SLASH_EVIDENCE_WINDOW_QUANTOS`), y no hay
+evidencia pendiente. La ventana de evidencia ≤ el tiempo que el bono sigue slashable.
+
+---
+
+## 11. Fees — split, elegibilidad y reparto
+
+**Split por fee** (en la unidad atómica mínima): `burn = ceil(fee/2)`,
+`validator = floor(fee/2)` → la proporción quemada nunca baja del 50%. Invariante:
+`fee = burned + validator_pool`.
+
+**Elegibilidad para cobrar el cuanto:** no basta estar registrado. El validador debe
+haber estado activo el período requerido, no estar jailed, no haber sido slasheado,
+cumplir `VALIDATOR_MIN_PARTICIPATION_BPS` (p.ej. 9000 = 90%), y no haber entrado
+después del snapshot del cuanto. Los que no llegan al mínimo no cobran ese cuanto
+(un nodo caído no cobra igual que uno disponible).
+
+**Snapshot del conjunto:** nuevos entran desde el cuanto siguiente; salidas se aplican
+en el borde siguiente; un slasheado pierde la recompensa del cuanto en curso; un
+jailed puede perderla; no se entra justo antes del cierre para cobrar retroactivo.
+
+**Reparto 1/N en el cierre:** `validator_reward = floor(fee_pool / eligible_count)`;
+cada validador elegible recibe lo mismo. El **residuo**
+(`fee_pool − reward × eligible_count`) **queda en el pool** para el próximo cuanto
+(no se quema, no va al proponente, no se pierde). **Si no hay validadores elegibles:**
+los fondos quedan en el pool, sin división ni quema extra, para el próximo cuanto con
+elegibles.
+
+**Alternativa escalable (recomendada):** un `validator_fee_index` (como el de
+staking) donde cada validador activo acumula virtualmente lo mismo y liquida al
+consultar/salir/cambiar de estado — evita el pago O(N) directo. (El protocolo igual
+puede necesitar recorrer el conjunto para calcular participación/jailing/elegibilidad.)
+
+---
+
+## 12. Separación estricta de pools
+
+Cuentas/módulos separados, **sin subsidio cruzado**:
+1. `validator_bond_escrow`
+2. `staking_reward_reserve`
+3. `validator_fee_pool`
+4. `staking_unbonding_pool`
+5. `validator_unbonding_pool`
+6. contador de burn
+
+Prohibido: pagar staking con fees; pagar validadores con emisión de staking; usar
+bonos para recompensas; usar recompensas no reclamadas para otro fin; contar bonos
+como stake circulante; incluir bonos en el cálculo del 12%. La emisión de cada cuanto
+se calcula **solo** sobre el valor efectivo de las posiciones **Active** de stakers
+comunes.
+
+---
+
+## 13. Invariantes económicas obligatorias (todo bloque)
+
+- **Oferta:** `Δoferta = emisión_staking − fees_quemados − bonos_slasheados`. Las
+  transferencias entre pools NO cambian la oferta.
+- **Staking:** `total_active_stake = total_shares × staking_index / INDEX_SCALE`.
+  Los bonos no forman parte de `total_active_stake`. Las posiciones en unbonding no
+  reciben emisión.
+- **Validadores:** Σ bonos del registro == saldo del `validator_bond_escrow`. Cada
+  validador activo == exactamente 500 QCH. Una dirección de validador no tiene shares.
+- **Fees:** `fees_totales = quemados + al_pool`; tras el cierre,
+  `pool_anterior + fees_nuevos = distribuidos + residuo_nuevo`.
+- **Redondeo:** ninguna operación de redondeo crea QCH; los residuos quedan en un
+  pool identificable o se queman por una regla explícita.
+
+---
+
+## 14. Terminología: `cuanto` ≠ `consensus_epoch`
+
+**No** reemplazar a ciegas todos los "epoch". El motor BFT puede seguir usando una
+época técnica interna (rotación del conjunto validador — fase 3.3, cambios de clave,
+checkpoints, sync, params de consenso). Se distinguen:
+- `consensus_epoch` — la época técnica del consenso (ya existe: `EPOCH_ROUNDS`).
+- `reward_quanto` — el período económico de recompensas.
+
+Aunque en v7 coincidan temporalmente, se mantienen **conceptualmente separados** para
+no acoplar consenso y economía. Nombres: `QUANTO_ROUNDS`, `CURRENT_QUANTO`,
+`QUANTO_START_ROUND`, `QUANTO_END_ROUND`, `QuantoClosed`, `quanto_reward_rate`,
+`validator_fee_pool_by_quanto`.
+
+---
+
+## 15. Génesis (Política A — reinicio total)
+
+La red arranca de cero: NO se migran saldos, posiciones ni validadores de v6.
+- **10.000.000 QCH al génesis, solo a la dirección fundadora** (único saldo inicial).
+  El suministro crece luego por emisión de staking (≤12% APY).
+- Nodos que se suman después arrancan en **0**; para ser validador consiguen los 500
+  del bono aparte.
+- Requiere: `chain_id` nuevo, hash de génesis nuevo, dominio de firma nuevo,
+  protección anti-replay v6↔v7, versión mínima obligatoria, rechazo de peers con
+  génesis distinto, archivo público de asignaciones, procedimiento de verificación
+  independiente, y altura/fecha de corte documentadas.
+
+---
+
+## 16. Riesgo económico del validador (aceptado)
+
+Con el modelo, `ingreso_validadores = fees_totales × 50%`, e
+`ingreso_por_validador = fees_totales × 50% / N`. Poca actividad → ingreso ~0. Más
+validadores sin más uso → menos ingreso por cabeza. El bono de 500: no cubre el VPS,
+no da flujo de caja, no garantiza rentabilidad — es solo colateral en riesgo.
+
+Antes del lanzamiento se **simulan** escenarios (TPS bajo/medio/alto × fee
+mínimo/promedio × 10/50/100/500/1000 validadores × costo de VPS → ingreso
+diario/mensual/anual por validador). La wallet/explorador **no prometen** rentabilidad
+fija: muestran estimación por fees reales de los últimos cuantos.
+
+---
+
+## 17. Parámetros de consenso (fijos en v7)
+
+Fijos, solo cambian por actualización coordinada, **visibles en el génesis y parte del
+hash de configuración de la red**:
+`VALIDATOR_BOND_ATOMS`, `MIN_VALIDATOR_STAKE_ATOMS`, `STAKING_TARGET_APY_BPS`,
+`FEE_BURN_BPS`, `VALIDATOR_FEE_BPS`, `ROUNDS_PER_QUANTO`, `ROUND_INTERVAL_MS`,
+`QUANTOS_PER_YEAR`, `STAKING_UNBONDING_QUANTOS`, `VALIDATOR_BOND_UNBONDING_QUANTOS`,
+`SLASH_EVIDENCE_WINDOW_QUANTOS`, `VALIDATOR_MIN_PARTICIPATION_BPS`, `INDEX_SCALE`,
+`MAX_MONIKER_LENGTH`, `MIN_MONIKER_LENGTH`.
+
+Modificarlos requiere: bump de versión, nueva config consensuada, actualización de
+todos los nodos, y — si rompe reglas incompatibles — hard fork o génesis nuevo.
+
+---
+
+## 18. Casos límite a especificar (obligatorio)
+
+Definir explícitamente: total stakeado = 0; sin validadores elegibles; un solo
+validador; validador que entra/solicita salida en el último bloque del cuanto;
+slashing durante el borde; cierre de cuanto coincidiendo con cambio de conjunto;
+rondas omitidas; recuperación de un bono cuyo registro falló; **cierre idempotente**
+(procesar dos veces el mismo cuanto NO re-emite ni re-distribuye); recuperación tras
+reiniciar exactamente en el borde; evitar doble-emisión; acumuladores tras años de
+operación; evitar overflow; distribución de residuos; reconstrucción del historial
+tras sync desde cero.
+
+---
+
+## 19. DST y pruebas obligatorias
+
+**Propiedades:** la oferta nunca cambia sin causa identificable; ningún staker supera
+el APY máximo; el bono nunca recibe recompensa; validador registrado nunca tiene
+staking activo (y viceversa); los fees siempre se parten en burn+pool; todos los
+elegibles reciben lo mismo; los residuos nunca desaparecen; **el acumulador da el
+mismo resultado que una simulación cuenta-por-cuenta**; tocar o no una posición da el
+mismo valor; reiniciar nodos no cambia el resultado; el orden de lectura de cuentas
+no cambia el state root.
+
+**Simulación diferencial:** un modelo lento de referencia O(N) que recorre todas las
+cuentas vs la implementación O(1). Tras cada cuanto deben coincidir: oferta, valor por
+posición, pool, bonos, fees, y **state root económico**.
+
+**Estrés:** millones de posiciones; depósitos/retiros en el borde; muchos años
+simulados; participación variable; validadores entrando/saliendo; slashing simultáneo;
+todos offline; pool < N; fees impares; valores máximos; particiones y recuperación;
+cambio de líder en el cierre.
+
+---
+
+## 20. Fases de construcción
+
+1. **Ejecución/economía** (`qchain-execution`): shares + índice de staking, tasa APY
+   por cuanto, 6 pools separados, bono 500 exacto (colateral, no gana), reglas
+   validador↔staker, split de fee ceil/floor + elegibilidad + reparto 1/N (o fee
+   index), emisión = 12% del stake efectivo sin bonos, invariantes. Tests + DST
+   diferencial.
+2. **Nodo** (`qchain-node`): borde de cuanto (idempotente, corre aunque rotación off),
+   `reward_quanto` separado de `consensus_epoch`, moniker en el registro, cierre
+   económico, `QuantoClosed`, `ROUNDS_PER_QUANTO`/`QUANTOS_PER_YEAR` consistentes.
+   Verificación en vivo.
+3. **CLI + `become-validator`**: flujo con crash-safety (§8), quitar `--validator` del
+   staking (pool global).
+4. **Wallet + explorador**: quitar selector de validador; mostrar valor de posición
+   creciendo por el índice (≤12% compuesto); reconstruir historial desde `QuantoClosed`;
+   panel del validador con su 1/N de fees (estimación por fees reales, sin prometer).
+5. **Génesis + docs**: génesis nuevo (Política A, 10M al fundador), `become-validator.sh`,
+   `ARCHITECTURE.md`/`DEPLOY.md`. Bump v7.0.0.
+
+---
+
+## 21. Detalles técnicos a fijar durante el build (no bloquean el diseño)
+
+1. **`INDEX_SCALE` / aritmética.** El complemento sugiere 10²⁷ + 256-bit. Rust tiene
+   `u128` nativo pero no `u256`. **Medir primero** la precisión necesaria y usar el
+   scale más chico que deje el error de redondeo despreciable manteniendo los productos
+   en `u128` con staging; recurrir a u256 (dependencia o mul/div propio) solo donde un
+   producto genuinamente desborde. Decisión en fase 1.
+2. **`VALIDATOR_MIN_PARTICIPATION_BPS` — métrica exacta.** Definir de forma
+   determinista y anti-Bizantina qué cuenta como "participación" (¿certificados de sus
+   vértices incluidos? ¿rondas propuestas?) y que no sea gameable. Decisión en fase 1/2.
+3. **Valores exactos de las constantes de §17** (números finales), fijados antes del
+   génesis y plegados en el hash de config.
+
+---
+
+## Estado del diseño
+
+**D4–D13 y la nomenclatura de `cuanto` están CERRADOS.** Génesis (Política A + 10M) y
+la economía fee-only del validador, aceptados. Permanecen por formalizar, ya en el
+build: los parámetros técnicos exactos (§21), las reglas exactas de elegibilidad/
+participación, y los casos límite de implementación (§18). Próximo paso: construir por
+fases (§20) con DST + verificación en vivo, y el génesis nuevo.
