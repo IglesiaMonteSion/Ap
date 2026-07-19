@@ -75,7 +75,12 @@ fn main() -> anyhow::Result<()> {
             let s = seed(&args[2])?;
             print!("{}", qchain_wasm::sign_v7_withdraw_unbonded_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
         }
-        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw ..."),
+        Some("treasury-release") => {
+            // treasury-release <seed> <to> <amount> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_v7_treasury_release_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+        }
+        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw|treasury-release ..."),
     }
     Ok(())
 }
