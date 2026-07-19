@@ -49,11 +49,6 @@ const STAKING_REWARDS_POOL_ID: [u8; 32] = [6u8; 32];
 const STAKING_RESERVE_ID: [u8; 32] = [11u8; 32];
 const STAKING_UNBONDING_POOL_ID: [u8; 32] = [13u8; 32];
 const STAKING_GLOBAL_ID: [u8; 32] = [15u8; 32];
-// v7 treasury (economics_v7). TREASURY_V7_PROGRAM_ID owns TREASURY_ACCOUNT_ID
-// (the locked genesis supply); a `Release` signed by the treasury AUTHORITY moves
-// funds out. Replicated from qchain-execution::ids for the wasm target.
-const TREASURY_V7_PROGRAM_ID: [u8; 32] = [17u8; 32];
-const TREASURY_ACCOUNT_ID: [u8; 32] = [18u8; 32];
 
 /// `StakingInstruction` Borsh encodings (variant order in
 /// `qchain-execution::staking`: Delegate=0, Undelegate=1, ClaimReward=2),
@@ -265,24 +260,6 @@ pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u6
         data: vec![3u8],
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
-    Ok(serde_json::to_string(&tx)?)
-}
-
-/// v7 treasury `Release` (`[0]` ++ amount 8 LE): unlock+send `amount` atoms from
-/// the genesis-locked treasury to `to`, signed by the treasury AUTHORITY (the key
-/// this `seed` derives). accounts = [authority, TREASURY_ACCOUNT, destination].
-/// The authority must be the one recorded in the treasury state (rotate it there
-/// with `treasury-set-authority` first). Encoding guarded by
-/// `treasury_instruction_encoding_is_stable` in qchain-execution.
-pub fn sign_v7_treasury_release_json(seed: &[u8; 32], to: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
-    let authority = Keypair::generate_from_seed(seed)?;
-    let dest: Pubkey = to.trim().parse().map_err(|e| anyhow::anyhow!("destination address invalid: {e}"))?;
-    let ix = Instruction {
-        program_id: Pubkey::new(TREASURY_V7_PROGRAM_ID),
-        accounts: vec![authority.pubkey(), Pubkey::new(TREASURY_ACCOUNT_ID), dest],
-        data: v7_amount_instruction_data(0, amount),
-    };
-    let tx = Transaction::new_signed(&authority, nonce, *chain_id, fee_limit, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -555,14 +532,6 @@ mod wasm {
     #[wasm_bindgen(js_name = signV7WithdrawUnbonded)]
     pub fn sign_v7_withdraw_unbonded(seed: &[u8], position: &str, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
         super::sign_v7_withdraw_unbonded_json(&as32(seed, "seed")?, position, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-
-    /// `signV7TreasuryRelease(seed, to, amount, nonce, chainId, feeLimit) -> string`
-    /// Signs a treasury Release with the authority key this seed derives. The seed
-    /// (the treasury authority) never leaves the browser.
-    #[wasm_bindgen(js_name = signV7TreasuryRelease)]
-    pub fn sign_v7_treasury_release(seed: &[u8], to: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
-        super::sign_v7_treasury_release_json(&as32(seed, "seed")?, to, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signVote(seed, proposal, stakeAccount, choice, nonce, chainId, feeLimit) -> string`

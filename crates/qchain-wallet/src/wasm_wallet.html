@@ -971,14 +971,6 @@
       </div>
     </div>
 
-    <div class="section-title" id="treasury-section-title" style="display:none">Tesorería</div>
-    <div class="card" id="treasury-card" style="display:none">
-      <div class="row-item nav" data-to="treasury" style="cursor:pointer">
-        <div><div style="font-weight:600">🏦 Liberar tesorería</div><div class="hint" style="margin:0">Desbloqueá y enviá fondos de la tesorería (autoridad)</div></div>
-        <span style="color:var(--brand2);font-size:20px">›</span>
-      </div>
-    </div>
-
     <div class="section-title">Respaldo</div>
     <div class="card accent">
       <div style="font-weight:700">Respaldo de recuperación</div>
@@ -1083,52 +1075,6 @@
     </div>
   </section>
 
-  <section class="view" id="v-treasury">
-    <button class="backlink nav" data-to="settings">← volver</button>
-    <h2 class="view-title">Liberar tesorería</h2>
-
-    <!-- Paso de configuración (una vez): definir la clave de autoridad -->
-    <div id="tr-setup">
-      <div class="card accent">
-        <div style="font-weight:700">Configurar la autoridad de tesorería</div>
-        <p class="hint" style="margin:6px 0 12px">La tesorería (los QCH bloqueados en el génesis) se libera con una <b>clave de autoridad</b> que sólo vos controlás. La ciframos con una <b>2da contraseña</b> y se guarda cifrada en este navegador — nunca en el servidor.</p>
-        <label class="hint">2da contraseña (para liberar)</label>
-        <input id="tr-pw1" type="password" placeholder="contraseña de tesorería" autocomplete="new-password">
-        <input id="tr-pw2" type="password" placeholder="repetí la contraseña" autocomplete="new-password" style="margin-top:8px">
-        <button class="btn-block btn-glow" id="tr-create" style="margin-top:12px">Generar clave de autoridad</button>
-        <div class="hint" style="margin-top:10px">¿Ya tenés una semilla de tesorería? <a href="#" id="tr-import-link">importarla</a>.</div>
-        <div id="tr-import-box" style="display:none;margin-top:10px">
-          <input id="tr-import-seed" placeholder="semilla de tesorería (64 hex)" autocomplete="off">
-          <button class="btn-block btn-sec" id="tr-import" style="margin-top:8px">Importar y cifrar</button>
-        </div>
-        <div class="msg" id="tr-setup-msg"></div>
-      </div>
-    </div>
-
-    <!-- Tras configurar: la dirección de autoridad + el botón Liberar -->
-    <div id="tr-ready" style="display:none">
-      <div class="card">
-        <div class="hint" style="margin:0">Dirección de autoridad (esta debe ser la autoridad on-chain de la tesorería)</div>
-        <div class="row-item" style="margin-top:6px"><span id="tr-authaddr" style="font-family:monospace;font-size:12px;word-break:break-all">—</span><button class="chip" id="tr-copyauth">⧉</button></div>
-        <div class="hint" id="tr-rotatehint" style="margin-top:10px">Si es la primera vez, rotá la autoridad on-chain a esta dirección (una vez, desde el server) — te lo explica el detalle de abajo.</div>
-        <button class="btn-block btn-outline" id="tr-showrotate" style="margin-top:8px">Ver cómo rotar la autoridad (1ra vez)</button>
-        <pre id="tr-rotatecmd" style="display:none;white-space:pre-wrap;word-break:break-all;background:rgba(0,0,0,.25);padding:10px;border-radius:8px;font-size:11px;margin-top:8px"></pre>
-      </div>
-
-      <div class="card accent">
-        <div style="font-weight:700">🏦 Liberar y enviar</div>
-        <p class="hint" style="margin:6px 0 12px">Desbloqueá una parte de la tesorería y enviala a una dirección. Te pide tu 2da contraseña para firmar (la clave nunca sale de este navegador).</p>
-        <label class="hint">Destino</label>
-        <input id="tr-to" placeholder="dirección destino" autocomplete="off">
-        <label class="hint" style="margin-top:8px">Monto (QCH)</label>
-        <input id="tr-amount" type="text" inputmode="decimal" placeholder="0" autocomplete="off">
-        <button class="btn-block btn-glow" id="tr-release" style="margin-top:12px">Liberar</button>
-        <button class="btn-block btn-outline" id="tr-forget" style="margin-top:10px">Olvidar esta autoridad en este dispositivo</button>
-        <div class="msg" id="tr-msg"></div>
-      </div>
-    </div>
-  </section>
-
   <!-- ===== Barra de navegación inferior ===== -->
   <nav class="tabbar" id="tabbar" style="display:none">
     <button class="tab" data-tab="home" data-to="home"><svg viewBox="0 0 24 24"><path d="M3 10.5L12 3l9 7.5M5 9.5V21h14V9.5"/></svg>Inicio</button>
@@ -1172,7 +1118,7 @@
 </div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded, signV7TreasuryRelease } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -1472,8 +1418,7 @@ function showView(name){
   if(name==="send") renderSend();
   if(name==="contacts") renderContacts();
   if(name==="staking") renderStaking();
-  if(name==="settings"){ renderSettings(); refreshTreasuryCard(); }
-  if(name==="treasury") renderTreasury();
+  if(name==="settings") renderSettings();
   if(name==="activity-all") renderActivityFull();
   if(name==="buy") renderBuy();
   if(name==="unlock") refreshBioUnlockBtn();
@@ -2710,94 +2655,6 @@ $("gov-execute").onclick=async()=>{
     msg.className="msg ok"; msg.textContent="✓ Ejecución enviada — si la propuesta pasó, el cambio se aplica";
     setTimeout(govLoad, 1600);
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
-};
-
-// ===== Tesorería v7: liberar los fondos bloqueados firmando con la clave de
-// AUTORIDAD en el NAVEGADOR (nunca en el server). La semilla de autoridad se
-// guarda cifrada con una 2da contraseña en localStorage (junto a su dirección
-// pública). El botón Liberar: descifra la semilla con la contraseña, firma el
-// Release localmente y lo relaya. La semilla en claro sólo vive en memoria un
-// instante (se limpia con .fill(0)). =====
-const TREASURY_KEY="qchain_treasury_v1";
-function hasTreasury(){ return !!localStorage.getItem(TREASURY_KEY); }
-async function refreshTreasuryCard(){
-  let v7=false; try{ const st=await api("/api/node"); v7=st&&st.economics_v7===true; }catch(e){}
-  const t=$("treasury-section-title"), c=$("treasury-card");
-  if(t) t.style.display=v7?"":"none"; if(c) c.style.display=v7?"":"none";
-}
-function renderTreasury(){
-  const setup=$("tr-setup"), ready=$("tr-ready");
-  if(hasTreasury()){
-    setup.style.display="none"; ready.style.display="";
-    let addr="—"; try{ addr=JSON.parse(localStorage.getItem(TREASURY_KEY)).addr||"—"; }catch(e){}
-    $("tr-authaddr").textContent=addr;
-    $("tr-to").value=""; $("tr-amount").value=""; $("tr-msg").textContent=""; $("tr-msg").className="msg";
-    $("tr-rotatecmd").style.display="none";
-  } else {
-    setup.style.display=""; ready.style.display="none";
-    $("tr-pw1").value=""; $("tr-pw2").value=""; $("tr-setup-msg").textContent=""; $("tr-import-box").style.display="none";
-  }
-}
-async function treasuryStore(seedBytes, password){
-  const store=await encryptSeed(seedBytes, password);
-  store.addr=await addressFromSeed(seedBytes);   // dirección de autoridad (pública, no secreta)
-  localStorage.setItem(TREASURY_KEY, JSON.stringify(store));
-  return store.addr;
-}
-if($("tr-import-link")) $("tr-import-link").onclick=(e)=>{ e.preventDefault(); const b=$("tr-import-box"); b.style.display=b.style.display==="none"?"":"none"; };
-if($("tr-create")) $("tr-create").onclick=async()=>{
-  const m=$("tr-setup-msg"); m.className="msg";
-  const p1=$("tr-pw1").value, p2=$("tr-pw2").value;
-  if(p1.length<6){ m.className="msg err"; m.textContent="la contraseña debe tener al menos 6 caracteres"; return; }
-  if(p1!==p2){ m.className="msg err"; m.textContent="las contraseñas no coinciden"; return; }
-  const seed=crypto.getRandomValues(new Uint8Array(32));
-  await treasuryStore(seed, p1); seed.fill(0);
-  toast("autoridad de tesorería creada"); renderTreasury();
-};
-if($("tr-import")) $("tr-import").onclick=async()=>{
-  const m=$("tr-setup-msg"); m.className="msg";
-  const p1=$("tr-pw1").value, p2=$("tr-pw2").value;
-  if(p1.length<6 || p1!==p2){ m.className="msg err"; m.textContent="definí y repetí una contraseña (mín 6)"; return; }
-  const hex=($("tr-import-seed").value||"").trim();
-  if(!/^[0-9a-fA-F]{64}$/.test(hex)){ m.className="msg err"; m.textContent="la semilla debe ser 64 caracteres hex"; return; }
-  const seed=fromHex(hex); await treasuryStore(seed, p1); seed.fill(0);
-  toast("autoridad importada"); renderTreasury();
-};
-if($("tr-copyauth")) $("tr-copyauth").onclick=()=>{ copy($("tr-authaddr").textContent); };
-if($("tr-showrotate")) $("tr-showrotate").onclick=()=>{
-  const addr=$("tr-authaddr").textContent, pre=$("tr-rotatecmd");
-  pre.style.display=pre.style.display==="none"?"":"none";
-  pre.textContent="# En el server, UNA sola vez, con tu clave de autoridad ACTUAL:\n"+
-    "docker run --rm --network host -v /root/qchain-treasury:/keys qchain:latest \\\n"+
-    "  qchain treasury-set-authority --rpc http://127.0.0.1:8080 \\\n"+
-    "  --keypair /keys/treasury-authority.json --new-authority "+addr;
-};
-if($("tr-forget")) $("tr-forget").onclick=()=>{
-  if(!confirm("¿Olvidar la autoridad de tesorería en ESTE dispositivo? La necesitás (o su respaldo) para liberar fondos.")) return;
-  localStorage.removeItem(TREASURY_KEY); toast("olvidada"); renderTreasury();
-};
-if($("tr-release")) $("tr-release").onclick=async()=>{
-  const m=$("tr-msg"); m.className="msg";
-  const to=$("tr-to").value.trim(); if(!to){ m.className="msg err"; m.textContent="poné la dirección destino"; return; }
-  let amount; try{ amount=qchToUnits($("tr-amount").value); }catch(e){ m.className="msg err"; m.textContent=e.message; return; }
-  if(amount<=0n){ m.className="msg err"; m.textContent="el monto debe ser mayor a 0"; return; }
-  const pw=prompt("2da contraseña de tesorería (para firmar la liberación):"); if(pw==null) return;
-  m.textContent="firmando en el navegador…";
-  let seed=null;
-  try{
-    const store=JSON.parse(localStorage.getItem(TREASURY_KEY));
-    seed=await decryptSeed(store, pw);
-    const authAddr=await addressFromSeed(seed);
-    const acct=await api("/api/account/"+authAddr);
-    const cid=await api("/api/chain_id");
-    const txJson=signV7TreasuryRelease(seed, to, amount, BigInt(acct.nonce||0), fromHex(cid.chain_id), 50000000n);
-    seed.fill(0); seed=null;
-    await relaySigned(txJson);
-    m.className="msg ok"; m.textContent="✓ Liberación enviada — "+$("tr-amount").value+" QCH a "+to.slice(0,10)+"…";
-    $("tr-amount").value="";
-  }catch(e){ if(seed)seed.fill(0);
-    const em=(e&&e.message)||"error";
-    m.className="msg err"; m.textContent=(em.includes("decrypt")||em.includes("operation-specific"))?"contraseña incorrecta":em; }
 };
 
 $("st-delegate").onclick=async()=>{
