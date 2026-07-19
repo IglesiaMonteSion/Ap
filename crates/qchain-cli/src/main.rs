@@ -13,6 +13,8 @@ use qchain_execution::{
     EconomicParams, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
+use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
+use qchain_execution::validator_v7::ValidatorV7Instruction;
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
 
@@ -188,6 +190,45 @@ enum Command {
     /// Remove your own entry from the on-chain validator registry. Does not
     /// touch your self-stake (unbond it separately with `stake-undelegate`).
     UnregisterValidator {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7: bond 500 QCH and register as a validator (economics_v7 networks only).
+    V7BondRegister {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Public validator moniker (3-32 chars, [a-z0-9_-], unique on-chain).
+        #[arg(long)]
+        moniker: String,
+        /// Public P2P address other validators dial (e.g. 1.2.3.4:9000).
+        #[arg(long)]
+        p2p_address: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7: begin exiting - move the bond to the unbonding pool and start the clock.
+    V7BeginExit {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7: withdraw the bond after the unbonding + evidence window elapses.
+    V7WithdrawBond {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
         #[arg(short, long)]
@@ -1167,6 +1208,55 @@ fn main() -> anyhow::Result<()> {
                 fee_limit,
             )?;
             println!("submitted: {body}");
+        }
+        Command::V7BondRegister { rpc, keypair, moniker, p2p_address, nonce, fee_limit } => {
+            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::BondAndRegister {
+                moniker: moniker.clone(),
+                pubkey_bundle: validator.public_key_bundle(),
+                p2p_address,
+            })?;
+            let body = submit_instruction(
+                &rpc,
+                &validator,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_GLOBAL_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("bonded 500 QCH and registered v7 validator {} as '{moniker}' (active next quanto)", validator.pubkey());
+        }
+        Command::V7BeginExit { rpc, keypair, nonce, fee_limit } => {
+            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::BeginExit)?;
+            let body = submit_instruction(
+                &rpc,
+                &validator,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("began exit for v7 validator {} - bond moved to the unbonding pool (still slashable until the window elapses)", validator.pubkey());
+        }
+        Command::V7WithdrawBond { rpc, keypair, nonce, fee_limit } => {
+            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::WithdrawBond)?;
+            let body = submit_instruction(
+                &rpc,
+                &validator,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("withdrew the 500 QCH bond for v7 validator {} (removed from the registry)", validator.pubkey());
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
