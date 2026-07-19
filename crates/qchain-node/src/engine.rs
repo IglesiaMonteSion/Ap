@@ -1052,6 +1052,11 @@ pub struct StatusResponse {
     /// parked because they can't yet afford the current fee (see
     /// `drain_ready_transactions`).
     pub mempool_transactions: u64,
+    /// Whether this network runs the v7 economy (`config.economics_v7`). Lets a
+    /// wallet detect a v7 network and switch its staking UI to the v7
+    /// shares+index model (Stake/BeginUnstake/WithdrawUnbonded, no validator
+    /// target) instead of the v6 Delegate/Undelegate/ClaimReward path.
+    pub economics_v7: bool,
 }
 
 /// Total size in bytes of every regular file under `dir`, recursively (a plain
@@ -2087,6 +2092,7 @@ impl Engine {
             dust_threshold: state.ledger.current_params().dust_threshold,
             round_interval_ms: self.round_interval_ms,
             mempool_transactions: state.mempool.values().map(|q| q.len() as u64).sum(),
+            economics_v7: state.ledger.is_economics_v7(),
         }
     }
 

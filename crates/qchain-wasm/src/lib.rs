@@ -42,6 +42,13 @@ const GOVERNANCE_PROGRAM_ID: [u8; 32] = [3u8; 32];
 const REGISTRY_ACCOUNT_ID: [u8; 32] = [4u8; 32];
 const PARAMS_ACCOUNT_ID: [u8; 32] = [5u8; 32];
 const STAKING_REWARDS_POOL_ID: [u8; 32] = [6u8; 32];
+// v7 staking singletons (economics_v7 networks). On a v7 network STAKING_PROGRAM_ID
+// dispatches to StakingV7Program, whose instructions (Stake/IncreaseStake/
+// BeginUnstake/WithdrawUnbonded) use the shares+index reserve model - a different
+// account set from the v6 Delegate/Undelegate above.
+const STAKING_RESERVE_ID: [u8; 32] = [11u8; 32];
+const STAKING_UNBONDING_POOL_ID: [u8; 32] = [13u8; 32];
+const STAKING_GLOBAL_ID: [u8; 32] = [15u8; 32];
 
 /// `StakingInstruction` Borsh encodings (variant order in
 /// `qchain-execution::staking`: Delegate=0, Undelegate=1, ClaimReward=2),
@@ -178,6 +185,78 @@ pub fn sign_claim_reward_json(
         program_id: Pubkey::new(STAKING_PROGRAM_ID),
         accounts: vec![stake_pk, Pubkey::new(STAKING_REWARDS_POOL_ID)],
         data: vec![2u8],
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// v7 staking instruction Borsh encodings (`StakingV7Instruction` variant order
+/// in qchain-execution::staking_v7: Stake=0, IncreaseStake=1, BeginUnstake=2,
+/// WithdrawUnbonded=3), guarded by `staking_v7_instruction_encoding_is_stable`
+/// in qchain-execution. Stake/IncreaseStake/BeginUnstake = `[disc]` ++ amount
+/// (8 LE bytes); WithdrawUnbonded = `[3]`.
+fn v7_amount_instruction_data(disc: u8, amount: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(9);
+    data.push(disc);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+/// v7 `Stake` (`[0]`): open a NEW position holding `amount` atoms. Unlike v6
+/// `Delegate` there is NO validator target - principal moves into the global
+/// staking reserve and the position accrues via the index. `position` is the
+/// fresh, seed-derived address the browser picked for this position. accounts =
+/// [payer, position, STAKING_GLOBAL, STAKING_RESERVE].
+pub fn sign_v7_stake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(STAKING_PROGRAM_ID),
+        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID)],
+        data: v7_amount_instruction_data(0, amount),
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// v7 `IncreaseStake` (`[1]`): add `amount` to an EXISTING position you own.
+/// accounts = [payer, position, STAKING_GLOBAL, STAKING_RESERVE].
+pub fn sign_v7_increase_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(STAKING_PROGRAM_ID),
+        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID)],
+        data: v7_amount_instruction_data(1, amount),
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// v7 `BeginUnstake` (`[2]`): move `amount` atoms of value into unbonding
+/// (withdrawing rewards = a partial unstake of the accrued value). accounts =
+/// [payer, position, STAKING_GLOBAL, STAKING_RESERVE, STAKING_UNBONDING_POOL].
+pub fn sign_v7_begin_unstake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(STAKING_PROGRAM_ID),
+        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID), Pubkey::new(STAKING_UNBONDING_POOL_ID)],
+        data: v7_amount_instruction_data(2, amount),
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// v7 `WithdrawUnbonded` (`[3]`): pay out the matured unbonding chunk. accounts =
+/// [payer, position, STAKING_UNBONDING_POOL].
+pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::new(STAKING_PROGRAM_ID),
+        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_UNBONDING_POOL_ID)],
+        data: vec![3u8],
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
@@ -427,6 +506,31 @@ mod wasm {
     ) -> Result<String, JsValue> {
         super::sign_claim_reward_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit)
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signV7Stake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+    /// v7 networks only: open a new staking position (no validator target).
+    #[wasm_bindgen(js_name = signV7Stake)]
+    pub fn sign_v7_stake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
+        super::sign_v7_stake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signV7IncreaseStake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signV7IncreaseStake)]
+    pub fn sign_v7_increase(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
+        super::sign_v7_increase_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signV7BeginUnstake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signV7BeginUnstake)]
+    pub fn sign_v7_begin_unstake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
+        super::sign_v7_begin_unstake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signV7WithdrawUnbonded(seed, position, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signV7WithdrawUnbonded)]
+    pub fn sign_v7_withdraw_unbonded(seed: &[u8], position: &str, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
+        super::sign_v7_withdraw_unbonded_json(&as32(seed, "seed")?, position, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signVote(seed, proposal, stakeAccount, choice, nonce, chainId, feeLimit) -> string`

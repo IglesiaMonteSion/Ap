@@ -56,7 +56,26 @@ fn main() -> anyhow::Result<()> {
             let s = seed(&args[2])?;
             print!("{}", qchain_wasm::sign_execute_json(&s, &args[3], args[4] != "0", args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
         }
-        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute ..."),
+        // v7 staking-path helpers, exercising the exact browser signing code.
+        Some("v7-stake") => {
+            // v7-stake <seed> <position> <amount> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_v7_stake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+        }
+        Some("v7-increase") => {
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_v7_increase_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+        }
+        Some("v7-begin-unstake") => {
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_v7_begin_unstake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+        }
+        Some("v7-withdraw") => {
+            // v7-withdraw <seed> <position> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_v7_withdraw_unbonded_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
+        }
+        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw ..."),
     }
     Ok(())
 }

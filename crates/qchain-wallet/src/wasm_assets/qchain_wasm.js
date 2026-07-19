@@ -344,6 +344,170 @@ export function signUndelegate(seed, stake_account, nonce, chain_id, fee_limit) 
 }
 
 /**
+ * `signV7BeginUnstake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+ * @param {Uint8Array} seed
+ * @param {string} position
+ * @param {bigint} amount
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signV7BeginUnstake(seed, position, amount, nonce, chain_id, fee_limit) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(position, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.signV7BeginUnstake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * `signV7IncreaseStake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+ * @param {Uint8Array} seed
+ * @param {string} position
+ * @param {bigint} amount
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signV7IncreaseStake(seed, position, amount, nonce, chain_id, fee_limit) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(position, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.signV7IncreaseStake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * `signV7Stake(seed, position, amount, nonce, chainId, feeLimit) -> string`
+ * v7 networks only: open a new staking position (no validator target).
+ * @param {Uint8Array} seed
+ * @param {string} position
+ * @param {bigint} amount
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signV7Stake(seed, position, amount, nonce, chain_id, fee_limit) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(position, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.signV7Stake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * `signV7WithdrawUnbonded(seed, position, nonce, chainId, feeLimit) -> string`
+ * @param {Uint8Array} seed
+ * @param {string} position
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signV7WithdrawUnbonded(seed, position, nonce, chain_id, fee_limit) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(position, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.signV7WithdrawUnbonded(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
  * `signVote(seed, proposal, stakeAccount, choice, nonce, chainId, feeLimit) -> string`
  * choice: 0=Yes, 1=No, 2=Abstain.
  * @param {Uint8Array} seed

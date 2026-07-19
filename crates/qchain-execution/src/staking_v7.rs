@@ -375,6 +375,25 @@ mod tests {
     use crate::economics_v7::{derive_quanto_rate_fp, DEFAULT_QUANTOS_PER_YEAR, STAKING_TARGET_APY_BPS};
     use qchain_core::UNITS_PER_QCH;
 
+    #[test]
+    fn staking_v7_instruction_encoding_is_stable() {
+        // The WASM wallet (crates/qchain-wasm) hand-rolls these encodings to sign
+        // v7 staking without depending on this crate. If the enum ever changes,
+        // this guard fails so the wallet's signV7* helpers are updated in the
+        // same batch (the lesson from v3.0.4: a stale wasm artifact silently
+        // produces txs the node rejects).
+        let amount = 0x0102_0304_0506_0708u64;
+        let mk = |disc: u8| {
+            let mut v = vec![disc];
+            v.extend_from_slice(&amount.to_le_bytes());
+            v
+        };
+        assert_eq!(borsh::to_vec(&StakingV7Instruction::Stake { amount }).unwrap(), mk(0), "wasm v7 Stake encoding out of sync");
+        assert_eq!(borsh::to_vec(&StakingV7Instruction::IncreaseStake { amount }).unwrap(), mk(1), "wasm v7 IncreaseStake encoding out of sync");
+        assert_eq!(borsh::to_vec(&StakingV7Instruction::BeginUnstake { amount }).unwrap(), mk(2), "wasm v7 BeginUnstake encoding out of sync");
+        assert_eq!(borsh::to_vec(&StakingV7Instruction::WithdrawUnbonded).unwrap(), vec![3u8], "wasm v7 WithdrawUnbonded encoding out of sync");
+    }
+
     fn pk(b: u8) -> Pubkey {
         Pubkey::new([b; 32])
     }

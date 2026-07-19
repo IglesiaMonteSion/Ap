@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "5.7.1"
+version = "6.3.19"
 dependencies = [
  "anyhow",
  "borsh",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "5.7.1"
+version = "6.3.19"
 dependencies = [
  "anyhow",
  "borsh",
