@@ -873,11 +873,14 @@
 
     <!-- Delegar -->
     <div class="card accent" style="margin-top:14px">
-      <div class="section-title" style="margin:0 0 10px">Delegar QCH</div>
+      <div class="section-title" style="margin:0 0 10px" id="st-deleg-title">Delegar QCH</div>
+      <div id="st-v6val">
       <label for="st-valselect">Validador</label>
       <select id="st-valselect"><option value="">— cargando validadores… —</option></select>
       <div class="hint" id="st-valhint" style="margin-top:4px">Elegí un validador de la red. También podés pegar una dirección abajo.</div>
       <input id="st-validator" placeholder="o pegá la dirección del validador" autocomplete="off" style="margin-top:8px">
+      </div>
+      <div class="hint" id="st-v7hint" style="margin-top:4px;display:none">Staking v7: tu QCH entra al pool global y rinde por el índice — no elegís validador. Retiralo cuando quieras (con un período de unbonding).</div>
       <label for="st-amount" style="margin-top:12px">Monto</label>
       <div class="stk-amt-row">
         <input id="st-amount" placeholder="0,00" inputmode="decimal" autocomplete="off">
@@ -897,6 +900,7 @@
     <div id="st-list"><div class="empty">todavía no delegaste nada</div></div>
 
     <!-- Importar una posición vieja por dirección (cuentas de dirección aleatoria, no derivables de la semilla) -->
+    <div id="st-import-sec">
     <div class="section-title" style="margin-top:20px">Importar posición</div>
     <div class="card" style="margin-top:8px;padding:12px">
       <div class="hint" style="margin-bottom:8px">¿Tenés una posición vieja que no aparece ni con <b>Recuperar</b>? Pegá la dirección de la cuenta de stake para importarla.</div>
@@ -906,20 +910,25 @@
       </div>
       <div class="msg" id="st-import-msg"></div>
     </div>
+    </div>
 
     <!-- Directorio / mercado de validadores (debajo de las posiciones propias: el usuario ve SU stake primero) -->
+    <div id="st-dir-sec">
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
       <span>Validadores de la red</span>
       <span class="hint" id="vd-count">—</span>
     </div>
     <div id="vd-list"><div class="empty">cargando validadores…</div></div>
+    </div>
 
     <!-- Historial de recompensas reclamadas -->
+    <div id="st-rh-sec">
     <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
       <span>Recompensas reclamadas</span>
       <span class="hint" id="rh-total"></span>
     </div>
     <div id="rh-list"><div class="empty">todavía no reclamaste recompensas</div></div>
+    </div>
 
     <div class="stk-info card" style="margin-top:14px">
       <div class="stk-info-row"><span>⏱️ Período de activación</span><b>100 rondas</b></div>
@@ -1109,7 +1118,7 @@
 </div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -2378,9 +2387,30 @@ async function renderRewardHistory(){
   </div>`).join("");
 }
 
+// ¿La red corre la economía v7? (staking shares+índice, sin validador destino).
+// Detectado del flag economics_v7 que el nodo expone en /status (proxied a
+// /api/node). En una red v6 (el default) NODE_V7 queda false y todo el path de
+// staking de abajo es byte-idéntico al de siempre.
+let NODE_V7=false;
+function setV7Ui(v7){
+  NODE_V7=v7;
+  const show=(id,on)=>{ const e=$(id); if(e) e.style.display= on?"":"none"; };
+  show("st-v6val", !v7);            // selector de validador (v6)
+  show("st-v7hint", v7);           // explicación v7
+  show("st-import-sec", !v7);      // importar posición (v6)
+  show("st-dir-sec", !v7);         // directorio de validadores (v6)
+  show("st-rh-sec", !v7);          // historial de recompensas reclamadas (v6)
+  const t=$("st-deleg-title"); if(t) t.textContent = v7 ? "Hacer staking" : "Delegar QCH";
+  const b=$("st-delegate"); if(b) b.textContent = v7 ? "Hacer staking" : "Delegar";
+}
+
 async function renderStaking(){
   const addr=myAddress(); if(!addr) return;
   $("st-msg").className="msg"; $("st-msg").textContent=""; $("st-amount").value=""; $("st-est").hidden=true;
+  // Detectar la economía de la red y adaptar la UI. En v7 el flujo es distinto
+  // (posiciones shares+índice, sin validador), así que se delega a renderStakingV7.
+  try{ const st=await api("/api/node"); setV7Ui(st&&st.economics_v7===true); }catch(e){ setV7Ui(false); }
+  if(NODE_V7){ await renderStakingV7(addr); return; }
   await Promise.all([loadStakingMeta(), loadValidatorList()]);
   renderValidatorDirectory(); renderRewardHistory();   // tras cargar economía (comisión); pueblan su propio DOM
   // saldo disponible para la tarjeta de delegar
@@ -2440,12 +2470,115 @@ async function stakeCtx(){
 $("st-recover").onclick=async()=>{
   const msg=$("st-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="buscando posiciones desde tu semilla…";
   try{
-    const n=await recoverStakes();
+    const n=NODE_V7 ? await recoverStakesV7() : await recoverStakes();
     msg.className="msg ok"; msg.textContent = n>0 ? `✓ Recuperé ${n} delegación${n>1?"es":""}` : "no se encontraron delegaciones nuevas para esta semilla";
     await renderStaking();
   }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
 };
 $("st-import-btn").onclick=importStakeByAddress;
+
+// ---- staking v7 (shares+índice, sin validador destino) ----
+// Sólo se usa cuando NODE_V7 (la red corre economics_v7). Firma con los signers
+// v7 de qchain-wasm (verificados end-to-end contra un nodo v7 real). Las
+// posiciones usan la MISMA derivación desde la semilla (stakeAddressFromSeed) →
+// recuperables, igual que las v6.
+async function renderStakingV7(addr){
+  await loadStakingMeta();                 // APY de emisión (economics)
+  $("stk-commission").textContent="—";     // v7 no expone comisión por-validador acá
+  try{ const acct=await api("/api/account/"+encodeURIComponent(addr)); STK_AVAIL=BigInt(acct.balance||0); $("st-avail").textContent="disponible: "+qchDisp(STK_AVAIL); }catch(e){ $("st-avail").textContent="disponible: —"; }
+  let stakes=myStakes().filter(s=>s.v7);
+  const list=$("st-list");
+  if(!stakes.length){ list.innerHTML='<div class="empty">buscando posiciones…</div>'; try{ await recoverStakesV7(); }catch(e){} stakes=myStakes().filter(s=>s.v7); }
+  if(!stakes.length){ list.innerHTML='<div class="empty">todavía no tenés posiciones de staking</div>'; $("stk-total").textContent="0 QCH"; $("stk-rewards").textContent="0 QCH"; return; }
+  const live=await Promise.all(stakes.map(s=>api("/api/stake_v7/"+encodeURIComponent(s.stakeAccount)).catch(()=>null)));
+  let totVal=0n, totDep=0n;
+  list.innerHTML=stakes.map((s,i)=>{
+    const d=live[i];
+    if(!(d&&d.exists)){ return `<div class="pos-card"><div class="pos-top"><div class="pos-val">Posición v7<div class="pv-addr">${esc(short(s.stakeAccount))}</div></div><div class="pos-amt">—</div></div><div class="pos-meta"><span class="badge cool">no encontrada</span></div></div>`; }
+    const value=BigInt(d.value||0), dep=BigInt(d.net_deposited||0), unb=BigInt(d.unbonding_amount||0);
+    totVal+=value; totDep+=dep;
+    const gain=value>dep?value-dep:0n;
+    const badge = (d.withdrawable||d.state==="Withdrawable") ? {cls:'ready',txt:'Listo para cobrar'} : (unb>0n?{cls:'cool',txt:'En unbonding'}:{cls:'active',txt:'Activo'});
+    let actions='';
+    if(unb>0n){ actions = d.withdrawable ? `<button class="btn-sec" data-v7withdraw="${i}">Cobrar ${esc(qchDisp(unb))}</button>` : `<button class="btn-sec" disabled>en unbonding (cuanto ${esc(String(d.unbonding_ready_quanto||0))})</button>`; }
+    else if(value>0n){ actions = `<button class="btn-sec" data-v7unstake="${i}">Retirar todo</button>`; }
+    const gainTxt = gain>0n ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(gain))}</b> rendimiento</span>` : `<span class="pos-reward">🎁 sin rendimiento aún</span>`;
+    return `<div class="pos-card">
+      <div class="pos-top">
+        <div class="pos-val">Staking v7<div class="pv-addr">${esc(short(s.stakeAccount))}</div></div>
+        <div class="pos-amt">${esc(qchDisp(value))}<small>${esc(usdOf(value))}</small></div>
+      </div>
+      <div class="pos-meta"><span class="badge ${badge.cls}">${esc(badge.txt)}</span>${gainTxt}</div>
+      <div class="pos-actions">${actions}</div>
+    </div>`;
+  }).join("");
+  $("stk-total").textContent=qchDisp(totVal);
+  $("stk-rewards").textContent=qchDisp(totVal>totDep?totVal-totDep:0n);
+  list.querySelectorAll("button[data-v7unstake]").forEach(b=>b.onclick=()=>v7StakeAction("unstake", stakes[+b.dataset.v7unstake], live[+b.dataset.v7unstake]));
+  list.querySelectorAll("button[data-v7withdraw]").forEach(b=>b.onclick=()=>v7StakeAction("withdraw", stakes[+b.dataset.v7withdraw], live[+b.dataset.v7withdraw]));
+}
+
+async function v7Stake(){
+  const amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
+  let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.textContent="monto inválido (ej: 1,5)"; return; }
+  if(amount<=0n){ msg.className="msg err"; msg.textContent="poné un monto mayor a 0"; return; }
+  $("st-delegate").disabled=true; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
+  try{
+    let index=nextStakeIndex(), position=stakeAddressFromSeed(SEED, index), guard=0;
+    while(guard++<300){
+      const d=await api("/api/stake_v7/"+encodeURIComponent(position)).catch(()=>null);
+      if(!(d && d.exists)) break;            // índice libre → usar este
+      index++; position=stakeAddressFromSeed(SEED, index);
+    }
+    const {nonce,chainId}=await stakeCtx();
+    const txJson=signV7Stake(SEED, position, amount, nonce, chainId, 50000000n);
+    msg.textContent="enviando al nodo…";
+    await relaySigned(txJson);
+    saveStake({ stakeAccount: position, index, v7:true, amount:amount.toString() });
+    msg.className="msg ok"; msg.innerHTML=`✓ Staking de ${esc(amt)} QCH`;
+    $("st-amount").value="";
+    setTimeout(renderStaking, 1500);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+  $("st-delegate").disabled=false;
+}
+
+async function v7StakeAction(kind, pos, d){
+  const msg=$("st-msg"); msg.className="msg"; msg.style.display="block";
+  try{
+    const {nonce,chainId}=await stakeCtx();
+    let txJson;
+    if(kind==="unstake"){
+      const value=BigInt((d&&d.value)||0);
+      if(value<=0n){ msg.className="msg err"; msg.textContent="no hay valor para retirar"; return; }
+      if(!confirm("Retirar mueve tu staking a un período de unbonding. Cuando termine, tocá 'Cobrar' para recibir los fondos. ¿Continuar?")){ msg.textContent=""; msg.style.display="none"; return; }
+      msg.textContent="retirando (firmando en tu navegador)…";
+      txJson=signV7BeginUnstake(SEED, pos.stakeAccount, value, nonce, chainId, 50000000n);
+    } else {
+      msg.textContent="cobrando (firmando en tu navegador)…";
+      txJson=signV7WithdrawUnbonded(SEED, pos.stakeAccount, nonce, chainId, 50000000n);
+    }
+    await relaySigned(txJson);
+    msg.className="msg ok"; msg.textContent = kind==="unstake" ? "✓ Unbonding iniciado — cobrá cuando termine el período" : "✓ Fondos cobrados";
+    setTimeout(renderStaking, 1500);
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message; }
+}
+
+async function recoverStakesV7(){
+  const addr=myAddress(); if(!addr) return 0;
+  const all=allStakes(); const listAll=all[addr]||[];
+  let idx=0, misses=0, found=0; const MAX_IDX=256, MAX_MISS=10;
+  while(idx<MAX_IDX && misses<MAX_MISS){
+    const sa=stakeAddressFromSeed(SEED, idx);
+    const d=await api("/api/stake_v7/"+encodeURIComponent(sa)).catch(()=>null);
+    if(d && d.exists && d.owner===addr){
+      if(!listAll.some(p=>p.stakeAccount===sa)){ listAll.push({ stakeAccount:sa, index:idx, v7:true, amount:String(d.value||0) }); found++; }
+      misses=0;
+    } else { misses++; }
+    idx++;
+  }
+  all[addr]=listAll; localStorage.setItem(STAKES_KEY, JSON.stringify(all));
+  return found;
+}
 
 // ===================== GOBERNANZA =====================
 // Firma Vote/Finalize/Execute en el navegador (signVote/signFinalize/signExecute
@@ -2525,6 +2658,7 @@ $("gov-execute").onclick=async()=>{
 };
 
 $("st-delegate").onclick=async()=>{
+  if(NODE_V7) return v7Stake();
   const validator=$("st-validator").value.trim(), amt=$("st-amount").value.trim(), msg=$("st-msg"); msg.className="msg"; msg.textContent="";
   if(!validator){ msg.className="msg err"; msg.textContent="poné la dirección del validador"; return; }
   // Bloqueá delegar a tu PROPIA dirección de wallet: eso crea un "self-stake"

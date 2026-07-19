@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chain_id", get(chain_id_ep))
         .route("/api/account/:address", get(account_ep))
         .route("/api/stake/:address", get(stake_ep))
+        .route("/api/stake_v7/:address", get(stake_v7_ep))
         .route("/api/relay-tx", post(relay_tx))
         .route("/api/config", get(config))
         .route("/api/node", get(node_status))
@@ -476,6 +477,17 @@ async fn stake_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) 
     // raw string, so only a well-formed address ever reaches the node.
     let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección inválida: {e}")))?;
     let url = format!("{}/stake/{}", st.rpc, pk);
+    let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
+    let val: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(val))
+}
+
+/// Live state of a v7 staking position, proxied from the node's
+/// `/stake_v7/:address` (index-accrued value + unbonding state). Read-only, no
+/// keys - the v7 staking UI reads this instead of `/api/stake` (v6 format).
+async fn stake_v7_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    let pk: Pubkey = address.trim().parse().map_err(|e| ApiError::bad(format!("dirección inválida: {e}")))?;
+    let url = format!("{}/stake_v7/{}", st.rpc, pk);
     let resp = st.http.get(&url).send().await.map_err(ApiError::internal)?;
     let val: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(val))

@@ -20,6 +20,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/tx", post(submit_tx))
         .route("/account/:address", get(get_account))
         .route("/stake/:address", get(get_stake))
+        .route("/stake_v7/:address", get(get_stake_v7))
         .route("/status", get(status))
         .route("/economics", get(economics))
         .route("/holders", get(holders))
@@ -155,6 +156,52 @@ async fn get_stake(State(engine): State<Arc<Engine>>, Path(address): Path<String
         "bonding_until_round": sad.bonding_until_round,
         "unbonding_requested_at_round": sad.unbonding_requested_at_round,
         "current_round": current_round,
+    })))
+}
+
+/// `/stake_v7/:address` - live state of a v7 staking position (economics_v7
+/// networks). The v6 `/stake/:address` decodes `StakeAccountData`; a v7 position
+/// is a `StakePositionV7` (shares+index), a different format, so the wallet's v7
+/// staking UI reads this instead. Returns the index-accrued `value` (what the
+/// position is worth NOW = shares × the live global index), the net deposited,
+/// the lifecycle `state`, and the pending unbonding chunk with whether it's
+/// withdrawable yet (`current_quanto >= unbonding_ready_quanto`). `value`,
+/// `active_shares`, and amounts are strings (u128 / can exceed 2^53). Returns
+/// `{exists:false}` for an address that isn't a v7 position.
+async fn get_stake_v7(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::{STAKING_GLOBAL_ID, STAKING_PROGRAM_ID};
+    use qchain_execution::staking_v7::{GlobalStakingState, StakePositionV7};
+    let pk: Pubkey = address.parse().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let Some(acct) = engine.get_account(&pk).await else {
+        return Ok(Json(json!({ "exists": false })));
+    };
+    if acct.owner != STAKING_PROGRAM_ID || acct.data.is_empty() {
+        return Ok(Json(json!({ "exists": false })));
+    }
+    // A v6 stake account also lives under STAKING_PROGRAM_ID; only a genuine
+    // StakePositionV7 decodes here, so a v6 account cleanly reports not-a-v7.
+    let Ok(pos) = StakePositionV7::try_from_slice(&acct.data) else {
+        return Ok(Json(json!({ "exists": false })));
+    };
+    let global = engine
+        .get_account(&STAKING_GLOBAL_ID)
+        .await
+        .and_then(|a| GlobalStakingState::try_from_slice(&a.data).ok())
+        .unwrap_or_else(GlobalStakingState::genesis);
+    let value = qchain_execution::economics_v7::position_value(pos.active_shares, global.index);
+    let withdrawable = pos.unbonding_amount > 0 && global.current_quanto >= pos.unbonding_ready_quanto;
+    Ok(Json(json!({
+        "exists": true,
+        "owner": pos.owner.to_string(),
+        "active_shares": pos.active_shares.to_string(),
+        "value": value.to_string(),
+        "net_deposited": pos.net_deposited,
+        "state": format!("{:?}", pos.state),
+        "unbonding_amount": pos.unbonding_amount,
+        "unbonding_ready_quanto": pos.unbonding_ready_quanto,
+        "withdrawable": withdrawable,
+        "current_quanto": global.current_quanto,
     })))
 }
 
