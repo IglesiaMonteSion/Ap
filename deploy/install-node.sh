@@ -60,6 +60,8 @@ ROUNDS_PER_QUANTO="${ROUNDS_PER_QUANTO:-172800}"
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
 FONDEAR_ADDR=""
 FONDEAR_QCH=""
+TREASURY_AUTH=""
+TREASURY_QCH=""
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -116,6 +118,13 @@ Opciones:
   --fondear-qch <n>      génesis con <n> QCH (además de la wallet de prueba). Para
                          arrancar tu propia wallet con un balance grande de una.
                          Ej: --fondear Ahc...Te2y --fondear-qch 10000000
+  --treasury-authority <dir>  (con --economics-v7) acuñar la tesorería inicial
+  --treasury-qch <n>          BLOQUEADA en el génesis: <n> QCH que sólo se liberan
+                         con un `Release` firmado por <dir> (tu clave de autoridad).
+                         Ideal para liberar liquidez de a poco. La autoridad debe
+                         tener algo de QCH líquido para pagar el fee del Release
+                         (fondeála con --fondear la MISMA dirección + unos QCH).
+                         Ej: --treasury-authority Bva...RNA7 --treasury-qch 100000000
   --con-wallet           Instalar también la wallet web sin preguntar (con --yes
                          te genera y muestra una contraseña fuerte).
   --con-tunel            Instalar también el túnel de Cloudflare (HTTPS público)
@@ -150,6 +159,8 @@ while [ $# -gt 0 ]; do
     --rounds-per-quanto|--rondas-por-cuanto) ROUNDS_PER_QUANTO="${2:-}"; shift 2 ;;
     --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
     --fondear-qch) FONDEAR_QCH="${2:-}"; shift 2 ;;
+    --treasury-authority|--tesoreria-autoridad) TREASURY_AUTH="${2:-}"; shift 2 ;;
+    --treasury-qch|--tesoreria-qch) TREASURY_QCH="${2:-}"; shift 2 ;;
     --con-wallet) CON_WALLET=1; shift ;;
     --con-tunel) CON_TUNEL=1; shift ;;
     --yes|-y) ASUMIR_SI=1; shift ;;
@@ -425,6 +436,23 @@ EOF
       if [ "$ECONOMICS_V7" = "1" ]; then
         GB_V7="--economics-v7 --rounds-per-quanto $ROUNDS_PER_QUANTO"
         decir "  -> ECONOMIA v7 (hard fork: emision por cuanto, fee 45/45/10, bono 500 QCH; rounds_per_quanto=$ROUNDS_PER_QUANTO)"
+        # Genesis treasury (v7 only): mint N QCH LOCKED, releasable by an authority.
+        if [ -n "$TREASURY_AUTH" ] || [ -n "$TREASURY_QCH" ]; then
+          if [ -z "$TREASURY_AUTH" ] || [ -z "$TREASURY_QCH" ]; then
+            error "--treasury-authority y --treasury-qch deben ir juntos"
+          fi
+          if ! printf '%s' "$TREASURY_QCH" | grep -Eq '^[0-9]+$'; then
+            error "--treasury-qch debe ser un numero de QCH (recibi: '$TREASURY_QCH')"
+          fi
+          if [ "$TREASURY_QCH" -gt 9223372036 ]; then
+            error "--treasury-qch demasiado grande (max 9223372036 QCH)"
+          fi
+          if ! printf '%s' "$TREASURY_AUTH" | grep -Eq '^[1-9A-HJ-NP-Za-km-z]{32,44}$'; then
+            error "--treasury-authority: direccion invalida (base58 32-44 chars)"
+          fi
+          GB_V7="$GB_V7 --treasury-authority $TREASURY_AUTH --treasury-qch $TREASURY_QCH"
+          decir "  -> TESORERIA v7: $TREASURY_QCH QCH BLOQUEADOS en el genesis, liberables por $TREASURY_AUTH (firma Release)"
+        fi
       fi
       qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO $GB_V7
       cp "$QCHAIN_HOME/out/node1.json" "$QCHAIN_HOME/config.json"

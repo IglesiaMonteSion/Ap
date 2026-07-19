@@ -90,6 +90,16 @@ struct Cli {
     /// with `--economics-v7`.
     #[arg(long)]
     quanto_rate_fp: Option<u128>,
+    /// (v7) base58 address allowed to release the genesis-locked treasury. With
+    /// `--treasury-qch`, mints that many QCH LOCKED into the treasury account at
+    /// genesis; only a `Release` signed by this authority moves them. Folded into
+    /// the `chain_id`. Only meaningful with `--economics-v7`.
+    #[arg(long)]
+    treasury_authority: Option<String>,
+    /// (v7) how much QCH to lock in the genesis treasury (converted to units:
+    /// 1 QCH = 1e9). Requires `--treasury-authority`. Max 9223372036 QCH.
+    #[arg(long)]
+    treasury_qch: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +214,24 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Resolve the genesis treasury (v7): validate the authority is a real address
+    // and the QCH amount is present + in range, then convert QCH → units (1e9).
+    let (treasury_authority, treasury_amount): (Option<String>, Option<u64>) = match (&cli.treasury_authority, cli.treasury_qch) {
+        (Some(auth), Some(qch)) => {
+            if !cli.economics_v7 {
+                anyhow::bail!("--treasury-authority/--treasury-qch require --economics-v7");
+            }
+            auth.parse::<qchain_crypto::Pubkey>()
+                .map_err(|e| anyhow::anyhow!("--treasury-authority is not a valid base58 address: {e}"))?;
+            if qch > 9_223_372_036 {
+                anyhow::bail!("--treasury-qch too large (max 9223372036 QCH)");
+            }
+            (Some(auth.clone()), Some(qch.saturating_mul(1_000_000_000)))
+        }
+        (None, None) => (None, None),
+        _ => anyhow::bail!("--treasury-authority and --treasury-qch must be given together"),
+    };
+
     std::fs::create_dir_all(&cli.out_dir)?;
     let mut shared_chain_id: Option<[u8; 32]> = None;
     for (i, manifest) in manifests.iter().enumerate() {
@@ -226,6 +254,8 @@ fn main() -> anyhow::Result<()> {
             economics_v7: cli.economics_v7,
             quanto_rate_fp: baked_rate_fp,
             rounds_per_quanto: cli.rounds_per_quanto,
+            treasury_authority: treasury_authority.clone(),
+            treasury_amount,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's
@@ -257,6 +287,9 @@ fn main() -> anyhow::Result<()> {
     if cli.economics_v7 {
         println!("economics: v7 ENABLED (rounds_per_quanto={}) — a hard-forked network, distinct from any v6 chain.", cli.rounds_per_quanto.map(|r| r.to_string()).unwrap_or_else(|| "default".into()));
         println!("quanto_rate_fp: {} (BAKED into every config — identical on every platform, no f64 re-derivation)", baked_rate_fp.unwrap_or(0));
+        if let (Some(auth), Some(units)) = (&treasury_authority, treasury_amount) {
+            println!("treasury: {} QCH ({units} units) LOCKED in genesis, release authority {auth} (only a signed Release moves it) — folded into the chain_id.", units / 1_000_000_000);
+        }
     }
     if cli.compressed_state_tree {
         println!("state tree: COMPRESSED — folded into the chain_id above.");

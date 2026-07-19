@@ -243,6 +243,12 @@ async fn main() -> anyhow::Result<()> {
             qchain_execution::ids::VALIDATOR_V7_PROGRAM_ID,
             Program::Native(Box::new(qchain_execution::validator_v7::ValidatorV7Program)),
         );
+        // The v7 treasury program (also its own id): releases the genesis-locked
+        // treasury supply only on an authority-signed `Release`.
+        ledger.register_program(
+            qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
+            Program::Native(Box::new(qchain_execution::treasury_v7::TreasuryV7Program)),
+        );
     } else {
         ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
     }
@@ -394,6 +400,26 @@ async fn main() -> anyhow::Result<()> {
                 VALIDATOR_BOND_ESCROW_ID,
                 qchain_core::Account { balance: escrow_total, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
             );
+            // Genesis treasury (optional): mint the initial circulating supply
+            // LOCKED into the treasury account, releasable only by the configured
+            // authority (SPEC: v7 treasury). Deterministic (same authority+amount on
+            // every node → identical genesis root). Absent when no treasury is
+            // configured, so a v7 network without one is unchanged.
+            if let (Some(auth_b58), Some(amount)) = (config.treasury_authority.as_deref(), config.treasury_amount) {
+                let authority = auth_b58
+                    .parse::<qchain_crypto::Pubkey>()
+                    .map_err(|e| anyhow::anyhow!("treasury_authority is not a valid address: {e}"))?;
+                ledger.seed_account(
+                    qchain_execution::ids::TREASURY_ACCOUNT_ID,
+                    qchain_execution::treasury_v7::genesis_treasury_account(authority, amount),
+                );
+                tracing::info!(
+                    "treasury: seeded {} units ({} QCH) LOCKED, release authority {}",
+                    amount,
+                    amount / 1_000_000_000,
+                    auth_b58
+                );
+            }
         }
     } else {
         tracing::info!("reusing persisted state from a prior run; skipping genesis seeding");

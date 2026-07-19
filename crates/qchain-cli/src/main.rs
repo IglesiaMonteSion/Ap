@@ -238,6 +238,41 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// v7 treasury: release (unlock+send) locked treasury funds to an address.
+    /// The keypair MUST be the treasury authority set at genesis.
+    TreasuryRelease {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The treasury AUTHORITY keypair (the only key allowed to release).
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Destination address receiving the released QCH.
+        #[arg(long)]
+        to: String,
+        /// Amount to release, in QCH-units (1 QCH = 1_000_000_000 units).
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 treasury: rotate the release authority to a new address (current
+    /// authority signs). Moves no funds.
+    TreasurySetAuthority {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The CURRENT treasury authority keypair.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The new authority address.
+        #[arg(long)]
+        new_authority: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
     /// Propose activating a new algorithm registry entry.
     ProposeActivate {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -1264,6 +1299,38 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("submitted: {body}");
             println!("withdrew the 500 QCH bond for v7 validator {} (removed from the registry)", validator.pubkey());
+        }
+        Command::TreasuryRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
+            let authority = qchain_crypto::read_keypair_file(&keypair)?;
+            let dest: qchain_crypto::Pubkey = to.parse().map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
+            let data = borsh::to_vec(&qchain_execution::treasury_v7::TreasuryV7Instruction::Release { amount })?;
+            let body = submit_instruction(
+                &rpc,
+                &authority,
+                qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
+                vec![authority.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID, dest],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("released {amount} units ({} QCH) from the treasury to {dest}", amount / 1_000_000_000);
+        }
+        Command::TreasurySetAuthority { rpc, keypair, new_authority, nonce, fee_limit } => {
+            let authority = qchain_crypto::read_keypair_file(&keypair)?;
+            let new_auth: qchain_crypto::Pubkey = new_authority.parse().map_err(|e| anyhow::anyhow!("invalid --new-authority address: {e}"))?;
+            let data = borsh::to_vec(&qchain_execution::treasury_v7::TreasuryV7Instruction::SetAuthority)?;
+            let body = submit_instruction(
+                &rpc,
+                &authority,
+                qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
+                vec![authority.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID, new_auth],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("rotated the treasury authority to {new_auth}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;

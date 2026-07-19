@@ -107,3 +107,15 @@ pub const ADMIN_FEE_WALLET: Pubkey = Pubkey::new([
     144, 32, 82, 243, 147, 55, 160, 242, 118, 129, 105, 137, 140, 206, 47, 83, 87, 91, 106, 239,
     138, 12, 249, 6, 33, 130, 72, 75, 174, 92, 140, 246,
 ]);
+
+/// v7 treasury program: processes `TreasuryV7Instruction` (Release / SetAuthority).
+/// Owns `TREASURY_ACCOUNT_ID`, so the locked genesis supply there can only be moved
+/// by a `Release` signed by the treasury authority — never by a plain transfer.
+/// Only registered when `economics_v7` is on. A distinct id from the staking/
+/// validator programs (whose instruction enums also start at discriminant 0).
+pub const TREASURY_V7_PROGRAM_ID: Pubkey = Pubkey::new([17u8; 32]);
+/// The genesis-locked treasury account (owned by `TREASURY_V7_PROGRAM_ID`). Its
+/// `balance` is the locked circulating supply the operator seeds at genesis; its
+/// `data` is a borsh-encoded `treasury_v7::TreasuryState` naming the release
+/// authority. Absent on a v6 network or a v7 network with no treasury configured.
+pub const TREASURY_ACCOUNT_ID: Pubkey = Pubkey::new([18u8; 32]);

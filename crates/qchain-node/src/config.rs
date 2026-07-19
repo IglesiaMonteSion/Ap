@@ -160,6 +160,18 @@ pub struct NodeConfig {
     /// boundary quickly.
     #[serde(default)]
     pub rounds_per_quanto: Option<u64>,
+    /// v7 genesis treasury authority — base58 pubkey allowed to sign `Release`
+    /// (unlock+send) / `SetAuthority` on the locked treasury account. Only read
+    /// when `economics_v7` is on AND `treasury_amount` is set. Part of the network
+    /// config hash (a different authority is a different genesis → different chain).
+    #[serde(default)]
+    pub treasury_authority: Option<String>,
+    /// v7 genesis treasury amount, in QCH-units (1 QCH = 1e9). Minted LOCKED into
+    /// `TREASURY_ACCOUNT_ID` at genesis (owned by the treasury program; only a
+    /// `Release` signed by `treasury_authority` moves it). Only meaningful with
+    /// `economics_v7` + `treasury_authority`; part of the network config hash.
+    #[serde(default)]
+    pub treasury_amount: Option<u64>,
 }
 
 fn default_storage_engine() -> String {
@@ -217,6 +229,16 @@ impl NodeConfig {
             bytes.extend_from_slice(b"economics-v7-45-45-10");
             bytes.extend_from_slice(&self.quanto_rate_fp().to_le_bytes());
             bytes.extend_from_slice(&self.rounds_per_quanto().to_le_bytes());
+            // The genesis treasury (locked supply + its release authority) is part
+            // of the genesis state, so it folds into the network identity: a
+            // different authority or amount is a genuinely different genesis. Only
+            // when a treasury is actually configured, so a v7 network without one
+            // keeps its chain_id unchanged.
+            if let (Some(auth), Some(amt)) = (&self.treasury_authority, self.treasury_amount) {
+                bytes.extend_from_slice(b"treasury-v7");
+                bytes.extend_from_slice(auth.as_bytes());
+                bytes.extend_from_slice(&amt.to_le_bytes());
+            }
         }
         Sha3_256::digest(bytes).into()
     }
@@ -272,6 +294,8 @@ mod tests {
             economics_v7: false,
             quanto_rate_fp: None,
             rounds_per_quanto: None,
+            treasury_authority: None,
+            treasury_amount: None,
         }
     }
 
