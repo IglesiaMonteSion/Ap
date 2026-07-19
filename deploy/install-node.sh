@@ -49,6 +49,12 @@ CON_TUNEL=0
 # Solo aplica al CREAR una red nueva (modo "solo") - todos los nodos de una red
 # deben usar el mismo valor (se pliega en el chain_id). Off por defecto.
 COMPRIMIDO=0
+# Arrancar la red con la ECONOMIA v7 (staking shares+indice, emision por cuanto,
+# split de fee 45/45/10, bono de validador 500 QCH). Hard fork: se pliega en el
+# chain_id, solo al CREAR una red nueva (modo "solo"), todos los nodos deben usar
+# el mismo valor. Off por defecto (una red v6 queda byte-identica).
+ECONOMICS_V7=0
+ROUNDS_PER_QUANTO="${ROUNDS_PER_QUANTO:-172800}"
 # Fondear una direccion ADICIONAL en el genesis (ademas de la wallet de prueba),
 # para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
@@ -98,6 +104,14 @@ Opciones:
                          (hard fork, ~6x throughput bajo carga, menos RAM/disco).
                          Solo al CREAR la red; todos los nodos deben usarlo. No se
                          puede convertir una cadena ya corriendo (cambia la raíz).
+  --economics-v7         (modo "solo") crear la red con la ECONOMÍA v7 (staking
+                         shares+índice, emisión por cuanto, split de fee 45/45/10,
+                         bono de validador 500 QCH). Hard fork: se pliega en el
+                         chain_id, solo al CREAR la red; TODOS los nodos deben
+                         usarlo. Una red sin este flag queda byte-idéntica a v6.
+  --rounds-per-quanto <n>  (con --economics-v7) rondas por cuanto — la unidad de
+                         tiempo económico de v7 (emisión/cierre). Por defecto
+                         172800. Parte del chain_id: todos los nodos igual.
   --fondear <dir>        (modo "solo") fondear una dirección ADICIONAL en el
   --fondear-qch <n>      génesis con <n> QCH (además de la wallet de prueba). Para
                          arrancar tu propia wallet con un balance grande de una.
@@ -132,6 +146,8 @@ while [ $# -gt 0 ]; do
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
+    --economics-v7|--economia-v7) ECONOMICS_V7=1; shift ;;
+    --rounds-per-quanto|--rondas-por-cuanto) ROUNDS_PER_QUANTO="${2:-}"; shift 2 ;;
     --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
     --fondear-qch) FONDEAR_QCH="${2:-}"; shift 2 ;;
     --con-wallet) CON_WALLET=1; shift ;;
@@ -405,7 +421,12 @@ EOF
         GB_COMPRIMIDO="--compressed-state-tree"
         decir "  -> arbol de estado COMPRIMIDO (hard fork, ~6x throughput bajo carga)"
       fi
-      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO
+      GB_V7=""
+      if [ "$ECONOMICS_V7" = "1" ]; then
+        GB_V7="--economics-v7 --rounds-per-quanto $ROUNDS_PER_QUANTO"
+        decir "  -> ECONOMIA v7 (hard fork: emision por cuanto, fee 45/45/10, bono 500 QCH; rounds_per_quanto=$ROUNDS_PER_QUANTO)"
+      fi
+      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO $GB_V7
       cp "$QCHAIN_HOME/out/node1.json" "$QCHAIN_HOME/config.json"
       rm -rf "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out" "$QCHAIN_HOME/genesis.json"
       mkdir -p "$QCHAIN_HOME/data"

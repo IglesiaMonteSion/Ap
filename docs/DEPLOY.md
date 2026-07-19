@@ -273,6 +273,31 @@ comprimido, arrancá una red nueva con `--comprimido` (el estado viejo no se
 migra automáticamente; es una cadena distinta). El beneficio se nota bajo carga
 alta; a tráfico bajo la diferencia es chica.
 
+### Red con economía v7 (`--economics-v7`)
+
+Para crear una red NUEVA con la **economía v7** (staking shares+índice, emisión
+por cuanto, split de fee **45% validadores / 45% quema / 10% admin**, bono de
+validador de **500 QCH**), agregá `--economics-v7` al crear la red en modo solo:
+
+```
+sudo ./deploy/install-node.sh --modo solo --economics-v7 --con-tunel --yes
+```
+
+Opcionalmente `--rounds-per-quanto <n>` fija cuántas rondas dura un cuanto (la
+unidad de tiempo económico de v7; por defecto 172800). En un testnet conviene
+bajarlo para ver la emisión/reparto cruzar borders rápido.
+
+**Es un hard fork, decidido en el génesis:** `economics_v7` se pliega en el
+`chain_id`, así que una red v7 es una red **separada** de una v6 (una tx firmada
+para v6 la rechaza v7, y viceversa) — solo se elige al CREAR la red, y TODOS los
+nodos deben usar el mismo valor (si no, divergen). Una red creada **sin** el flag
+queda byte-idéntica a v6. Se combina con `--comprimido` (ambos son decisiones de
+génesis). Tras crear la red, un validador se registra con
+`qchain v7-bond-register --moniker <nombre> --p2p-address <ip:puerto>` (bloquea
+500 QCH y entra al comité de reparto de fees al cuanto siguiente); sale con
+`qchain v7-begin-exit` y recupera el bono con `qchain v7-withdraw-bond` tras la
+ventana de unbonding.
+
 ## Red de 2 validadores (principal + secundario) en un paso: `deploy/setup-2validators.sh`
 
 Para armar una red NUEVA de dos VPS sin hacer el ida y vuelta de bundles/configs
