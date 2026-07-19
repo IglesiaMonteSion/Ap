@@ -189,7 +189,27 @@ pub struct Ledger {
     /// Rounds per reward quanto (`economics_v7::DEFAULT_ROUNDS_PER_QUANTO`). Only
     /// read when `economics_v7` is on; 0 disables the quanto close.
     rounds_per_quanto: u64,
+    /// v7 participation (§21.2): per-quanto `(validator, credits, opportunities)`
+    /// tallies the NODE feeds in from the committed order (which validators had a
+    /// committed certificate in each of the quanto's rounds vs which were in the
+    /// active committee). The quanto close reads a LAGGED quanto's tally
+    /// (`cur - PARTICIPATION_LAG_QUANTOS`) so it scores only rounds that are fully
+    /// committed-in-order and IDENTICAL on every node (no fork). In-memory only
+    /// (re-derivable from the persisted DAG on restart); pruned by window. Empty
+    /// on a v6 network → no participation gating (bps stays 10000, byte-identical).
+    participation_by_quanto: std::collections::HashMap<u64, Vec<(Pubkey, u64, u64)>>,
 }
+
+/// v7 participation lag: closing quanto `q` scores participation from quanto
+/// `q - 1`. That quanto's rounds are all ≥ `rounds_per_quanto` behind the close's
+/// `current_round`, so their committed order is final and byte-identical on every
+/// node (finalization lags the frontier by only a few rounds ≪ a quanto). Scoring
+/// the CURRENT quanto instead would read not-yet-finalized rounds that two nodes
+/// could disagree on → a fork. This lag is the safety margin.
+const PARTICIPATION_LAG_QUANTOS: u64 = 1;
+/// Keep this many recent quantos' participation tallies in memory (the close only
+/// ever reads `cur - 1`; a small window covers a multi-quanto catch-up).
+const PARTICIPATION_RETENTION_QUANTOS: u64 = 64;
 
 /// Defensive per-transaction cap on how many elapsed quantos one apply closes in
 /// a single pass (a long idle gap then a burst). Emission is never lost — the
@@ -239,6 +259,7 @@ impl Ledger {
             economics_v7: false,
             quanto_rate_fp: 0,
             rounds_per_quanto: 0,
+            participation_by_quanto: std::collections::HashMap::new(),
         })
     }
 
@@ -260,6 +281,13 @@ impl Ledger {
     /// seed the v7 genesis singletons.
     pub fn is_economics_v7(&self) -> bool {
         self.economics_v7
+    }
+
+    /// Rounds per reward quanto (0 when v7 economics is off). The node reads this
+    /// to map a committed round to its quanto when feeding the participation
+    /// tally (§21.2).
+    pub fn rounds_per_quanto(&self) -> u64 {
+        self.rounds_per_quanto
     }
 
     /// Close every reward quanto that has fully elapsed by `current_round`,
@@ -300,6 +328,7 @@ impl Ledger {
                     // the settle `map` (global/reserve), and - like the emission
                     // mint - happen before any receipt root is captured (STARK-safe).
                     self.activate_due_validators(cur);
+                    self.apply_participation_for_quanto(cur);
                     self.distribute_fee_pool_for_quanto(cur);
                 }
                 Err(_) => break, // never abort the tx on a settle hiccup
@@ -348,6 +377,79 @@ impl Ledger {
             return;
         }
         let mut acct = self.store.get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap_or_else(|| Account::new_wallet(STAKING_PROGRAM_ID));
+        if let Ok(data) = borsh::to_vec(&registry) {
+            acct.data = data;
+            self.write_account(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, acct);
+        }
+    }
+
+    /// v7 (§21.2): record the NODE-supplied participation tally for a quanto
+    /// (`entries` = `(validator, credits, opportunities)`), pruning old quantos
+    /// out of the in-memory window. The node feeds this from the committed order
+    /// (which validators had a committed certificate in each of the quanto's
+    /// rounds), and the quanto close later reads a LAGGED quanto's tally so it
+    /// only ever scores rounds whose order is final and identical on every node.
+    pub fn set_quanto_participation(&mut self, quanto: u64, entries: Vec<(Pubkey, u64, u64)>) {
+        if !self.economics_v7 {
+            return;
+        }
+        self.participation_by_quanto.insert(quanto, entries);
+        // Prune anything older than the retention window (keeps the map bounded;
+        // the close only ever reads `cur - PARTICIPATION_LAG_QUANTOS`).
+        let cutoff = quanto.saturating_sub(PARTICIPATION_RETENTION_QUANTOS);
+        self.participation_by_quanto.retain(|&q, _| q >= cutoff);
+    }
+
+    /// v7 (§21.2): at the close of quanto `cur`, fold the LAGGED quanto's
+    /// (`cur - PARTICIPATION_LAG_QUANTOS`) participation tally into the on-chain
+    /// registry, so `fees_v7::is_eligible` (which reads `participation_bps()`)
+    /// can drop a validator that was down. Runs AFTER `activate_due_validators`
+    /// and BEFORE `distribute_fee_pool_for_quanto`, so a newly-Active validator
+    /// keeps its default 10000bps (no tally yet) and a validator that missed the
+    /// lagged quanto is gated out of that quanto's payout. Deterministic: the
+    /// tally comes from the committed order (identical on every node) and the
+    /// scored quanto is old enough that its rounds are all finalized. No-op when
+    /// there is no tally for the scored quanto (bps stays at its default), so a
+    /// v7 network without the node feed, or the first quanto, is byte-identical
+    /// to the pre-participation behavior. Writes each validator's
+    /// `participation_credits`/`participation_opportunities` (absolute, from the
+    /// tally) so `participation_bps()` reflects that quanto's real uptime.
+    fn apply_participation_for_quanto(&mut self, cur: u64) {
+        if cur < PARTICIPATION_LAG_QUANTOS {
+            return; // no lagged quanto exists yet
+        }
+        let scored = cur - PARTICIPATION_LAG_QUANTOS;
+        let tally = match self.participation_by_quanto.get(&scored) {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => return, // no feed for this quanto → leave bps at its default
+        };
+        let mut registry = match self
+            .store
+            .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+        {
+            Some(r) => r,
+            None => return,
+        };
+        let by_addr: std::collections::HashMap<Pubkey, (u64, u64)> =
+            tally.into_iter().map(|(a, c, o)| (a, (c, o))).collect();
+        let mut changed = false;
+        for v in registry.validators.iter_mut() {
+            if let Some(&(credits, opportunities)) = by_addr.get(&v.address) {
+                if v.participation_credits != credits || v.participation_opportunities != opportunities {
+                    v.participation_credits = credits;
+                    v.participation_opportunities = opportunities;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+        let mut acct = self
+            .store
+            .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+            .unwrap_or_else(|| Account::new_wallet(STAKING_PROGRAM_ID));
         if let Ok(data) = borsh::to_vec(&registry) {
             acct.data = data;
             self.write_account(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, acct);
@@ -1909,6 +2011,99 @@ mod tests {
         // was this fee (the seeded 100 was distributed OUT, not routed in).
         assert_eq!(pool_after, 1 + l.pool_earned, "pool = remainder + this tx's routed validator share");
         assert!(l.pool_earned > 0, "the boundary-crossing tx routed a real fee into the pool for next quanto");
+    }
+
+    /// v7 (§21.2): the node-fed participation tally gates a down validator out of
+    /// the fee split. At the close of quanto `cur`, the LAGGED quanto's
+    /// (`cur-1`) tally is folded into the registry, so a validator that missed
+    /// too many rounds in quanto 0 drops below `VALIDATOR_MIN_PARTICIPATION_BPS`
+    /// and collects nothing when quanto 1's pool is distributed, while its stake
+    /// stays intact (it's a fee penalty, not a slash). A fully-participating
+    /// validator keeps its share.
+    #[test]
+    fn v7_participation_tally_gates_a_down_validator_out_of_the_fee_split() {
+        use crate::validator_v7::{ValidatorV7Entry, ValidatorV7Registry, ValidatorV7State};
+        use qchain_crypto::PublicKeyBundle;
+
+        let rpq = 4u64;
+        let mut l = new_test_ledger_v7(rpq);
+
+        // Genesis global already at quanto 1 (last settled 0), so a tx at round
+        // 2*rpq closes exactly quanto 1 — whose scoring reads the quanto-0 tally.
+        let mut g = Account::new_wallet(STAKING_PROGRAM_ID);
+        g.data = borsh::to_vec(&crate::staking_v7::GlobalStakingState {
+            index: crate::economics_v7::INDEX_SCALE,
+            total_shares: 0,
+            current_quanto: 1,
+            last_settled_quanto: 0,
+        })
+        .unwrap();
+        l.write_account(crate::ids::STAKING_GLOBAL_ID, g);
+
+        // Pool seeded with 100 (as if fees accrued during quanto 1).
+        let mut pool = Account::new_wallet(STAKING_PROGRAM_ID);
+        pool.balance = 100;
+        l.write_account(VALIDATOR_FEE_POOL_ID, pool);
+
+        // 3 Active validators activated at quanto 0 (all eligible for quanto 1
+        // absent participation gating).
+        let va = Pubkey::new([20; 32]);
+        let vb = Pubkey::new([21; 32]);
+        let vc = Pubkey::new([22; 32]);
+        let mk = |addr: Pubkey| ValidatorV7Entry {
+            address: addr,
+            moniker: "n".into(),
+            pubkey_bundle: PublicKeyBundle { components: vec![] },
+            p2p_address: "1.2.3.4:9000".into(),
+            bond: crate::economics_v7::VALIDATOR_BOND_ATOMS,
+            state: ValidatorV7State::Active,
+            registered_quanto: 0,
+            activation_quanto: 0,
+            exit_requested_quanto: 0,
+            bond_release_quanto: 0,
+            participation_credits: 0,
+            participation_opportunities: 0,
+        };
+        let registry = ValidatorV7Registry { validators: vec![mk(va), mk(vb), mk(vc)] };
+        let mut reg = Account::new_wallet(STAKING_PROGRAM_ID);
+        reg.data = borsh::to_vec(&registry).unwrap();
+        l.write_account(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, reg);
+
+        // Feed the quanto-0 participation tally: va/vb full (100/100 → 10000bps),
+        // vc down (50/100 → 5000bps, below the 9000 minimum).
+        l.set_quanto_participation(0, vec![
+            (va, 100, 100),
+            (vb, 100, 100),
+            (vc, 50, 100),
+        ]);
+
+        // A transfer crossing the quanto-1 boundary triggers the close.
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        l.apply_transaction(&tx, &proposer, 2 * rpq).unwrap();
+
+        // vc was gated out by its low participation → 100/2 = 50 to va and vb, 0 to vc.
+        assert_eq!(l.get_balance(&va), 50, "fully-participating A gets 1/2");
+        assert_eq!(l.get_balance(&vb), 50, "fully-participating B gets 1/2");
+        assert_eq!(l.get_balance(&vc), 0, "down validator C is gated out of the split");
+
+        // The gating wrote the tally into the registry (C now reflects 50/100).
+        let reg_after: crate::validator_v7::ValidatorV7Registry =
+            borsh::from_slice(&l.store.get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data).unwrap();
+        let c = reg_after.validators.iter().find(|v| v.address == vc).unwrap();
+        assert_eq!((c.participation_credits, c.participation_opportunities), (50, 100), "C's real uptime recorded");
+        assert!(c.participation_bps() < crate::economics_v7::VALIDATOR_MIN_PARTICIPATION_BPS, "C below the minimum");
+        // C's bond/stake is untouched (fee penalty, not slash).
+        assert_eq!(c.bond, crate::economics_v7::VALIDATOR_BOND_ATOMS, "C's bond intact");
+        assert_eq!(c.state, crate::validator_v7::ValidatorV7State::Active, "C still Active");
     }
 
     #[test]

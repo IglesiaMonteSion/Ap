@@ -664,6 +664,29 @@ pub struct EngineState {
     /// or just after the proposal); vacuously satisfied for an empty (no-tx)
     /// vertex, so empty rounds still vote immediately. Pruned by round window.
     pub pending_availability_votes: HashMap<Digest, (Vertex, ValidatorId, Round)>,
+    /// v7 participation (§21.2): per-quanto accumulator of how many rounds each
+    /// validator had a COMMITTED certificate — `quanto -> (validator ->
+    /// committed-cert count)`. Incremented once per certificate as it enters the
+    /// committed order (`try_commit`'s newly-ordered loop, IDENTICAL on every
+    /// node), so the tally is deterministic. O(committee) per live quanto (not
+    /// O(rounds)), so a large `rounds_per_quanto` doesn't blow it up. Only touched
+    /// when the ledger runs the v7 economics; empty (and unused) otherwise.
+    /// Re-derivable from the persisted DAG on restart (a fresh `ConsensusState`
+    /// re-emits the whole committed order). A quanto's entry is dropped once its
+    /// tally has been fed to the ledger.
+    pub participation_credits: std::collections::BTreeMap<u64, HashMap<ValidatorId, u64>>,
+    /// v7 participation: the highest round this node has seen a committed
+    /// certificate for. A quanto is "complete" (all its rounds finalized and
+    /// identical on every node) once this reaches the quanto's last round, at
+    /// which point its tally can be safely fed to the ledger.
+    pub participation_hi_round: Round,
+    /// v7 participation: the next quanto index whose tally this node will feed to
+    /// the ledger (`set_quanto_participation`). Advances monotonically as quantos
+    /// complete; a quanto is fed exactly once (from finalized data) a full quanto
+    /// before the ledger reads it (at the close of the following quanto), so the
+    /// tally is always present and identical when the close applies it. Resets to
+    /// 0 on restart and re-feeds idempotently as the committed order re-derives.
+    pub participation_next_quanto: u64,
 }
 
 /// One row of the validator directory served by `GET /validators`: the
@@ -3149,8 +3172,31 @@ impl Engine {
         // lose a certificate that is still waiting for its batch. Applied in
         // the vertex's own `batch_digests` order (worker-lane order at
         // proposal time), the identical certified list every validator sees.
+        // v7 participation (§21.2): tally each certificate as it enters the
+        // committed order. `credits[quanto(round)][author] += 1` counts the rounds
+        // a validator had a committed certificate; the highest committed round is
+        // tracked so a quanto's tally is only fed once all its rounds are final.
+        // Driven off the committed order (identical on every node) and off a fresh
+        // `advance` (which re-emits each digest exactly once), so it never
+        // double-counts and re-derives identically on restart. Gated on the v7
+        // economics — a v6 network never touches these maps (byte-identical).
+        let participation_on = state.ledger.is_economics_v7();
+        let rpq = state.ledger.rounds_per_quanto();
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
+            if participation_on && rpq > 0 {
+                let round = cert.vertex.round;
+                let quanto = round / rpq;
+                *state
+                    .participation_credits
+                    .entry(quanto)
+                    .or_default()
+                    .entry(cert.vertex.author)
+                    .or_insert(0) += 1;
+                if round > state.participation_hi_round {
+                    state.participation_hi_round = round;
+                }
+            }
             state.pending_execution.push_back(cert);
         }
         // Drain the queue in committed order. Execution BLOCKS at the first
@@ -3288,6 +3334,52 @@ impl Engine {
         // for /stark_proof only for the recent few hundred, light for the rest).
         state.ledger.strip_old_receipt_proofs(N_FULL_PROOF_RECEIPTS);
         state.ledger.cap_staking_events(MAX_INMEM_STAKING_EVENTS);
+
+        // v7 participation (§21.2): feed the ledger every quanto whose rounds are
+        // now ALL committed — final and identical on every node — so the FOLLOWING
+        // quanto's close can gate a down validator out of the 1/N fee split.
+        // `complete = hi / rpq` is the count of fully-elapsed quantos (a quanto's
+        // last round `(q+1)*rpq - 1` is committed once `hi >= (q+1)*rpq`, and
+        // rounds commit in order, so all its rounds are then final). Each quanto is
+        // fed exactly once, a FULL quanto before the ledger reads it (the ledger
+        // closes quanto `q+1` at round `(q+2)*rpq`, long after `q` completed at
+        // `(q+1)*rpq`), so the tally is always present and identical when the close
+        // applies it — no fork. `opportunities` = how many of the quanto's rounds a
+        // validator was in the committee (from the schedule, whose PAST-round
+        // committees never change); `credits` = the accumulated committed-cert
+        // count. Fixed-membership (rotation off, the default) is the cheap path
+        // (`opps = rpq` for each committee member). Gated on the v7 economics — a
+        // v6 network never enters this block (byte-identical).
+        if participation_on && rpq > 0 {
+            let complete = state.participation_hi_round / rpq;
+            let fixed_membership = schedule_snapshot.frontier_epoch() == u64::MAX;
+            while state.participation_next_quanto < complete {
+                let q = state.participation_next_quanto;
+                let mut opps: HashMap<ValidatorId, u64> = HashMap::new();
+                if fixed_membership {
+                    // The committee is constant across all rounds → every member
+                    // had `rpq` opportunities. Avoids iterating `rpq` rounds.
+                    for id in schedule_snapshot.base().ids_sorted() {
+                        opps.insert(id, rpq);
+                    }
+                } else {
+                    let start = q.saturating_mul(rpq);
+                    let end = start.saturating_add(rpq); // exclusive
+                    for r in start..end {
+                        for id in schedule_snapshot.for_round(r).ids_sorted() {
+                            *opps.entry(id).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let credits = state.participation_credits.remove(&q).unwrap_or_default();
+                let entries: Vec<(ValidatorId, u64, u64)> = opps
+                    .into_iter()
+                    .map(|(v, o)| (v, credits.get(&v).copied().unwrap_or(0), o))
+                    .collect();
+                state.ledger.set_quanto_participation(q, entries);
+                state.participation_next_quanto = q + 1;
+            }
+        }
 
         // ---- Phase-3.3 rotation ratchet ----
         // If this schedule rotates and the frontier epoch is now fully
@@ -3833,6 +3925,9 @@ mod tests {
             update_available: None,
             pending_execution: std::collections::VecDeque::new(),
             pending_availability_votes: HashMap::new(),
+            participation_credits: std::collections::BTreeMap::new(),
+            participation_hi_round: 0,
+            participation_next_quanto: 0,
         }
     }
 

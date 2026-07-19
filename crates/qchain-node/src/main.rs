@@ -724,6 +724,9 @@ async fn main() -> anyhow::Result<()> {
             update_available: None,
             pending_execution: std::collections::VecDeque::new(),
             pending_availability_votes: HashMap::new(),
+            participation_credits: std::collections::BTreeMap::new(),
+            participation_hi_round: 0,
+            participation_next_quanto: 0,
         }),
     });
 
