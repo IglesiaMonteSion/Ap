@@ -143,6 +143,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     std::fs::create_dir_all(&cli.out_dir)?;
+    let mut shared_chain_id: Option<[u8; 32]> = None;
     for (i, manifest) in manifests.iter().enumerate() {
         let config = NodeConfig {
             keypair_path: PathBuf::from(&cli.keypair_name),
@@ -164,11 +165,20 @@ fn main() -> anyhow::Result<()> {
             quanto_rate_fp: None,
             rounds_per_quanto: cli.rounds_per_quanto,
         };
+        // Every output config shares the same validators+genesis (+ folded genesis
+        // flags), so they all resolve to the identical chain_id — the network's
+        // identity. Compute it once and confirm it never differs between configs.
+        let cid = config.chain_id();
+        match shared_chain_id {
+            None => shared_chain_id = Some(cid),
+            Some(prev) => debug_assert_eq!(prev, cid, "all configs must share one chain_id"),
+        }
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;
         println!("{} -> validator {} (listen {}, rpc {}) [from {}]", out_path.display(), manifest.pubkey_bundle.to_address(), manifest.listen_addr, manifest.rpc_addr, manifest_paths[i].display());
     }
 
+    let cid_hex = hex::encode(shared_chain_id.unwrap_or([0u8; 32]));
     println!(
         "\nWrote {} node config(s) to {}. Send each nodeN.json to the matching participant - they place it next to their own {} and a {}/ directory, then run: qchain-node --config nodeN.json",
         manifests.len(),
@@ -176,5 +186,18 @@ fn main() -> anyhow::Result<()> {
         cli.keypair_name,
         cli.data_dir_name
     );
+    // The network's identity. In a COORDINATED relaunch every operator must build
+    // from the SAME manifests+genesis+flags and confirm this exact value — a
+    // mismatch means two operators built different networks that will not
+    // interoperate (they would fork). Cross-check it against every running node's
+    // `GET /chain_id` after launch.
+    println!("\nchain_id: {cid_hex}");
+    if cli.economics_v7 {
+        println!("economics: v7 ENABLED (rounds_per_quanto={}) — a hard-forked network, distinct from any v6 chain.", cli.rounds_per_quanto.map(|r| r.to_string()).unwrap_or_else(|| "default".into()));
+    }
+    if cli.compressed_state_tree {
+        println!("state tree: COMPRESSED — folded into the chain_id above.");
+    }
+    println!("EVERY validator of this network must build from the same manifests + genesis + flags and see this SAME chain_id, or the network will fork.");
     Ok(())
 }

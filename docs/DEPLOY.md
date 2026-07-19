@@ -298,6 +298,12 @@ génesis). Tras crear la red, un validador se registra con
 `qchain v7-begin-exit` y recupera el bono con `qchain v7-withdraw-bond` tras la
 ventana de unbonding.
 
+**¿Pasar una red v6 que YA existe a v7?** Eso es un **relanzamiento coordinado**
+(génesis nuevo, `chain_id` distinto, con opción de conservar los saldos v6). El
+runbook completo paso a paso — incluyendo el carry-over de saldos con
+`deploy/v6-snapshot-to-v7-genesis.sh` y el cross-check del `chain_id` que ahora
+imprime `qchain-genesis-build` — está en **[`RELAUNCH-V7.md`](RELAUNCH-V7.md)**.
+
 ## Red de 2 validadores (principal + secundario) en un paso: `deploy/setup-2validators.sh`
 
 Para armar una red NUEVA de dos VPS sin hacer el ida y vuelta de bundles/configs
