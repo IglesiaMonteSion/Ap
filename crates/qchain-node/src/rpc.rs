@@ -32,6 +32,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/rounds", get(rounds))
         .route("/validators", get(validators))
         .route("/validator_registry", get(validator_registry))
+        .route("/validator_v7_registry", get(validator_v7_registry))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
@@ -384,6 +385,56 @@ async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<se
         })
         .collect();
     Ok(Json(json!({ "validators": validators })))
+}
+
+/// `/validator_v7_registry` - the v7 validator registry (economics_v7 networks).
+/// The v7 registry lives at the SAME account id as the phase-3 v6 registry but
+/// in the v7 `ValidatorV7Registry` format, so `/validator_registry` (a v6
+/// reader) can't decode it - this endpoint decodes the v7 shape and reports each
+/// validator's moniker, address, bond, lifecycle state, activation/exit/release
+/// quanto, live participation, and whether it's eligible for the current
+/// quanto's fee distribution (Active, past activation, min participation). On a
+/// v6 network (or a not-yet-seeded store) it returns an empty list rather than
+/// erroring. Read-only; nothing here changes state.
+async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_REGISTRY_ACCOUNT_ID};
+    use qchain_execution::staking_v7::GlobalStakingState;
+    use qchain_execution::validator_v7::ValidatorV7Registry;
+    let Some(acct) = engine.get_account(&VALIDATOR_REGISTRY_ACCOUNT_ID).await else {
+        return Ok(Json(json!({ "current_quanto": 0, "validators": [] })));
+    };
+    // Decode the v7 format; a v6-format registry (or empty) → empty list, so a
+    // caller hitting this on a v6 network gets a clean answer, not a 500.
+    let Ok(registry) = ValidatorV7Registry::try_from_slice(&acct.data) else {
+        return Ok(Json(json!({ "current_quanto": 0, "validators": [] })));
+    };
+    let current_quanto = engine
+        .get_account(&STAKING_GLOBAL_ID)
+        .await
+        .and_then(|a| GlobalStakingState::try_from_slice(&a.data).ok())
+        .map(|g| g.current_quanto)
+        .unwrap_or(0);
+    let validators: Vec<serde_json::Value> = registry
+        .validators
+        .iter()
+        .map(|v| {
+            json!({
+                "moniker": v.moniker,
+                "address": v.address.to_string(),
+                "p2p_address": v.p2p_address,
+                "bond": v.bond,
+                "state": format!("{:?}", v.state),
+                "registered_quanto": v.registered_quanto,
+                "activation_quanto": v.activation_quanto,
+                "exit_requested_quanto": v.exit_requested_quanto,
+                "bond_release_quanto": v.bond_release_quanto,
+                "participation_bps": v.participation_bps(),
+                "eligible_now": qchain_execution::fees_v7::is_eligible(v, current_quanto),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "current_quanto": current_quanto, "validators": validators })))
 }
 
 /// `/active_validators` - the ACTIVE validator set for the current epoch,

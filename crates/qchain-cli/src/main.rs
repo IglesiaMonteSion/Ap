@@ -420,6 +420,13 @@ enum Command {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
     },
+    /// v7: list the on-chain v7 validator registry (moniker, state, bond,
+    /// participation, and whether each is eligible for the current quanto's
+    /// fee distribution). economics_v7 networks only.
+    V7Validators {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+    },
     /// Regenerate a node config's `validators` array straight from the
     /// on-chain validator registry (phase 3). Fetches every self-registered
     /// validator (bundle + address + stake) and prints the JSON array ready
@@ -1382,6 +1389,30 @@ fn main() -> anyhow::Result<()> {
             let registry: Vec<RegistryEntry> = borsh::from_slice(&account.data)?;
             for entry in registry {
                 println!("id={} name={} status={:?}", entry.id.0, entry.name, entry.status);
+            }
+        }
+        Command::V7Validators { rpc } => {
+            let resp: serde_json::Value = reqwest::blocking::get(format!("{rpc}/validator_v7_registry"))?.error_for_status()?.json()?;
+            let q = resp.get("current_quanto").and_then(|v| v.as_u64()).unwrap_or(0);
+            let vals = resp.get("validators").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            println!("v7 validator registry (current_quanto={q}, {} registered):", vals.len());
+            if vals.is_empty() {
+                println!("  (empty - a v6 network, or no v7 validator has registered yet)");
+            }
+            for v in vals {
+                let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                let elig = v.get("eligible_now").and_then(|x| x.as_bool()).unwrap_or(false);
+                println!(
+                    "  {} [{}] bond={} state={} activation_q={} participation={}bps eligible={}",
+                    s("moniker"),
+                    s("address"),
+                    n("bond"),
+                    s("state"),
+                    n("activation_quanto"),
+                    n("participation_bps"),
+                    elig,
+                );
             }
         }
         Command::Params { rpc } => {
