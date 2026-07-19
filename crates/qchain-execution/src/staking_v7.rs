@@ -221,6 +221,39 @@ impl StakingV7Program {
             if existing.is_some() {
                 return Err(ExecError::ProgramError("position account already exists - Stake opens a fresh one".into()));
             }
+            // SECURITY (pre-launch audit): `write_position` is a BLIND overwrite
+            // (sets balance=0, owner=STAKING_PROGRAM_ID, data=<position>). Without
+            // this guard, a 1-unit Stake naming ANY occupied account as accounts[1]
+            // — a user wallet, the reserve, the bond escrow, any pool, the global
+            // singleton — would wipe it (its `data` doesn't decode as a position, so
+            // `existing` is None and the check above passes). A fresh position must
+            // therefore be a genuinely NEW/EMPTY, system-owned account (never seen,
+            // so the ledger left it absent from the working set — or present only as
+            // an empty system wallet), never a protocol singleton, and never the
+            // payer's own funding wallet. This is the Solana "account being created
+            // must be empty" rule; `IncreaseStake`/`BeginUnstake`/`WithdrawUnbonded`
+            // are unaffected (they require a pre-existing valid position).
+            if position_pk == *payer {
+                return Err(ExecError::Unauthorized("the staking position must be a fresh account, not the payer's wallet".into()));
+            }
+            const RESERVED: [Pubkey; 8] = [
+                STAKING_GLOBAL_ID,
+                STAKING_RESERVE_ID,
+                STAKING_UNBONDING_POOL_ID,
+                crate::ids::VALIDATOR_BOND_ESCROW_ID,
+                crate::ids::VALIDATOR_UNBONDING_POOL_ID,
+                crate::ids::VALIDATOR_FEE_POOL_ID,
+                crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID,
+                crate::ids::STAKING_STATS_ID,
+            ];
+            if RESERVED.contains(&position_pk) {
+                return Err(ExecError::Unauthorized("the staking position must not be a protocol singleton account".into()));
+            }
+            if let Some(occupied) = accounts.get(&position_pk) {
+                if occupied.balance != 0 || !occupied.data.is_empty() || occupied.owner != Pubkey::system_program_id() {
+                    return Err(ExecError::Unauthorized("Stake opens a FRESH position — the named account is already in use".into()));
+                }
+            }
             let staker_balance = accounts.get(&staker).ok_or(ExecError::AccountNotFound(staker))?.balance;
             if staker_balance < amount {
                 return Err(ExecError::InsufficientFunds);
@@ -304,8 +337,18 @@ impl StakingV7Program {
         let staker = *ix.accounts.first().ok_or_else(|| ExecError::ProgramError("WithdrawUnbonded requires accounts[0]".into()))?;
         let position_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("WithdrawUnbonded requires accounts[1]".into()))?;
         let unbonding_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("WithdrawUnbonded requires accounts[2]".into()))?;
+        // The global staking account MUST be named (accounts[3]) and pinned:
+        // `read_global` reads it from the working set, and the ledger only loads
+        // DECLARED accounts. Without it, `read_global` silently falls back to
+        // `genesis()` (current_quanto=0), so the maturity check `0 < ready` is
+        // always true and EVERY legitimate withdrawal is rejected forever
+        // (fails safe — no theft — but broken). Pre-launch audit fix.
+        let global_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("WithdrawUnbonded requires accounts[3] (the global staking account)".into()))?;
         if unbonding_pk != STAKING_UNBONDING_POOL_ID {
             return Err(ExecError::Unauthorized("WithdrawUnbonded must name the canonical unbonding pool".into()));
+        }
+        if global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("WithdrawUnbonded must name the canonical global staking account".into()));
         }
         let g = read_global(accounts);
         let mut pos = read_position(accounts, &position_pk).ok_or_else(|| ExecError::ProgramError("no such position".into()))?;
@@ -521,18 +564,65 @@ mod tests {
         reserve_value_invariant(&accounts);
 
         // Withdraw before the window closes → rejected.
-        let e = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker);
+        let e = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &staker);
         assert!(e.is_err(), "cannot withdraw before the unbonding window elapses");
 
         // Advance a quanto (settle) so current_quanto reaches the ready quanto.
         let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         settle_quanto(&mut accounts, 0, rate).unwrap(); // current_quanto -> 1 >= ready (0+1)
         let before = accounts.get(&staker).unwrap().balance;
-        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &staker).unwrap();
         assert_eq!(accounts.get(&staker).unwrap().balance, before + half, "the unbonded funds are paid out");
         assert_eq!(accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance, 0);
         // Still has the other half active.
         assert_eq!(read_position(&accounts, &position).unwrap().state, PositionState::Active);
+    }
+
+    /// SECURITY REGRESSION (pre-launch audit): a fresh-open `Stake` must NOT be
+    /// able to name an OCCUPIED account (a user wallet, a pool, a singleton) as
+    /// its position and thereby wipe it (`write_position` blindly overwrites
+    /// balance/owner/data). The guard rejects it and the victim is untouched.
+    #[test]
+    fn stake_cannot_wipe_an_occupied_account_or_a_singleton() {
+        let attacker = pk(70);
+        let victim = pk(71);
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        accounts.insert(attacker, wallet(100 * UNITS_PER_QCH));
+        accounts.insert(victim, wallet(50 * UNITS_PER_QCH)); // a real user wallet with funds
+
+        // Attack: Stake 1 unit naming the victim wallet as the position account.
+        let e = StakingV7Program::execute(
+            &mut accounts,
+            &ix(&StakingV7Instruction::Stake { amount: 1 }, vec![attacker, victim, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]),
+            &attacker,
+        );
+        assert!(e.is_err(), "Stake onto an occupied wallet must be rejected");
+        assert_eq!(accounts.get(&victim).unwrap().balance, 50 * UNITS_PER_QCH, "victim balance untouched");
+        assert_eq!(accounts.get(&victim).unwrap().owner, Pubkey::system_program_id(), "victim owner untouched");
+
+        // Attack: name a protocol singleton (the reserve) as the position.
+        accounts.insert(STAKING_RESERVE_ID, {
+            let mut a = Account::new_wallet(STAKING_PROGRAM_ID);
+            a.balance = 999;
+            a
+        });
+        let e2 = StakingV7Program::execute(
+            &mut accounts,
+            &ix(&StakingV7Instruction::Stake { amount: 1 }, vec![attacker, STAKING_RESERVE_ID, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]),
+            &attacker,
+        );
+        assert!(e2.is_err(), "Stake onto a singleton (the reserve) must be rejected");
+        assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, 999, "reserve untouched");
+
+        // A genuinely fresh position (never-seen address, absent from the set) still works.
+        let fresh = pk(72);
+        StakingV7Program::execute(
+            &mut accounts,
+            &ix(&StakingV7Instruction::Stake { amount: 10 * UNITS_PER_QCH }, vec![attacker, fresh, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]),
+            &attacker,
+        )
+        .unwrap();
+        assert!(read_position(&accounts, &fresh).is_some(), "a fresh position opens normally");
     }
 
     #[test]

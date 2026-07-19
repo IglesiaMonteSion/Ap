@@ -419,6 +419,33 @@ const MAX_ROUND_LOOKAHEAD: Round = 1_024;
 /// draws).
 const DAG_RETENTION_ROUNDS: Round = 1_024;
 
+/// v7 participation gating (§21.2) master switch — DISABLED.
+///
+/// The async participation feed (accumulate per-quanto committed-cert credits
+/// from the DAG on this node, feed the ledger a tally the following quanto's
+/// close reads to gate a down validator out of the 1/N fee split) is
+/// STRUCTURALLY INCOMPATIBLE WITH DAG PRUNING across a restart. A quanto is only
+/// safe to feed once it is `gc_floor`-final (below the watermark under which
+/// certs can never be revised) — but those very certs are then PRUNED, so a
+/// RESTARTED node has no DAG history to rebuild that quanto's credits from and
+/// re-derives a DIFFERENT tally than a node that never restarted → FORK. Both a
+/// `finalized_floor` and a `gc_floor` threshold were confirmed live to fork a
+/// restarted node (wrong bps on validators that were never down). Making the
+/// gating fork-safe requires PERSISTING the fed tallies + `participation_next_quanto`
+/// to disk (a new sled layer) so a restart resumes from persisted state instead
+/// of re-deriving from a pruned DAG — deferred as its own increment.
+///
+/// With the switch OFF: no credits accumulate, no tally is ever fed, the
+/// ledger's `apply_participation_for_quanto` always finds no tally and leaves
+/// `participation_bps` at the genesis-seeded 10000, so every Active founder is
+/// eligible → deterministic 1/N split identical on every node → NO FORK. The
+/// accepted imperfection is that a DOWN validator keeps earning its 1/N share
+/// (a fee overpayment, never a safety/consensus issue; its bond/stake is still
+/// intact and equivocation is still slashed). The ledger unit test that feeds a
+/// tally directly (`set_quanto_participation`) still exercises the gating logic
+/// in isolation — only the node's async feed is inert.
+const V7_PARTICIPATION_GATING: bool = false;
+
 /// How many of `available` receipts a single `/stark_proof` call actually
 /// proves, given what the caller requested (`None` meaning "all of them").
 /// Always `<= MAX_STARK_PROOF_RECEIPTS` and `<= available` - see
@@ -675,11 +702,6 @@ pub struct EngineState {
     /// re-emits the whole committed order). A quanto's entry is dropped once its
     /// tally has been fed to the ledger.
     pub participation_credits: std::collections::BTreeMap<u64, HashMap<ValidatorId, u64>>,
-    /// v7 participation: the highest round this node has seen a committed
-    /// certificate for. A quanto is "complete" (all its rounds finalized and
-    /// identical on every node) once this reaches the quanto's last round, at
-    /// which point its tally can be safely fed to the ledger.
-    pub participation_hi_round: Round,
     /// v7 participation: the next quanto index whose tally this node will feed to
     /// the ledger (`set_quanto_participation`). Advances monotonically as quantos
     /// complete; a quanto is fed exactly once (from finalized data) a full quanto
@@ -3174,13 +3196,14 @@ impl Engine {
         // proposal time), the identical certified list every validator sees.
         // v7 participation (§21.2): tally each certificate as it enters the
         // committed order. `credits[quanto(round)][author] += 1` counts the rounds
-        // a validator had a committed certificate; the highest committed round is
-        // tracked so a quanto's tally is only fed once all its rounds are final.
-        // Driven off the committed order (identical on every node) and off a fresh
-        // `advance` (which re-emits each digest exactly once), so it never
-        // double-counts and re-derives identically on restart. Gated on the v7
-        // economics — a v6 network never touches these maps (byte-identical).
-        let participation_on = state.ledger.is_economics_v7();
+        // a validator had a committed certificate. Driven off the committed order
+        // (identical on every node) and off a fresh `advance` (which re-emits each
+        // digest exactly once). DISABLED behind `V7_PARTICIPATION_GATING` (false)
+        // because the async rebuild-on-restart forks under DAG pruning — see the
+        // const's doc comment. With it off `participation_on` is false, both the
+        // credit accumulator and the feed loop below are skipped, and the ledger
+        // keeps every founder at 10000 bps → deterministic 1/N split, no fork.
+        let participation_on = state.ledger.is_economics_v7() && V7_PARTICIPATION_GATING;
         let rpq = state.ledger.rounds_per_quanto();
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
@@ -3193,11 +3216,67 @@ impl Engine {
                     .or_default()
                     .entry(cert.vertex.author)
                     .or_insert(0) += 1;
-                if round > state.participation_hi_round {
-                    state.participation_hi_round = round;
-                }
             }
             state.pending_execution.push_back(cert);
+        }
+        // v7 participation (§21.2): feed the ledger every quanto whose rounds are
+        // now PERMANENTLY FINAL, so the FOLLOWING quanto's close can gate a down
+        // validator out of the 1/N fee split. TWO audit-hardened invariants:
+        //  (1) FED BEFORE READ, SAME PASS. This runs BEFORE the execution drain
+        //      below — which is what CONSUMES a tally (a tx that closes quanto q+1
+        //      reads tally[q]). A single `advance()` can jump ≥2 quanto boundaries
+        //      (resync / partition-heal / restart re-derivation); feeding after the
+        //      drain (an earlier bug) let that drain read a tally not yet supplied
+        //      on THIS node → default 10000 bps here vs real gating elsewhere →
+        //      FORK. Feeding first guarantees every tally the drain can read is
+        //      supplied first.
+        //  (2) GC-FLOOR FINAL, not merely "resolved". The threshold is
+        //      `gc_floor / rpq`. `finalized_floor` is NOT safe: it advances
+        //      monotonically but `extend_order` re-runs from a fixed low
+        //      `from_round`, so a LATE resync can still REVISE a round below
+        //      `finalized_floor` (Skipped→Committed) — a restarted node that fed a
+        //      quanto from its partial DAG would then diverge from a node that saw
+        //      the full causal history (CONFIRMED live: identical registry bps but
+        //      different 1/N fee splits after a restart-with-resync). `gc_floor` is
+        //      the ONLY watermark under which certs are PRUNED and can never be
+        //      revised, so a quanto fully below it has an identical committed cert
+        //      set on every node → identical tally. This makes the feed fork-safe
+        //      at every rpq. Timeliness (fed before the ledger reads it at
+        //      `(q+2)*rpq`) holds when `DAG_RETENTION_ROUNDS < rpq` — true for the
+        //      production default (rpq=172800 ≫ 1024). If rpq ≤ retention (a tiny
+        //      test network), a quanto isn't gc-final in time, so the close finds no
+        //      tally and leaves bps at 10000 — no gating, but IDENTICAL on every
+        //      node → still no fork. Gated on economics_v7 — a v6 network never
+        //      enters here.
+        if participation_on && rpq > 0 {
+            let complete = state.consensus.gc_floor() / rpq;
+            let fixed_membership = schedule_snapshot.frontier_epoch() == u64::MAX;
+            while state.participation_next_quanto < complete {
+                let q = state.participation_next_quanto;
+                let mut opps: HashMap<ValidatorId, u64> = HashMap::new();
+                if fixed_membership {
+                    // The committee is constant across all rounds → every member
+                    // had `rpq` opportunities. Avoids iterating `rpq` rounds.
+                    for id in schedule_snapshot.base().ids_sorted() {
+                        opps.insert(id, rpq);
+                    }
+                } else {
+                    let start = q.saturating_mul(rpq);
+                    let end = start.saturating_add(rpq); // exclusive
+                    for r in start..end {
+                        for id in schedule_snapshot.for_round(r).ids_sorted() {
+                            *opps.entry(id).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let credits = state.participation_credits.remove(&q).unwrap_or_default();
+                let entries: Vec<(ValidatorId, u64, u64)> = opps
+                    .into_iter()
+                    .map(|(v, o)| (v, credits.get(&v).copied().unwrap_or(0), o))
+                    .collect();
+                state.ledger.set_quanto_participation(q, entries);
+                state.participation_next_quanto = q + 1;
+            }
         }
         // Drain the queue in committed order. Execution BLOCKS at the first
         // certificate whose worker batches aren't all locally available yet -
@@ -3334,52 +3413,6 @@ impl Engine {
         // for /stark_proof only for the recent few hundred, light for the rest).
         state.ledger.strip_old_receipt_proofs(N_FULL_PROOF_RECEIPTS);
         state.ledger.cap_staking_events(MAX_INMEM_STAKING_EVENTS);
-
-        // v7 participation (§21.2): feed the ledger every quanto whose rounds are
-        // now ALL committed — final and identical on every node — so the FOLLOWING
-        // quanto's close can gate a down validator out of the 1/N fee split.
-        // `complete = hi / rpq` is the count of fully-elapsed quantos (a quanto's
-        // last round `(q+1)*rpq - 1` is committed once `hi >= (q+1)*rpq`, and
-        // rounds commit in order, so all its rounds are then final). Each quanto is
-        // fed exactly once, a FULL quanto before the ledger reads it (the ledger
-        // closes quanto `q+1` at round `(q+2)*rpq`, long after `q` completed at
-        // `(q+1)*rpq`), so the tally is always present and identical when the close
-        // applies it — no fork. `opportunities` = how many of the quanto's rounds a
-        // validator was in the committee (from the schedule, whose PAST-round
-        // committees never change); `credits` = the accumulated committed-cert
-        // count. Fixed-membership (rotation off, the default) is the cheap path
-        // (`opps = rpq` for each committee member). Gated on the v7 economics — a
-        // v6 network never enters this block (byte-identical).
-        if participation_on && rpq > 0 {
-            let complete = state.participation_hi_round / rpq;
-            let fixed_membership = schedule_snapshot.frontier_epoch() == u64::MAX;
-            while state.participation_next_quanto < complete {
-                let q = state.participation_next_quanto;
-                let mut opps: HashMap<ValidatorId, u64> = HashMap::new();
-                if fixed_membership {
-                    // The committee is constant across all rounds → every member
-                    // had `rpq` opportunities. Avoids iterating `rpq` rounds.
-                    for id in schedule_snapshot.base().ids_sorted() {
-                        opps.insert(id, rpq);
-                    }
-                } else {
-                    let start = q.saturating_mul(rpq);
-                    let end = start.saturating_add(rpq); // exclusive
-                    for r in start..end {
-                        for id in schedule_snapshot.for_round(r).ids_sorted() {
-                            *opps.entry(id).or_insert(0) += 1;
-                        }
-                    }
-                }
-                let credits = state.participation_credits.remove(&q).unwrap_or_default();
-                let entries: Vec<(ValidatorId, u64, u64)> = opps
-                    .into_iter()
-                    .map(|(v, o)| (v, credits.get(&v).copied().unwrap_or(0), o))
-                    .collect();
-                state.ledger.set_quanto_participation(q, entries);
-                state.participation_next_quanto = q + 1;
-            }
-        }
 
         // ---- Phase-3.3 rotation ratchet ----
         // If this schedule rotates and the frontier epoch is now fully
@@ -3926,7 +3959,6 @@ mod tests {
             pending_execution: std::collections::VecDeque::new(),
             pending_availability_votes: HashMap::new(),
             participation_credits: std::collections::BTreeMap::new(),
-            participation_hi_round: 0,
             participation_next_quanto: 0,
         }
     }

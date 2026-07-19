@@ -249,13 +249,14 @@ pub fn sign_v7_begin_unstake_json(seed: &[u8; 32], position: &str, amount: u64, 
 }
 
 /// v7 `WithdrawUnbonded` (`[3]`): pay out the matured unbonding chunk. accounts =
-/// [payer, position, STAKING_UNBONDING_POOL].
+/// [payer, position, STAKING_UNBONDING_POOL, STAKING_GLOBAL]. The global account
+/// is required so the maturity check reads the real current quanto (audit fix).
 pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
     let ix = Instruction {
         program_id: Pubkey::new(STAKING_PROGRAM_ID),
-        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_UNBONDING_POOL_ID)],
+        accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_UNBONDING_POOL_ID), Pubkey::new(STAKING_GLOBAL_ID)],
         data: vec![3u8],
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;

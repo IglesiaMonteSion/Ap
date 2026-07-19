@@ -79,6 +79,17 @@ struct Cli {
     /// to cross a quanto boundary quickly. Only meaningful with `--economics-v7`.
     #[arg(long)]
     rounds_per_quanto: Option<u64>,
+    /// The per-quanto compounding rate (fixed-point, scale 1e18), for a v7
+    /// network. Omitted (the default) BAKES the value computed ONCE on this build
+    /// machine into every config — the critical mitigation for the f64 derivation
+    /// (`(1+apy)^(1/quantos_per_year)`), which is NOT bit-identical across
+    /// platforms (glibc/musl/x86/aarch64). If it were left unbaked, two validators
+    /// of the same network on different architectures would each re-derive it and
+    /// get a different value → a different `chain_id` and a diverging on-chain
+    /// staking index → fork. Override only to pin an exact integer. Only meaningful
+    /// with `--economics-v7`.
+    #[arg(long)]
+    quanto_rate_fp: Option<u128>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +153,57 @@ fn main() -> anyhow::Result<()> {
         None => Vec::new(),
     };
 
+    // Validate the genesis allocations before anyone launches (audit hardening):
+    // a DUPLICATE address would be silently SUMMED by `ledger.credit` (additive),
+    // and an address equal to a reserved singleton (System Program, the v7 pool
+    // ids, the phase-3 governance/staking singletons) would be credited and then
+    // OVERWRITTEN by the singleton seeding — its funds vanishing. Reject both with
+    // an actionable error, same spirit as the duplicate-manifest check.
+    {
+        use std::collections::HashSet;
+        let reserved: Vec<(qchain_crypto::Pubkey, &str)> = vec![
+            (qchain_crypto::Pubkey::system_program_id(), "System Program"),
+            (qchain_execution::STAKING_PROGRAM_ID, "STAKING_PROGRAM"),
+            (qchain_execution::STAKING_STATS_ID, "STAKING_STATS"),
+            (qchain_execution::GOVERNANCE_PROGRAM_ID, "GOVERNANCE_PROGRAM"),
+            (qchain_execution::REGISTRY_ACCOUNT_ID, "REGISTRY"),
+            (qchain_execution::PARAMS_ACCOUNT_ID, "PARAMS"),
+            (qchain_execution::STAKING_REWARDS_POOL_ID, "STAKING_REWARDS_POOL"),
+            (qchain_execution::VALIDATOR_REGISTRY_ACCOUNT_ID, "VALIDATOR_REGISTRY"),
+            (qchain_execution::ids::VALIDATOR_BOND_ESCROW_ID, "VALIDATOR_BOND_ESCROW"),
+            (qchain_execution::ids::STAKING_RESERVE_ID, "STAKING_RESERVE"),
+            (qchain_execution::ids::VALIDATOR_FEE_POOL_ID, "VALIDATOR_FEE_POOL"),
+            (qchain_execution::ids::STAKING_UNBONDING_POOL_ID, "STAKING_UNBONDING_POOL"),
+            (qchain_execution::ids::VALIDATOR_UNBONDING_POOL_ID, "VALIDATOR_UNBONDING_POOL"),
+            (qchain_execution::ids::STAKING_GLOBAL_ID, "STAKING_GLOBAL"),
+            (qchain_execution::ids::ADMIN_FEE_WALLET, "ADMIN_FEE_WALLET"),
+        ];
+        let mut seen: HashSet<qchain_crypto::Pubkey> = HashSet::new();
+        for a in &genesis {
+            if !seen.insert(a.address) {
+                anyhow::bail!("duplicate genesis allocation for {} — two entries for the same address would be silently summed", a.address);
+            }
+            if let Some((_, name)) = reserved.iter().find(|(id, _)| *id == a.address) {
+                anyhow::bail!("genesis allocation to the reserved singleton {name} ({}) — it would be overwritten by seeding and the funds lost; remove it", a.address);
+            }
+        }
+    }
+
+    // Bake the per-quanto rate ONCE on this machine (audit fix for the cross-arch
+    // f64 fork): resolve it here and write `Some(...)` into every config, so every
+    // node — whatever its platform — reads the SAME integer instead of each
+    // re-deriving it via non-bit-identical `f64::powf`.
+    let baked_rate_fp: Option<u128> = if cli.economics_v7 {
+        Some(cli.quanto_rate_fp.unwrap_or_else(|| {
+            qchain_execution::economics_v7::derive_quanto_rate_fp(
+                qchain_execution::economics_v7::STAKING_TARGET_APY_BPS,
+                qchain_execution::economics_v7::DEFAULT_QUANTOS_PER_YEAR,
+            )
+        }))
+    } else {
+        None
+    };
+
     std::fs::create_dir_all(&cli.out_dir)?;
     let mut shared_chain_id: Option<[u8; 32]> = None;
     for (i, manifest) in manifests.iter().enumerate() {
@@ -162,7 +224,7 @@ fn main() -> anyhow::Result<()> {
             epoch_rounds: None,
             storage_engine: "sled".to_string(),
             economics_v7: cli.economics_v7,
-            quanto_rate_fp: None,
+            quanto_rate_fp: baked_rate_fp,
             rounds_per_quanto: cli.rounds_per_quanto,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
@@ -171,7 +233,7 @@ fn main() -> anyhow::Result<()> {
         let cid = config.chain_id();
         match shared_chain_id {
             None => shared_chain_id = Some(cid),
-            Some(prev) => debug_assert_eq!(prev, cid, "all configs must share one chain_id"),
+            Some(prev) => assert_eq!(prev, cid, "all configs must share one chain_id"),
         }
         let out_path = cli.out_dir.join(format!("node{}.json", i + 1));
         std::fs::write(&out_path, serde_json::to_string_pretty(&config)?)?;
@@ -194,6 +256,7 @@ fn main() -> anyhow::Result<()> {
     println!("\nchain_id: {cid_hex}");
     if cli.economics_v7 {
         println!("economics: v7 ENABLED (rounds_per_quanto={}) — a hard-forked network, distinct from any v6 chain.", cli.rounds_per_quanto.map(|r| r.to_string()).unwrap_or_else(|| "default".into()));
+        println!("quanto_rate_fp: {} (BAKED into every config — identical on every platform, no f64 re-derivation)", baked_rate_fp.unwrap_or(0));
     }
     if cli.compressed_state_tree {
         println!("state tree: COMPRESSED — folded into the chain_id above.");

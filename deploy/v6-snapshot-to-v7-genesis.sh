@@ -54,43 +54,80 @@ command -v curl >/dev/null 2>&1 || { echo "curl es necesario" >&2; exit 1; }
 RPC="${RPC%/}"
 
 # 1) snapshot meta (round + root + account count) — the point-in-time being carried.
+#    The node serves a CONSISTENT cached snapshot (short TTL); we pin its round +
+#    merkle_root up front and REQUIRE every page to carry the same root, so a
+#    cache rotation or an advancing (non-frozen) node can never stitch pages from
+#    two different states into a torn genesis (audit fix).
 META="$(curl -fsS "$RPC/snapshot/meta")" || { echo "no pude leer $RPC/snapshot/meta (¿nodo v6 arriba?)" >&2; exit 1; }
 echo "snapshot meta: $META" >&2
 if [ "$META_ONLY" = "1" ]; then echo "$META"; exit 0; fi
+EXPECT_ROUND="$(printf '%s' "$META" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("round",""))')"
+EXPECT_ROOT="$(printf '%s' "$META" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("merkle_root",""))')"
+EXPECT_COUNT="$(printf '%s' "$META" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("account_count",0))')"
+[ -n "$EXPECT_ROOT" ] || { echo "meta sin merkle_root — nodo demasiado viejo" >&2; exit 1; }
 
 # 2) page through /snapshot/page?after=<addr> (keyset pagination, stable page size)
-#    accumulating {address,balance,owner}. Filter + sort + emit happens in python.
-TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+#    accumulating {address,balance,owner}. Each page's parser VERIFIES the page's
+#    merkle_root matches EXPECT_ROOT and exits non-zero on any parse/mismatch — no
+#    `|| true` swallowing errors (which would silently truncate the genesis).
+TMP="$(mktemp)"; TMPM="$(mktemp)"; trap 'rm -f "$TMP" "$TMPM" "$TMP.page"' EXIT
 AFTER=""
 PAGES=0
+SEEN_TOTAL=0
 while :; do
   if [ -z "$AFTER" ]; then URL="$RPC/snapshot/page"; else URL="$RPC/snapshot/page?after=$AFTER"; fi
-  PAGE="$(curl -fsS "$URL")" || { echo "fallo al leer una página: $URL" >&2; exit 1; }
-  # append raw page json (one per line) and get the last address for the next cursor
-  NEXT="$(printf '%s' "$PAGE" | python3 -c '
+  curl -fsS "$URL" > "$TMP.page" || { echo "fallo al leer una página: $URL" >&2; exit 1; }
+  # parse.py: verify root, emit account lines to stdout, write CURSOR:/COUNT: markers
+  # to stderr, and EXIT NON-ZERO on bad JSON or a root mismatch (no error swallowed).
+  if ! python3 - "$TMP.page" "$EXPECT_ROOT" >> "$TMP" 2> "$TMPM" <<'PY'
 import sys, json
-p = json.load(sys.stdin)
+page_file, expect_root = sys.argv[1], sys.argv[2]
+try:
+    with open(page_file) as f: p = json.load(f)
+except Exception as e:
+    sys.stderr.write("PARSE_ERROR:%s\n" % e); sys.exit(2)
+root = str(p.get("merkle_root", ""))
+if root != expect_root:
+    sys.stderr.write("ROOT_MISMATCH:%s\n" % root); sys.exit(3)
 accts = p.get("accounts") or []
-# each entry is {"address": <base58>, "account": {"balance":.., "owner":<base58>, ..}}
-last = ""
+last = ""; n = 0
 for a in accts:
     addr = a.get("address")
     acc  = a.get("account") or {}
     if addr is None: continue
     print(json.dumps({"address": addr, "balance": str(acc.get("balance", 0)), "owner": str(acc.get("owner", ""))}))
-    last = addr
-sys.stderr.write("CURSOR:" + last + "\n")
-' 2>>"$TMP.cursor" >>"$TMP")" || true
+    last = addr; n += 1
+sys.stderr.write("CURSOR:%s\nCOUNT:%d\n" % (last, n))
+PY
+  then
+    echo "página $PAGES inválida (parse/mismatch): $(cat "$TMPM")" >&2
+    echo "el snapshot rotó a mitad de la descarga o el nodo no está congelado — abortá, congelá v6 y reintentá" >&2
+    exit 1
+  fi
   PAGES=$((PAGES+1))
-  LAST="$(sed -n 's/^CURSOR://p' "$TMP.cursor" | tail -1)"
-  : >"$TMP.cursor"
-  # stop when the page returned no new accounts (empty cursor) or didn't advance
+  LAST="$(sed -n 's/^CURSOR://p' "$TMPM" | tail -1)"
+  PCOUNT="$(sed -n 's/^COUNT://p' "$TMPM" | tail -1)"
+  SEEN_TOTAL=$((SEEN_TOTAL + ${PCOUNT:-0}))
+  : > "$TMPM"
   if [ -z "$LAST" ] || [ "$LAST" = "$AFTER" ]; then break; fi
   AFTER="$LAST"
-  # hard cap so a misbehaving endpoint can't loop forever
   if [ "$PAGES" -ge 100000 ]; then echo "demasiadas páginas, abortando" >&2; exit 1; fi
 done
-rm -f "$TMP.cursor"
+
+# 2b) confirm the snapshot did NOT rotate under us: re-read meta, require the same
+#     round + root, and that we saw exactly account_count accounts.
+META2="$(curl -fsS "$RPC/snapshot/meta")" || { echo "no pude re-leer meta" >&2; exit 1; }
+ROUND2="$(printf '%s' "$META2" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("round",""))')"
+ROOT2="$(printf '%s' "$META2" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("merkle_root",""))')"
+if [ "$ROUND2" != "$EXPECT_ROUND" ] || [ "$ROOT2" != "$EXPECT_ROOT" ]; then
+  echo "el snapshot cambió durante la descarga (round $EXPECT_ROUND/$ROUND2, root $EXPECT_ROOT/$ROOT2) — congelá v6 y reintentá" >&2
+  exit 1
+fi
+if [ "$SEEN_TOTAL" != "$EXPECT_COUNT" ]; then
+  echo "conté $SEEN_TOTAL cuentas pero meta dice $EXPECT_COUNT — descarga incompleta, abortando" >&2
+  exit 1
+fi
+echo "snapshot íntegro: round $EXPECT_ROUND, $SEEN_TOTAL/$EXPECT_COUNT cuentas, root $EXPECT_ROOT" >&2
 
 # 3) filter to system-owned user wallets with balance>0, dedup, sort by address, emit.
 python3 - "$TMP" "$OUT" "$SYSTEM_PROGRAM" <<'PY'
@@ -99,6 +136,7 @@ tmp, out, sysprog = sys.argv[1], sys.argv[2], sys.argv[3]
 seen = {}
 skipped_prog = 0
 skipped_zero = 0
+dropped_prog_balance = 0   # QCH held in program-owned accounts NOT carried (esp. STAKED principal)
 with open(tmp) as f:
     for line in f:
         line = line.strip()
@@ -109,7 +147,9 @@ with open(tmp) as f:
         except: bal = 0
         # only real user wallets (owned by the System Program)
         if owner != sysprog:
-            skipped_prog += 1; continue
+            skipped_prog += 1
+            if bal > 0: dropped_prog_balance += bal
+            continue
         if bal <= 0:
             skipped_zero += 1; continue
         seen[addr] = bal   # dedup by address (snapshot is unique already)
@@ -123,6 +163,15 @@ total = sum(b for b in seen.values())
 sys.stderr.write(f"wrote {len(allocs)} user-wallet allocations to {out} "
                  f"(total {total} units = {total/1e9:.6f} QCH); "
                  f"skipped {skipped_prog} program-owned + {skipped_zero} zero-balance\n")
+if dropped_prog_balance > 0:
+    sys.stderr.write(
+        "\n*** ATENCIÓN: NO se carga el principal STAKEADO ni el de los pools ***\n"
+        f"    {dropped_prog_balance} units = {dropped_prog_balance/1e9:.6f} QCH viven en cuentas\n"
+        "    program-owned (cuentas de stake de usuarios + pools) y NO se incluyen en el\n"
+        "    genesis v7 (v7 tiene un staking nuevo shares+índice; el ledger v6 no migra).\n"
+        "    Si querés que los usuarios conserven lo que tenían STAKEADO, pediles que\n"
+        "    DESSTAKEEN (Undelegate) ANTES de congelar la red v6 — así su principal vuelve\n"
+        "    a su wallet líquida y SÍ se carga. Lo que dejen stakeado se pierde en v7.\n")
 PY
 
 echo ""
