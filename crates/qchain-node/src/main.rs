@@ -328,9 +328,10 @@ async fn main() -> anyhow::Result<()> {
                     ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
                 },
             );
-            // The five fund pools start empty; each is program-owned so the dust
-            // sweep never touches it and no source subsidizes another (§12).
-            for pool in [STAKING_RESERVE_ID, VALIDATOR_FEE_POOL_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID] {
+            // The fund pools start empty; each is program-owned so the dust
+            // sweep never touches it and no source subsidizes another (§12). The
+            // bond escrow is seeded below with the founder validators' bonds.
+            for pool in [STAKING_RESERVE_ID, VALIDATOR_FEE_POOL_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID] {
                 ledger.seed_account(pool, qchain_core::Account::new_wallet(STAKING_PROGRAM_ID));
             }
             // Admin-fee wallet: a REAL system-owned wallet (the operator spends it
@@ -340,15 +341,58 @@ async fn main() -> anyhow::Result<()> {
             // The validator registry account ([9;32]) was seeded above in the
             // phase-3 (`validator_registry`) format; a v7 network instead uses the
             // `validator_v7::ValidatorV7Registry` format at the SAME id (SPEC §7).
-            // Re-seed it EMPTY in the v7 format so `BondAndRegister` (dispatched to
-            // `VALIDATOR_V7_PROGRAM_ID`) reads/writes a well-defined registry from
-            // genesis rather than transiently holding the wrong format.
+            // Seed it with the FOUNDER validators (the genesis `validators` set) as
+            // Active from quanto 0, so a fresh v7 network has an eligible committee
+            // for the fee distribution from the first quanto (instead of pooling
+            // fees with nobody to pay until someone `v7-bond-register`s). Each
+            // founder's 500 QCH bond is MINTED into the escrow at genesis (operator
+            // decision), so the §13 invariant holds: escrow balance == Σ bonds and
+            // every bond == VALIDATOR_BOND_ATOMS. Deterministic (config order), so
+            // every node of the network seeds the identical registry + escrow → same
+            // genesis state root, no fork. Monikers: the config `name` if it's a
+            // valid, unique moniker, else a deterministic `founder-<i>` fallback.
+            use qchain_execution::economics_v7::{moniker_is_valid, normalize_moniker, VALIDATOR_BOND_ATOMS};
+            use qchain_execution::validator_v7::{ValidatorV7Entry, ValidatorV7Registry, ValidatorV7State};
+            let mut used_monikers = std::collections::HashSet::new();
+            let mut founders = Vec::with_capacity(config.validators.len());
+            for (i, v) in config.validators.iter().enumerate() {
+                let named = v.name.as_deref().map(normalize_moniker).filter(|m| moniker_is_valid(m));
+                let mut moniker = match named {
+                    Some(m) if !used_monikers.contains(&m) => m,
+                    _ => format!("founder-{i}"),
+                };
+                let mut k = 0u32;
+                while used_monikers.contains(&moniker) {
+                    k += 1;
+                    moniker = format!("founder-{i}-{k}");
+                }
+                used_monikers.insert(moniker.clone());
+                founders.push(ValidatorV7Entry {
+                    address: v.pubkey_bundle.to_address(),
+                    moniker,
+                    pubkey_bundle: v.pubkey_bundle.clone(),
+                    p2p_address: v.addr.to_string(),
+                    bond: VALIDATOR_BOND_ATOMS,
+                    state: ValidatorV7State::Active,
+                    registered_quanto: 0,
+                    activation_quanto: 0,
+                    exit_requested_quanto: 0,
+                    bond_release_quanto: 0,
+                    participation_credits: 0,
+                    participation_opportunities: 0,
+                });
+            }
+            let escrow_total = VALIDATOR_BOND_ATOMS.saturating_mul(founders.len() as u64);
             ledger.seed_account(
                 VALIDATOR_REGISTRY_ACCOUNT_ID,
                 qchain_core::Account {
-                    data: borsh::to_vec(&qchain_execution::validator_v7::ValidatorV7Registry::default())?,
+                    data: borsh::to_vec(&ValidatorV7Registry { validators: founders })?,
                     ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
                 },
+            );
+            ledger.seed_account(
+                VALIDATOR_BOND_ESCROW_ID,
+                qchain_core::Account { balance: escrow_total, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
             );
         }
     } else {
