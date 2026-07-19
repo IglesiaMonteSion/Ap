@@ -293,6 +293,14 @@ impl Ledger {
                 Ok(minted) => {
                     self.total_emitted = self.total_emitted.saturating_add(minted);
                     settled_any = true;
+                    // Step 4: promote any BondedPending validators whose
+                    // activation quanto has arrived, THEN split the fee pool that
+                    // accumulated during quanto `cur` 1/N among its eligible
+                    // validators. Both write directly to the store, disjoint from
+                    // the settle `map` (global/reserve), and - like the emission
+                    // mint - happen before any receipt root is captured (STARK-safe).
+                    self.activate_due_validators(cur);
+                    self.distribute_fee_pool_for_quanto(cur);
                 }
                 Err(_) => break, // never abort the tx on a settle hiccup
             }
@@ -307,6 +315,97 @@ impl Ledger {
             }
             if let Some(r) = map.remove(&crate::ids::STAKING_RESERVE_ID) {
                 self.write_account(crate::ids::STAKING_RESERVE_ID, r);
+            }
+        }
+    }
+
+    /// v7 (step 4): at a quanto close, flip every `BondedPending` validator
+    /// whose `activation_quanto` has arrived (`<= quanto`) to `Active` — the
+    /// lifecycle transition the spec promises ("BondedPending → Active at the
+    /// next quanto") but that nothing performed until the quanto close was
+    /// wired. Deterministic (reads the committed registry + the settled quanto
+    /// clock), so every node activates the same validators at the same boundary.
+    /// Runs before `distribute_fee_pool_for_quanto` so a validator is `Active`
+    /// in time to collect its first quanto's fee share. No-op when there is no
+    /// v7 registry or nothing is due.
+    fn activate_due_validators(&mut self, quanto: u64) {
+        let mut registry = match self
+            .store
+            .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+        {
+            Some(r) => r,
+            None => return,
+        };
+        let mut changed = false;
+        for v in registry.validators.iter_mut() {
+            if v.state == crate::validator_v7::ValidatorV7State::BondedPending && v.activation_quanto <= quanto {
+                v.state = crate::validator_v7::ValidatorV7State::Active;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let mut acct = self.store.get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap_or_else(|| Account::new_wallet(STAKING_PROGRAM_ID));
+        if let Ok(data) = borsh::to_vec(&registry) {
+            acct.data = data;
+            self.write_account(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, acct);
+        }
+    }
+
+    /// v7 (step 4): at a quanto close, split the accumulated
+    /// `VALIDATOR_FEE_POOL_ID` balance 1/N among the validators eligible for
+    /// `quanto` (Active, past their activation, meeting min participation),
+    /// crediting each one's balance directly (liquid — no claim, matching "la
+    /// comisión se acredita al balance"). The remainder (`pool − reward×N`)
+    /// stays in the pool for the next quanto; nothing is ever burned here or
+    /// given to the proposer. Deterministic — reads the committed
+    /// `ValidatorV7Registry` and uses integer division, so every node
+    /// distributes identically (no fork). Runs inside `close_due_quantos`, i.e.
+    /// before any receipt root is captured, so a transfer receipt taken in the
+    /// boundary-crossing tx stays internally valid (STARK-safe, exactly like the
+    /// emission mint). Loads each eligible validator's REAL store account first
+    /// so the credit ADDS to (never overwrites) an existing balance. Fast-path
+    /// no-op when the pool is empty, so an idle multi-quanto catch-up stays cheap.
+    fn distribute_fee_pool_for_quanto(&mut self, quanto: u64) {
+        // Fast path: an empty pool means nothing to distribute (the common case,
+        // and the whole tail of an idle catch-up). Avoids reading the registry.
+        let pool_balance = self.store.get(&VALIDATOR_FEE_POOL_ID).map(|a| a.balance).unwrap_or(0);
+        if pool_balance == 0 {
+            return;
+        }
+        let registry = self
+            .store
+            .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+            .unwrap_or_default();
+        let eligible = crate::fees_v7::eligible_addresses(&registry, quanto);
+        if eligible.is_empty() {
+            return; // pool carries forward untouched (nothing burned)
+        }
+        // Load the pool + each eligible validator's REAL account so `credit`
+        // adds to an existing balance instead of a fresh zero-balance one (a
+        // full `write_account` overwrite would otherwise clobber it).
+        let mut map: HashMap<Pubkey, Account> = HashMap::new();
+        if let Some(pool) = self.store.get(&VALIDATOR_FEE_POOL_ID) {
+            map.insert(VALIDATOR_FEE_POOL_ID, pool);
+        }
+        for addr in &eligible {
+            if let Some(a) = self.store.get(addr) {
+                map.insert(*addr, a);
+            }
+        }
+        let (reward, _n, _rem) = crate::fees_v7::distribute_fee_pool(&mut map, &registry, quanto);
+        if reward == 0 {
+            return; // pool smaller than N → nothing paid this quanto, pool untouched
+        }
+        if let Some(pool) = map.remove(&VALIDATOR_FEE_POOL_ID) {
+            self.write_account(VALIDATOR_FEE_POOL_ID, pool);
+        }
+        for addr in &eligible {
+            if let Some(a) = map.remove(addr) {
+                self.write_account(*addr, a);
             }
         }
     }
@@ -1721,6 +1820,95 @@ mod tests {
         assert_eq!(l6.get_balance(&proposer), fee6 - fee6 / 2, "v6: proposer keeps the validator half");
         assert_eq!(l6.store.get(&VALIDATOR_FEE_POOL_ID).map(|a| a.balance).unwrap_or(0), 0, "v6 never touches the v7 fee pool");
         assert_eq!(l6.store.get(&ADMIN_FEE_WALLET).map(|a| a.balance).unwrap_or(0), 0, "v6 never touches the admin wallet");
+    }
+
+    /// Node-wiring step 4: at a quanto close the accumulated
+    /// `VALIDATOR_FEE_POOL_ID` is split 1/N among the eligible validators
+    /// (crediting each balance directly, remainder kept in the pool), and a
+    /// fresh fee charged in the boundary-crossing tx re-accumulates in the pool
+    /// for the NEXT quanto. Verifies the hook runs, is deterministic, and pays
+    /// the exact 1/N — the piece that closes the v7 fee cycle end to end.
+    #[test]
+    fn v7_quanto_close_distributes_the_fee_pool_1_of_n_to_eligible_validators() {
+        use crate::validator_v7::{ValidatorV7Entry, ValidatorV7Registry, ValidatorV7State};
+        use qchain_crypto::PublicKeyBundle;
+
+        let rpq = 4u64;
+        let mut l = new_test_ledger_v7(rpq);
+
+        // Seed the global at genesis (current_quanto 0) so a tx at round `rpq`
+        // closes quanto 0.
+        let mut g = Account::new_wallet(STAKING_PROGRAM_ID);
+        g.data = borsh::to_vec(&crate::staking_v7::GlobalStakingState::genesis()).unwrap();
+        l.write_account(crate::ids::STAKING_GLOBAL_ID, g);
+
+        // Seed the fee pool with a known 100 units (as if fees accrued in quanto 0).
+        let mut pool = Account::new_wallet(STAKING_PROGRAM_ID);
+        pool.balance = 100;
+        l.write_account(VALIDATOR_FEE_POOL_ID, pool);
+
+        // Registry with 3 Active, fully-participating validators activated at
+        // quanto 0 (all eligible for quanto 0), plus a jailed one (never paid).
+        let va = Pubkey::new([20; 32]);
+        let vb = Pubkey::new([21; 32]);
+        let vc = Pubkey::new([22; 32]);
+        let vjail = Pubkey::new([23; 32]);
+        let mk = |addr: Pubkey, state: ValidatorV7State| ValidatorV7Entry {
+            address: addr,
+            moniker: "n".into(),
+            pubkey_bundle: PublicKeyBundle { components: vec![] },
+            p2p_address: "1.2.3.4:9000".into(),
+            bond: crate::economics_v7::VALIDATOR_BOND_ATOMS,
+            state,
+            registered_quanto: 0,
+            activation_quanto: 0,
+            exit_requested_quanto: 0,
+            bond_release_quanto: 0,
+            participation_credits: 0,
+            participation_opportunities: 0,
+        };
+        // va/vb already Active; vc is BondedPending with its activation quanto
+        // already arrived (0) — the close must flip it to Active AND pay it,
+        // proving the activation hook fires. vjail never collects.
+        let registry = ValidatorV7Registry {
+            validators: vec![
+                mk(va, ValidatorV7State::Active),
+                mk(vb, ValidatorV7State::Active),
+                mk(vc, ValidatorV7State::BondedPending),
+                mk(vjail, ValidatorV7State::Jailed),
+            ],
+        };
+        let mut reg = Account::new_wallet(STAKING_PROGRAM_ID);
+        reg.data = borsh::to_vec(&registry).unwrap();
+        l.write_account(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, reg);
+
+        // A transfer crossing the quanto-0 boundary triggers the close.
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        l.apply_transaction(&tx, &proposer, rpq).unwrap();
+
+        // 100 / 3 = 33 each, remainder 1 stays; the jailed validator gets nothing.
+        assert_eq!(l.get_balance(&va), 33, "eligible validator A gets 1/N");
+        assert_eq!(l.get_balance(&vb), 33, "eligible validator B gets 1/N");
+        assert_eq!(l.get_balance(&vc), 33, "eligible validator C gets 1/N");
+        assert_eq!(l.get_balance(&vjail), 0, "jailed validator collects nothing");
+        // The pool now holds the remainder (1) PLUS this tx's own validator share
+        // (routed in AFTER the close, for the next quanto).
+        let pool_after = l.store.get(&VALIDATOR_FEE_POOL_ID).unwrap().balance;
+        assert!(pool_after >= 1, "the sub-unit remainder stays in the pool");
+        // Exact: pool = remainder(1) + the validator 45% of THIS tx's byte fee.
+        // pool_earned counts every validator-share routed this tx; the only route
+        // was this fee (the seeded 100 was distributed OUT, not routed in).
+        assert_eq!(pool_after, 1 + l.pool_earned, "pool = remainder + this tx's routed validator share");
+        assert!(l.pool_earned > 0, "the boundary-crossing tx routed a real fee into the pool for next quanto");
     }
 
     #[test]
