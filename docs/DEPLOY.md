@@ -49,6 +49,11 @@ un `qchain-image.tar` que dejes junto al repo). En todos los casos el
 script verifica que la imagen realmente tenga los binarios de qchain antes
 de avanzar.
 
+> **¿URL fija con tu dominio?** El quick-tunnel da una URL random que cambia al
+> reiniciar. Para una URL **fija** con tu dominio (ej. `wallet.qchain.com`) —
+> prerequisito del puente wallet-connect — seguí [`DOMAIN-SETUP.md`](DOMAIN-SETUP.md):
+> `sudo ./deploy/install-tunnel.sh --hostname wallet.qchain.com`.
+
 Al final, si elegís instalar la **wallet web**, también te ofrece exponerla
 por **HTTPS con un túnel de Cloudflare** (sin abrir puertos en el firewall de
 la nube) — así un nodo público completo (validador + wallet + HTTPS) queda en

@@ -10,21 +10,31 @@
 # certificado HTTPS (real, válido en el navegador).
 #
 # Uso (en la VPS, como root):
-#   sudo ./deploy/install-tunnel.sh                 # túnel a la wallet (puerto 8090)
+#   sudo ./deploy/install-tunnel.sh                 # QUICK tunnel a la wallet (URL random, cambia al reiniciar)
 #   sudo ./deploy/install-tunnel.sh --wallet-port 8090
-#   sudo ./deploy/install-tunnel.sh --url           # solo imprimir la URL actual
+#   sudo ./deploy/install-tunnel.sh --url           # solo imprimir la URL actual (quick tunnel)
 #   sudo ./deploy/install-tunnel.sh --uninstall     # quitar el túnel
 #
-# LÍMITE HONESTO: este es un "quick tunnel" gratis y sin cuenta. La URL
-# (https://algo-al-azar.trycloudflare.com) es NUEVA cada vez que el túnel
-# reinicia (reboot, crash, o restart manual). Para una URL FIJA que no cambie
-# hace falta una cuenta gratis de Cloudflare + un dominio propio (túnel con
-# nombre) — documentado al final. Para probar/usar la wallet desde el celular
-# ya, el quick tunnel alcanza.
+#   # TÚNEL NOMBRADO (URL FIJA con TU dominio — recomendado cuando tengas el dominio):
+#   #   1) Comprá un dominio (ej. qchain.com) y agregalo a una cuenta gratis de Cloudflare.
+#   #   2) En la VPS, una vez:  cloudflared tunnel login   (abre un navegador, autoriza tu dominio)
+#   #   3) Después:
+#   sudo ./deploy/install-tunnel.sh --hostname wallet.qchain.com
+#   sudo ./deploy/install-tunnel.sh --hostname wallet.qchain.com --qscan-hostname scan.qchain.com --qscan-port 8091
+#
+# LÍMITE HONESTO: sin --hostname es un "quick tunnel" gratis y sin cuenta — la URL
+# (https://algo-al-azar.trycloudflare.com) es NUEVA cada vez que el túnel reinicia.
+# Para una URL FIJA (necesaria para el allowlist de origen del futuro puente
+# wallet-connect) usá --hostname con tu dominio propio (túnel con nombre). El
+# subdominio va ANTES del dominio: wallet.qchain.com ✓, NUNCA qchain.wallet.com.
 set -Eeuo pipefail
 
 WALLET_PORT="8090"
 MODE="install"
+HOSTNAME_FQDN=""              # túnel nombrado si se setea (ej. wallet.qchain.com)
+QSCAN_HOSTNAME=""             # opcional: exponer QScan en su propio subdominio
+QSCAN_PORT="8091"
+TUNNEL_NAME="qchain"          # nombre del túnel nombrado en tu cuenta Cloudflare
 # Versión de cloudflared a instalar (pin reproducible; ver el bloque de descarga
 # más abajo). `latest` = la última (tag mutable). Overridable por env o flag.
 CF_VERSION="${CF_VERSION:-2024.12.2}"
@@ -36,11 +46,15 @@ trap 'error "falló en la línea $LINENO. Revisá el mensaje de arriba."' ERR
 while [ $# -gt 0 ]; do
   case "$1" in
     --wallet-port) WALLET_PORT="${2:-}"; shift 2 ;;
+    --hostname) HOSTNAME_FQDN="${2:-}"; shift 2 ;;
+    --qscan-hostname) QSCAN_HOSTNAME="${2:-}"; shift 2 ;;
+    --qscan-port) QSCAN_PORT="${2:-}"; shift 2 ;;
+    --tunnel-name) TUNNEL_NAME="${2:-}"; shift 2 ;;
     --cf-version) CF_VERSION="${2:-}"; shift 2 ;;
     --cf-sha256) CF_SHA256="${2:-}"; shift 2 ;;
     --url) MODE="url"; shift ;;
     --uninstall) MODE="uninstall"; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,26p'; exit 0 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,33p'; exit 0 ;;
     *) error "opción desconocida: $1 (usá --help)" ;;
   esac
 done
@@ -67,9 +81,11 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$MODE" = "uninstall" ]; then
   systemctl disable --now qchain-tunnel 2>/dev/null || true
-  rm -f "$SERVICE"
+  rm -f "$SERVICE" /etc/cloudflared/qchain.yml
   systemctl daemon-reload
-  echo "Túnel quitado. (No se tocó la wallet ni el nodo.)"
+  echo "Túnel quitado. (No se tocó la wallet ni el nodo, ni tu login/túnel de Cloudflare.)"
+  echo "  (El túnel nombrado sigue existiendo en tu cuenta Cloudflare; borralo con:"
+  echo "   cloudflared tunnel delete $TUNNEL_NAME — si querés eliminarlo del todo.)"
   exit 0
 fi
 
@@ -122,6 +138,95 @@ if ! command -v cloudflared >/dev/null 2>&1; then
   /usr/local/bin/cloudflared --version >/dev/null 2>&1 || error "el cloudflared descargado no ejecuta (¿arquitectura equivocada o descarga corrupta?)."
 fi
 echo "cloudflared: $(cloudflared --version 2>&1 | head -1)"
+
+# ===========================================================================
+# TÚNEL NOMBRADO (URL FIJA con tu dominio) — cuando se pasa --hostname.
+# Requiere: dominio propio en una cuenta Cloudflare + `cloudflared tunnel login`
+# corrido una vez en esta VPS (crea /root/.cloudflared/cert.pem).
+# ===========================================================================
+if [ -n "$HOSTNAME_FQDN" ]; then
+  # Sanidad del hostname: debe tener al menos un punto (subdominio.dominio.tld).
+  case "$HOSTNAME_FQDN" in
+    *.*.*|*.*) : ;;
+    *) error "--hostname debe ser un FQDN tipo wallet.tudominio.com (recibí: '$HOSTNAME_FQDN')" ;;
+  esac
+  CF_DIR="/root/.cloudflared"
+  if [ ! -f "$CF_DIR/cert.pem" ]; then
+    echo "==========================================================================="
+    echo "  Primero autorizá tu dominio en Cloudflare (una sola vez, abre un navegador):"
+    echo
+    echo "      cloudflared tunnel login"
+    echo
+    echo "  Elegí tu dominio (ej. qchain.com) en la página que se abre. Eso crea"
+    echo "  $CF_DIR/cert.pem. Después re-corré este comando."
+    echo "==========================================================================="
+    exit 1
+  fi
+  # Crear el túnel si no existe (idempotente); obtener su UUID.
+  TUNNEL_ID="$(cloudflared tunnel list 2>/dev/null | awk -v n="$TUNNEL_NAME" '$2==n{print $1}' | head -1 || true)"
+  if [ -z "$TUNNEL_ID" ]; then
+    echo "Creando el túnel nombrado '$TUNNEL_NAME'..."
+    cloudflared tunnel create "$TUNNEL_NAME" >/dev/null || error "no pude crear el túnel '$TUNNEL_NAME'."
+    TUNNEL_ID="$(cloudflared tunnel list 2>/dev/null | awk -v n="$TUNNEL_NAME" '$2==n{print $1}' | head -1 || true)"
+  fi
+  [ -n "$TUNNEL_ID" ] || error "no pude obtener el UUID del túnel '$TUNNEL_NAME'."
+  CRED="$CF_DIR/${TUNNEL_ID}.json"
+  [ -f "$CRED" ] || error "no encuentro el archivo de credenciales del túnel ($CRED). Recreá con: cloudflared tunnel create $TUNNEL_NAME"
+  echo "Túnel '$TUNNEL_NAME' = $TUNNEL_ID"
+
+  # Config de ingress: cada hostname → su servicio local; el resto → 404.
+  mkdir -p /etc/cloudflared
+  {
+    echo "tunnel: $TUNNEL_ID"
+    echo "credentials-file: $CRED"
+    echo "ingress:"
+    echo "  - hostname: $HOSTNAME_FQDN"
+    echo "    service: http://localhost:${WALLET_PORT}"
+    if [ -n "$QSCAN_HOSTNAME" ]; then
+      echo "  - hostname: $QSCAN_HOSTNAME"
+      echo "    service: http://localhost:${QSCAN_PORT}"
+    fi
+    echo "  - service: http_status:404"
+  } > /etc/cloudflared/qchain.yml
+  echo "-> /etc/cloudflared/qchain.yml escrito"
+
+  # Ruta DNS (crea el registro CNAME del subdominio hacia el túnel). Idempotente:
+  # si ya existe, cloudflared avisa y seguimos.
+  cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME_FQDN" 2>/dev/null || echo "  (la ruta DNS de $HOSTNAME_FQDN ya existía o se ajustará)"
+  if [ -n "$QSCAN_HOSTNAME" ]; then
+    cloudflared tunnel route dns "$TUNNEL_NAME" "$QSCAN_HOSTNAME" 2>/dev/null || echo "  (la ruta DNS de $QSCAN_HOSTNAME ya existía)"
+  fi
+
+  # Servicio systemd corriendo el túnel nombrado por config.
+  cat > "$SERVICE" <<EOF
+[Unit]
+Description=qchain named Cloudflare tunnel ($TUNNEL_NAME)
+After=network-online.target qchain-wallet.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --config /etc/cloudflared/qchain.yml run
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now qchain-tunnel
+  echo
+  echo "==========================================================================="
+  echo "  Túnel NOMBRADO listo — URL FIJA (no cambia al reiniciar):"
+  echo
+  echo "      https://$HOSTNAME_FQDN/          (wallet)"
+  [ -n "$QSCAN_HOSTNAME" ] && echo "      https://$QSCAN_HOSTNAME/          (QScan)"
+  echo
+  echo "  El DNS puede tardar 1-2 min la primera vez. Cloudflare pone el HTTPS."
+  echo "  Esta URL fija es la que va en el allowlist de origen del puente wallet-connect."
+  echo "==========================================================================="
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Servicio systemd: un quick tunnel a la wallet local. Arranca solo, se
