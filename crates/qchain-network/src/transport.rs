@@ -56,6 +56,24 @@ struct PeerConn {
 /// stopped draining.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Post-compromise security: bound an ENCRYPTED connection's lifetime so a
+/// transient session-key compromise heals within a bounded window. Once a
+/// session has sealed this many frames, the transport drops the cached
+/// connection and re-dials, which re-runs the full handshake and mints a FRESH
+/// ephemeral ML-KEM secret the attacker never saw — from that point the channel
+/// is secure again even if the old session key leaked. This deliberately reuses
+/// the existing, well-tested reconnect + handshake path instead of an in-band
+/// rekey protocol: a rekey double-ratchet would add stateful, desync-prone
+/// coordination to the transport (this project's most freeze-bug-prone layer)
+/// for a defense-in-depth confidentiality property whose payloads are already
+/// signed. Worst case of forcing a reconnect is one extra handshake — the same
+/// thing that happens on any natural network blip. Large enough that the
+/// periodic handshake is negligible churn (natural reconnects heal far more
+/// often in practice); this is a guaranteed ceiling on the exposure window, not
+/// the common case. A non-encrypted connection (`session == None`) has no
+/// channel secret to heal, so it is never force-recycled.
+const CONNECTION_REKEY_FRAMES: u64 = 1 << 20; // 1,048,576 frames
+
 /// Caps how many inbound authenticated handshakes may be in flight at once
 /// (task #176 hardening). Only meaningful when auth is on. Each in-flight
 /// handshake holds a small pre-authentication allocation and forces the node
@@ -361,8 +379,20 @@ impl Network {
     /// from two concurrent callers is handled by re-checking the cache
     /// after connecting and discarding the loser's redundant stream.
     async fn connection_for(&self, addr: SocketAddr) -> anyhow::Result<Arc<Mutex<PeerConn>>> {
-        if let Some(conn) = self.connections.lock().await.get(&addr) {
-            return Ok(conn.clone());
+        let cached = self.connections.lock().await.get(&addr).cloned();
+        if let Some(conn) = cached {
+            // Post-compromise security: once an encrypted session is over its
+            // frame budget, evict it so we re-dial and re-handshake with a fresh
+            // ephemeral ML-KEM secret (see `CONNECTION_REKEY_FRAMES`). A
+            // non-encrypted connection has no channel secret to heal, so
+            // `frames_sent` is only consulted when a session exists. The old
+            // stream closes when this scope drops its last `Arc`.
+            let over_budget = conn.lock().await.session.as_ref().is_some_and(|s| s.frames_sent() >= CONNECTION_REKEY_FRAMES);
+            if !over_budget {
+                return Ok(conn);
+            }
+            self.connections.lock().await.remove(&addr);
+            // fall through to dial a fresh, freshly-handshaked connection
         }
         let mut stream = tokio::time::timeout(SEND_TIMEOUT, TcpStream::connect(addr))
             .await

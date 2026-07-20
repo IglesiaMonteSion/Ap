@@ -171,6 +171,14 @@ impl Session {
         let nonce = self.recv.next_nonce()?;
         self.recv.cipher.decrypt(&nonce, ciphertext).map_err(|_| anyhow::anyhow!("AEAD open failed: authentication tag did not verify"))
     }
+
+    /// How many frames this session has sealed on the send side. The transport
+    /// uses this to bound a connection's lifetime and force a fresh handshake
+    /// (a new ephemeral ML-KEM secret) for post-compromise security — see
+    /// `CONNECTION_REKEY_FRAMES` in `transport`.
+    pub fn frames_sent(&self) -> u64 {
+        self.send.counter
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +234,19 @@ mod tests {
         let mut relay = Session::new(&[8u8; 32], &[1u8; 32], &[2u8; 32], &cid, &sid, false);
         let ct = client.seal(b"secret").unwrap();
         assert!(relay.open(&ct).is_err(), "a foreign shared secret must not decrypt the channel");
+    }
+
+    /// `frames_sent` reflects the send counter — the signal the transport uses
+    /// to bound a connection's lifetime for post-compromise security.
+    #[test]
+    fn frames_sent_counts_sealed_frames() {
+        let (cid, sid) = ids();
+        let mut s = Session::new(&[7u8; 32], &[1u8; 32], &[2u8; 32], &cid, &sid, true);
+        assert_eq!(s.frames_sent(), 0);
+        for i in 1..=5 {
+            s.seal(b"x").unwrap();
+            assert_eq!(s.frames_sent(), i);
+        }
     }
 
     /// The ratchet stays in lock-step: sealing and opening well past several
