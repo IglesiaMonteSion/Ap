@@ -317,7 +317,7 @@ impl Ledger {
             if cur >= target_quanto {
                 break;
             }
-            match crate::staking_v7::settle_quanto(&mut map, cur, self.quanto_rate_fp) {
+            match crate::staking_v7::settle_quanto(&mut map, cur) {
                 Ok(minted) => {
                     self.total_emitted = self.total_emitted.saturating_add(minted);
                     settled_any = true;

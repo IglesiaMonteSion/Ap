@@ -141,10 +141,22 @@ pub enum StakingV7Instruction {
 pub struct StakingV7Program;
 
 fn read_global(accounts: &HashMap<Pubkey, Account>) -> GlobalStakingState {
-    accounts
-        .get(&STAKING_GLOBAL_ID)
-        .and_then(|a| GlobalStakingState::try_from_slice(&a.data).ok())
-        .unwrap_or_else(GlobalStakingState::genesis)
+    match accounts.get(&STAKING_GLOBAL_ID) {
+        // Not in the working set → genesis (a v7 network always seeds it, so this
+        // is only the pre-seed / not-yet-created case).
+        None => GlobalStakingState::genesis(),
+        // Present but undecodable is NOT a recoverable state: it means corrupted or
+        // version-skewed staking bytes (e.g. a new binary reading a pre-6.3.31 v7
+        // `data_dir`). Silently falling back to `genesis()` would ZERO all staking
+        // (total_shares=0, rate_fp=0) — value-destroying and, worse, would let a
+        // deposit collect its join-quanto reward unbacked (rate_fp=0 vs the real
+        // settle rate). Refuse to run instead (same fail-loud philosophy as the
+        // SledStore corruption guard); the fresh-v7-genesis + same-binary deployment
+        // never hits this.
+        Some(a) => GlobalStakingState::try_from_slice(&a.data).unwrap_or_else(|e| {
+            panic!("STAKING_GLOBAL is present but does not decode ({e}); refusing to run on corrupted/version-skewed staking state (a v7 binary needs a fresh v7 genesis — see the v6.3.31 deploy note)")
+        }),
+    }
 }
 
 fn write_global(accounts: &mut HashMap<Pubkey, Account>, g: &GlobalStakingState) -> Result<(), ExecError> {
@@ -512,8 +524,16 @@ impl StakingV7Program {
 /// per quanto** via `last_settled_quanto`. Deterministic (pure over committed
 /// state). Returns the emission minted (0 if nothing staked or already settled).
 ///
-/// `rate_fp` is the genesis-baked per-quanto rate (`economics_v7::derive_quanto_rate_fp`).
-pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u64, rate_fp: u128) -> Result<u64, ExecError> {
+/// The compounding rate is read from `g.rate_fp` (the genesis-baked per-quanto
+/// rate, `economics_v7::derive_quanto_rate_fp`). This is the SINGLE SOURCE OF
+/// TRUTH: `stake()`/`add_pending_deposit` price a pending deposit's shares at
+/// `advance_staking_index(g.index, g.rate_fp)`, and this function advances the
+/// live index with the SAME `g.rate_fp` — so pricing and advancing provably use
+/// one number, and a late-joining deposit's activation index matches the index
+/// it was priced at exactly (never over/under-funded). Taking the rate from a
+/// caller-supplied parameter risked a divergence where a deposit could collect a
+/// join-quanto reward unbacked by emission (auditor finding, closed here).
+pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u64) -> Result<u64, ExecError> {
     let mut g = read_global(accounts);
     // Idempotency + ordering: only the currently-accruing quanto can close. Once
     // it does, `current_quanto` advances, so a repeat call with the same
@@ -524,7 +544,7 @@ pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u6
         return Ok(0);
     }
     let old_index = g.index;
-    let new_index = crate::economics_v7::advance_staking_index(old_index, rate_fp);
+    let new_index = crate::economics_v7::advance_staking_index(old_index, g.rate_fp);
     // Emission for the CLOSING quanto is computed on the shares that were EARNING
     // during it — i.e. BEFORE folding in this quanto's pending deposits, so a
     // deposit made during the closing quanto never collects its reward.
@@ -638,7 +658,7 @@ mod tests {
         // Close the join quanto (0): the deposit activates. Emission for quanto 0 is
         // ZERO (nobody was earning), so the position is worth EXACTLY its principal —
         // it did NOT collect the reward of the partial quanto it joined during.
-        let minted0 = settle_quanto(&mut accounts, 0, rate).unwrap();
+        let minted0 = settle_quanto(&mut accounts, 0).unwrap();
         assert_eq!(minted0, 0, "no emission for the join quanto — the deposit wasn't earning yet");
         let g1 = read_global(&accounts);
         let pos1 = read_position(&accounts, &position).unwrap();
@@ -650,7 +670,7 @@ mod tests {
         reserve_value_invariant(&accounts);
 
         // Close the NEXT quanto (1): NOW it earns.
-        let minted1 = settle_quanto(&mut accounts, 1, rate).unwrap();
+        let minted1 = settle_quanto(&mut accounts, 1).unwrap();
         assert!(minted1 > 0, "the activated deposit earns from the next quanto");
         let g2 = read_global(&accounts);
         assert!(position_current_value(&pos1, &g2) > amount as u128, "value grew once actually earning");
@@ -671,7 +691,7 @@ mod tests {
         // Close one quanto per day for a protocol year. Quanto 0 (the join quanto)
         // mints nothing (the deposit wasn't earning yet); every quanto after does.
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
-            let minted = settle_quanto(&mut accounts, q, rate).unwrap();
+            let minted = settle_quanto(&mut accounts, q).unwrap();
             if q == 0 {
                 assert_eq!(minted, 0, "the join quanto mints no reward for the just-made deposit");
             } else {
@@ -699,11 +719,11 @@ mod tests {
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
         seed_global(&mut accounts, rate);
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: 100 * UNITS_PER_QCH }, vec![staker, pk(60), STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
-        settle_quanto(&mut accounts, 0, rate).unwrap(); // close the join quanto → the deposit activates
+        settle_quanto(&mut accounts, 0).unwrap(); // close the join quanto → the deposit activates
         // Quanto 1 is the first the deposit earns: it mints, and re-settling it is a no-op.
-        let m1 = settle_quanto(&mut accounts, 1, rate).unwrap();
+        let m1 = settle_quanto(&mut accounts, 1).unwrap();
         let idx1 = read_global(&accounts).index;
-        let m2 = settle_quanto(&mut accounts, 1, rate).unwrap();
+        let m2 = settle_quanto(&mut accounts, 1).unwrap();
         assert_eq!(m2, 0, "re-settling the same quanto mints nothing");
         assert_eq!(read_global(&accounts).index, idx1, "index unchanged on repeat");
         assert!(m1 > 0);
@@ -723,7 +743,7 @@ mod tests {
         assert!(shares0 > 0);
         // Grow the index a full year (the initial deposit activates at quanto 1's close).
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
-            settle_quanto(&mut accounts, q, rate).unwrap();
+            settle_quanto(&mut accounts, q).unwrap();
         }
         // Add the same principal again: the prior (activated) deposit folds into
         // active shares, and the NEW deposit is pending — priced at the now-higher
@@ -747,7 +767,7 @@ mod tests {
         let amount = 40 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         // Activate the deposit (close its join quanto → current_quanto = 1).
-        settle_quanto(&mut accounts, 0, rate).unwrap();
+        settle_quanto(&mut accounts, 0).unwrap();
 
         // Unstake half of the now-active position.
         let half = 20 * UNITS_PER_QCH;
@@ -764,7 +784,7 @@ mod tests {
 
         // Advance a quanto so current_quanto reaches the ready quanto (unstake was at
         // quanto 1 → ready = 2).
-        settle_quanto(&mut accounts, 1, rate).unwrap(); // current_quanto -> 2 >= ready (1+1)
+        settle_quanto(&mut accounts, 1).unwrap(); // current_quanto -> 2 >= ready (1+1)
         let before = accounts.get(&staker).unwrap().balance;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &staker).unwrap();
         let paid = accounts.get(&staker).unwrap().balance - before;
@@ -865,7 +885,7 @@ mod tests {
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![late, pl, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &late).unwrap();
 
         // Close quanto 0: NEITHER earns it (they weren't active during it).
-        assert_eq!(settle_quanto(&mut accounts, 0, rate).unwrap(), 0, "no reward is paid for the join quanto");
+        assert_eq!(settle_quanto(&mut accounts, 0).unwrap(), 0, "no reward is paid for the join quanto");
         let g1 = read_global(&accounts);
         let (v_e1, v_l1) = (
             position_current_value(&read_position(&accounts, &pe).unwrap(), &g1),
@@ -875,7 +895,7 @@ mod tests {
         assert_eq!(v_e1, v_l1, "both stakers are worth the same (neither got a free quanto)");
 
         // Close quanto 1: NOW both earn, equally.
-        assert!(settle_quanto(&mut accounts, 1, rate).unwrap() > 0);
+        assert!(settle_quanto(&mut accounts, 1).unwrap() > 0);
         let g2 = read_global(&accounts);
         let (v_e2, v_l2) = (
             position_current_value(&read_position(&accounts, &pe).unwrap(), &g2),
@@ -901,7 +921,7 @@ mod tests {
         }
         // Some quantos pass (all five deposits activate at quanto 0's close, then earn).
         for q in 0..30 {
-            settle_quanto(&mut accounts, q, rate).unwrap();
+            settle_quanto(&mut accounts, q).unwrap();
         }
         let g = read_global(&accounts);
         let o1_total = position_value(g.total_shares, g.index);
