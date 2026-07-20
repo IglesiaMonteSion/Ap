@@ -49,6 +49,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/address/:addr", get(address))
         .route("/api/validators", get(validators))
         .route("/api/holders", get(holders))
+        .route("/api/programs", get(programs))
         .route("/api/search", get(search))
         .route("/api/health", get(health))
         .layer(axum::middleware::from_fn(security_headers))
@@ -229,6 +230,13 @@ async fn validators(State(st): State<ApiState>) -> Json<Value> {
 
 async fn holders(State(st): State<ApiState>) -> Json<Value> {
     Json(st.store.get_meta_json("holders").unwrap_or(json!({"top": []})))
+}
+
+/// Deployed smart contracts (read-only), for QScan's "Contratos" section.
+/// Proxied live from the node's `/programs` (short-TTL cached) — metadata only
+/// (address, code-hash, entry point, size), never keys or bytecode.
+async fn programs(State(st): State<ApiState>) -> Json<Value> {
+    Json(fetch_node(&st, "/programs?limit=500").await)
 }
 
 #[derive(Deserialize)]

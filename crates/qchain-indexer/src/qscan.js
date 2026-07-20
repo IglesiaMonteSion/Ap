@@ -300,6 +300,29 @@
       <div class="dim center" style="margin:14px 0">"Circulante" = QCH que vive en cuentas (excluye lo quemado). Foto point-in-time del nodo seguido.</div>`;
   }
 
+  async function programsPage() {
+    setNav("#/contracts");
+    app.innerHTML = `<h2 class="title">Contratos inteligentes</h2>${loading()}`;
+    let d = {};
+    try { d = await api("/programs"); } catch (e) {}
+    const progs = (d && d.programs) || [];
+    const fmtKb = (n) => (Number(n || 0) / 1024).toFixed(1) + " KB";
+    app.innerHTML = `<h2 class="title">Contratos inteligentes</h2>
+      <div class="grid stats">
+        <div class="card pad stat"><div class="k">Contratos desplegados</div><div class="v">${fmtNum(d.count || progs.length)}</div><div class="s">programas WASM</div></div>
+        <div class="card pad stat"><div class="k">Ronda</div><div class="v">${fmtNum(d.round)}</div><div class="s">foto del estado</div></div>
+      </div>
+      <div class="card"><table><thead><tr><th>Dirección</th><th>Entry point</th><th class="right">Tamaño</th><th>Code-hash</th></tr></thead>
+      <tbody>${progs.length ? progs.map((p) => `<tr>
+        <td>${addrLink(p.address)}${copyBtn(p.address)}</td>
+        <td class="mono">${esc(p.entry_point || "—")}</td>
+        <td class="right">${fmtKb(p.size_bytes)}</td>
+        <td class="mono dim">${esc(short(p.code_hash || "", 10, 8))}</td></tr>`).join("")
+        : `<tr><td colspan=4 class=empty>Todavía no hay contratos desplegados en esta red</td></tr>`}</tbody></table></div>
+      <div class="dim center note" style="margin:14px 0">Vista de solo lectura (metadata: dirección, entry point, tamaño, code-hash) — nunca el bytecode ni claves.
+      Desplegar / interactuar con un contrato (firmando con tu wallet) llegará en un próximo incremento — requiere el puente wallet-connect + un dominio propio para la wallet.</div>`;
+  }
+
   function notFound(msg) { return `<div class="card pad empty">${esc(msg)}<div style="margin-top:12px"><a href="#/">← Volver al inicio</a></div></div>`; }
   function toHex(v) {
     if (v == null) return "";
@@ -337,6 +360,7 @@
     if (seg === "address") return addressPage(p[1], parseInt(p[2] || "0", 10) || 0);
     if (seg === "validators") return validatorsPage();
     if (seg === "holders") return holdersPage();
+    if (seg === "contracts") return programsPage();
     return home();
   }
 

@@ -1314,6 +1314,37 @@ pub struct HoldersResponse {
     pub top: Vec<HolderEntry>,
 }
 
+/// One deployed smart contract (`GET /programs`): a WASM program account owned by
+/// the loader. Read-only metadata — never the bytecode itself (a contract can be
+/// up to 256 KB; the explorer lists them, it doesn't download them).
+#[derive(Serialize)]
+pub struct ProgramEntry {
+    /// The program's on-chain address (where `call-program` points).
+    pub address: String,
+    /// SHA3-256 of the deployed bytecode, hex — the contract's code fingerprint.
+    pub code_hash: String,
+    /// The exported entry-point function name it's invoked through.
+    pub entry_point: String,
+    /// Size of the deployed bytecode in bytes.
+    pub size_bytes: usize,
+    /// Liquid QCH held by the program account (usually 0 for a plain contract).
+    #[serde(serialize_with = "ser_u64_str")]
+    pub balance: u64,
+}
+
+/// Deployed smart contracts (`GET /programs`), for QScan's read-only "Contratos"
+/// section. Built from the same TTL-cached point-in-time snapshot `/holders`
+/// uses, so listing contracts never hammers the consensus lock. Read-only: it
+/// exposes metadata (address, code-hash, entry point, size), never keys and
+/// never the bytecode — safe to expose publicly, like the rest of the explorer.
+#[derive(Serialize)]
+pub struct ProgramsResponse {
+    pub count: usize,
+    pub round: Round,
+    pub merkle_root: String,
+    pub programs: Vec<ProgramEntry>,
+}
+
 /// Lightweight header of a state snapshot (`GET /snapshot/meta`) - what a
 /// far-behind peer or a fresh joining validator reads first to learn a
 /// server's current round, account-state Merkle root, and size before
@@ -2241,6 +2272,45 @@ impl Engine {
             merkle_root: cached.merkle_root.clone(),
             top,
         }
+    }
+
+    /// Deployed smart contracts (`GET /programs`), read-only. Scans the same
+    /// TTL-cached snapshot `holders` uses for accounts owned by the loader
+    /// program, decoding each one's `WasmProgramData` for its entry point and
+    /// bytecode size. Never returns the bytecode or any key. `limit` is clamped
+    /// so an unauthenticated caller can't ask for an unbounded list.
+    pub async fn programs(&self, limit: usize) -> ProgramsResponse {
+        use qchain_execution::ids::LOADER_PROGRAM_ID;
+        use qchain_execution::native::WasmProgramData;
+        let _permit = SNAPSHOT_PERMITS.acquire().await.expect("snapshot semaphore is never closed");
+        let limit = limit.min(MAX_ACTIVITY_LIMIT);
+        let cached = self.cached_snapshot().await;
+        let mut programs: Vec<ProgramEntry> = Vec::new();
+        for sa in cached.accounts.iter() {
+            if sa.account.owner != LOADER_PROGRAM_ID {
+                continue;
+            }
+            // Decode the program data for its entry point + size. A loader-owned
+            // account whose data doesn't decode is skipped (shouldn't happen for
+            // a real DeployProgram, but never panic on snapshot data).
+            let (entry_point, size_bytes) = match borsh::from_slice::<WasmProgramData>(&sa.account.data) {
+                Ok(w) => (w.entry_point, w.module_bytes.len()),
+                Err(_) => continue,
+            };
+            programs.push(ProgramEntry {
+                address: sa.address.to_string(),
+                code_hash: hex::encode(sa.account.code_hash),
+                entry_point,
+                size_bytes,
+                balance: sa.account.balance,
+            });
+        }
+        // Newest-ish first is not knowable from the snapshot (no deploy round on
+        // the account), so order deterministically by address for a stable list.
+        programs.sort_by(|a, b| a.address.cmp(&b.address));
+        let count = programs.len();
+        programs.truncate(limit);
+        ProgramsResponse { count, round: cached.round, merkle_root: cached.merkle_root.clone(), programs }
     }
 
     /// This process's live RAM/CPU/disk/thread usage (see `ResourcesResponse`).

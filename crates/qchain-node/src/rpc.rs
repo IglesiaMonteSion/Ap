@@ -24,6 +24,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/status", get(status))
         .route("/economics", get(economics))
         .route("/holders", get(holders))
+        .route("/programs", get(programs))
         .route("/resources", get(resources))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
@@ -247,6 +248,21 @@ fn default_holders_limit() -> usize {
 /// Read-only; built from the TTL-cached snapshot, so it doesn't slow consensus.
 async fn holders(State(engine): State<Arc<Engine>>, Query(query): Query<HoldersQuery>) -> Json<HoldersResponse> {
     Json(engine.holders(query.limit).await)
+}
+
+#[derive(serde::Deserialize)]
+struct ProgramsQuery {
+    #[serde(default = "default_holders_limit")]
+    limit: usize,
+}
+
+/// `/programs?limit=N` - the deployed smart contracts (loader-owned WASM program
+/// accounts), read-only, for QScan's "Contratos" section. Metadata only
+/// (address, code-hash, entry point, size) - never keys, never bytecode. Built
+/// from the TTL-cached snapshot, so it doesn't slow consensus. See
+/// `ProgramsResponse`.
+async fn programs(State(engine): State<Arc<Engine>>, Query(query): Query<ProgramsQuery>) -> Json<crate::engine::ProgramsResponse> {
+    Json(engine.programs(query.limit).await)
 }
 
 /// `/resources` - the node's own live RAM/CPU/disk/thread usage, so a load tool
