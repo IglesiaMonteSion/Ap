@@ -43,15 +43,23 @@ CF_SHA256="${CF_SHA256:-}"
 error() { echo "ERROR: $*" >&2; exit 1; }
 trap 'error "falló en la línea $LINENO. Revisá el mensaje de arriba."' ERR
 
+# Exige que un flag que lleva valor realmente lo tenga (y no sea otro flag ni
+# esté vacío). Así un comando cortado (ej. `--qscan-hostname` sin nada detrás)
+# da un mensaje claro en vez de un error críptico de `shift`.
+need_val() {
+  case "${2-}" in
+    ""|--*) error "el flag $1 necesita un valor. Ej: $1 <valor>" ;;
+  esac
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --wallet-port) WALLET_PORT="${2:-}"; shift 2 ;;
-    --hostname) HOSTNAME_FQDN="${2:-}"; shift 2 ;;
-    --qscan-hostname) QSCAN_HOSTNAME="${2:-}"; shift 2 ;;
-    --qscan-port) QSCAN_PORT="${2:-}"; shift 2 ;;
-    --tunnel-name) TUNNEL_NAME="${2:-}"; shift 2 ;;
-    --cf-version) CF_VERSION="${2:-}"; shift 2 ;;
-    --cf-sha256) CF_SHA256="${2:-}"; shift 2 ;;
+    --wallet-port) need_val "$1" "${2-}"; WALLET_PORT="$2"; shift 2 ;;
+    --hostname) need_val "$1" "${2-}"; HOSTNAME_FQDN="$2"; shift 2 ;;
+    --qscan-hostname) need_val "$1" "${2-}"; QSCAN_HOSTNAME="$2"; shift 2 ;;
+    --qscan-port) need_val "$1" "${2-}"; QSCAN_PORT="$2"; shift 2 ;;
+    --tunnel-name) need_val "$1" "${2-}"; TUNNEL_NAME="$2"; shift 2 ;;
+    --cf-version) need_val "$1" "${2-}"; CF_VERSION="$2"; shift 2 ;;
+    --cf-sha256) need_val "$1" "${2-}"; CF_SHA256="$2"; shift 2 ;;
     --url) MODE="url"; shift ;;
     --uninstall) MODE="uninstall"; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,33p'; exit 0 ;;
