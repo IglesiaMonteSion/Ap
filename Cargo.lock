@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-cli"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-consensus"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "qchain-core",
  "qchain-crypto",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-execution"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-faucet"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "axum",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-governance"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "borsh",
  "qchain-core",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-indexer"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "axum",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-network"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-node"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "axum",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-simulation"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "qchain-consensus",
  "qchain-core",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-stark"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "hex",
  "qchain-core",
@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-storage"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-wallet"
-version = "6.3.31"
+version = "6.3.32"
 dependencies = [
  "aes-gcm",
  "anyhow",

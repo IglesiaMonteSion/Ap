@@ -2512,7 +2512,7 @@ async function renderStakingV7(addr){
   let totVal=0n, totDep=0n;
   list.innerHTML=stakes.map((s,i)=>{
     const d=live[i];
-    if(!(d&&d.exists)){ return `<div class="pos-card"><div class="pos-top"><div class="pos-val">Posición v7<div class="pv-addr">${esc(short(s.stakeAccount))}</div></div><div class="pos-amt">—</div></div><div class="pos-meta"><span class="badge cool">no encontrada</span></div></div>`; }
+    if(!(d&&d.exists)){ return `<div class="pos-card"><div class="pos-top"><div class="pos-val">Posición v7<div class="pv-addr">${esc(short(s.stakeAccount))}</div></div><div class="pos-amt">—</div></div><div class="pos-meta"><span class="badge cool">no encontrada</span></div><div class="hint" style="margin-top:8px">Esta posición ya no existe en la red (o la red se reinició).</div><div class="pos-actions"><button class="btn-sec" data-v7drop="${esc(s.stakeAccount)}">Quitar de la lista</button></div></div>`; }
     const value=BigInt(d.value||0), dep=BigInt(d.net_deposited||0), unb=BigInt(d.unbonding_amount||0);
     totVal+=value; totDep+=dep;
     const gain=value>dep?value-dep:0n;
@@ -2563,6 +2563,7 @@ async function renderStakingV7(addr){
   $("stk-rewards").textContent=qchDisp(totVal>totDep?totVal-totDep:0n);
   list.querySelectorAll("button[data-v7unstake]").forEach(b=>b.onclick=()=>v7StakeAction("unstake", stakes[+b.dataset.v7unstake], live[+b.dataset.v7unstake]));
   list.querySelectorAll("button[data-v7withdraw]").forEach(b=>b.onclick=()=>v7StakeAction("withdraw", stakes[+b.dataset.v7withdraw], live[+b.dataset.v7withdraw]));
+  list.querySelectorAll("button[data-v7drop]").forEach(b=>b.onclick=()=>{ if(confirm("Esta posición no existe en la red. ¿Quitarla de la lista? (no toca ningún fondo)")){ dropStake(b.dataset.v7drop); renderStaking(); } });
 }
 
 async function v7Stake(){
