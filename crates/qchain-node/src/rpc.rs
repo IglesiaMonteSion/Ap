@@ -189,7 +189,11 @@ async fn get_stake_v7(State(engine): State<Arc<Engine>>, Path(address): Path<Str
         .await
         .and_then(|a| GlobalStakingState::try_from_slice(&a.data).ok())
         .unwrap_or_else(GlobalStakingState::genesis);
-    let value = qchain_execution::economics_v7::position_value(pos.active_shares, global.index);
+    // The position's real worth includes any deposit still activating (shown at
+    // face while in its join quanto), so a just-staked position never displays
+    // below what was put in.
+    let value = qchain_execution::staking_v7::position_current_value(&pos, &global);
+    let activating = qchain_execution::staking_v7::is_activating(&pos, &global);
     let withdrawable = pos.unbonding_amount > 0 && global.current_quanto >= pos.unbonding_ready_quanto;
     // Cadence for the wallet's reward/unbonding progress bars: with these the
     // wallet draws "next reward in ~Xh" (progress within the current quanto) and
@@ -202,6 +206,9 @@ async fn get_stake_v7(State(engine): State<Arc<Engine>>, Path(address): Path<Str
         "value": value.to_string(),
         "net_deposited": pos.net_deposited,
         "state": format!("{:?}", pos.state),
+        "activating": activating,
+        "pending_amount": pos.pending_amount,
+        "activation_quanto": pos.pending_activation_quanto,
         "created_quanto": pos.created_quanto,
         "last_modified_quanto": pos.last_modified_quanto,
         "unbonding_amount": pos.unbonding_amount,

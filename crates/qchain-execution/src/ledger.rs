@@ -1798,6 +1798,11 @@ mod tests {
         // v7 validator program under its OWN id (distinct from staking — both v7
         // instruction enums start at discriminant 0, so they cannot share an id).
         ledger.register_program(crate::ids::VALIDATOR_V7_PROGRAM_ID, Program::Native(Box::new(crate::validator_v7::ValidatorV7Program)));
+        // Seed the global staking singleton WITH the per-quanto rate, so `stake()`
+        // prices a fresh deposit at the next quanto's index (epoch-aligned).
+        let mut g = Account::new_wallet(STAKING_PROGRAM_ID);
+        g.data = borsh::to_vec(&crate::staking_v7::GlobalStakingState::genesis_with_rate(rate)).unwrap();
+        ledger.write_account(crate::ids::STAKING_GLOBAL_ID, g);
         ledger
     }
 
@@ -1938,11 +1943,8 @@ mod tests {
         let rpq = 4u64;
         let mut l = new_test_ledger_v7(rpq);
 
-        // Seed the global at genesis (current_quanto 0) so a tx at round `rpq`
-        // closes quanto 0.
-        let mut g = Account::new_wallet(STAKING_PROGRAM_ID);
-        g.data = borsh::to_vec(&crate::staking_v7::GlobalStakingState::genesis()).unwrap();
-        l.write_account(crate::ids::STAKING_GLOBAL_ID, g);
+        // The global is already seeded (current_quanto 0, with the rate) by
+        // `new_test_ledger_v7`, so a tx at round `rpq` closes quanto 0.
 
         // Seed the fee pool with a known 100 units (as if fees accrued in quanto 0).
         let mut pool = Account::new_wallet(STAKING_PROGRAM_ID);
@@ -2036,6 +2038,8 @@ mod tests {
             total_shares: 0,
             current_quanto: 1,
             last_settled_quanto: 0,
+            rate_fp: 0,
+            pending_shares: 0,
         })
         .unwrap();
         l.write_account(crate::ids::STAKING_GLOBAL_ID, g);

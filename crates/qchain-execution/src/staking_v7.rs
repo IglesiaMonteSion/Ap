@@ -49,12 +49,31 @@ pub struct GlobalStakingState {
     pub current_quanto: u64,
     /// The last quanto whose emission was settled (idempotency guard for 1c).
     pub last_settled_quanto: u64,
+    /// The genesis-baked per-quanto compounding rate (`quanto_rate_fp`). Stored
+    /// here so `stake()` can price a fresh deposit's shares at the NEXT quanto's
+    /// index (`advance_staking_index`) — deposits earn from the next quanto, not
+    /// the partial one they joined during (epoch-aligned activation).
+    pub rate_fp: u128,
+    /// Shares deposited during the CURRENTLY-accruing quanto that are NOT yet
+    /// earning. They activate (fold into `total_shares`) at the next quanto close,
+    /// AFTER that quanto's emission is computed — so a deposit never collects the
+    /// reward of the quanto it joined during. O(1): one accumulator, no per-position
+    /// iteration at the close.
+    pub pending_shares: u128,
 }
 
 impl GlobalStakingState {
-    /// The genesis state: index at 1.0, nothing staked, quanto 0.
+    /// The genesis state: index at 1.0, nothing staked, quanto 0. `rate_fp` unset
+    /// (0) — use `genesis_with_rate` when seeding a real network so `stake()` can
+    /// align activation.
     pub fn genesis() -> Self {
-        GlobalStakingState { index: INITIAL_STAKING_INDEX, total_shares: 0, current_quanto: 0, last_settled_quanto: 0 }
+        GlobalStakingState { index: INITIAL_STAKING_INDEX, total_shares: 0, current_quanto: 0, last_settled_quanto: 0, rate_fp: 0, pending_shares: 0 }
+    }
+
+    /// Genesis state carrying the network's per-quanto rate, so a fresh deposit's
+    /// shares are priced at the next quanto's index (epoch-aligned activation).
+    pub fn genesis_with_rate(rate_fp: u128) -> Self {
+        GlobalStakingState { rate_fp, ..Self::genesis() }
     }
 }
 
@@ -87,6 +106,18 @@ pub struct StakePositionV7 {
     /// Quanto at which `unbonding_amount` becomes withdrawable (0 = none).
     pub unbonding_ready_quanto: u64,
     pub state: PositionState,
+    /// Shares from a deposit made during the current quanto that are NOT yet
+    /// earning (epoch-aligned activation). Priced at the NEXT quanto's index, so
+    /// once they activate their value is exactly the principal (no reward for the
+    /// partial join quanto). 0 = none.
+    pub pending_shares: u128,
+    /// Principal (atoms) behind `pending_shares` — shown at face value while the
+    /// deposit is still in its join quanto (so a just-made deposit never displays
+    /// below what was put in, and can be cancelled without loss).
+    pub pending_amount: u64,
+    /// Quanto at which `pending_shares` start earning (= join quanto + 1). Once
+    /// `current_quanto >= this`, the pending folds into `active_shares`. 0 = none.
+    pub pending_activation_quanto: u64,
 }
 
 /// v7 staking instructions. Borsh discriminants are stable within v7 (a fresh
@@ -147,6 +178,63 @@ pub fn global_state(accounts: &HashMap<Pubkey, Account>) -> GlobalStakingState {
     read_global(accounts)
 }
 
+/// Fold a position's activated pending deposit into its earning shares. A deposit
+/// made during quanto `Q` is pending until `Q+1` starts; once `current_quanto`
+/// reaches `pending_activation_quanto` the pending shares were already added to
+/// the global `total_shares` (at that quanto's close, in `settle_quanto`), so
+/// here we only move the position's own bookkeeping — never touching the global —
+/// keeping `Σ position shares == total_shares`. Idempotent (no-op if nothing
+/// pending or not yet activated). Call at the start of any position mutation.
+pub fn settle_position(pos: &mut StakePositionV7, g: &GlobalStakingState) {
+    if pos.pending_shares > 0 && g.current_quanto >= pos.pending_activation_quanto {
+        pos.active_shares = pos.active_shares.saturating_add(pos.pending_shares);
+        pos.pending_shares = 0;
+        pos.pending_amount = 0;
+        pos.pending_activation_quanto = 0;
+    }
+}
+
+/// A position's current worth (atoms): its earning value, plus any pending
+/// deposit — valued by the live index once activated, or at face (the deposited
+/// principal) while still in its join quanto so a fresh deposit never shows below
+/// what was put in. This is what the wallet displays and what a withdrawal frees.
+pub fn position_current_value(pos: &StakePositionV7, g: &GlobalStakingState) -> u128 {
+    let active = crate::economics_v7::position_value(pos.active_shares, g.index);
+    let pending = if pos.pending_shares > 0 {
+        if g.current_quanto >= pos.pending_activation_quanto {
+            crate::economics_v7::position_value(pos.pending_shares, g.index)
+        } else {
+            pos.pending_amount as u128
+        }
+    } else {
+        0
+    };
+    active.saturating_add(pending)
+}
+
+/// True while a position has a deposit that hasn't started earning yet (still in
+/// its join quanto). The wallet shows this as "Activándose" and defers the reward
+/// progress bar to the next quanto.
+pub fn is_activating(pos: &StakePositionV7, g: &GlobalStakingState) -> bool {
+    pos.pending_shares > 0 && g.current_quanto < pos.pending_activation_quanto
+}
+
+/// Record a mid-quanto deposit as PENDING: its shares are priced at the NEXT
+/// quanto's index (`advance_staking_index`), so once they activate the position's
+/// value is exactly the principal — the deposit earns from the next quanto, never
+/// the partial one it joined during (epoch-aligned activation, the fairness fix).
+/// Same-quanto deposits accumulate into the single pending chunk. Returns the
+/// shares that were added (the caller adds them to the GLOBAL `pending_shares`).
+fn add_pending_deposit(pos: &mut StakePositionV7, g: &GlobalStakingState, amount: u64) -> u128 {
+    let activation_index = crate::economics_v7::advance_staking_index(g.index, g.rate_fp);
+    let shares = shares_for_deposit(amount, activation_index);
+    pos.pending_shares = pos.pending_shares.saturating_add(shares);
+    pos.pending_amount = pos.pending_amount.saturating_add(amount);
+    pos.pending_activation_quanto = g.current_quanto.saturating_add(1);
+    pos.net_deposited = pos.net_deposited.saturating_add(amount);
+    shares
+}
+
 impl crate::native::NativeProgram for StakingV7Program {
     fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, _current_round: qchain_core::Round) -> Result<(), ExecError> {
         // v7 staking has no notion of "round" — its clock is the quanto, read
@@ -188,7 +276,6 @@ impl StakingV7Program {
         }
 
         let mut g = read_global(accounts);
-        let index = g.index;
 
         // A validator's registered address may not open a staking position (SPEC
         // §5/§6). Enforced at the ledger boundary (needs the validator registry);
@@ -207,13 +294,16 @@ impl StakingV7Program {
             if staker_balance < amount {
                 return Err(ExecError::InsufficientFunds);
             }
+            // Fold any prior pending that has since activated into the earning
+            // shares, then record THIS deposit as pending for the current quanto
+            // (it starts earning next quanto — the added principal doesn't collect
+            // the partial join quanto's reward either).
+            settle_position(&mut pos, &g);
             accounts.get_mut(&staker).unwrap().balance -= amount;
-            let new_shares = shares_for_deposit(amount, index);
-            pos.active_shares = pos.active_shares.saturating_add(new_shares);
-            pos.net_deposited = pos.net_deposited.saturating_add(amount);
+            let added = add_pending_deposit(&mut pos, &g, amount);
+            g.pending_shares = g.pending_shares.saturating_add(added);
             pos.last_modified_quanto = g.current_quanto;
             pos.state = PositionState::Active;
-            g.total_shares = g.total_shares.saturating_add(new_shares);
             credit(accounts, &reserve_pk, STAKING_PROGRAM_ID, amount);
             write_global(accounts, &g)?;
             write_position(accounts, &position_pk, &pos)?;
@@ -259,18 +349,23 @@ impl StakingV7Program {
                 return Err(ExecError::InsufficientFunds);
             }
             accounts.get_mut(&staker).unwrap().balance -= amount;
-            let new_shares = shares_for_deposit(amount, index);
-            let pos = StakePositionV7 {
+            let mut pos = StakePositionV7 {
                 owner: staker,
-                active_shares: new_shares,
+                active_shares: 0,
                 created_quanto: g.current_quanto,
                 last_modified_quanto: g.current_quanto,
-                net_deposited: amount,
+                net_deposited: 0,
                 unbonding_amount: 0,
                 unbonding_ready_quanto: 0,
                 state: PositionState::Active,
+                pending_shares: 0,
+                pending_amount: 0,
+                pending_activation_quanto: 0,
             };
-            g.total_shares = g.total_shares.saturating_add(new_shares);
+            // A fresh deposit is PENDING: it starts earning next quanto, so it
+            // never collects the reward of the partial quanto it joined during.
+            let added = add_pending_deposit(&mut pos, &g, amount);
+            g.pending_shares = g.pending_shares.saturating_add(added);
             credit(accounts, &reserve_pk, STAKING_PROGRAM_ID, amount);
             write_global(accounts, &g)?;
             write_position(accounts, &position_pk, &pos)?;
@@ -299,26 +394,53 @@ impl StakingV7Program {
         if amount == 0 {
             return Err(ExecError::ProgramError("cannot unstake zero".into()));
         }
-        let current_value = position_value(pos.active_shares, index);
-        if (amount as u128) > current_value {
+        // Fold any activated pending into the earning shares first.
+        settle_position(&mut pos, &g);
+        // What the owner can pull out: the earning value, plus any deposit still in
+        // its join quanto (at face — it never earned, and cancelling it must never
+        // lose principal). The still-pending shares were never in `total_shares`,
+        // so cancelling them only decrements the global `pending_shares` accumulator.
+        let active_value = position_value(pos.active_shares, index);
+        let pending_face = pos.pending_amount as u128; // 0 unless a deposit is still in its join quanto
+        let available = active_value.saturating_add(pending_face);
+        if (amount as u128) > available {
             return Err(ExecError::ProgramError("cannot unstake more than the position's current value".into()));
         }
-        // Shares to remove for `amount` of value; the value actually removed is
+        // Take from the active (earning) shares first; value actually removed is
         // recomputed from those shares (floor), so we never move more out of the
-        // reserve than the shares we burned represent.
-        let shares_to_remove = if (amount as u128) == current_value {
+        // reserve than the burned shares represent.
+        let take_active = (amount as u128).min(active_value);
+        let shares_to_remove = if take_active == active_value {
             pos.active_shares
         } else {
-            shares_for_deposit(amount, index).min(pos.active_shares)
+            shares_for_deposit(take_active as u64, index).min(pos.active_shares)
         };
-        let value_removed = position_value(shares_to_remove, index).min(amount as u128) as u64;
-
+        let active_removed = position_value(shares_to_remove, index).min(take_active) as u64;
         pos.active_shares = pos.active_shares.saturating_sub(shares_to_remove);
         g.total_shares = g.total_shares.saturating_sub(shares_to_remove);
+        // Any remainder comes from the still-pending (join-quanto) chunk at face.
+        let mut pending_removed = 0u64;
+        let remaining = amount.saturating_sub(active_removed);
+        if remaining > 0 && pos.pending_amount > 0 {
+            let take = remaining.min(pos.pending_amount);
+            let ps_remove = if take == pos.pending_amount {
+                pos.pending_shares
+            } else {
+                pos.pending_shares.saturating_mul(take as u128) / (pos.pending_amount as u128)
+            };
+            pos.pending_shares = pos.pending_shares.saturating_sub(ps_remove);
+            pos.pending_amount = pos.pending_amount.saturating_sub(take);
+            g.pending_shares = g.pending_shares.saturating_sub(ps_remove);
+            if pos.pending_amount == 0 {
+                pos.pending_activation_quanto = 0;
+            }
+            pending_removed = take;
+        }
+        let value_removed = active_removed.saturating_add(pending_removed);
         pos.unbonding_amount = value_removed;
         pos.unbonding_ready_quanto = g.current_quanto.saturating_add(STAKING_UNBONDING_QUANTOS);
         pos.last_modified_quanto = g.current_quanto;
-        pos.state = if pos.active_shares > 0 { PositionState::Active } else { PositionState::Unbonding };
+        pos.state = if pos.active_shares > 0 || pos.pending_shares > 0 { PositionState::Active } else { PositionState::Unbonding };
 
         // Move the value out of the reserve into the unbonding pool.
         let reserve_bal = accounts.get(&reserve_pk).map(|a| a.balance).unwrap_or(0);
@@ -355,6 +477,9 @@ impl StakingV7Program {
         if pos.owner != *payer || staker != *payer {
             return Err(ExecError::Unauthorized("only the position owner can withdraw".into()));
         }
+        // Fold any activated pending into the earning shares (keeps the position's
+        // active/pending bookkeeping current; global total_shares already updated).
+        settle_position(&mut pos, &g);
         if pos.unbonding_amount == 0 {
             return Err(ExecError::ProgramError("nothing is unbonding on this position".into()));
         }
@@ -375,7 +500,7 @@ impl StakingV7Program {
         pos.unbonding_amount = 0;
         pos.unbonding_ready_quanto = 0;
         pos.last_modified_quanto = g.current_quanto;
-        pos.state = if pos.active_shares > 0 { PositionState::Active } else { PositionState::Closed };
+        pos.state = if pos.active_shares > 0 || pos.pending_shares > 0 { PositionState::Active } else { PositionState::Closed };
         write_position(accounts, &position_pk, &pos)?;
         Ok(())
     }
@@ -400,10 +525,19 @@ pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u6
     }
     let old_index = g.index;
     let new_index = crate::economics_v7::advance_staking_index(old_index, rate_fp);
+    // Emission for the CLOSING quanto is computed on the shares that were EARNING
+    // during it — i.e. BEFORE folding in this quanto's pending deposits, so a
+    // deposit made during the closing quanto never collects its reward.
     let minted = crate::economics_v7::emission_for_quanto(g.total_shares, old_index, new_index);
     g.index = new_index;
     g.last_settled_quanto = closing_quanto;
     g.current_quanto = closing_quanto.saturating_add(1);
+    // Now ACTIVATE the deposits that were pending during the quanto that just
+    // closed: they start earning from the next quanto. Their shares were priced at
+    // this `new_index` (`advance` of the deposit-quanto index) — so at this index
+    // each is worth exactly its principal, and they compound from here.
+    g.total_shares = g.total_shares.saturating_add(g.pending_shares);
+    g.pending_shares = 0;
     let minted_u64 = minted.min(u64::MAX as u128) as u64;
     if minted_u64 > 0 {
         credit(accounts, &STAKING_RESERVE_ID, STAKING_PROGRAM_ID, minted_u64);
@@ -449,37 +583,77 @@ mod tests {
         Instruction { program_id: STAKING_PROGRAM_ID, accounts: accts, data: borsh::to_vec(data).unwrap() }
     }
 
+    /// Seed the global staking singleton carrying the per-quanto `rate`, so
+    /// `stake()` prices a fresh deposit at the NEXT quanto's index (epoch-aligned
+    /// activation). Unit tests build accounts by hand, so they must seed this.
+    fn seed_global(accounts: &mut HashMap<Pubkey, Account>, rate: u128) {
+        let mut a = Account::new_wallet(STAKING_PROGRAM_ID);
+        a.data = borsh::to_vec(&GlobalStakingState::genesis_with_rate(rate)).unwrap();
+        accounts.insert(STAKING_GLOBAL_ID, a);
+    }
+
     fn reserve_value_invariant(accounts: &HashMap<Pubkey, Account>) {
-        // The reserve must always hold AT LEAST the total active position value
-        // (never underfunded — everyone can withdraw). A deposit adds exact QCH
-        // but mints floor-valued shares, and the aggregate floors once vs the
-        // per-position sum flooring N times, so a tiny sub-unit residue can
-        // accumulate IN the reserve (an identifiable pool, per SPEC §14). The gap
-        // is bounded and negligible (sub-QCH), never a shortfall.
+        // The reserve must always hold AT LEAST what backs every position: the
+        // active (earning) value PLUS the principal of any deposit still pending
+        // activation (waiting for its next-quanto start). A deposit adds exact QCH
+        // but mints floor-valued shares, so a tiny sub-unit residue can accumulate
+        // IN the reserve (an identifiable pool, per SPEC §14) — bounded, never a
+        // shortfall. `pending_shares` were priced at `advance(index)`, so valuing
+        // them there recovers the deposited principal held in the reserve.
         let g = read_global(accounts);
         let reserve = accounts.get(&STAKING_RESERVE_ID).map(|a| a.balance).unwrap_or(0);
-        let total_value = position_value(g.total_shares, g.index) as u64;
-        assert!(reserve >= total_value, "reserve underfunded: {reserve} < {total_value}");
-        assert!(reserve - total_value < 1000, "reserve residue must stay tiny: {}", reserve - total_value);
+        let active = position_value(g.total_shares, g.index) as u64;
+        let pending_principal =
+            position_value(g.pending_shares, crate::economics_v7::advance_staking_index(g.index, g.rate_fp)) as u64;
+        let backed = active.saturating_add(pending_principal);
+        assert!(reserve >= backed, "reserve underfunded: {reserve} < {backed}");
+        assert!(reserve - backed < 1000, "reserve residue must stay tiny: {}", reserve - backed);
     }
 
     #[test]
-    fn stake_mints_shares_and_funds_the_reserve() {
+    fn a_fresh_deposit_is_pending_and_earns_from_the_next_quanto_not_the_join_one() {
         let staker = pk(50);
         let position = pk(60);
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(10 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
 
         let amount = 5 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
 
         assert_eq!(accounts.get(&staker).unwrap().balance, 5 * UNITS_PER_QCH);
-        assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, amount);
+        assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, amount, "principal is in the reserve immediately");
+        let g0 = read_global(&accounts);
         let pos = read_position(&accounts, &position).unwrap();
-        // At genesis index, shares == amount and value == amount.
-        assert_eq!(pos.active_shares, amount as u128);
+        // The deposit is PENDING (not earning yet), shown at face during the join quanto.
+        assert_eq!(pos.active_shares, 0, "a fresh deposit does not earn its join quanto");
+        assert!(pos.pending_shares > 0, "the deposit is held as pending shares");
+        assert_eq!(pos.pending_amount, amount);
         assert_eq!(pos.net_deposited, amount);
-        assert_eq!(position_value(pos.active_shares, read_global(&accounts).index), amount as u128);
+        assert!(is_activating(&pos, &g0), "still activating during the join quanto");
+        assert_eq!(position_current_value(&pos, &g0), amount as u128, "shown at exactly the principal (never below) while activating");
+        reserve_value_invariant(&accounts);
+
+        // Close the join quanto (0): the deposit activates. Emission for quanto 0 is
+        // ZERO (nobody was earning), so the position is worth EXACTLY its principal —
+        // it did NOT collect the reward of the partial quanto it joined during.
+        let minted0 = settle_quanto(&mut accounts, 0, rate).unwrap();
+        assert_eq!(minted0, 0, "no emission for the join quanto — the deposit wasn't earning yet");
+        let g1 = read_global(&accounts);
+        let pos1 = read_position(&accounts, &position).unwrap();
+        assert!(!is_activating(&pos1, &g1), "now active");
+        // Worth the principal (modulo a sub-unit floor residue) — NOT the principal
+        // plus a quanto's reward, which the old immediate-activation model gave.
+        let v1 = position_current_value(&pos1, &g1);
+        assert!(v1 <= amount as u128 && v1 + 10 >= amount as u128, "worth ~principal, no join-quanto reward: {v1} vs {amount}");
+        reserve_value_invariant(&accounts);
+
+        // Close the NEXT quanto (1): NOW it earns.
+        let minted1 = settle_quanto(&mut accounts, 1, rate).unwrap();
+        assert!(minted1 > 0, "the activated deposit earns from the next quanto");
+        let g2 = read_global(&accounts);
+        assert!(position_current_value(&pos1, &g2) > amount as u128, "value grew once actually earning");
         reserve_value_invariant(&accounts);
     }
 
@@ -490,23 +664,31 @@ mod tests {
         let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
         let amount = 100 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
 
-        // Close one quanto per day for a protocol year.
+        // Close one quanto per day for a protocol year. Quanto 0 (the join quanto)
+        // mints nothing (the deposit wasn't earning yet); every quanto after does.
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
             let minted = settle_quanto(&mut accounts, q, rate).unwrap();
-            assert!(minted > 0, "quanto {q} with real stake mints emission");
+            if q == 0 {
+                assert_eq!(minted, 0, "the join quanto mints no reward for the just-made deposit");
+            } else {
+                assert!(minted > 0, "quanto {q} with an active stake mints emission");
+            }
             reserve_value_invariant(&accounts); // holds every step (reserve grows with the index)
         }
         let g = read_global(&accounts);
         let pos = read_position(&accounts, &position).unwrap();
-        let value = position_value(pos.active_shares, g.index) as u64;
-        // ~12% APY, never more; and clearly grown.
+        // Value includes the (now activated) deposit; the deposit earned every
+        // quanto EXCEPT its join quanto, so ~12% APY, never more, and clearly grown.
+        let value = position_current_value(&pos, &g) as u64;
         assert!(value <= amount * 112 / 100, "yield exceeded 12%: {value} vs {}", amount);
-        assert!(value >= amount * 1119 / 1000, "yield too low: {value}");
-        // The reserve backs the grown value exactly.
-        assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, value);
+        assert!(value >= amount * 1118 / 1000, "yield too low: {value}");
+        // The reserve backs the grown value (modulo a sub-unit floor residue).
+        let reserve = accounts.get(&STAKING_RESERVE_ID).unwrap().balance;
+        assert!(reserve >= value && reserve - value < 1000, "reserve backs the value: {reserve} vs {value}");
     }
 
     #[test]
@@ -515,11 +697,13 @@ mod tests {
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         let staker = pk(50);
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: 100 * UNITS_PER_QCH }, vec![staker, pk(60), STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
-        let m1 = settle_quanto(&mut accounts, 0, rate).unwrap();
+        settle_quanto(&mut accounts, 0, rate).unwrap(); // close the join quanto → the deposit activates
+        // Quanto 1 is the first the deposit earns: it mints, and re-settling it is a no-op.
+        let m1 = settle_quanto(&mut accounts, 1, rate).unwrap();
         let idx1 = read_global(&accounts).index;
-        // Re-settling the SAME quanto mints nothing and doesn't move the index.
-        let m2 = settle_quanto(&mut accounts, 0, rate).unwrap();
+        let m2 = settle_quanto(&mut accounts, 1, rate).unwrap();
         assert_eq!(m2, 0, "re-settling the same quanto mints nothing");
         assert_eq!(read_global(&accounts).index, idx1, "index unchanged on repeat");
         assert!(m1 > 0);
@@ -532,17 +716,22 @@ mod tests {
         let position = pk(60);
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(200 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
         let amount = 100 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
-        let shares0 = read_position(&accounts, &position).unwrap().active_shares;
-        // Grow the index a full year, then add the same principal again.
+        let shares0 = read_position(&accounts, &position).unwrap().pending_shares; // the initial deposit's shares
+        assert!(shares0 > 0);
+        // Grow the index a full year (the initial deposit activates at quanto 1's close).
         for q in 0..DEFAULT_QUANTOS_PER_YEAR {
             settle_quanto(&mut accounts, q, rate).unwrap();
         }
+        // Add the same principal again: the prior (activated) deposit folds into
+        // active shares, and the NEW deposit is pending — priced at the now-higher
+        // index, so it mints FEWER shares for the same principal.
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::IncreaseStake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         let pos = read_position(&accounts, &position).unwrap();
-        let added_shares = pos.active_shares - shares0;
-        assert!(added_shares < shares0, "the same principal mints fewer shares once the index grew");
+        assert_eq!(pos.active_shares, shares0, "the first deposit's shares folded into active");
+        assert!(pos.pending_shares < shares0, "the same principal mints fewer shares once the index grew");
         assert_eq!(pos.net_deposited, 2 * amount);
         reserve_value_invariant(&accounts);
     }
@@ -551,28 +740,35 @@ mod tests {
     fn begin_unstake_then_withdraw_after_the_window_pays_out() {
         let staker = pk(50);
         let position = pk(60);
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
         accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
         let amount = 40 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        // Activate the deposit (close its join quanto → current_quanto = 1).
+        settle_quanto(&mut accounts, 0, rate).unwrap();
 
-        // Unstake half.
+        // Unstake half of the now-active position.
         let half = 20 * UNITS_PER_QCH;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::BeginUnstake { amount: half }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID]), &staker).unwrap();
-        assert_eq!(accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance, half);
-        assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, amount - half);
+        let unb = accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance;
+        assert!(unb <= half && unb + 10 >= half, "~half moved to unbonding (floor residue): {unb} vs {half}");
+        let reserve = accounts.get(&STAKING_RESERVE_ID).unwrap().balance;
+        assert!(reserve >= amount - half && reserve <= amount - half + 10, "~half left in reserve: {reserve}");
         reserve_value_invariant(&accounts);
 
         // Withdraw before the window closes → rejected.
         let e = StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &staker);
         assert!(e.is_err(), "cannot withdraw before the unbonding window elapses");
 
-        // Advance a quanto (settle) so current_quanto reaches the ready quanto.
-        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
-        settle_quanto(&mut accounts, 0, rate).unwrap(); // current_quanto -> 1 >= ready (0+1)
+        // Advance a quanto so current_quanto reaches the ready quanto (unstake was at
+        // quanto 1 → ready = 2).
+        settle_quanto(&mut accounts, 1, rate).unwrap(); // current_quanto -> 2 >= ready (1+1)
         let before = accounts.get(&staker).unwrap().balance;
         StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::WithdrawUnbonded, vec![staker, position, STAKING_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &staker).unwrap();
-        assert_eq!(accounts.get(&staker).unwrap().balance, before + half, "the unbonded funds are paid out");
+        let paid = accounts.get(&staker).unwrap().balance - before;
+        assert!(paid <= half && paid + 10 >= half, "the unbonded funds are paid out (~half): {paid}");
         assert_eq!(accounts.get(&STAKING_UNBONDING_POOL_ID).unwrap().balance, 0);
         // Still has the other half active.
         assert_eq!(read_position(&accounts, &position).unwrap().state, PositionState::Active);
@@ -645,12 +841,57 @@ mod tests {
         assert!(bad3.is_err(), "only the owner can unstake");
     }
 
+    /// THE FAIRNESS FIX (epoch-aligned activation): a deposit made LATE in a quanto
+    /// must NOT collect that quanto's full reward — it earns from the next quanto,
+    /// same as one that was staked since the quanto began. Two stakers put in the
+    /// same amount in the SAME quanto (one "early", one "late" — indistinguishable
+    /// on-chain since the index is flat within a quanto): after the quanto closes,
+    /// both are worth exactly their principal (neither earned it), and both earn
+    /// equally from the next quanto. Before the fix, both would have collected the
+    /// full quanto reward for a partial stake.
+    #[test]
+    fn a_late_join_does_not_collect_the_quanto_reward_and_earns_equally_next_quanto() {
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        seed_global(&mut accounts, rate);
+        let (early, late) = (pk(50), pk(51));
+        let (pe, pl) = (pk(60), pk(61));
+        accounts.insert(early, wallet(100 * UNITS_PER_QCH));
+        accounts.insert(late, wallet(100 * UNITS_PER_QCH));
+        let amount = 50 * UNITS_PER_QCH;
+        // Both stake the same amount during quanto 0 (the index is flat within a
+        // quanto, so "early" and "late" in the same quanto are identical on-chain).
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![early, pe, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &early).unwrap();
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![late, pl, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &late).unwrap();
+
+        // Close quanto 0: NEITHER earns it (they weren't active during it).
+        assert_eq!(settle_quanto(&mut accounts, 0, rate).unwrap(), 0, "no reward is paid for the join quanto");
+        let g1 = read_global(&accounts);
+        let (v_e1, v_l1) = (
+            position_current_value(&read_position(&accounts, &pe).unwrap(), &g1),
+            position_current_value(&read_position(&accounts, &pl).unwrap(), &g1),
+        );
+        assert!(v_e1 <= amount as u128 && v_e1 + 10 >= amount as u128, "worth ~principal, no join-quanto reward: {v_e1}");
+        assert_eq!(v_e1, v_l1, "both stakers are worth the same (neither got a free quanto)");
+
+        // Close quanto 1: NOW both earn, equally.
+        assert!(settle_quanto(&mut accounts, 1, rate).unwrap() > 0);
+        let g2 = read_global(&accounts);
+        let (v_e2, v_l2) = (
+            position_current_value(&read_position(&accounts, &pe).unwrap(), &g2),
+            position_current_value(&read_position(&accounts, &pl).unwrap(), &g2),
+        );
+        assert!(v_e2 > amount as u128, "both now earn from the next quanto");
+        assert_eq!(v_e2, v_l2, "both earn equally");
+    }
+
     #[test]
     fn differential_o1_total_matches_on_sum_of_positions() {
         // The O(1) global total_shares/index must agree with an O(N) sum over
         // every position — the core property the full DST (1f) will assert.
         let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        seed_global(&mut accounts, rate);
         let positions: Vec<Pubkey> = (0..5).map(|i| pk(100 + i)).collect();
         for (i, p) in positions.iter().enumerate() {
             let staker = pk(60 + i as u8);
@@ -658,13 +899,13 @@ mod tests {
             let amt = (i as u64 + 1) * 10 * UNITS_PER_QCH;
             StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount: amt }, vec![staker, *p, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
         }
-        // Some quantos pass.
+        // Some quantos pass (all five deposits activate at quanto 0's close, then earn).
         for q in 0..30 {
             settle_quanto(&mut accounts, q, rate).unwrap();
         }
         let g = read_global(&accounts);
         let o1_total = position_value(g.total_shares, g.index);
-        let o_n_total: u128 = positions.iter().map(|p| position_value(read_position(&accounts, p).unwrap().active_shares, g.index)).sum();
+        let o_n_total: u128 = positions.iter().map(|p| position_current_value(&read_position(&accounts, p).unwrap(), &g)).sum();
         // Aggregate (floor once) ≥ per-position sum (floor N times); the gap is a
         // sub-unit rounding residue bounded by the position count. This is the
         // core O(1)-vs-O(N) agreement the full DST (1f) will assert.

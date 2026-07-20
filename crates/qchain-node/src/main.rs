@@ -325,12 +325,16 @@ async fn main() -> anyhow::Result<()> {
             use qchain_execution::ids::{
                 ADMIN_FEE_WALLET, STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_FEE_POOL_ID, VALIDATOR_UNBONDING_POOL_ID,
             };
-            // Global staking singleton: MUST seed with `genesis()` (index = 1.0),
-            // never `Default` (index = 0) — the per-quanto close reads this.
+            // Global staking singleton: MUST seed with `genesis_with_rate` (index =
+            // 1.0, carrying the per-quanto rate), never `Default` (index = 0) — the
+            // per-quanto close reads this, and `stake()` reads `rate_fp` to price a
+            // fresh deposit's shares at the NEXT quanto's index (epoch-aligned
+            // activation: a deposit earns from the next quanto, not the partial one
+            // it joined during).
             ledger.seed_account(
                 STAKING_GLOBAL_ID,
                 qchain_core::Account {
-                    data: borsh::to_vec(&qchain_execution::staking_v7::GlobalStakingState::genesis())?,
+                    data: borsh::to_vec(&qchain_execution::staking_v7::GlobalStakingState::genesis_with_rate(config.quanto_rate_fp()))?,
                     ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
                 },
             );

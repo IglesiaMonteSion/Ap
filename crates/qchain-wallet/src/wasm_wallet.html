@@ -2531,6 +2531,13 @@ async function renderStakingV7(addr){
       const pct=Math.max(3,Math.min(100,Math.round((totalRounds-leftRounds)/totalRounds*100)));
       actions=`<button class="btn-sec" disabled>🔒 en espera</button>`;
       progHtml=`<div class="pos-progtxt"><span>⏳ Disponible para cobrar en</span><b>~${esc(fmtDur(leftRounds*ri))}</b></div><div class="pos-prog"><i class="unb" style="width:${pct}%"></i></div>`;
+    } else if(d.activating){
+      // Depósito recién hecho: en pausa hasta que empiece el próximo cuanto — así
+      // no cobra la recompensa del cuanto en que entró (activación alineada).
+      badge={cls:'warm',txt:'Activándose'};
+      actions=`<button class="btn-sec" data-v7unstake="${i}">Retirar</button>`;
+      const into=rpq>0?(((cr%rpq)+rpq)%rpq):0, pct=rpq>0?Math.max(4,Math.min(100,Math.round(into/rpq*100))):4;
+      progHtml=`<div class="pos-progtxt"><span>⏳ Empieza a rendir en</span><b>~${esc(fmtDur(rpq>0?(rpq-into)*ri:0))}</b></div><div class="pos-prog"><i class="rw" style="width:${pct}%"></i></div>`;
     } else if(value>0n){
       badge={cls:'active',txt:'Activo · rindiendo'};
       actions=`<button class="btn-sec" data-v7unstake="${i}">Retirar todo</button>`;
@@ -2539,7 +2546,7 @@ async function renderStakingV7(addr){
         progHtml=`<div class="pos-progtxt"><span>🎁 Próxima recompensa en</span><b>~${esc(fmtDur((rpq-into)*ri))}</b></div><div class="pos-prog"><i class="rw" style="width:${pct}%"></i></div>`;
       }
     } else { badge={cls:'cool',txt:'Vacía'}; }
-    const gainTxt = gain>0n ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(gain))}</b> rendimiento</span>` : `<span class="pos-reward">🎁 acumulando…</span>`;
+    const gainTxt = d.activating ? `<span class="pos-reward">🕒 en pausa · rinde desde el próximo cuanto</span>` : (gain>0n ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(gain))}</b> rendimiento</span>` : `<span class="pos-reward">🎁 acumulando…</span>`);
     const headAmt = value>0n?value:unb;
     return `<div class="pos-card">
       <div class="pos-top">
