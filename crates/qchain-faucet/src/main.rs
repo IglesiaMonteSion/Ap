@@ -51,6 +51,17 @@ struct Cli {
     /// Minimum seconds between payouts to the same address.
     #[arg(long, default_value_t = 60)]
     cooldown_secs: u64,
+    /// Global cap: the maximum number of payouts the faucet will make in any
+    /// rolling `rate_window_secs` window, across ALL addresses. The per-address
+    /// cooldown alone gives no Sybil resistance — an attacker naming a fresh
+    /// random address every request never trips it and can slowly drain the
+    /// faucet wallet — so this bounds the total outflow regardless of how many
+    /// distinct addresses ask. Default 200/hour.
+    #[arg(long, default_value_t = 200)]
+    max_payouts_per_window: usize,
+    /// The rolling window (seconds) for `max_payouts_per_window`. Default 1h.
+    #[arg(long, default_value_t = 3600)]
+    rate_window_secs: u64,
 }
 
 struct FaucetState {
@@ -60,6 +71,13 @@ struct FaucetState {
     fee_limit: u64,
     cooldown: Duration,
     last_claim: HashMap<Pubkey, Instant>,
+    /// Global rate limit (across all addresses) — the timestamps of recent
+    /// confirmed payouts, pruned to the rolling window. Bounds total outflow
+    /// against a Sybil that rotates its recipient address to evade the
+    /// per-address cooldown.
+    recent_payouts: Vec<Instant>,
+    rate_window: Duration,
+    max_payouts_per_window: usize,
     /// The faucet wallet's own nonce, tracked locally instead of re-fetched
     /// from the network on every request - a real, live-confirmed bug this
     /// closes (see `project-lessons-learned`): re-fetching raced the
@@ -145,6 +163,16 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
             return Err((StatusCode::TOO_MANY_REQUESTS, format!("already funded recently - try again in {wait}s")));
         }
     }
+    // Global rate cap across ALL addresses — the per-address cooldown above
+    // gives no Sybil resistance (a fresh recipient address per request never
+    // trips it), so this bounds total outflow regardless of how many distinct
+    // addresses ask. Prune the rolling window, then reject if the cap is hit.
+    let now = Instant::now();
+    let window = state.rate_window;
+    state.recent_payouts.retain(|t| now.duration_since(*t) < window);
+    if state.recent_payouts.len() >= state.max_payouts_per_window {
+        return Err((StatusCode::TOO_MANY_REQUESTS, format!("faucet global rate limit reached ({} payouts per {}s) - try again later", state.max_payouts_per_window, window.as_secs())));
+    }
 
     let client = reqwest::Client::new();
     let from = state.keypair.pubkey();
@@ -210,6 +238,8 @@ async fn faucet(State(state): State<Arc<Mutex<FaucetState>>>, Json(req): Json<Fa
     let cooldown = state.cooldown; // copy out before the &mut borrow in retain
     state.last_claim.retain(|_, t| now.duration_since(*t) < cooldown);
     state.last_claim.insert(to, now);
+    // Record this confirmed payout against the global rolling-window cap.
+    state.recent_payouts.push(now);
     Ok(Json(json!({ "funded": req.address, "amount": state.amount, "tx": body })))
 }
 
@@ -231,6 +261,9 @@ async fn main() -> anyhow::Result<()> {
         fee_limit: cli.fee_limit,
         cooldown: Duration::from_secs(cli.cooldown_secs),
         last_claim: HashMap::new(),
+        recent_payouts: Vec::new(),
+        rate_window: Duration::from_secs(cli.rate_window_secs),
+        max_payouts_per_window: cli.max_payouts_per_window,
         next_nonce: None,
     }));
 

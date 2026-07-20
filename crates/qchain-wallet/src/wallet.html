@@ -470,7 +470,7 @@ function renderHome(){
   if(listSig!==lastListSig){
     lastListSig=listSig;
     box.innerHTML = WALLETS.map(x=>`
-      <div class="wallet-item" data-name="${x.name}">
+      <div class="wallet-item" data-name="${esc(x.name)}">
         <div class="wi-ic">${esc(initials(x.name))}</div>
         <div class="wi-main"><div class="wi-name">${esc(x.name)}</div><div class="wi-addr">${esc(short(x.address))}</div></div>
         <div class="wi-bal">${qchDisp(x.balance)} ${x.name===active?'<span class="wi-check">✓</span>':''}</div>

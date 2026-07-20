@@ -338,7 +338,23 @@ impl StakingV7Program {
             if position_pk == *payer {
                 return Err(ExecError::Unauthorized("the staking position must be a fresh account, not the payer's wallet".into()));
             }
-            const RESERVED: [Pubkey; 8] = [
+            // Every protocol singleton and program account — a fresh `Stake`
+            // must never be allowed to open its position ON one of these
+            // (`write_position` is a blind overwrite). The occupied-account
+            // guard below ALSO rejects most of them, but only while they hold a
+            // balance / data / non-system owner; for a system-owned, zero-
+            // balance, empty-data singleton (notably `ADMIN_FEE_WALLET` at
+            // genesis) that guard's protection is emergent — it relies on the
+            // byte fee being routed to `ADMIN_FEE_WALLET` *before* the
+            // instruction loop, making it non-empty by check time. Listing every
+            // singleton here makes the guarantee EXPLICIT rather than dependent
+            // on fee-ordering, so a future refactor (fee-exempt tx, reordered
+            // fee routing) can't silently reopen a grief/DoS on the operator's
+            // admin-revenue wallet or any protocol account. Byte-identical on the
+            // happy path: a legitimate `Stake` to a fresh user address is
+            // unaffected, and every reachable `Stake` naming a singleton was
+            // already rejected by the occupied-account guard.
+            const RESERVED: [Pubkey; 19] = [
                 STAKING_GLOBAL_ID,
                 STAKING_RESERVE_ID,
                 STAKING_UNBONDING_POOL_ID,
@@ -347,6 +363,17 @@ impl StakingV7Program {
                 crate::ids::VALIDATOR_FEE_POOL_ID,
                 crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID,
                 crate::ids::STAKING_STATS_ID,
+                crate::ids::STAKING_PROGRAM_ID,
+                crate::ids::GOVERNANCE_PROGRAM_ID,
+                crate::ids::REGISTRY_ACCOUNT_ID,
+                crate::ids::PARAMS_ACCOUNT_ID,
+                crate::ids::STAKING_REWARDS_POOL_ID,
+                crate::ids::LOADER_PROGRAM_ID,
+                crate::ids::FEE_STATE_ACCOUNT_ID,
+                crate::ids::VALIDATOR_V7_PROGRAM_ID,
+                crate::ids::TREASURY_V7_PROGRAM_ID,
+                crate::ids::TREASURY_ACCOUNT_ID,
+                crate::ids::ADMIN_FEE_WALLET,
             ];
             if RESERVED.contains(&position_pk) {
                 return Err(ExecError::Unauthorized("the staking position must not be a protocol singleton account".into()));
@@ -829,6 +856,22 @@ mod tests {
         );
         assert!(e2.is_err(), "Stake onto a singleton (the reserve) must be rejected");
         assert_eq!(accounts.get(&STAKING_RESERVE_ID).unwrap().balance, 999, "reserve untouched");
+
+        // Attack the emergent-safety case made explicit: a protocol wallet that
+        // is genuinely system-owned, zero-balance, empty-data (the exact state
+        // `ADMIN_FEE_WALLET` has at genesis, before any fee routes to it). The
+        // occupied-account guard would ALLOW this (it looks free); RESERVED must
+        // reject it so a Stake can never convert the admin-revenue wallet into
+        // an attacker-owned position.
+        accounts.insert(crate::ids::ADMIN_FEE_WALLET, Account::new_wallet(Pubkey::system_program_id()));
+        let e3 = StakingV7Program::execute(
+            &mut accounts,
+            &ix(&StakingV7Instruction::Stake { amount: 1 }, vec![attacker, crate::ids::ADMIN_FEE_WALLET, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]),
+            &attacker,
+        );
+        assert!(e3.is_err(), "Stake onto the (empty, system-owned) admin fee wallet must be rejected by RESERVED");
+        assert_eq!(accounts.get(&crate::ids::ADMIN_FEE_WALLET).unwrap().owner, Pubkey::system_program_id(), "admin wallet owner untouched");
+        assert!(accounts.get(&crate::ids::ADMIN_FEE_WALLET).unwrap().data.is_empty(), "admin wallet not converted to a position");
 
         // A genuinely fresh position (never-seen address, absent from the set) still works.
         let fresh = pk(72);

@@ -119,3 +119,31 @@ pub const TREASURY_V7_PROGRAM_ID: Pubkey = Pubkey::new([17u8; 32]);
 /// `data` is a borsh-encoded `treasury_v7::TreasuryState` naming the release
 /// authority. Absent on a v6 network or a v7 network with no treasury configured.
 pub const TREASURY_ACCOUNT_ID: Pubkey = Pubkey::new([18u8; 32]);
+
+#[cfg(test)]
+mod wasm_id_contract_tests {
+    use super::*;
+
+    /// `qchain-wasm` (the browser self-custody signer, excluded from this
+    /// workspace and built separately for wasm32) hand-copies the singleton
+    /// account ids it needs to build v7 staking/governance instructions, since
+    /// it can't depend on this crate. Those literals MUST stay byte-identical to
+    /// the ids here — a drift wouldn't move funds without the payer's signature
+    /// (the node validates the account set, so a wrong id yields a rejected tx,
+    /// not a loss), but it is a silent footgun that breaks the wallet's v7
+    /// flows. This test mirrors `qchain-wasm/src/lib.rs`'s hardcoded values so
+    /// any change to an id here fails loudly, flagging that the wasm copy (and
+    /// its regenerated assets) must be updated in the same change.
+    #[test]
+    fn wasm_hardcoded_singleton_ids_match_this_crate() {
+        assert_eq!(STAKING_PROGRAM_ID, Pubkey::new([1u8; 32]), "wasm STAKING_PROGRAM_ID");
+        assert_eq!(STAKING_STATS_ID, Pubkey::new([2u8; 32]), "wasm STAKING_STATS_ID");
+        assert_eq!(GOVERNANCE_PROGRAM_ID, Pubkey::new([3u8; 32]), "wasm GOVERNANCE_PROGRAM_ID");
+        assert_eq!(REGISTRY_ACCOUNT_ID, Pubkey::new([4u8; 32]), "wasm REGISTRY_ACCOUNT_ID");
+        assert_eq!(PARAMS_ACCOUNT_ID, Pubkey::new([5u8; 32]), "wasm PARAMS_ACCOUNT_ID");
+        assert_eq!(STAKING_REWARDS_POOL_ID, Pubkey::new([6u8; 32]), "wasm STAKING_REWARDS_POOL_ID");
+        assert_eq!(STAKING_RESERVE_ID, Pubkey::new([11u8; 32]), "wasm STAKING_RESERVE_ID");
+        assert_eq!(STAKING_UNBONDING_POOL_ID, Pubkey::new([13u8; 32]), "wasm STAKING_UNBONDING_POOL_ID");
+        assert_eq!(STAKING_GLOBAL_ID, Pubkey::new([15u8; 32]), "wasm STAKING_GLOBAL_ID");
+    }
+}
