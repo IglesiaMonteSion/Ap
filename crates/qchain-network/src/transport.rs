@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 /// Bounds how long a single `send_to` write attempt may block on a
 /// half-stuck peer connection before being treated as a failure - see
@@ -43,6 +43,20 @@ use tokio::sync::{mpsc, Mutex};
 /// timed out under real load - only a connection that has genuinely
 /// stopped draining.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Caps how many inbound authenticated handshakes may be in flight at once
+/// (task #176 hardening). Only meaningful when auth is on. Each in-flight
+/// handshake holds a small pre-authentication allocation and forces the node
+/// to do one hybrid PQC sign; without a cap, an attacker opening connections
+/// and stalling mid-handshake (or replaying a *public* validator bundle it
+/// can't finish) could accumulate memory/fds/CPU without bound — exactly the
+/// unbounded-growth class this project has been OOM-killed by before, but on
+/// the new pre-auth surface. The permit is held only for the duration of the
+/// handshake, NOT the connection's lifetime, so an established persistent
+/// connection never occupies a slot; legit validators handshake once and hold
+/// a slot for milliseconds, so this bound is far above real concurrent-join
+/// load while still bounding a flood. Auth-off transport never touches this.
+const MAX_CONCURRENT_INBOUND_HANDSHAKES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
@@ -132,7 +146,7 @@ const FIRST_ENVELOPE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// messages once it's proven itself with at least one, and timing out
 /// *that* would fight the persistent-connection optimization instead of
 /// the actual attack (open many connections, send nothing, ever).
-async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration, auth: Option<Arc<AuthState>>) {
+async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration, auth: Option<Arc<AuthState>>, handshake_permits: Option<Arc<Semaphore>>) {
     // When authenticated transport is on, prove identities before a single
     // envelope is read. A connection that fails the handshake (a non-member,
     // a wrong-network peer, a bad signature, or a stall) is dropped here,
@@ -141,13 +155,26 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     // of the spoofable `Envelope.from`, which strengthens attribution for
     // even the message types whose payload isn't itself signed.
     let authed_id: Option<ValidatorId> = match &auth {
-        Some(a) => match server_handshake(&mut stream, a).await {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::debug!("dropping an inbound connection that failed the handshake: {e}");
-                return;
+        Some(a) => {
+            // Bound concurrent in-flight handshakes. The permit is dropped at
+            // the end of this block - i.e. as soon as the handshake finishes -
+            // so the established connection's (untimed, long-lived) message
+            // loop below never holds a handshake slot.
+            let _permit = match &handshake_permits {
+                Some(sem) => match sem.clone().acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(_) => return, // semaphore closed (shutdown)
+                },
+                None => None,
+            };
+            match server_handshake(&mut stream, a).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::debug!("dropping an inbound connection that failed the handshake: {e}");
+                    return;
+                }
             }
-        },
+        }
         None => None,
     };
     let attributed = |envelope: &Envelope| authed_id.unwrap_or(envelope.from);
@@ -187,12 +214,23 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     }
 }
 
-async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>, auth: Option<Arc<AuthState>>) {
+async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>, auth: Option<Arc<AuthState>>, handshake_permits: Option<Arc<Semaphore>>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
-        let tx = tx.clone();
-        let auth = auth.clone();
-        tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT, auth));
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let tx = tx.clone();
+                let auth = auth.clone();
+                let permits = handshake_permits.clone();
+                tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT, auth, permits));
+            }
+            Err(e) => {
+                // Back off instead of busy-spinning: a transient accept error
+                // (notably fd exhaustion) would otherwise pin a core at 100%
+                // retrying instantly with no log.
+                tracing::warn!("accept error, backing off: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
@@ -221,7 +259,10 @@ impl Network {
     ) -> anyhow::Result<(Self, mpsc::Receiver<(ValidatorId, NetMessage)>)> {
         let listener = TcpListener::bind(listen_addr).await?;
         let (tx, rx) = mpsc::channel(4096);
-        tokio::spawn(accept_loop(listener, tx, auth.clone()));
+        // Only allocate the handshake-concurrency semaphore when auth is on;
+        // the auth-off accept path never acquires it (byte-identical to before).
+        let handshake_permits = auth.as_ref().map(|_| Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_HANDSHAKES)));
+        tokio::spawn(accept_loop(listener, tx, auth.clone(), handshake_permits));
         Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()), auth }, rx))
     }
 
@@ -527,7 +568,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_inbound(stream, tx, std::time::Duration::from_millis(200), None).await;
+            handle_inbound(stream, tx, std::time::Duration::from_millis(200), None, None).await;
         });
 
         // Connect but deliberately never write anything - the exact

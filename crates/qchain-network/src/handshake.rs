@@ -29,6 +29,19 @@
 //! there is no key exchange or encryption — that would be an optional
 //! follow-up (ML-KEM, never X25519), out of scope here.
 //!
+//! **Honest scope of the "anti-MITM" property (audited):** the handshake stops
+//! an *off-path* attacker (anyone who does not hold a member's private key)
+//! from spoofing a validator — that is the DoS/anti-spoofing door gate it
+//! genuinely delivers, and it is what closes the real gap. It does NOT resist
+//! an *on-path* attacker who can transparently relay the three frames between
+//! two honest validators (there is no channel binding, since there is no
+//! encrypted channel to bind to). Such a relay could forge attribution of
+//! *unsigned* messages between those two peers; it can never impersonate a
+//! third identity or forge signed consensus traffic (votes/certs/vertex
+//! proposals stay protected by their own signatures). Full relay resistance is
+//! deferred to the optional ML-KEM channel follow-up, which would provide an
+//! exporter to bind into the transcript.
+//!
 //! Wire protocol (each frame is `[u32 LE len][Borsh]`, same framing as an
 //! `Envelope`):
 //!   1. dialer  → acceptor: `HandshakeInit  { bundle_c, nonce_c }`
@@ -51,11 +64,14 @@ const HANDSHAKE_DOMAIN: &[u8] = b"qchain-p2p-auth-v1";
 const ROLE_CLIENT: u8 = 0x01;
 const ROLE_SERVER: u8 = 0x02;
 
-/// A handshake frame is a public key bundle plus a signature — a few KB of
-/// hybrid PQC material — never megabytes. This stops a malformed length
-/// prefix from causing an unbounded allocation during the handshake, the
-/// same reason `transport::read_envelope` bounds its own frames.
-const HANDSHAKE_FRAME_CAP: usize = 256 * 1024;
+/// A handshake frame is a public key bundle plus a signature — at most tens of
+/// KB even for the opt-in triple combo (Ed25519 + ML-DSA-65 + SLH-DSA, whose
+/// signature alone is ~30 KB), never megabytes. Bounded tightly (64 KB) so a
+/// malformed length prefix can't drive a large pre-body allocation during the
+/// still-unauthenticated handshake; combined with the concurrency cap in
+/// `transport::accept_loop`, the total memory a flood of half-open handshakes
+/// can hold is bounded to a small, fixed multiple of this.
+const HANDSHAKE_FRAME_CAP: usize = 64 * 1024;
 
 /// The whole handshake (three small frames) must complete inside this
 /// window. A peer that connects and then stalls mid-handshake is dropped —
@@ -126,10 +142,13 @@ fn transcript(role: u8, network_id: &[u8; 32], client_id: &ValidatorId, server_i
     t
 }
 
-fn fresh_nonce() -> [u8; 32] {
+fn fresh_nonce() -> anyhow::Result<[u8; 32]> {
     let mut n = [0u8; 32];
-    getrandom::getrandom(&mut n).expect("OS randomness must be available for a P2P handshake nonce");
-    n
+    // Fail the handshake as a normal error rather than panicking the task/await
+    // path if OS randomness is somehow unavailable — the caller already treats a
+    // handshake error like any other connect failure (drop and retry).
+    getrandom::getrandom(&mut n).map_err(|e| anyhow::anyhow!("OS randomness unavailable for a P2P handshake nonce: {e}"))?;
+    Ok(n)
 }
 
 async fn write_frame<T: BorshSerialize>(stream: &mut TcpStream, value: &T) -> anyhow::Result<()> {
@@ -163,7 +182,7 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let bundle_c = auth.keypair.public_key_bundle();
         let client_id = bundle_c.to_address();
-        let nonce_c = fresh_nonce();
+        let nonce_c = fresh_nonce()?;
         write_frame(stream, &HandshakeInit { bundle: bundle_c, nonce: nonce_c }).await?;
 
         let resp: HandshakeResp = read_frame(stream).await?;
@@ -171,10 +190,16 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
         if !auth.is_authorized(&server_id) {
             anyhow::bail!("peer authenticated as {server_id}, which is not an authorized validator");
         }
-        if let Some(want) = expected {
-            if server_id != want {
-                anyhow::bail!("dialed a peer expecting {want} but it authenticated as {server_id}");
-            }
+        // Require the peer to authenticate as exactly the id we dialed this
+        // address for (anti-misrouting). A dial to an address not in the peer
+        // set (`expected == None`) is refused rather than accepted on
+        // membership alone: under authenticated transport this node only ever
+        // dials known peers, so a `None` here is unexpected and gets no
+        // membership-only fallback that a relay could exploit.
+        match expected {
+            Some(want) if server_id == want => {}
+            Some(want) => anyhow::bail!("dialed a peer expecting {want} but it authenticated as {server_id}"),
+            None => anyhow::bail!("refusing to authenticate {server_id} at an address that is not a known peer"),
         }
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce);
         if !qchain_crypto::verify(&resp.bundle, &t_server, &resp.signature) {
@@ -206,7 +231,7 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
 
         let bundle_s = auth.keypair.public_key_bundle();
         let server_id = bundle_s.to_address();
-        let nonce_s = fresh_nonce();
+        let nonce_s = fresh_nonce()?;
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s);
         let sig_s = auth.keypair.sign(&t_server)?;
         write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, signature: sig_s }).await?;
@@ -341,5 +366,32 @@ mod tests {
         // We dialed expecting id_other, but the peer is actually id_s.
         let res = client_handshake(&mut stream, &auth_c, Some(id_other)).await;
         assert!(res.is_err(), "authenticating as a different id than dialed must be rejected");
+    }
+
+    /// Dialing with no expected id (an address not in the peer set) is refused
+    /// under authenticated transport, even against an authorized member — the
+    /// anti-misrouting stance: this node only ever dials known peers, so there
+    /// is no membership-only fallback for a `None`-expected dial to exploit.
+    #[tokio::test]
+    async fn dialing_with_no_expected_id_is_refused_even_for_a_member() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let auth_s = auth_for(&kp_s, net, &[id_c, id_s]);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = server_handshake(&mut stream, &auth_s).await;
+        });
+
+        let auth_c = auth_for(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let res = client_handshake(&mut stream, &auth_c, None).await;
+        assert!(res.is_err(), "a None-expected dial must be refused even against an authorized member");
     }
 }
