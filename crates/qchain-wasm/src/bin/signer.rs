@@ -75,7 +75,23 @@ fn main() -> anyhow::Result<()> {
             let s = seed(&args[2])?;
             print!("{}", qchain_wasm::sign_v7_withdraw_unbonded_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
         }
-        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw ..."),
+        Some("program-addr") => {
+            // program-addr <seed> <index>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::program_address_from_seed(&s, args[3].parse()?));
+        }
+        Some("deploy-program") => {
+            // deploy-program <seed> <program_addr> <wasm_file> <entry_point> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            let module = std::fs::read(&args[4])?;
+            print!("{}", qchain_wasm::sign_deploy_program_json(&s, &args[3], &module, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+        }
+        Some("call-program") => {
+            // call-program <seed> <program_id> <accounts_csv> <args_csv> <nonce> <chain_id_hex> <fee_limit>
+            let s = seed(&args[2])?;
+            print!("{}", qchain_wasm::sign_call_program_json(&s, &args[3], &args[4], &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+        }
+        _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw|program-addr|deploy-program|call-program ..."),
     }
     Ok(())
 }

@@ -178,6 +178,23 @@ mod tests {
         assert_eq!(encoded, expected, "wasm wallet's hand-rolled Transfer encoding is out of sync");
     }
 
+    /// Guards the wasm wallet's hand-rolled `DeployProgram` encoding (used by the
+    /// wallet-connect bridge's `signDeployProgram`): if the enum order/shape ever
+    /// changes, this fails and `qchain-wasm` must be updated to match.
+    #[test]
+    fn deploy_program_instruction_encoding_is_stable() {
+        let module_bytes = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let entry_point = "run".to_string();
+        let encoded = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: module_bytes.clone(), entry_point: entry_point.clone() }).unwrap();
+        // `[2]` ++ u32 LE len(module) ++ module ++ u32 LE len(entry) ++ entry utf8.
+        let mut expected = vec![2u8];
+        expected.extend_from_slice(&(module_bytes.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&module_bytes);
+        expected.extend_from_slice(&(entry_point.len() as u32).to_le_bytes());
+        expected.extend_from_slice(entry_point.as_bytes());
+        assert_eq!(encoded, expected, "wasm wallet's hand-rolled DeployProgram encoding is out of sync");
+    }
+
     #[test]
     fn transfer_moves_balance() {
         let from = qchain_crypto::Keypair::generate().unwrap().pubkey();

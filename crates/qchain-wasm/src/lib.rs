@@ -34,6 +34,21 @@ fn transfer_instruction_data(amount: u64) -> Vec<u8> {
     data
 }
 
+/// `SystemInstruction::DeployProgram { module_bytes, entry_point }` Borsh
+/// encoding (variant order in `qchain-execution::native`: CreateAccount=0,
+/// Transfer=1, DeployProgram=2), guarded by
+/// `deploy_program_instruction_encoding_is_stable` in qchain-execution.
+/// `[2]` ++ Vec<u8>(u32 LE len ++ bytes) ++ String(u32 LE len ++ utf8).
+fn deploy_program_instruction_data(module_bytes: &[u8], entry_point: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(1 + 4 + module_bytes.len() + 4 + entry_point.len());
+    data.push(2u8);
+    data.extend_from_slice(&(module_bytes.len() as u32).to_le_bytes());
+    data.extend_from_slice(module_bytes);
+    data.extend_from_slice(&(entry_point.len() as u32).to_le_bytes());
+    data.extend_from_slice(entry_point.as_bytes());
+    data
+}
+
 // Well-known staking addresses (qchain-execution::ids), replicated here for the
 // same reason as the instruction encodings above.
 const STAKING_PROGRAM_ID: [u8; 32] = [1u8; 32];
@@ -363,6 +378,78 @@ pub fn sign_transfer_json(
     Ok(serde_json::to_string(&tx)?)
 }
 
+/// Derive a fresh, recoverable **program (contract) address** from the master
+/// seed + an index. Domain-separated (`"qchain-program-account-v1"`) so it can
+/// never collide with the wallet address or a stake account. A program account
+/// is program-owned (nobody signs *as* it), so its address just needs to be
+/// unique and reproducible — deriving it from the seed means a restored wallet
+/// can re-find the contracts it deployed. Deploy-once: pick the next unused
+/// index (the node's `/programs` / `/account` says which exist).
+pub fn program_address_from_seed(seed: &[u8; 32], index: u32) -> String {
+    use sha3::{Digest, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"qchain-program-account-v1");
+    hasher.update(seed);
+    hasher.update(index.to_le_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    Pubkey::new(digest).to_string()
+}
+
+/// Sign a `DeployProgram` transaction: publish `module_bytes` (raw `.wasm`) as a
+/// contract at `program_address` (a fresh address, e.g. `programAddressFromSeed`),
+/// callable via `entry_point`. accounts = [program_address], program_id =
+/// System Program (the loader runs on deploy). The payer (seed) signs and pays
+/// the byte fee (bigger `.wasm` = proportionally bigger fee).
+pub fn sign_deploy_program_json(
+    seed: &[u8; 32],
+    program_address: &str,
+    module_bytes: &[u8],
+    entry_point: &str,
+    nonce: u64,
+    chain_id: &[u8; 32],
+    fee_limit: u64,
+) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let program_pk: Pubkey = program_address.trim().parse().map_err(|e| anyhow::anyhow!("program address invalid: {e}"))?;
+    let ix = Instruction {
+        program_id: Pubkey::system_program_id(),
+        accounts: vec![program_pk],
+        data: deploy_program_instruction_data(module_bytes, entry_point),
+    };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
+/// Sign a contract-call transaction: invoke the contract at `program_id` with
+/// `accounts` (comma-separated base58 addresses the instruction touches) and
+/// `args` (comma-separated `i64` values — the on-chain calling convention packs
+/// each as little-endian `i64` in `ix.data`). program_id = the contract's
+/// address (the ledger dispatches loader-owned accounts to WASM). The payer
+/// (seed) signs; `host_is_signer` sees the payer as the authenticated signer.
+pub fn sign_call_program_json(
+    seed: &[u8; 32],
+    program_id: &str,
+    accounts_csv: &str,
+    args_csv: &str,
+    nonce: u64,
+    chain_id: &[u8; 32],
+    fee_limit: u64,
+) -> anyhow::Result<String> {
+    let payer = Keypair::generate_from_seed(seed)?;
+    let program_pk: Pubkey = program_id.trim().parse().map_err(|e| anyhow::anyhow!("program address invalid: {e}"))?;
+    let mut accounts = Vec::new();
+    for a in accounts_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        accounts.push(a.parse::<Pubkey>().map_err(|e| anyhow::anyhow!("account address '{a}' invalid: {e}"))?);
+    }
+    let mut data = Vec::new();
+    for arg in args_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        data.extend_from_slice(&arg.parse::<i64>().map_err(|e| anyhow::anyhow!("arg '{arg}' is not an i64: {e}"))?.to_le_bytes());
+    }
+    let ix = Instruction { program_id: program_pk, accounts, data };
+    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    Ok(serde_json::to_string(&tx)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +490,38 @@ mod tests {
         assert_ne!(stake_address_from_seed(&seed, 0), stake_address_from_seed(&[8u8; 32], 0));
         // And it must never equal the wallet address itself (distinct domains).
         assert_ne!(stake_address_from_seed(&seed, 0), address_from_seed(&seed).unwrap());
+    }
+
+    #[test]
+    fn program_address_is_deterministic_index_separated_and_distinct_from_wallet_and_stake() {
+        let seed = [7u8; 32];
+        // Recoverable: same (seed, index) → same address.
+        assert_eq!(program_address_from_seed(&seed, 0), program_address_from_seed(&seed, 0));
+        // Distinct per index (deploy-once needs a fresh address each time).
+        assert_ne!(program_address_from_seed(&seed, 0), program_address_from_seed(&seed, 1));
+        // Per-wallet.
+        assert_ne!(program_address_from_seed(&seed, 0), program_address_from_seed(&[8u8; 32], 0));
+        // Distinct domain from the wallet address and the stake-account address.
+        assert_ne!(program_address_from_seed(&seed, 0), address_from_seed(&seed).unwrap());
+        assert_ne!(program_address_from_seed(&seed, 0), stake_address_from_seed(&seed, 0));
+    }
+
+    #[test]
+    fn deploy_and_call_signers_produce_valid_signed_txs() {
+        let seed = [7u8; 32];
+        let chain = [9u8; 32];
+        let prog = program_address_from_seed(&seed, 0);
+        let module = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Deploy signs and round-trips as JSON.
+        let dep = sign_deploy_program_json(&seed, &prog, &module, "run", 0, &chain, 10_000_000).unwrap();
+        assert!(dep.contains("signature"), "deploy tx must be a signed tx json");
+        // Call signs with i64 args + accounts.
+        let call = sign_call_program_json(&seed, &prog, &format!("{prog}"), "1,2,3", 1, &chain, 10_000_000).unwrap();
+        assert!(call.contains("signature"), "call tx must be a signed tx json");
+        // A bad program address is rejected, not silently mis-encoded.
+        assert!(sign_call_program_json(&seed, "not-an-address", "", "", 0, &chain, 1).is_err());
+        // A non-i64 arg is rejected.
+        assert!(sign_call_program_json(&seed, &prog, "", "abc", 0, &chain, 1).is_err());
     }
 }
 
@@ -578,6 +697,45 @@ mod wasm {
         fee_limit: u64,
     ) -> Result<String, JsValue> {
         super::sign_execute_json(&as32(seed, "seed")?, proposal, registry, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `programAddressFromSeed(seed, index) -> string` — a fresh, recoverable
+    /// contract address to deploy at.
+    #[wasm_bindgen(js_name = programAddressFromSeed)]
+    pub fn program_address_from_seed(seed: &[u8], index: u32) -> Result<String, JsValue> {
+        Ok(super::program_address_from_seed(&as32(seed, "seed")?, index))
+    }
+
+    /// `signDeployProgram(seed, programAddress, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signDeployProgram)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_deploy_program(
+        seed: &[u8],
+        program_address: &str,
+        module_bytes: &[u8],
+        entry_point: &str,
+        nonce: u64,
+        chain_id: &[u8],
+        fee_limit: u64,
+    ) -> Result<String, JsValue> {
+        super::sign_deploy_program_json(&as32(seed, "seed")?, program_address, module_bytes, entry_point, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit) -> string`
+    #[wasm_bindgen(js_name = signCallProgram)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_call_program(
+        seed: &[u8],
+        program_id: &str,
+        accounts_csv: &str,
+        args_csv: &str,
+        nonce: u64,
+        chain_id: &[u8],
+        fee_limit: u64,
+    ) -> Result<String, JsValue> {
+        super::sign_call_program_json(&as32(seed, "seed")?, program_id, accounts_csv, args_csv, nonce, &as32(chain_id, "chain_id")?, fee_limit)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
