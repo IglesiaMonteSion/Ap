@@ -37,13 +37,42 @@
 //! ChaCha20-Poly1305 safety. A connection would have to send 2^64 frames to
 //! exhaust a counter, which never happens in a real connection lifetime; the
 //! seal path fails loudly rather than wrapping if it ever did.
+//!
+//! **Forward secrecy — a symmetric KDF ratchet.** The per-connection ML-KEM
+//! keypair is already ephemeral, so a compromise of a validator's long-term
+//! ML-DSA signing key never decrypts past *connections* (their KEM secret was
+//! destroyed). This adds forward secrecy *within* a long-lived connection: P2P
+//! connections here are persistent and can stay up for the network's lifetime,
+//! so one static session key would otherwise protect days of traffic. Each
+//! direction's key is ratcheted every `REKEY_INTERVAL` frames via a one-way
+//! SHA3 KDF (`k' = SHA3(RATCHET_DOMAIN || k || boundary_counter)`), and the old
+//! key is zeroized. Because the KDF is one-way, a session key compromised at
+//! ratchet epoch `e` cannot recover any traffic from epoch `< e` — the exposure
+//! window of a mid-connection key leak is bounded to `REKEY_INTERVAL` frames
+//! instead of the whole connection. The ratchet is a pure function of the frame
+//! counter, so both peers advance the key at exactly the same frame over the
+//! ordered TCP stream — **no rekey messages, no round trips, no coordination to
+//! desync**, which is why it can't fork or stall consensus (unlike an in-band
+//! DH/KEM rekey). The global frame counter still drives the nonce (never
+//! resets), so nonce uniqueness is preserved trivially across ratchets. This
+//! delivers forward secrecy; *post-compromise healing* within a single
+//! unbroken connection (re-injecting fresh KEM entropy) remains a follow-up,
+//! though connections already heal on reconnect via a fresh ephemeral KEM.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use qchain_core::ValidatorId;
 use sha3::{Digest, Sha3_256};
+use zeroize::Zeroizing;
 
 const SESSION_DOMAIN: &[u8] = b"qchain-p2p-enc-v1";
+const RATCHET_DOMAIN: &[u8] = b"qchain-p2p-rekey-v1";
+
+/// Re-derive each direction's key after this many frames. Bounds the window a
+/// compromised session key exposes to at most this many messages. Ratcheting is
+/// one SHA3 hash, so this can be small; 1024 keeps the window tight while adding
+/// negligible cost.
+const REKEY_INTERVAL: u64 = 1024;
 
 fn derive_key(label: &[u8], shared_secret: &[u8], nonce_c: &[u8; 32], nonce_s: &[u8; 32], client_id: &ValidatorId, server_id: &ValidatorId) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -57,20 +86,46 @@ fn derive_key(label: &[u8], shared_secret: &[u8], nonce_c: &[u8; 32], nonce_s: &
     h.finalize().into()
 }
 
-/// One direction's AEAD state: a fixed key and a monotonic frame counter.
+/// One direction's AEAD state: the current ratchet key, its cipher, and the
+/// global monotonic frame counter (which drives both the nonce and the ratchet
+/// schedule). `key` is held in `Zeroizing` so the old key is wiped from memory
+/// when the ratchet replaces it.
 struct DirCipher {
+    key: Zeroizing<[u8; 32]>,
     cipher: ChaCha20Poly1305,
     counter: u64,
 }
 
 impl DirCipher {
     fn new(key: [u8; 32]) -> Self {
-        DirCipher { cipher: ChaCha20Poly1305::new(Key::from_slice(&key)), counter: 0 }
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        DirCipher { key: Zeroizing::new(key), cipher, counter: 0 }
+    }
+
+    /// Advance the ratchet: derive the next key one-way from the current one,
+    /// zeroize the old key (dropping the previous `Zeroizing`), and rebuild the
+    /// cipher. Both peers call this at the same `counter` boundary, so their
+    /// keys stay in lock-step.
+    fn ratchet(&mut self) {
+        let mut h = Sha3_256::new();
+        h.update(RATCHET_DOMAIN);
+        h.update(*self.key);
+        h.update(self.counter.to_le_bytes());
+        let next: [u8; 32] = h.finalize().into();
+        self.key = Zeroizing::new(next); // old key wiped when the previous Zeroizing drops
+        self.cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key[..]));
     }
 
     fn next_nonce(&mut self) -> anyhow::Result<Nonce> {
-        // 12-byte nonce = [4 zero bytes][8-byte LE counter]. Unique per frame
-        // for this direction's key, which is the AEAD safety requirement.
+        // Ratchet the key at each REKEY_INTERVAL boundary, before this frame is
+        // sealed/opened with it — deterministic on the frame counter, so both
+        // sides advance at the same frame.
+        if self.counter != 0 && self.counter.is_multiple_of(REKEY_INTERVAL) {
+            self.ratchet();
+        }
+        // 12-byte nonce = [4 zero bytes][8-byte LE global counter]. The counter
+        // never resets, so nonces are unique across the whole connection
+        // regardless of ratcheting — the AEAD safety requirement.
         if self.counter == u64::MAX {
             anyhow::bail!("session frame counter exhausted (this never happens in a real connection)");
         }
@@ -171,5 +226,52 @@ mod tests {
         let mut relay = Session::new(&[8u8; 32], &[1u8; 32], &[2u8; 32], &cid, &sid, false);
         let ct = client.seal(b"secret").unwrap();
         assert!(relay.open(&ct).is_err(), "a foreign shared secret must not decrypt the channel");
+    }
+
+    /// The ratchet stays in lock-step: sealing and opening well past several
+    /// `REKEY_INTERVAL` boundaries keeps decrypting correctly, so the key
+    /// re-derivation happens at the same frame on both sides.
+    #[test]
+    fn the_ratchet_stays_in_sync_across_rekey_boundaries() {
+        let ss = [7u8; 32];
+        let (cid, sid) = ids();
+        let mut client = Session::new(&ss, &[1u8; 32], &[2u8; 32], &cid, &sid, true);
+        let mut server = Session::new(&ss, &[1u8; 32], &[2u8; 32], &cid, &sid, false);
+        // Two full rekey intervals plus a few, so the key has ratcheted twice.
+        for i in 0..(REKEY_INTERVAL * 2 + 5) {
+            let msg = format!("frame {i}");
+            let ct = client.seal(msg.as_bytes()).unwrap();
+            assert_eq!(server.open(&ct).unwrap(), msg.as_bytes(), "frame {i} must decrypt after ratcheting");
+        }
+    }
+
+    /// Forward secrecy in miniature: a peer that keeps the INITIAL key and never
+    /// ratchets (what an attacker holding only the connection-start key has)
+    /// cannot open a frame sealed after the sender has ratcheted — the current
+    /// key is a one-way derivation the initial key can't reproduce.
+    #[test]
+    fn a_non_ratcheting_holder_of_the_initial_key_cannot_open_post_ratchet_frames() {
+        let ss = [7u8; 32];
+        let (cid, sid) = ids();
+        let mut client = Session::new(&ss, &[1u8; 32], &[2u8; 32], &cid, &sid, true);
+        let mut server = Session::new(&ss, &[1u8; 32], &[2u8; 32], &cid, &sid, false);
+        // Advance past the first ratchet boundary with real traffic.
+        for _ in 0..(REKEY_INTERVAL + 2) {
+            let ct = client.seal(b"x").unwrap();
+            server.open(&ct).unwrap();
+        }
+        // The next frame is sealed under the ratcheted key.
+        let post = client.seal(b"post-ratchet-secret").unwrap();
+        // A fresh server session that only ever knew the initial key (no
+        // ratchet) — reconstruct just the initial recv cipher and try to open
+        // the post-ratchet frame with the initial key at that frame's nonce.
+        let initial_key = derive_key(b"c2s", &ss, &[1u8; 32], &[2u8; 32], &cid, &sid);
+        let stale = ChaCha20Poly1305::new(Key::from_slice(&initial_key));
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&(REKEY_INTERVAL + 2).to_le_bytes());
+        assert!(
+            stale.decrypt(Nonce::from_slice(&nonce), post.as_slice()).is_err(),
+            "the initial key must not open a frame sealed under the ratcheted key"
+        );
     }
 }
