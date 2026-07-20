@@ -1801,6 +1801,15 @@ impl Engine {
         state.ledger.store().get(pk)
     }
 
+    /// v7 reward/unbonding timing for the wallet's staking progress bars:
+    /// `(current committed round, rounds per quanto, round interval ms)`. The
+    /// wallet uses these to draw "next reward in ~Xh" and the unbonding
+    /// countdown from real on-chain cadence.
+    pub async fn quanto_timing(&self) -> (Round, u64, u64) {
+        let state = self.state.lock().await;
+        (state.next_round, state.ledger.rounds_per_quanto(), self.round_interval_ms)
+    }
+
     /// Current state-tree Merkle root, plus how many `TransferReceipt`s
     /// this validator has captured so far - what a light client polls to
     /// notice the root has advanced before asking for a proof.

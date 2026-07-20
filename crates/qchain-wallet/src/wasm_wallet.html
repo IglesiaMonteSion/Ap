@@ -411,9 +411,18 @@
   .badge.ready{color:#7aa0ff;background:rgba(120,150,255,.12)}
   .pos-meta{display:flex;justify-content:space-between;align-items:center;margin-top:11px;gap:10px;flex-wrap:wrap}
   .pos-reward{font-size:13px;color:var(--muted)} .pos-reward b{color:var(--good)}
-  .pos-prog{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:10px}
-  .pos-prog>i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#7c5cff,#4f74ff)}
-  .pos-progtxt{font-size:11px;color:var(--muted);margin-top:5px}
+  .pos-prog{height:7px;border-radius:4px;background:var(--line);overflow:hidden;margin-top:6px}
+  .pos-prog>i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#7c5cff,#4f74ff);transition:width .6s ease}
+  .pos-prog>i.unb{background:linear-gradient(90deg,#e0a44a,#ff8c5a)}
+  .pos-progtxt{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);margin-top:11px}
+  .pos-progtxt b{color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pos-brk{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin-top:11px;padding-top:11px;border-top:1px solid var(--line)}
+  .pos-brk b{color:var(--ink);font-weight:700} .pos-brk b.g{color:var(--good)}
+  @media (prefers-reduced-motion: no-preference){
+    .pos-prog>i.rw{position:relative;overflow:hidden}
+    .pos-prog>i.rw::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);transform:translateX(-100%);animation:posShimmer 2.4s linear infinite}
+    @keyframes posShimmer{to{transform:translateX(220%)}}
+  }
   .pos-actions{display:flex;gap:8px;margin-top:12px}
   .pos-actions button{flex:1;padding:9px;font-size:13px;border-radius:11px}
   /* directorio de validadores */
@@ -2482,6 +2491,15 @@ $("st-import-btn").onclick=importStakeByAddress;
 // v7 de qchain-wasm (verificados end-to-end contra un nodo v7 real). Las
 // posiciones usan la MISMA derivación desde la semilla (stakeAddressFromSeed) →
 // recuperables, igual que las v6.
+// Formatea una duración (ms) en algo humano: "2d 3h" / "11h 59m" / "45m" / "listo".
+function fmtDur(ms){
+  if(!(ms>0)) return "listo";
+  const s=Math.round(ms/1000), d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  if(d>0) return d+"d "+h+"h";
+  if(h>0) return h+"h "+m+"m";
+  if(m>0) return m+"m";
+  return Math.max(1,s)+"s";
+}
 async function renderStakingV7(addr){
   await loadStakingMeta();                 // APY de emisión (economics)
   $("stk-commission").textContent="—";     // v7 no expone comisión por-validador acá
@@ -2498,17 +2516,39 @@ async function renderStakingV7(addr){
     const value=BigInt(d.value||0), dep=BigInt(d.net_deposited||0), unb=BigInt(d.unbonding_amount||0);
     totVal+=value; totDep+=dep;
     const gain=value>dep?value-dep:0n;
-    const badge = (d.withdrawable||d.state==="Withdrawable") ? {cls:'ready',txt:'Listo para cobrar'} : (unb>0n?{cls:'cool',txt:'En unbonding'}:{cls:'active',txt:'Activo'});
-    let actions='';
-    if(unb>0n){ actions = d.withdrawable ? `<button class="btn-sec" data-v7withdraw="${i}">Cobrar ${esc(qchDisp(unb))}</button>` : `<button class="btn-sec" disabled>en unbonding (cuanto ${esc(String(d.unbonding_ready_quanto||0))})</button>`; }
-    else if(value>0n){ actions = `<button class="btn-sec" data-v7unstake="${i}">Retirar todo</button>`; }
-    const gainTxt = gain>0n ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(gain))}</b> rendimiento</span>` : `<span class="pos-reward">🎁 sin rendimiento aún</span>`;
+    // Cadencia real on-chain para las barras de progreso.
+    const rpq=Number(d.rounds_per_quanto||0), ri=Number(d.round_interval_ms||0), cr=Number(d.current_round||0);
+    const unbQ=Number(d.unbonding_quantos||1);
+    let badge, actions='', progHtml='';
+    if(unb>0n && d.withdrawable){
+      badge={cls:'ready',txt:'Listo para cobrar'};
+      actions=`<button class="btn-sec" data-v7withdraw="${i}">Cobrar ${esc(qchDisp(unb))}</button>`;
+      progHtml=`<div class="pos-progtxt"><span>🔓 Fondos liberados</span><b>${esc(qchDisp(unb))} listos</b></div><div class="pos-prog"><i class="unb" style="width:100%"></i></div>`;
+    } else if(unb>0n){
+      badge={cls:'cool',txt:'En unbonding'};
+      const readyRound=Number(d.unbonding_ready_quanto||0)*rpq, totalRounds=Math.max(1,unbQ*rpq);
+      const leftRounds=Math.max(0,readyRound-cr);
+      const pct=Math.max(3,Math.min(100,Math.round((totalRounds-leftRounds)/totalRounds*100)));
+      actions=`<button class="btn-sec" disabled>🔒 en espera</button>`;
+      progHtml=`<div class="pos-progtxt"><span>⏳ Disponible para cobrar en</span><b>~${esc(fmtDur(leftRounds*ri))}</b></div><div class="pos-prog"><i class="unb" style="width:${pct}%"></i></div>`;
+    } else if(value>0n){
+      badge={cls:'active',txt:'Activo · rindiendo'};
+      actions=`<button class="btn-sec" data-v7unstake="${i}">Retirar todo</button>`;
+      if(rpq>0){
+        const into=((cr%rpq)+rpq)%rpq, pct=Math.max(3,Math.min(100,Math.round(into/rpq*100)));
+        progHtml=`<div class="pos-progtxt"><span>🎁 Próxima recompensa en</span><b>~${esc(fmtDur((rpq-into)*ri))}</b></div><div class="pos-prog"><i class="rw" style="width:${pct}%"></i></div>`;
+      }
+    } else { badge={cls:'cool',txt:'Vacía'}; }
+    const gainTxt = gain>0n ? `<span class="pos-reward">🎁 <b>${esc(qchDisp(gain))}</b> rendimiento</span>` : `<span class="pos-reward">🎁 acumulando…</span>`;
+    const headAmt = value>0n?value:unb;
     return `<div class="pos-card">
       <div class="pos-top">
         <div class="pos-val">Staking v7<div class="pv-addr">${esc(short(s.stakeAccount))}</div></div>
-        <div class="pos-amt">${esc(qchDisp(value))}<small>${esc(usdOf(value))}</small></div>
+        <div class="pos-amt">${esc(qchDisp(headAmt))}<small>${esc(usdOf(headAmt))}</small></div>
       </div>
       <div class="pos-meta"><span class="badge ${badge.cls}">${esc(badge.txt)}</span>${gainTxt}</div>
+      <div class="pos-brk"><span>Capital <b>${esc(qchDisp(dep))}</b></span><span>Rendimiento <b class="g">${esc(qchDisp(gain))}</b></span></div>
+      ${progHtml}
       <div class="pos-actions">${actions}</div>
     </div>`;
   }).join("");
@@ -2550,7 +2590,9 @@ async function v7StakeAction(kind, pos, d){
     if(kind==="unstake"){
       const value=BigInt((d&&d.value)||0);
       if(value<=0n){ msg.className="msg err"; msg.textContent="no hay valor para retirar"; return; }
-      if(!confirm("Retirar mueve tu staking a un período de unbonding. Cuando termine, tocá 'Cobrar' para recibir los fondos. ¿Continuar?")){ msg.textContent=""; msg.style.display="none"; return; }
+      const wMs=Number((d&&d.unbonding_quantos)||1)*Number((d&&d.rounds_per_quanto)||0)*Number((d&&d.round_interval_ms)||0);
+      const wTxt=wMs>0?("~"+fmtDur(wMs)):"un período";
+      if(!confirm("Al retirar, tu staking entra en un período de espera (unbonding) de "+wTxt+" antes de poder cobrarlo. Durante ese tiempo deja de generar rendimiento. Cuando termine, tocá «Cobrar». ¿Continuar?")){ msg.textContent=""; msg.style.display="none"; return; }
       msg.textContent="retirando (firmando en tu navegador)…";
       txJson=signV7BeginUnstake(SEED, pos.stakeAccount, value, nonce, chainId, 50000000n);
     } else {

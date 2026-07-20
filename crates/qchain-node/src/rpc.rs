@@ -191,6 +191,10 @@ async fn get_stake_v7(State(engine): State<Arc<Engine>>, Path(address): Path<Str
         .unwrap_or_else(GlobalStakingState::genesis);
     let value = qchain_execution::economics_v7::position_value(pos.active_shares, global.index);
     let withdrawable = pos.unbonding_amount > 0 && global.current_quanto >= pos.unbonding_ready_quanto;
+    // Cadence for the wallet's reward/unbonding progress bars: with these the
+    // wallet draws "next reward in ~Xh" (progress within the current quanto) and
+    // the unbonding countdown, from real on-chain timing rather than guesses.
+    let (current_round, rounds_per_quanto, round_interval_ms) = engine.quanto_timing().await;
     Ok(Json(json!({
         "exists": true,
         "owner": pos.owner.to_string(),
@@ -198,10 +202,16 @@ async fn get_stake_v7(State(engine): State<Arc<Engine>>, Path(address): Path<Str
         "value": value.to_string(),
         "net_deposited": pos.net_deposited,
         "state": format!("{:?}", pos.state),
+        "created_quanto": pos.created_quanto,
+        "last_modified_quanto": pos.last_modified_quanto,
         "unbonding_amount": pos.unbonding_amount,
         "unbonding_ready_quanto": pos.unbonding_ready_quanto,
         "withdrawable": withdrawable,
         "current_quanto": global.current_quanto,
+        "current_round": current_round,
+        "rounds_per_quanto": rounds_per_quanto,
+        "round_interval_ms": round_interval_ms,
+        "unbonding_quantos": qchain_execution::economics_v7::STAKING_UNBONDING_QUANTOS,
     })))
 }
 
