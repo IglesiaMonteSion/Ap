@@ -75,6 +75,14 @@ struct Cli {
     /// is a coordinated cutover. Off by default.
     #[arg(long, default_value_t = false)]
     authenticated_transport: bool,
+    /// Also ENCRYPT the authenticated P2P transport (`encrypted_transport: true`):
+    /// an ML-KEM-768 exchange inside the handshake so every message is AEAD-
+    /// encrypted and the channel is bound into the signed transcript (closes the
+    /// on-path relay gap). Requires `--authenticated-transport`. Like it, NOT
+    /// folded into `chain_id` but wire-breaking → coordinated cutover, same value
+    /// on every node. Off by default.
+    #[arg(long, default_value_t = false)]
+    encrypted_transport: bool,
     /// Start the network with the v7 ECONOMICS (`economics_v7: true`): shares+index
     /// staking, per-quanto emission, the 45/45/10 fee split, the 500 QCH validator
     /// bond. Like `--compressed-state-tree` this is a network-wide, genesis-level
@@ -125,6 +133,10 @@ struct ValidatorManifest {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.encrypted_transport && !cli.authenticated_transport {
+        anyhow::bail!("--encrypted-transport requires --authenticated-transport (encryption without authentication is meaningless)");
+    }
 
     let mut manifest_paths: Vec<PathBuf> = std::fs::read_dir(&cli.manifests_dir)?
         .filter_map(|e| e.ok())
@@ -261,6 +273,7 @@ fn main() -> anyhow::Result<()> {
             epoch_rounds: None,
             storage_engine: "sled".to_string(),
             authenticated_transport: cli.authenticated_transport,
+            encrypted_transport: cli.encrypted_transport,
             economics_v7: cli.economics_v7,
             quanto_rate_fp: baked_rate_fp,
             rounds_per_quanto: cli.rounds_per_quanto,

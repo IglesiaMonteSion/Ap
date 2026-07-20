@@ -25,6 +25,7 @@
 
 use crate::handshake::{client_handshake, server_handshake, AuthState};
 use crate::message::{Envelope, NetMessage};
+use crate::session::Session;
 use qchain_core::ValidatorId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -33,6 +34,17 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
+
+/// A cached outbound connection: the TCP stream plus, when the encrypted
+/// transport is on, the AEAD `Session` established during the handshake. The
+/// two live together so a write can seal under the session's send key and a
+/// reconnect fully replaces both (a fresh handshake mints a fresh session).
+/// `session` is `None` for the unauthenticated or auth-only transport, in
+/// which case framing is byte-identical to before this field existed.
+struct PeerConn {
+    stream: TcpStream,
+    session: Option<Session>,
+}
 
 /// Bounds how long a single `send_to` write attempt may block on a
 /// half-stuck peer connection before being treated as a failure - see
@@ -82,7 +94,7 @@ pub struct Network {
     /// changes, letting a genuinely new validator be dialed automatically. For a
     /// fixed-membership network it is set once at startup and never changes.
     peers: StdRwLock<Vec<PeerInfo>>,
-    connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
+    connections: Mutex<HashMap<SocketAddr, Arc<Mutex<PeerConn>>>>,
     /// When `Some`, every connection — inbound and outbound — is
     /// authenticated with a per-connection ML-DSA handshake before any
     /// `Envelope` flows (task #176, see `handshake`). When `None` (the
@@ -96,23 +108,39 @@ pub struct Network {
     auth: Option<Arc<AuthState>>,
 }
 
-async fn read_envelope(stream: &mut TcpStream) -> anyhow::Result<Envelope> {
+/// Reads one length-prefixed frame and decodes it into an `Envelope`. When
+/// `session` is `Some`, the frame body is AEAD ciphertext that is opened (and
+/// the frame counter advanced) before Borsh-decoding; when `None`, the body is
+/// the plaintext Borsh envelope — byte-identical to the pre-encryption wire.
+async fn read_envelope(stream: &mut TcpStream, session: Option<&mut Session>) -> anyhow::Result<Envelope> {
     let len = stream.read_u32_le().await? as usize;
     // A sanity bound - real message sizes here are at most a handful of
     // megabytes (a batch of PQC-signed transactions); this just stops a
-    // malformed length prefix from causing an unbounded allocation.
+    // malformed length prefix from causing an unbounded allocation. The AEAD
+    // tag adds only 16 bytes, so the bound is unaffected by encryption.
     if len > 64 * 1024 * 1024 {
         anyhow::bail!("rejecting oversized message: {len} bytes");
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(borsh::from_slice(&buf)?)
+    let plaintext = match session {
+        Some(s) => s.open(&buf)?,
+        None => buf,
+    };
+    Ok(borsh::from_slice(&plaintext)?)
 }
 
-async fn write_envelope(stream: &mut TcpStream, envelope: &Envelope) -> anyhow::Result<()> {
+/// Writes one length-prefixed frame. When `session` is `Some`, the Borsh bytes
+/// are sealed (and the send counter advanced) so the body is AEAD ciphertext;
+/// when `None`, the plaintext Borsh is written — byte-identical to before.
+async fn write_envelope(stream: &mut TcpStream, session: Option<&mut Session>, envelope: &Envelope) -> anyhow::Result<()> {
     let bytes = borsh::to_vec(envelope)?;
-    stream.write_u32_le(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
+    let frame = match session {
+        Some(s) => s.seal(&bytes)?,
+        None => bytes,
+    };
+    stream.write_u32_le(frame.len() as u32).await?;
+    stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -154,7 +182,7 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     // established sender of every envelope on this connection - used in place
     // of the spoofable `Envelope.from`, which strengthens attribution for
     // even the message types whose payload isn't itself signed.
-    let authed_id: Option<ValidatorId> = match &auth {
+    let (authed_id, mut session): (Option<ValidatorId>, Option<Session>) = match &auth {
         Some(a) => {
             // Bound concurrent in-flight handshakes. The permit is dropped at
             // the end of this block - i.e. as soon as the handshake finishes -
@@ -168,18 +196,18 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
                 None => None,
             };
             match server_handshake(&mut stream, a).await {
-                Ok(id) => Some(id),
+                Ok((id, sess)) => (Some(id), sess),
                 Err(e) => {
                     tracing::debug!("dropping an inbound connection that failed the handshake: {e}");
                     return;
                 }
             }
         }
-        None => None,
+        None => (None, None),
     };
     let attributed = |envelope: &Envelope| authed_id.unwrap_or(envelope.from);
 
-    let first = match tokio::time::timeout(first_envelope_timeout, read_envelope(&mut stream)).await {
+    let first = match tokio::time::timeout(first_envelope_timeout, read_envelope(&mut stream, session.as_mut())).await {
         Ok(Ok(envelope)) => envelope,
         Ok(Err(e)) => {
             tracing::debug!("inbound connection closed: {e}");
@@ -195,7 +223,7 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     }
 
     loop {
-        match read_envelope(&mut stream).await {
+        match read_envelope(&mut stream, session.as_mut()).await {
             Ok(envelope) => {
                 let from = attributed(&envelope);
                 if tx.send((from, envelope.message)).await.is_err() {
@@ -332,7 +360,7 @@ impl Network {
     /// lock is process-wide, not per-peer. Connecting to the same new peer
     /// from two concurrent callers is handled by re-checking the cache
     /// after connecting and discarding the loser's redundant stream.
-    async fn connection_for(&self, addr: SocketAddr) -> anyhow::Result<Arc<Mutex<TcpStream>>> {
+    async fn connection_for(&self, addr: SocketAddr) -> anyhow::Result<Arc<Mutex<PeerConn>>> {
         if let Some(conn) = self.connections.lock().await.get(&addr) {
             return Ok(conn.clone());
         }
@@ -346,16 +374,21 @@ impl Network {
         // caller treats the error like any other connect failure and retries
         // on its next tick. Run outside the connections lock (like the
         // connect itself) so a slow-to-handshake peer never blocks sends to
-        // any other peer - see `connection_for`'s doc comment.
-        if let Some(auth) = &self.auth {
+        // any other peer - see `connection_for`'s doc comment. The handshake
+        // also returns the AEAD `Session` when the encrypted transport is on;
+        // it's cached alongside the stream so writes seal under it.
+        let session = if let Some(auth) = &self.auth {
             let expected = self.addr_of_expected(addr);
-            client_handshake(&mut stream, auth, expected).await?;
-        }
+            let (_id, sess) = client_handshake(&mut stream, auth, expected).await?;
+            sess
+        } else {
+            None
+        };
         let mut conns = self.connections.lock().await;
         if let Some(conn) = conns.get(&addr) {
             return Ok(conn.clone());
         }
-        let conn = Arc::new(Mutex::new(stream));
+        let conn = Arc::new(Mutex::new(PeerConn { stream, session }));
         conns.insert(addr, conn.clone());
         Ok(conn)
     }
@@ -422,15 +455,17 @@ impl Network {
         let envelope = Envelope { from: self.self_id, message: message.clone() };
         let conn = self.connection_for(addr).await?;
         {
-            let mut stream = conn.lock().await;
-            if tokio::time::timeout(SEND_TIMEOUT, write_envelope(&mut stream, &envelope)).await.is_ok_and(|r| r.is_ok()) {
+            let mut guard = conn.lock().await;
+            let PeerConn { stream, session } = &mut *guard;
+            if tokio::time::timeout(SEND_TIMEOUT, write_envelope(stream, session.as_mut(), &envelope)).await.is_ok_and(|r| r.is_ok()) {
                 return Ok(());
             }
         }
         self.connections.lock().await.remove(&addr);
         let conn = self.connection_for(addr).await?;
-        let mut stream = conn.lock().await;
-        tokio::time::timeout(SEND_TIMEOUT, write_envelope(&mut stream, &envelope))
+        let mut guard = conn.lock().await;
+        let PeerConn { stream, session } = &mut *guard;
+        tokio::time::timeout(SEND_TIMEOUT, write_envelope(stream, session.as_mut(), &envelope))
             .await
             .map_err(|_| anyhow::anyhow!("timed out writing to {addr} after {SEND_TIMEOUT:?}"))?
     }
@@ -539,7 +574,7 @@ mod tests {
             let conns = net_a.connections.lock().await;
             let conn = conns.get(&addr_b).expect("first send must have cached a connection").clone();
             drop(conns);
-            conn.lock().await.shutdown().await.unwrap();
+            conn.lock().await.stream.shutdown().await.unwrap();
         }
 
         // This send must detect the dead connection, drop it, reconnect,

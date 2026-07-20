@@ -61,6 +61,9 @@ ROUNDS_PER_QUANTO="${ROUNDS_PER_QUANTO:-172800}"
 # red, no consenso), pero es wire-breaking: todos los nodos deben usar el mismo
 # valor. Off por defecto.
 AUTENTICADO=0
+# ADEMAS cifrar el transporte autenticado (ML-KEM-768 + ChaCha20-Poly1305).
+# Implica AUTENTICADO. Wire-breaking, no cambia el chain_id. Off por defecto.
+CIFRADO=0
 # Fondear una direccion ADICIONAL en el genesis (ademas de la wallet de prueba),
 # para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
@@ -112,6 +115,11 @@ Opciones:
                          AUTENTICADO (handshake ML-DSA por conexión: solo
                          validadores reales se conectan). Todos los nodos deben
                          usarlo. No cambia el chain_id.
+  --cifrado              (modo "solo") ADEMÁS cifrar el transporte autenticado
+                         (ML-KEM-768 en el handshake + AEAD ChaCha20-Poly1305:
+                         confidencialidad + cierra el relay on-path). Implica
+                         --autenticado. Todos los nodos deben usarlo. No cambia
+                         el chain_id.
   --comprimido           (modo "solo") crear la red con el ÁRBOL COMPRIMIDO
                          (hard fork, ~6x throughput bajo carga, menos RAM/disco).
                          Solo al CREAR la red; todos los nodos deben usarlo. No se
@@ -166,6 +174,7 @@ while [ $# -gt 0 ]; do
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
     --autenticado|--authenticated) AUTENTICADO=1; shift ;;
+    --cifrado|--encrypted) CIFRADO=1; AUTENTICADO=1; shift ;;
     --economics-v7|--economia-v7) ECONOMICS_V7=1; shift ;;
     --rounds-per-quanto|--rondas-por-cuanto) ROUNDS_PER_QUANTO="${2:-}"; shift 2 ;;
     --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
@@ -447,6 +456,10 @@ EOF
       if [ "$AUTENTICADO" = "1" ]; then
         GB_AUTH="--authenticated-transport"
         decir "  -> TRANSPORTE P2P AUTENTICADO (handshake ML-DSA por conexion; todos los nodos deben usarlo)"
+      fi
+      if [ "$CIFRADO" = "1" ]; then
+        GB_AUTH="$GB_AUTH --encrypted-transport"
+        decir "  -> TRANSPORTE P2P CIFRADO (ML-KEM-768 + ChaCha20-Poly1305; todos los nodos deben usarlo)"
       fi
       GB_V7=""
       if [ "$ECONOMICS_V7" = "1" ]; then

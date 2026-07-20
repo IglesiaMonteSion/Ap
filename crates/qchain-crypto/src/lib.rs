@@ -29,6 +29,7 @@
 //! without it, two different combos that happened to produce
 //! same-length/same-byte component keys could collide.
 
+pub mod kem;
 pub mod registry;
 pub mod slh_dsa;
 

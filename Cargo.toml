@@ -23,7 +23,7 @@ members = [
 exclude = ["crates/qchain-wasm"]
 
 [workspace.package]
-version = "6.4.2"
+version = "6.5.0"
 edition = "2021"
 
 # Defense-in-depth for a ledger: catch integer overflow/underflow as a loud
@@ -50,8 +50,11 @@ borsh = { version = "1", features = ["derive"] }
 sha3 = "0.10"
 bs58 = "0.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-oqs = { version = "0.11", default-features = false, features = ["ml_dsa", "sphincs", "vendored", "std"] }
+oqs = { version = "0.11", default-features = false, features = ["ml_dsa", "ml_kem", "sphincs", "vendored", "std"] }
 rand = "0.8"
+# AEAD for the optional encrypted P2P channel (node-only). Pure Rust, RustCrypto,
+# no C — pairs with the ML-KEM shared secret to encrypt the authenticated transport.
+chacha20poly1305 = "0.10"
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }

@@ -24,33 +24,41 @@
 //!   separating the two signatures so a captured signature can't be reflected
 //!   back as the other party's.
 //!
-//! Deliberately **not** confidentiality: P2P traffic here is public data
-//! (blocks, votes, batches). The goal is authentication / anti-spoofing, so
-//! there is no key exchange or encryption — that would be an optional
-//! follow-up (ML-KEM, never X25519), out of scope here.
+//! **Confidentiality is opt-in** via the `encrypt` flag (see `AuthState`). With
+//! it off (the default when auth alone is on), this is exactly the v6.4.x
+//! authentication-only handshake: P2P traffic is public data (blocks, votes,
+//! batches) and stays in the clear. With it on, the same three frames also
+//! carry an **ML-KEM-768** exchange (never X25519 — post-quantum by
+//! construction), so both peers derive a shared secret and every subsequent
+//! envelope is AEAD-encrypted (`session`).
 //!
-//! **Honest scope of the "anti-MITM" property (audited):** the handshake stops
-//! an *off-path* attacker (anyone who does not hold a member's private key)
-//! from spoofing a validator — that is the DoS/anti-spoofing door gate it
-//! genuinely delivers, and it is what closes the real gap. It does NOT resist
-//! an *on-path* attacker who can transparently relay the three frames between
-//! two honest validators (there is no channel binding, since there is no
-//! encrypted channel to bind to). Such a relay could forge attribution of
-//! *unsigned* messages between those two peers; it can never impersonate a
-//! third identity or forge signed consensus traffic (votes/certs/vertex
-//! proposals stay protected by their own signatures). Full relay resistance is
-//! deferred to the optional ML-KEM channel follow-up, which would provide an
-//! exporter to bind into the transcript.
+//! **How encryption closes the honest limitation of the auth-only handshake.**
+//! Auth-only stops an *off-path* attacker (anyone without a member's private
+//! key) from spoofing a validator, but it does NOT resist an *on-path*
+//! attacker who transparently relays the three frames between two honest peers
+//! (there is no channel binding, since there is no encrypted channel to bind
+//! to). Such a relay could forge attribution of *unsigned* messages between
+//! those peers. With `encrypt` on, the ML-KEM public key and ciphertext are
+//! folded into the **signed transcript**, so a relay that substitutes its own
+//! ML-KEM keypair to MITM the channel changes the transcript and breaks both
+//! parties' signatures — the channel is cryptographically bound to the signed
+//! identities. It never could impersonate a third identity or forge signed
+//! consensus traffic (votes/certs stay protected by their own signatures);
+//! encryption additionally closes the unsigned-message relay gap.
 //!
 //! Wire protocol (each frame is `[u32 LE len][Borsh]`, same framing as an
 //! `Envelope`):
-//!   1. dialer  → acceptor: `HandshakeInit  { bundle_c, nonce_c }`
-//!   2. acceptor → dialer:  `HandshakeResp  { bundle_s, nonce_s, sig_s }`
+//!   1. dialer  → acceptor: `HandshakeInit  { bundle_c, nonce_c, kem_pk? }`
+//!   2. acceptor → dialer:  `HandshakeResp  { bundle_s, nonce_s, kem_ct?, sig_s }`
 //!   3. dialer  → acceptor: `HandshakeFinal { sig_c }`
 //!
 //! where `sig_x = Sign_x( DOMAIN || role_x || network_id || client_id ||`
-//! `server_id || nonce_c || nonce_s )`.
+//! `server_id || nonce_c || nonce_s || kem_pk || kem_ct )` — `kem_pk`/`kem_ct`
+//! are empty when encryption is off. When encryption is on, the acceptor
+//! encapsulates against `kem_pk` to produce `kem_ct` + the shared secret, and
+//! the dialer decapsulates `kem_ct` to recover the identical secret.
 
+use crate::session::Session;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::ValidatorId;
 use qchain_crypto::{Keypair, MultiSignature, PublicKeyBundle};
@@ -90,11 +98,32 @@ pub struct AuthState {
     keypair: Arc<Keypair>,
     network_id: [u8; 32],
     authorized: StdRwLock<HashSet<ValidatorId>>,
+    /// When true, the handshake also runs an ML-KEM exchange and returns a
+    /// `Session`, so the connection is AEAD-encrypted (`session`). When false
+    /// (the default), the handshake is authentication-only (v6.4.x behavior)
+    /// and returns no session — envelopes flow in the clear. A network must run
+    /// all nodes with the same choice; a mismatch simply fails the handshake
+    /// (the signed transcript differs, so signatures don't verify), the same
+    /// coordinated-cutover requirement as turning auth on.
+    encrypt: bool,
 }
 
 impl AuthState {
+    /// Authentication-only handshake (v6.4.x). Equivalent to
+    /// `new_with_encryption(.., false)`.
     pub fn new(keypair: Arc<Keypair>, network_id: [u8; 32], authorized: HashSet<ValidatorId>) -> Self {
-        AuthState { keypair, network_id, authorized: StdRwLock::new(authorized) }
+        Self::new_with_encryption(keypair, network_id, authorized, false)
+    }
+
+    /// Like `new`, but `encrypt` selects whether the handshake also performs
+    /// the ML-KEM exchange and encrypts the channel.
+    pub fn new_with_encryption(keypair: Arc<Keypair>, network_id: [u8; 32], authorized: HashSet<ValidatorId>, encrypt: bool) -> Self {
+        AuthState { keypair, network_id, authorized: StdRwLock::new(authorized), encrypt }
+    }
+
+    /// Whether this node runs the encrypted (ML-KEM + AEAD) transport.
+    pub fn encrypts(&self) -> bool {
+        self.encrypt
     }
 
     pub fn is_authorized(&self, id: &ValidatorId) -> bool {
@@ -113,12 +142,18 @@ impl AuthState {
 struct HandshakeInit {
     bundle: PublicKeyBundle,
     nonce: [u8; 32],
+    /// The dialer's ephemeral ML-KEM public key. `Some` only when the dialer
+    /// runs the encrypted transport; `None` for authentication-only.
+    kem_pk: Option<Vec<u8>>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
 struct HandshakeResp {
     bundle: PublicKeyBundle,
     nonce: [u8; 32],
+    /// The acceptor's ML-KEM ciphertext (encapsulated against `kem_pk`).
+    /// `Some` only in the encrypted transport.
+    kem_ct: Option<Vec<u8>>,
     signature: MultiSignature,
 }
 
@@ -129,9 +164,14 @@ struct HandshakeFinal {
 
 /// The bytes both parties sign. Symmetric in content (same identities and
 /// nonces), separated only by the `role` byte so the dialer's and acceptor's
-/// signatures are distinct and one cannot be replayed as the other.
-fn transcript(role: u8, network_id: &[u8; 32], client_id: &ValidatorId, server_id: &ValidatorId, nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> Vec<u8> {
-    let mut t = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 1 + 32 * 5);
+/// signatures are distinct and one cannot be replayed as the other. The ML-KEM
+/// public key and ciphertext are folded in (length-delimited so their boundary
+/// is unambiguous) — empty when encryption is off — so a signed handshake
+/// **binds the channel**: a relay that swaps in its own ML-KEM keypair changes
+/// these bytes and both signatures fail to verify.
+#[allow(clippy::too_many_arguments)] // each field is a distinct, meaningful part of the signed transcript
+fn transcript(role: u8, network_id: &[u8; 32], client_id: &ValidatorId, server_id: &ValidatorId, nonce_c: &[u8; 32], nonce_s: &[u8; 32], kem_pk: &[u8], kem_ct: &[u8]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 1 + 32 * 5 + 8 + kem_pk.len() + kem_ct.len());
     t.extend_from_slice(HANDSHAKE_DOMAIN);
     t.push(role);
     t.extend_from_slice(network_id);
@@ -139,6 +179,10 @@ fn transcript(role: u8, network_id: &[u8; 32], client_id: &ValidatorId, server_i
     t.extend_from_slice(&server_id.0);
     t.extend_from_slice(nonce_c);
     t.extend_from_slice(nonce_s);
+    t.extend_from_slice(&(kem_pk.len() as u32).to_le_bytes());
+    t.extend_from_slice(kem_pk);
+    t.extend_from_slice(&(kem_ct.len() as u32).to_le_bytes());
+    t.extend_from_slice(kem_ct);
     t
 }
 
@@ -178,12 +222,21 @@ async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> anyhow::Resu
 /// if the peer isn't an authorized validator, if — when `expected` is `Some`
 /// — it authenticates as a different id than the one we dialed this address
 /// for, or if any signature doesn't verify.
-pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected: Option<ValidatorId>) -> anyhow::Result<ValidatorId> {
+pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected: Option<ValidatorId>) -> anyhow::Result<(ValidatorId, Option<Session>)> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let bundle_c = auth.keypair.public_key_bundle();
         let client_id = bundle_c.to_address();
         let nonce_c = fresh_nonce()?;
-        write_frame(stream, &HandshakeInit { bundle: bundle_c, nonce: nonce_c }).await?;
+        // Encrypted transport: a fresh ephemeral ML-KEM keypair per connection.
+        // `kem_secret` never leaves this function; `kem_pk` goes on the wire.
+        let (kem_pk, kem_secret): (Vec<u8>, Option<Vec<u8>>) = if auth.encrypt {
+            let (pk, sk) = qchain_crypto::kem::keypair()?;
+            (pk, Some(sk))
+        } else {
+            (Vec::new(), None)
+        };
+        let kem_pk_field = if auth.encrypt { Some(kem_pk.clone()) } else { None };
+        write_frame(stream, &HandshakeInit { bundle: bundle_c, nonce: nonce_c, kem_pk: kem_pk_field }).await?;
 
         let resp: HandshakeResp = read_frame(stream).await?;
         let server_id = resp.bundle.to_address();
@@ -201,15 +254,32 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
             Some(want) => anyhow::bail!("dialed a peer expecting {want} but it authenticated as {server_id}"),
             None => anyhow::bail!("refusing to authenticate {server_id} at an address that is not a known peer"),
         }
-        let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce);
+        // In encrypted mode the acceptor must have returned a ciphertext bound
+        // to our kem_pk; its absence means a mode mismatch (peer not encrypting).
+        let kem_ct: Vec<u8> = match (auth.encrypt, resp.kem_ct) {
+            (true, Some(ct)) => ct,
+            (true, None) => anyhow::bail!("peer did not return an ML-KEM ciphertext — it is not running the encrypted transport"),
+            (false, _) => Vec::new(),
+        };
+        let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
         if !qchain_crypto::verify(&resp.bundle, &t_server, &resp.signature) {
             anyhow::bail!("peer {server_id}'s handshake signature did not verify");
         }
 
-        let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce);
+        let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
         let sig_c = auth.keypair.sign(&t_client)?;
         write_frame(stream, &HandshakeFinal { signature: sig_c }).await?;
-        Ok(server_id)
+
+        // Only after the transcript (which binds kem_pk/kem_ct) verified do we
+        // decapsulate — so the shared secret is bound to the authenticated peer.
+        let session = match kem_secret {
+            Some(sk) => {
+                let shared = qchain_crypto::kem::decapsulate(&sk, &kem_ct)?;
+                Some(Session::new(&shared, &nonce_c, &resp.nonce, &client_id, &server_id, true))
+            }
+            None => None,
+        };
+        Ok((server_id, session))
     })
     .await
     .map_err(|_| anyhow::anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
@@ -221,7 +291,7 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
 /// authenticated validator id — which the caller uses as the true sender of
 /// every subsequent envelope on this connection, ignoring the spoofable
 /// `Envelope.from`.
-pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyhow::Result<ValidatorId> {
+pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyhow::Result<(ValidatorId, Option<Session>)> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let init: HandshakeInit = read_frame(stream).await?;
         let client_id = init.bundle.to_address();
@@ -229,19 +299,32 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
             anyhow::bail!("inbound peer authenticated as {client_id}, which is not an authorized validator");
         }
 
+        // In encrypted mode, encapsulate against the dialer's ML-KEM public key
+        // to produce the ciphertext (sent back) and the shared secret (kept).
+        let (kem_pk, kem_ct, shared): (Vec<u8>, Vec<u8>, Option<Vec<u8>>) = match (auth.encrypt, init.kem_pk) {
+            (true, Some(pk)) => {
+                let (ct, ss) = qchain_crypto::kem::encapsulate(&pk)?;
+                (pk, ct, Some(ss))
+            }
+            (true, None) => anyhow::bail!("inbound peer sent no ML-KEM public key — it is not running the encrypted transport"),
+            (false, _) => (Vec::new(), Vec::new(), None),
+        };
+
         let bundle_s = auth.keypair.public_key_bundle();
         let server_id = bundle_s.to_address();
         let nonce_s = fresh_nonce()?;
-        let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s);
+        let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
         let sig_s = auth.keypair.sign(&t_server)?;
-        write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, signature: sig_s }).await?;
+        let kem_ct_field = if auth.encrypt { Some(kem_ct.clone()) } else { None };
+        write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, kem_ct: kem_ct_field, signature: sig_s }).await?;
 
         let fin: HandshakeFinal = read_frame(stream).await?;
-        let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s);
+        let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
         if !qchain_crypto::verify(&init.bundle, &t_client, &fin.signature) {
             anyhow::bail!("inbound peer {client_id}'s handshake signature did not verify");
         }
-        Ok(client_id)
+        let session = shared.map(|ss| Session::new(&ss, &init.nonce, &nonce_s, &client_id, &server_id, false));
+        Ok((client_id, session))
     })
     .await
     .map_err(|_| anyhow::anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
@@ -254,6 +337,10 @@ mod tests {
 
     fn auth_for(kp: &Arc<Keypair>, network_id: [u8; 32], authorized: &[ValidatorId]) -> AuthState {
         AuthState::new(kp.clone(), network_id, authorized.iter().cloned().collect())
+    }
+
+    fn auth_enc(kp: &Arc<Keypair>, network_id: [u8; 32], authorized: &[ValidatorId]) -> AuthState {
+        AuthState::new_with_encryption(kp.clone(), network_id, authorized.iter().cloned().collect(), true)
     }
 
     /// Two validators that each know the other is authorized complete the
@@ -277,11 +364,78 @@ mod tests {
 
         let auth_c = auth_for(&kp_c, net, &[id_c, id_s]);
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let seen_server = client_handshake(&mut stream, &auth_c, Some(id_s)).await.unwrap();
-        let seen_client = server.await.unwrap().unwrap();
+        let (seen_server, sess_c) = client_handshake(&mut stream, &auth_c, Some(id_s)).await.unwrap();
+        let (seen_client, sess_s) = server.await.unwrap().unwrap();
 
         assert_eq!(seen_server, id_s, "dialer must learn the acceptor's real id");
         assert_eq!(seen_client, id_c, "acceptor must learn the dialer's real id");
+        assert!(sess_c.is_none() && sess_s.is_none(), "auth-only handshake returns no encrypted session");
+    }
+
+    /// The encrypted handshake: two known validators running the encrypted
+    /// transport complete the handshake, each learns the other's id, AND each
+    /// gets a `Session` whose derived keys agree — a frame sealed by one opens
+    /// on the other. This is the ML-KEM exchange + channel established
+    /// end-to-end over real TCP.
+    #[tokio::test]
+    async fn the_encrypted_handshake_establishes_a_working_session() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let auth_s = auth_enc(&kp_s, net, &[id_c, id_s]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_handshake(&mut stream, &auth_s).await
+        });
+
+        let auth_c = auth_enc(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let (seen_server, sess_c) = client_handshake(&mut stream, &auth_c, Some(id_s)).await.unwrap();
+        let (seen_client, sess_s) = server.await.unwrap().unwrap();
+
+        assert_eq!(seen_server, id_s);
+        assert_eq!(seen_client, id_c);
+        let mut sess_c = sess_c.expect("encrypted handshake must return a client session");
+        let mut sess_s = sess_s.expect("encrypted handshake must return a server session");
+        // The two sessions share the KEM secret: a sealed frame round-trips.
+        let ct = sess_c.seal(b"encrypted consensus traffic").unwrap();
+        assert_eq!(sess_s.open(&ct).unwrap(), b"encrypted consensus traffic");
+        let ct2 = sess_s.seal(b"reply").unwrap();
+        assert_eq!(sess_c.open(&ct2).unwrap(), b"reply");
+    }
+
+    /// A mode mismatch fails to connect: an encrypting dialer against an
+    /// auth-only acceptor (and vice versa) must not complete the handshake —
+    /// the coordinated-cutover requirement, the same as auth-on vs auth-off.
+    #[tokio::test]
+    async fn an_encryption_mode_mismatch_fails_to_handshake() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Acceptor is auth-only; dialer encrypts.
+        let auth_s = auth_for(&kp_s, net, &[id_c, id_s]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_handshake(&mut stream, &auth_s).await
+        });
+
+        let auth_c = auth_enc(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let res = client_handshake(&mut stream, &auth_c, Some(id_s)).await;
+        assert!(res.is_err(), "an encrypting dialer must not complete a handshake with an auth-only acceptor");
+        assert!(server.await.unwrap().is_err(), "the auth-only acceptor must reject the encrypting dialer");
     }
 
     /// A connector whose id is not in the acceptor's authorized set is

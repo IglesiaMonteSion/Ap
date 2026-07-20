@@ -136,11 +136,21 @@ async fn main() -> anyhow::Result<()> {
     // node's ratchet later widens it to the registry committee (kept in
     // lock-step with `set_peers` — see the epoch ratchet in `engine`). Binds
     // `chain_id`, so a validator from a different network can't even connect.
+    // Encryption requires authentication (there is no verified peer to bind an
+    // encrypted channel to otherwise). Reject a misconfiguration loudly rather
+    // than silently ignoring the flag.
+    if config.encrypted_transport && !config.authenticated_transport {
+        anyhow::bail!("encrypted_transport requires authenticated_transport (encryption without authentication is meaningless)");
+    }
     let auth = if config.authenticated_transport {
         let authorized: std::collections::HashSet<_> =
             config.validators.iter().map(|v| v.pubkey_bundle.to_address()).collect();
-        tracing::info!("authenticated P2P transport: ENABLED (per-connection ML-DSA handshake)");
-        Some(Arc::new(qchain_network::AuthState::new(keypair.clone(), config.chain_id(), authorized)))
+        if config.encrypted_transport {
+            tracing::info!("authenticated + ENCRYPTED P2P transport: ENABLED (ML-DSA handshake + ML-KEM-768 channel, ChaCha20-Poly1305)");
+        } else {
+            tracing::info!("authenticated P2P transport: ENABLED (per-connection ML-DSA handshake)");
+        }
+        Some(Arc::new(qchain_network::AuthState::new_with_encryption(keypair.clone(), config.chain_id(), authorized, config.encrypted_transport)))
     } else {
         None
     };

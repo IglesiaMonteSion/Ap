@@ -149,6 +149,21 @@ pub struct NodeConfig {
     /// flip it on with a coordinated restart, no fresh genesis needed.
     #[serde(default)]
     pub authenticated_transport: bool,
+    /// Opt-in **encrypted** transport, on top of `authenticated_transport`.
+    /// `false` (default) is the auth-only handshake (v6.4.x): P2P traffic is
+    /// public data and flows in the clear. `true` runs an ML-KEM-768 exchange
+    /// inside the same handshake, so every message is AEAD-encrypted
+    /// (ChaCha20-Poly1305) and the channel is cryptographically bound into the
+    /// signed transcript — adding confidentiality and closing the on-path relay
+    /// gap the auth-only handshake documents as its honest limit. Requires
+    /// `authenticated_transport` (encryption without authentication is
+    /// meaningless — there is no verified peer to bind the channel to). Like the
+    /// auth flag it is a NETWORK-LAYER choice, NOT consensus/state: NOT folded
+    /// into `chain_id`, but wire-breaking (an encrypting node and a non-
+    /// encrypting node can't complete a connection), so it is a COORDINATED
+    /// cutover — every node sets it identically. No genesis/state change.
+    #[serde(default)]
+    pub encrypted_transport: bool,
     /// v7 economics (shares+index staking, per-quanto emission, the 45/45/10 fee
     /// split, the 500 QCH validator bond). `false` (default, every existing
     /// network) is the v6 economics — byte-identical, zero change. `true` is a
@@ -307,6 +322,7 @@ mod tests {
             compressed_state_tree: false,
             storage_engine: "sled".to_string(),
             authenticated_transport: false,
+            encrypted_transport: false,
             economics_v7: false,
             quanto_rate_fp: None,
             rounds_per_quanto: None,
