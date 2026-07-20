@@ -25,6 +25,7 @@ QCHAIN_HOME="${QCHAIN_HOME:-/opt/qchain}"
 RPC_PORT="8080"
 EXPLORER_PORT="9200"
 POLL_MS="1000"
+WALLET_URL=""
 ASUMIR_SI=0
 UNINSTALL=0
 NO_BUILD=0
@@ -41,6 +42,11 @@ Opciones:
   --port <puerto>        Puerto del explorador web QScan (por defecto 9200).
   --rpc-port <puerto>    Puerto RPC del nodo al que seguir (por defecto 8080).
   --poll-ms <ms>         Intervalo de sondeo del nodo (por defecto 1000).
+  --wallet-url <url>     URL pública de la wallet (ej. https://wallet.tudominio.com)
+                         para abrir a firmar al desplegar/interactuar contratos
+                         desde QScan. Sin esto, la sección Contratos queda de solo
+                         lectura. La wallet debe correr con --connect-origin apuntando
+                         al origen de ESTE explorador.
   --image <nombre>       Imagen Docker a usar (por defecto qchain:latest).
   --home <ruta>          Carpeta de qchain (por defecto /opt/qchain).
   --no-build             No construir la imagen desde el código aunque falte.
@@ -55,6 +61,7 @@ while [ $# -gt 0 ]; do
     --port) EXPLORER_PORT="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT="${2:-}"; shift 2 ;;
     --poll-ms) POLL_MS="${2:-}"; shift 2 ;;
+    --wallet-url) WALLET_URL="${2:-}"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
@@ -101,6 +108,12 @@ install -m 644 "$SCRIPT_DIR/systemd/qchain-indexer.service" /etc/systemd/system/
 sed -i "s#--node http://127.0.0.1:8080#--node http://127.0.0.1:$RPC_PORT#" /etc/systemd/system/qchain-indexer.service
 sed -i "s#--bind 0.0.0.0:9200#--bind 0.0.0.0:$EXPLORER_PORT#" /etc/systemd/system/qchain-indexer.service
 sed -i "s#--poll-ms 1000#--poll-ms $POLL_MS#" /etc/systemd/system/qchain-indexer.service
+# Puente wallet-connect: si el operador pasó --wallet-url, QScan muestra el panel
+# de desplegar/interactuar (abre esa wallet a firmar). Sin esto queda read-only.
+if [ -n "$WALLET_URL" ]; then
+  sed -i "s#--poll-ms $POLL_MS#--poll-ms $POLL_MS --wallet-url $WALLET_URL#" /etc/systemd/system/qchain-indexer.service
+  echo "Puente wallet-connect: QScan abrirá $WALLET_URL para firmar deploys/llamadas de contratos."
+fi
 
 # Abrir el puerto del explorador si ufw está activo.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then

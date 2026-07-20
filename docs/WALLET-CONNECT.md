@@ -12,10 +12,19 @@ wallet-connect se construya de forma mecánica, sin re-diseñar nada. Habilita:
 | Túnel nombrado (URL fija) `install-tunnel.sh --hostname` | ✅ hecho (v6.7.3) |
 | Runbook del dominio `docs/DOMAIN-SETUP.md` | ✅ hecho (v6.7.3) |
 | Sección Contratos read-only en QScan (`/programs`, `/api/programs`, UI) | ✅ hecho (v6.7.2) |
-| **Dominio propio estable** | ⏳ el usuario lo compra |
-| **Puente wallet-connect** (este spec) | ⏳ se construye cuando haya dominio |
-| UI de deploy/interact en QScan | ⏳ va con el puente |
-| SDK Rust de contratos | ⏳ para producir el `.wasm` |
+| Firma de contratos en la wallet (`signDeployProgram`/`signCallProgram`) | ✅ hecho (v6.7.4) |
+| **Dominio propio estable** (`qchainhq.com`) | ✅ el usuario lo tiene |
+| **Puente wallet-connect** (listener postMessage + UI) | ✅ hecho (v6.8.0) |
+| UI de deploy/interact en QScan | ✅ hecho (v6.8.0) |
+| SDK Rust de contratos | ⏳ para producir el `.wasm` (pendiente) |
+
+> **ETAPA 2 IMPLEMENTADA (v6.8.0)** — el puente funciona de punta a punta. La wallet
+> arranca con `--connect-origin https://scan.qchainhq.com`, el indexer (QScan) con
+> `--wallet-url https://wallet.qchainhq.com`. QScan abre la wallet en un popup y le
+> pide firmas por `postMessage` (origen validado en ambos lados); la wallet muestra
+> una aprobación humana y firma; la semilla nunca sale del navegador. Verificado en
+> vivo el data path completo (deploy firmado por el código de la wallet → `/programs`
+> lo lista → proxies `/api/programs` y `/api/config` correctos).
 
 ## Por qué el puente ESPERA al dominio (no es pereza, es seguridad)
 

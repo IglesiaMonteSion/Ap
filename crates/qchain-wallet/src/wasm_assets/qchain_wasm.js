@@ -95,6 +95,86 @@ export function deriveAccountSeed(master_seed, index) {
 }
 
 /**
+ * `programAddressFromSeed(seed, index) -> string` — a fresh, recoverable
+ * contract address to deploy at.
+ * @param {Uint8Array} seed
+ * @param {number} index
+ * @returns {string}
+ */
+export function programAddressFromSeed(seed, index) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.programAddressFromSeed(retptr, ptr0, len0, index);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit) -> string`
+ * @param {Uint8Array} seed
+ * @param {string} program_id
+ * @param {string} accounts_csv
+ * @param {string} args_csv
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signCallProgram(seed, program_id, accounts_csv, args_csv, nonce, chain_id, fee_limit) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(program_id, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(accounts_csv, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(args_csv, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.signCallProgram(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, nonce, ptr4, len4, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred7_0, deferred7_1, 1);
+    }
+}
+
+/**
  * `signClaimReward(seed, stakeAccount, nonce, chainId, feeLimit) -> string`
  * @param {Uint8Array} seed
  * @param {string} stake_account
@@ -175,6 +255,52 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export2(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * `signDeployProgram(seed, programAddress, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`
+ * @param {Uint8Array} seed
+ * @param {string} program_address
+ * @param {Uint8Array} module_bytes
+ * @param {string} entry_point
+ * @param {bigint} nonce
+ * @param {Uint8Array} chain_id
+ * @param {bigint} fee_limit
+ * @returns {string}
+ */
+export function signDeployProgram(seed, program_address, module_bytes, entry_point, nonce, chain_id, fee_limit) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(program_address, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(module_bytes, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(entry_point, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.signDeployProgram(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, nonce, ptr4, len4, fee_limit);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred7_0, deferred7_1, 1);
     }
 }
 

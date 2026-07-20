@@ -62,6 +62,58 @@
   const loading = () => `<div class="empty"><span class="spin"></span></div>`;
   function setNav(hash) { document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === hash)); }
 
+  // ---------- wallet-connect bridge (client side) ----------
+  // QScan is UNTRUSTED and never sees a key. To deploy/interact with a contract
+  // it opens the wallet (a separate origin) in a popup and asks it to SIGN via
+  // window.postMessage. The wallet shows a human approval and signs there; the
+  // key never leaves it. We validate `ev.origin === WALLET_ORIGIN` on every reply
+  // and correlate requests by a random id.
+  let WALLET_URL = null, WALLET_ORIGIN = null, CONNECTED_ADDR = null;
+  async function loadConfig() {
+    try { const c = await api("/config"); WALLET_URL = c.wallet_url || null; }
+    catch (e) { WALLET_URL = null; }
+    if (WALLET_URL) { try { WALLET_ORIGIN = new URL(WALLET_URL).origin; } catch (e) { WALLET_URL = null; WALLET_ORIGIN = null; } }
+  }
+  const Bridge = (function () {
+    let popup = null, seq = 0;
+    const pending = new Map(); // id -> {resolve, reject}
+    window.addEventListener("message", (ev) => {
+      if (!WALLET_ORIGIN || ev.origin !== WALLET_ORIGIN) return; // strict origin allowlist
+      const m = ev.data || {};
+      if (!m || m.v !== 1) return;
+      if (m.type === "ready") { if (readyWaiter) { readyWaiter(); readyWaiter = null; } return; }
+      if (!m.id) return;
+      const p = pending.get(m.id); if (!p) return;
+      pending.delete(m.id);
+      if (m.type === "error") p.reject(new Error(m.msg || "error en la wallet"));
+      else if (m.type === "rejected") p.reject(new Error("rechazado en la wallet"));
+      else p.resolve(m);
+    });
+    let readyWaiter = null;
+    function ensurePopup() {
+      if (popup && !popup.closed) return Promise.resolve();
+      popup = window.open(WALLET_URL, "qchain_wallet", "width=430,height=760");
+      if (!popup) return Promise.reject(new Error("el navegador bloqueó la ventana de la wallet — permití pop-ups para este sitio"));
+      // wait for the wallet's "ready" (or a short grace period)
+      return new Promise((res) => { readyWaiter = res; setTimeout(res, 2500); });
+    }
+    function send(type, extra) {
+      const id = "q" + (++seq) + "_" + Math.random().toString(36).slice(2);
+      return new Promise(async (resolve, reject) => {
+        try { await ensurePopup(); } catch (e) { return reject(e); }
+        pending.set(id, { resolve, reject });
+        try { popup.focus(); } catch (e) {}
+        popup.postMessage(Object.assign({ v: 1, id, type }, extra || {}), WALLET_ORIGIN);
+        setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error("la wallet no respondió (¿ventana cerrada?)")); } }, 180000);
+      });
+    }
+    return {
+      connect: () => send("connect").then((m) => { CONNECTED_ADDR = m.address || null; return CONNECTED_ADDR; }),
+      signAndSubmit: (tx) => send("signAndSubmit", { tx }),
+      disconnect: () => { CONNECTED_ADDR = null; if (popup && !popup.closed) popup.close(); popup = null; },
+    };
+  })();
+
   // ---------- pages ----------
   function statCells(s) {
     return [
@@ -307,20 +359,99 @@
     try { d = await api("/programs"); } catch (e) {}
     const progs = (d && d.programs) || [];
     const fmtKb = (n) => (Number(n || 0) / 1024).toFixed(1) + " KB";
+    // Deploy/interact panel only when the operator wired a wallet URL; otherwise
+    // stay read-only with an honest note.
+    const bridgePanel = WALLET_URL ? `
+      <div class="card pad" id="bridge">
+        <div class="panel-h"><h3>Desplegar / interactuar</h3>
+          <span id="bridge-conn" class="dim tag">no conectado</span></div>
+        <div id="bridge-body"></div>
+      </div>` : `
+      <div class="dim center note" style="margin:14px 0">Vista de solo lectura (metadata: dirección, entry point, tamaño, code-hash) — nunca el bytecode ni claves.
+      Para desplegar / interactuar con un contrato hace falta que el operador configure la URL de la wallet (<span class="mono">--wallet-url</span>).</div>`;
     app.innerHTML = `<h2 class="title">Contratos inteligentes</h2>
       <div class="grid stats">
         <div class="card pad stat"><div class="k">Contratos desplegados</div><div class="v">${fmtNum(d.count || progs.length)}</div><div class="s">programas WASM</div></div>
         <div class="card pad stat"><div class="k">Ronda</div><div class="v">${fmtNum(d.round)}</div><div class="s">foto del estado</div></div>
       </div>
+      ${bridgePanel}
       <div class="card"><table><thead><tr><th>Dirección</th><th>Entry point</th><th class="right">Tamaño</th><th>Code-hash</th></tr></thead>
       <tbody>${progs.length ? progs.map((p) => `<tr>
         <td>${addrLink(p.address)}${copyBtn(p.address)}</td>
         <td class="mono">${esc(p.entry_point || "—")}</td>
         <td class="right">${fmtKb(p.size_bytes)}</td>
         <td class="mono dim">${esc(short(p.code_hash || "", 10, 8))}</td></tr>`).join("")
-        : `<tr><td colspan=4 class=empty>Todavía no hay contratos desplegados en esta red</td></tr>`}</tbody></table></div>
-      <div class="dim center note" style="margin:14px 0">Vista de solo lectura (metadata: dirección, entry point, tamaño, code-hash) — nunca el bytecode ni claves.
-      Desplegar / interactuar con un contrato (firmando con tu wallet) llegará en un próximo incremento — requiere el puente wallet-connect + un dominio propio para la wallet.</div>`;
+        : `<tr><td colspan=4 class=empty>Todavía no hay contratos desplegados en esta red</td></tr>`}</tbody></table></div>`;
+    if (WALLET_URL) renderBridgePanel();
+  }
+
+  // The deploy/interact panel: a Connect button first, then the two forms once a
+  // wallet address is connected. QScan holds no key — every signature is a popup
+  // round-trip to the wallet, which shows a human approval.
+  function renderBridgePanel() {
+    const body = $("#bridge-body"), conn = $("#bridge-conn");
+    if (!body) return;
+    if (!CONNECTED_ADDR) {
+      conn.textContent = "no conectado";
+      body.innerHTML = `
+        <div class="dim" style="margin-bottom:10px">Conectá tu wallet Qchain para desplegar un contrato (.wasm) o llamar uno existente. Tu clave nunca sale de la wallet: QScan solo recibe la transacción ya firmada.</div>
+        <button class="btn" id="b-connect">Conectar wallet</button>
+        <div id="b-msg" class="dim" style="margin-top:10px"></div>`;
+      $("#b-connect").addEventListener("click", async () => {
+        const msg = $("#b-msg"); msg.textContent = "abriendo la wallet…";
+        try { await Bridge.connect(); renderBridgePanel(); }
+        catch (e) { msg.textContent = "no se pudo conectar: " + (e.message || e); }
+      });
+      return;
+    }
+    conn.innerHTML = `conectado: <span class="mono">${esc(short(CONNECTED_ADDR, 8, 6))}</span> <a href="#" id="b-disc">desconectar</a>`;
+    body.innerHTML = `
+      <div class="grid cols">
+        <div>
+          <h4 style="margin:4px 0 8px">Desplegar un contrato</h4>
+          <div class="dim" style="font-size:13px;margin-bottom:8px">Subí un módulo <span class="mono">.wasm</span> (máx 256 KB). La dirección del contrato se deriva de tu semilla (recuperable).</div>
+          <input type="file" id="d-file" accept=".wasm,application/wasm" class="in" style="margin-bottom:8px">
+          <label class="dim" style="font-size:13px">Entry point</label>
+          <input type="text" id="d-entry" class="in" value="run" placeholder="run" style="margin-bottom:8px">
+          <button class="btn" id="d-go">Desplegar contrato</button>
+          <div id="d-msg" class="dim" style="margin-top:10px;word-break:break-all"></div>
+        </div>
+        <div>
+          <h4 style="margin:4px 0 8px">Interactuar con un contrato</h4>
+          <div class="dim" style="font-size:13px;margin-bottom:8px">Llamá un contrato ya desplegado. Los argumentos son enteros <span class="mono">i64</span> separados por coma (la convención on-chain).</div>
+          <label class="dim" style="font-size:13px">Dirección del contrato</label>
+          <input type="text" id="c-pid" class="in mono" placeholder="dirección base58 del programa" style="margin-bottom:8px">
+          <label class="dim" style="font-size:13px">Cuentas (CSV de direcciones, opcional)</label>
+          <input type="text" id="c-accts" class="in mono" placeholder="addr1,addr2" style="margin-bottom:8px">
+          <label class="dim" style="font-size:13px">Args i64 (CSV, opcional)</label>
+          <input type="text" id="c-args" class="in mono" placeholder="1,2,3" style="margin-bottom:8px">
+          <button class="btn" id="c-go">Llamar contrato</button>
+          <div id="c-msg" class="dim" style="margin-top:10px;word-break:break-all"></div>
+        </div>
+      </div>`;
+    $("#b-disc").addEventListener("click", (e) => { e.preventDefault(); Bridge.disconnect(); renderBridgePanel(); });
+    $("#d-go").addEventListener("click", async () => {
+      const msg = $("#d-msg"), f = $("#d-file").files && $("#d-file").files[0];
+      if (!f) { msg.textContent = "elegí un archivo .wasm"; return; }
+      if (f.size > 262144) { msg.textContent = "el módulo supera el máximo de 256 KB"; return; }
+      msg.textContent = "leyendo el módulo…";
+      try {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        msg.textContent = "aprobá y firmá en la wallet…";
+        const r = await Bridge.signAndSubmit({ kind: "deployProgram", moduleBytes: Array.from(buf), entryPoint: ($("#d-entry").value || "run").trim() });
+        msg.innerHTML = `✓ Contrato desplegado en <a class="mono" href="#/address/${esc(r.programAddress || "")}">${esc(r.programAddress || "")}</a>`;
+        setTimeout(programsPage, 1500);
+      } catch (e) { msg.textContent = "✗ " + (e.message || e); }
+    });
+    $("#c-go").addEventListener("click", async () => {
+      const msg = $("#c-msg"), pid = ($("#c-pid").value || "").trim();
+      if (!pid) { msg.textContent = "poné la dirección del contrato"; return; }
+      msg.textContent = "aprobá y firmá en la wallet…";
+      try {
+        const r = await Bridge.signAndSubmit({ kind: "callProgram", programId: pid, accounts: ($("#c-accts").value || "").trim(), args: ($("#c-args").value || "").trim() });
+        msg.innerHTML = `✓ Llamada enviada${r.hash ? ` · <span class="mono">${esc(short(r.hash, 12, 8))}</span>` : ""}`;
+      } catch (e) { msg.textContent = "✗ " + (e.message || e); }
+    });
   }
 
   function notFound(msg) { return `<div class="card pad empty">${esc(msg)}<div style="margin-top:12px"><a href="#/">← Volver al inicio</a></div></div>`; }
@@ -384,7 +515,9 @@
     setTimeout(() => { c.textContent = prev; c.classList.remove("ok"); delete c.dataset.busy; }, 1000);
   });
   window.addEventListener("hashchange", route);
-  route();
+  // Load the frontend config (wallet URL for the connect bridge) before the
+  // first route so the contracts page can decide whether to show deploy/interact.
+  loadConfig().finally(route);
   // Light auto-refresh of the home page — patches data in place (no page blackout).
   setInterval(() => { if ((location.hash || "#/") === "#/" && $("#statpanel")) loadHomeData(); }, 10000);
 })();

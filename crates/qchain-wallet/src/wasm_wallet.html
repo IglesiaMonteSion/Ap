@@ -1127,7 +1127,7 @@
 </div>
 
 <script type="module">
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded, programAddressFromSeed, signDeployProgram, signCallProgram } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -2885,6 +2885,128 @@ function runBoot(){
   });
 }
 
+// ==================== puente wallet-connect (firmar contratos desde QScan) ====================
+// Modelo de seguridad (ver docs/WALLET-CONNECT.md): esta wallet es el LÍMITE DE
+// CONFIANZA. QScan (no confiable) le pide firmas por window.postMessage; la
+// semilla NUNCA sale de acá. Invariantes: (1) origin allowlist estricto validado
+// en CADA mensaje; (2) aprobación HUMANA explícita por acción, mostrando en claro
+// qué se firma; (3) conectar = solo lectura de la dirección; cada firma
+// re-pregunta; (4) el bridge está APAGADO salvo que el server pase connect_origin.
+let CONNECT_ORIGIN = null;   // origen exacto autorizado (de /api/config), ej. https://scan.qchainhq.com
+
+// Modal de aprobación genérico: devuelve true si el usuario aprueba.
+function bridgeApprove(title, lines){
+  return new Promise((resolve)=>{
+    const ov=document.createElement("div");
+    ov.style.cssText="position:fixed;inset:0;z-index:9999;background:rgba(4,6,20,.72);display:flex;align-items:center;justify-content:center;padding:18px";
+    const rows=lines.map(l=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.08)"><span style="opacity:.7">${esc(l[0])}</span><span style="font-weight:600;word-break:break-all;text-align:right">${esc(l[1])}</span></div>`).join("");
+    ov.innerHTML=`<div style="max-width:420px;width:100%;background:var(--card,#0f1330);border:1px solid rgba(140,120,255,.25);border-radius:16px;padding:20px">
+      <div style="font-weight:800;font-size:17px;margin-bottom:4px">${esc(title)}</div>
+      <div style="opacity:.65;font-size:13px;margin-bottom:12px">Pedido desde <span class="mono">${esc(CONNECT_ORIGIN||"")}</span></div>
+      ${rows}
+      <div style="opacity:.6;font-size:12px;margin:12px 0">Tu clave NUNCA sale de esta wallet. Se firma acá y se envía la transacción ya firmada.</div>
+      <div style="display:flex;gap:10px;margin-top:6px">
+        <button id="bg-no" class="btn-sec" style="flex:1">Rechazar</button>
+        <button id="bg-yes" class="btn-glow" style="flex:1">Aprobar y firmar</button>
+      </div></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector("#bg-no").onclick=()=>{ ov.remove(); resolve(false); };
+    ov.querySelector("#bg-yes").onclick=()=>{ ov.remove(); resolve(true); };
+  });
+}
+
+// La primera dirección de programa (derivada de la semilla) que todavía NO tiene
+// un contrato desplegado — deploy-once necesita una fresca. Se compara contra la
+// lista real de contratos del nodo (/api/programs), no contra /api/account (que
+// no distingue un slot vacío de una cuenta program-owned).
+async function freshProgramAddr(){
+  let deployed=new Set();
+  try{ const r=await api("/api/programs"); (r.programs||[]).forEach(p=>deployed.add(p.address)); }catch(e){}
+  for(let i=0;i<64;i++){
+    const a=programAddressFromSeed(SEED, i);
+    if(!deployed.has(a)) return a;
+  }
+  throw new Error("no encontré un índice de programa libre");
+}
+
+async function bridgeSignAndSubmit(tx){
+  if(!MASTER || !SEED) throw new Error("desbloqueá la wallet primero");
+  const cid=await api("/api/chain_id"); const chainId=fromHex(cid.chain_id);
+  const me=myAddress();
+  const acct=await api("/api/account/"+encodeURIComponent(me));
+  const nonce=BigInt(acct.nonce||0);
+  const node=await api("/api/node").catch(()=>({}));
+  const bfpb=BigInt(node.base_fee_per_byte||180);
+  if(tx.kind==="deployProgram"){
+    const bytes=Uint8Array.from(tx.moduleBytes||[]);
+    if(!bytes.length) throw new Error("el .wasm está vacío");
+    const kb=(bytes.length/1024).toFixed(1);
+    const feeEst=qchDisp(bfpb*BigInt(bytes.length+300));   // aprox: bytes del módulo + overhead de la tx
+    const ok=await bridgeApprove("Desplegar contrato", [
+      ["Acción","Desplegar un contrato WASM"],
+      ["Tamaño", kb+" KB"],
+      ["Entry point", tx.entryPoint||"run"],
+      ["Fee de red aprox", feeEst],
+      ["Firmando como", short(me)],
+    ]);
+    if(!ok) return { rejected:true };
+    const paddr=await freshProgramAddr();
+    const txJson=signDeployProgram(SEED, paddr, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000));
+    const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
+    const body=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(body.error||("error "+r.status));
+    return { hash: body.hash||"", programAddress: paddr };
+  }
+  if(tx.kind==="callProgram"){
+    const pid=String(tx.programId||"").trim(); if(!pid) throw new Error("falta la dirección del contrato");
+    const accountsCsv=String(tx.accounts||"");
+    const argsCsv=String(tx.args||"");
+    const ok=await bridgeApprove("Interactuar con contrato", [
+      ["Acción","Llamar un contrato"],
+      ["Contrato", short(pid)],
+      ["Cuentas", accountsCsv||"—"],
+      ["Args (i64)", argsCsv||"—"],
+      ["Fee de red aprox", qchDisp(bfpb*6000n)],
+      ["Firmando como", short(me)],
+    ]);
+    if(!ok) return { rejected:true };
+    const txJson=signCallProgram(SEED, pid, accountsCsv, argsCsv, nonce, chainId, BigInt(node.fee_limit||10000000));
+    const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
+    const body=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(body.error||("error "+r.status));
+    return { hash: body.hash||"" };
+  }
+  throw new Error("tipo de operación desconocido");
+}
+
+async function initConnectBridge(){
+  try{ const cfg=await api("/api/config"); CONNECT_ORIGIN=cfg.connect_origin||null; }catch(e){ CONNECT_ORIGIN=null; }
+  if(!CONNECT_ORIGIN) return;   // bridge OFF salvo que el server lo configure
+  window.addEventListener("message", async (ev)=>{
+    // INVARIANTE 3: allowlist de origen estricto, en CADA mensaje.
+    if(ev.origin !== CONNECT_ORIGIN) return;
+    const msg=ev.data||{};
+    if(!msg || msg.v!==1 || !msg.type || !msg.id) return;
+    const reply=(obj)=>{ try{ (ev.source||window.opener)?.postMessage(Object.assign({v:1,id:msg.id},obj), CONNECT_ORIGIN); }catch(e){} };
+    try{
+      if(msg.type==="connect"){
+        if(!MASTER){ reply({type:"error", msg:"la wallet está bloqueada — desbloqueala y reintentá"}); return; }
+        const ok=await bridgeApprove("Conectar", [["Sitio", CONNECT_ORIGIN],["Permiso","Ver tu dirección pública (solo lectura)"]]);
+        if(!ok){ reply({type:"rejected"}); return; }
+        reply({type:"connected", address: myAddress()});
+      } else if(msg.type==="signAndSubmit"){
+        const res=await bridgeSignAndSubmit(msg.tx||{});
+        if(res.rejected) reply({type:"rejected"});
+        else reply({type:"submitted", hash:res.hash, programAddress:res.programAddress});
+      } else if(msg.type==="disconnect"){
+        reply({type:"disconnected"});
+      }
+    }catch(e){ reply({type:"error", msg:String(e.message||e)}); }
+  });
+  // avisar a quien nos abrió que estamos listos
+  try{ window.opener?.postMessage({v:1,type:"ready"}, CONNECT_ORIGIN); }catch(e){}
+}
+
 // ==================== arranque ====================
 (async function(){
   applyTheme(localStorage.getItem("qchain_theme")||"dark");
@@ -2909,6 +3031,7 @@ function runBoot(){
   await bootDone;                             // no revelar hasta que la animación termine
   refreshBioUnlockBtn();                      // botón de biométrico en la pantalla de bloqueo si está activado
   showView(localStorage.getItem(LS_KEY) ? "unlock" : "welcome");
+  try{ await initConnectBridge(); }catch(e){ console.warn("connect bridge no inicializado:", e); }  // puente wallet-connect (postMessage con allowlist de origen)
 
   // refrescos en vivo (sin parpadeo: la actividad solo se redibuja si cambió)
   nodeTimer=setInterval(loadNode, 6000);

@@ -68,6 +68,15 @@ struct Cli {
     /// así que la wallet lo proxya en `/api/faucet`. Ausente = botón oculto.
     #[arg(long)]
     faucet: Option<String>,
+    /// Origen EXACTO (esquema+host, ej. `https://scan.qchainhq.com`) del
+    /// explorador QScan autorizado a pedirle firmas a esta wallet por el puente
+    /// wallet-connect. Cuando se setea, la wallet escucha pedidos `postMessage`
+    /// SÓLO de ese origen y, tras aprobación HUMANA explícita, firma el deploy /
+    /// interacción de contratos (la semilla nunca sale del navegador). Ausente =
+    /// el puente está APAGADO (la wallet ignora todo `postMessage`). También por
+    /// la variable de entorno QCHAIN_CONNECT_ORIGIN.
+    #[arg(long)]
+    connect_origin: Option<String>,
 }
 
 struct AppState {
@@ -99,6 +108,12 @@ struct AppState {
     /// can ask for test QCH via the `/api/faucet` proxy (the faucet is a
     /// separate origin the browser can't reach directly). None = feature off.
     faucet: Option<String>,
+    /// Exact origin (scheme+host) of the QScan explorer allowed to request
+    /// signatures from this wallet over the wallet-connect bridge. The browser
+    /// enforces `event.origin === connect_origin` on every postMessage. None =
+    /// the bridge is OFF (the wallet ignores all postMessage). See the bridge
+    /// listener in `wasm_wallet.html`.
+    connect_origin: Option<String>,
 }
 
 #[tokio::main]
@@ -136,6 +151,12 @@ async fn main() -> anyhow::Result<()> {
         custodial_enabled,
         loopback_bound,
         faucet: cli.faucet.clone().map(|u| u.trim_end_matches('/').to_string()),
+        connect_origin: cli
+            .connect_origin
+            .clone()
+            .or_else(|| std::env::var("QCHAIN_CONNECT_ORIGIN").ok())
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty()),
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -179,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/transfers", get(recent_transfers))
         .route("/api/staking_activity/:address", get(staking_activity))
         .route("/api/validators", get(validators))
+        .route("/api/programs", get(programs))
         .route("/api/proposal/:address", get(proposal_ep))
         .route("/api/economics", get(economics))
         .route("/api/faucet", post(faucet_request));
@@ -335,6 +357,10 @@ async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
         // the faucet URL itself is never leaked to the browser; requests go
         // through the `/api/faucet` proxy.
         "faucet_enabled": st.faucet.is_some(),
+        // The wallet-connect bridge's allowed origin (the QScan explorer that may
+        // request signatures). null = bridge off. The browser enforces
+        // `event.origin === connect_origin` on every postMessage.
+        "connect_origin": st.connect_origin,
     }))
 }
 
@@ -729,6 +755,17 @@ async fn recent_transfers(State(st): State<Arc<AppState>>) -> Result<Json<Value>
 /// to paste a raw address.
 async fn validators(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let resp = st.http.get(format!("{}/validators", st.rpc)).send().await.map_err(ApiError::internal)?;
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+/// Read-only list of deployed programs, proxied from the node's `/programs`
+/// (address, code_hash, entry_point, size, balance - metadata only, never the
+/// bytecode). The connect-bridge uses it to pick a fresh (undeployed) program
+/// address for a deploy, since `/api/account` can't tell an empty slot from a
+/// program-owned one.
+async fn programs(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let resp = st.http.get(format!("{}/programs?limit=1000", st.rpc)).send().await.map_err(ApiError::internal)?;
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(body))
 }

@@ -35,6 +35,7 @@ UNINSTALL=0
 NO_BUILD=0
 RPC_PORT="8080"
 WALLET_PORT="8090"
+CONNECT_ORIGIN=""
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -51,6 +52,11 @@ Opciones:
   --generar-password     Genera una contraseña fuerte al azar y te la muestra.
   --port <puerto>        Puerto de la wallet web (por defecto 8090).
   --rpc-port <puerto>    Puerto RPC del nodo al que hablarle (por defecto 8080).
+  --connect-origin <url> Origen EXACTO de QScan (ej. https://scan.tudominio.com)
+                         autorizado a pedirle firmas por el puente wallet-connect.
+                         Sin esto, el puente queda apagado (la wallet ignora todo
+                         postMessage). Habilita desplegar/interactuar contratos
+                         desde QScan firmando acá.
   --image <nombre>       Imagen Docker a usar (por defecto qchain:latest).
   --home <ruta>          Carpeta de qchain (por defecto /opt/qchain).
   --no-build             No construir la imagen desde el código aunque falte.
@@ -66,6 +72,7 @@ while [ $# -gt 0 ]; do
     --generar-password) GENERAR_PASSWORD=1; shift ;;
     --port) WALLET_PORT="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT="${2:-}"; shift 2 ;;
+    --connect-origin) CONNECT_ORIGIN="${2:-}"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
@@ -209,6 +216,12 @@ sed -i "s#EnvironmentFile=/opt/qchain/wallet.env#EnvironmentFile=$QCHAIN_HOME/wa
 sed -i "s#-v /opt/qchain/wallets:/wallets#-v $QCHAIN_HOME/wallets:/wallets#" /etc/systemd/system/qchain-wallet.service
 sed -i "s#--rpc http://127.0.0.1:8080#--rpc http://127.0.0.1:$RPC_PORT#" /etc/systemd/system/qchain-wallet.service
 sed -i "s#--port 8090#--port $WALLET_PORT#" /etc/systemd/system/qchain-wallet.service
+# Puente wallet-connect: si el operador pasó --connect-origin, lo agregamos al
+# final del ExecStart para que la wallet acepte pedidos de firma de QScan.
+if [ -n "$CONNECT_ORIGIN" ]; then
+  sed -i "s#--bind 0.0.0.0 --port $WALLET_PORT#--bind 0.0.0.0 --port $WALLET_PORT --connect-origin $CONNECT_ORIGIN#" /etc/systemd/system/qchain-wallet.service
+  echo "Puente wallet-connect habilitado: la wallet aceptará pedidos de firma desde $CONNECT_ORIGIN"
+fi
 systemctl daemon-reload
 systemctl enable --now qchain-wallet
 

@@ -34,6 +34,9 @@ pub struct ApiState {
     pub node: String,
     pub http: reqwest::Client,
     pub node_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
+    /// Public URL of the non-custodial wallet to open for signing (deploy /
+    /// interact). None = the deploy/interact UI is hidden (read-only contracts).
+    pub wallet_url: Option<String>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -51,6 +54,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/holders", get(holders))
         .route("/api/programs", get(programs))
         .route("/api/search", get(search))
+        .route("/api/config", get(config))
         .route("/api/health", get(health))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
@@ -113,6 +117,14 @@ const MAX_SIZE: usize = 100;
 
 async fn health() -> Json<Value> {
     Json(json!({"ok": true}))
+}
+
+/// Frontend config: the wallet URL to open for signing (deploy/interact), when
+/// the operator configured `--wallet-url`. Absent = the deploy/interact UI stays
+/// hidden and QScan is read-only. QScan never receives any key; signing happens
+/// entirely in the wallet popup over the postMessage bridge.
+async fn config(State(st): State<ApiState>) -> Json<Value> {
+    Json(json!({ "wallet_url": st.wallet_url }))
 }
 
 /// Home-page stat cards: chain height, totals the indexer owns, plus the

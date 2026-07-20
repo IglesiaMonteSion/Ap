@@ -35,6 +35,13 @@ struct Args {
     /// Poll interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     poll_ms: u64,
+    /// Public URL of the non-custodial wallet (e.g. https://wallet.qchainhq.com)
+    /// to open for signing when deploying/interacting with a contract from QScan.
+    /// None = the deploy/interact UI is hidden (read-only contracts only). The
+    /// wallet must be started with `--connect-origin <this-explorer's-origin>` for
+    /// the postMessage bridge to accept requests. QScan never sees any key.
+    #[arg(long)]
+    wallet_url: Option<String>,
 }
 
 #[tokio::main]
@@ -71,6 +78,11 @@ async fn main() -> Result<()> {
         node: args.node.clone(),
         http,
         node_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        wallet_url: args
+            .wallet_url
+            .clone()
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty()),
     };
     let app = api::router(state);
 
