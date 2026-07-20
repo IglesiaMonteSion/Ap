@@ -763,7 +763,7 @@ fn take_executable_prefix(
 
 pub struct Engine {
     pub self_id: ValidatorId,
-    pub keypair: Keypair,
+    pub keypair: std::sync::Arc<Keypair>,
     /// The consensus committee currently in effect (this epoch). Under fixed
     /// membership (rotation off) it never changes; under phase-3.3 rotation the
     /// epoch ratchet in `try_commit` swaps it at each boundary. Used for
@@ -3558,7 +3558,16 @@ impl Engine {
                     // the config) is now reached automatically.
                     if derived.is_some() {
                         let active = qchain_execution::validator_registry::select_active_set(&registry, qchain_execution::validator_registry::MAX_ACTIVE_VALIDATORS);
-                        self.network.set_peers(merge_peers(&self.config_peers, &active, &self.self_id));
+                        let merged = merge_peers(&self.config_peers, &active, &self.self_id);
+                        // Keep the authenticated-transport accept set in lock-step
+                        // with the dial set (task #176), so a genuinely new
+                        // registered validator can both be dialed AND complete the
+                        // handshake to us. Include self for completeness. A no-op
+                        // when auth is off.
+                        let authorized: std::collections::HashSet<_> =
+                            merged.iter().map(|p| p.id).chain(std::iter::once(self.self_id)).collect();
+                        self.network.set_authorized(authorized);
+                        self.network.set_peers(merged);
                     }
                     let source = if derived.is_some() {
                         "derived from the on-chain registry"

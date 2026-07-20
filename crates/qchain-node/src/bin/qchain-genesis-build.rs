@@ -66,6 +66,15 @@ struct Cli {
     /// compressed-tree notes. Off by default (the legacy tree).
     #[arg(long, default_value_t = false)]
     compressed_state_tree: bool,
+    /// Run the AUTHENTICATED P2P transport (`authenticated_transport: true`): a
+    /// per-connection mutual ML-DSA handshake so only real validators of this
+    /// network can connect and no one can spoof a validator at the transport
+    /// layer. Unlike the two flags above this is NOT folded into `chain_id`
+    /// (it's a network-layer choice, not consensus/state), but it IS
+    /// wire-breaking, so every node must use the same value and turning it on
+    /// is a coordinated cutover. Off by default.
+    #[arg(long, default_value_t = false)]
+    authenticated_transport: bool,
     /// Start the network with the v7 ECONOMICS (`economics_v7: true`): shares+index
     /// staking, per-quanto emission, the 45/45/10 fee split, the 500 QCH validator
     /// bond. Like `--compressed-state-tree` this is a network-wide, genesis-level
@@ -251,6 +260,7 @@ fn main() -> anyhow::Result<()> {
             validator_rotation: false,
             epoch_rounds: None,
             storage_engine: "sled".to_string(),
+            authenticated_transport: cli.authenticated_transport,
             economics_v7: cli.economics_v7,
             quanto_rate_fp: baked_rate_fp,
             rounds_per_quanto: cli.rounds_per_quanto,

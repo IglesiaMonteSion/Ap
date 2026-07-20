@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = NodeConfig::load(&cli.config)?;
 
-    let keypair = qchain_crypto::read_keypair_file(&config.keypair_path)?;
+    let keypair = Arc::new(qchain_crypto::read_keypair_file(&config.keypair_path)?);
     let self_id = keypair.pubkey();
 
     let mut validator_infos = Vec::new();
@@ -131,7 +131,20 @@ async fn main() -> anyhow::Result<()> {
     // Keep the config mesh so the phase-3.3 rotation ratchet can union it with
     // the current committee's registry addresses (stage-3 peer discovery).
     let config_peers = peers.clone();
-    let (network, mut rx) = Network::start(self_id, config.listen_addr, peers).await?;
+    // Authenticated transport (task #176), opt-in via `authenticated_transport`.
+    // The authorized set starts as every configured validator id; a rotation
+    // node's ratchet later widens it to the registry committee (kept in
+    // lock-step with `set_peers` — see the epoch ratchet in `engine`). Binds
+    // `chain_id`, so a validator from a different network can't even connect.
+    let auth = if config.authenticated_transport {
+        let authorized: std::collections::HashSet<_> =
+            config.validators.iter().map(|v| v.pubkey_bundle.to_address()).collect();
+        tracing::info!("authenticated P2P transport: ENABLED (per-connection ML-DSA handshake)");
+        Some(Arc::new(qchain_network::AuthState::new(keypair.clone(), config.chain_id(), authorized)))
+    } else {
+        None
+    };
+    let (network, mut rx) = Network::start_with_auth(self_id, config.listen_addr, peers, auth).await?;
     let network = Arc::new(network);
 
     // A `SledStore` reopened at a path from a previous run already holds

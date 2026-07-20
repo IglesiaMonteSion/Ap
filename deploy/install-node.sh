@@ -55,6 +55,12 @@ COMPRIMIDO=0
 # el mismo valor. Off por defecto (una red v6 queda byte-identica).
 ECONOMICS_V7=0
 ROUNDS_PER_QUANTO="${ROUNDS_PER_QUANTO:-172800}"
+# Arrancar la red con el TRANSPORTE P2P AUTENTICADO (handshake ML-DSA por
+# conexion: solo validadores reales de ESTA red se conectan, nadie puede
+# suplantar a un validador en la red). NO se pliega en el chain_id (es capa de
+# red, no consenso), pero es wire-breaking: todos los nodos deben usar el mismo
+# valor. Off por defecto.
+AUTENTICADO=0
 # Fondear una direccion ADICIONAL en el genesis (ademas de la wallet de prueba),
 # para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
@@ -102,6 +108,10 @@ Opciones:
                          red multi-nodo. TODOS los nodos deben usar el mismo
                          valor. Ojo: la emisión de staking es por-ronda (retuneá
                          el APR por gobernanza si cambiás esto).
+  --autenticado          (modo "solo") crear la red con el TRANSPORTE P2P
+                         AUTENTICADO (handshake ML-DSA por conexión: solo
+                         validadores reales se conectan). Todos los nodos deben
+                         usarlo. No cambia el chain_id.
   --comprimido           (modo "solo") crear la red con el ÁRBOL COMPRIMIDO
                          (hard fork, ~6x throughput bajo carga, menos RAM/disco).
                          Solo al CREAR la red; todos los nodos deben usarlo. No se
@@ -155,6 +165,7 @@ while [ $# -gt 0 ]; do
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
+    --autenticado|--authenticated) AUTENTICADO=1; shift ;;
     --economics-v7|--economia-v7) ECONOMICS_V7=1; shift ;;
     --rounds-per-quanto|--rondas-por-cuanto) ROUNDS_PER_QUANTO="${2:-}"; shift 2 ;;
     --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
@@ -432,6 +443,11 @@ EOF
         GB_COMPRIMIDO="--compressed-state-tree"
         decir "  -> arbol de estado COMPRIMIDO (hard fork, ~6x throughput bajo carga)"
       fi
+      GB_AUTH=""
+      if [ "$AUTENTICADO" = "1" ]; then
+        GB_AUTH="--authenticated-transport"
+        decir "  -> TRANSPORTE P2P AUTENTICADO (handshake ML-DSA por conexion; todos los nodos deben usarlo)"
+      fi
       GB_V7=""
       if [ "$ECONOMICS_V7" = "1" ]; then
         GB_V7="--economics-v7 --rounds-per-quanto $ROUNDS_PER_QUANTO"
@@ -454,7 +470,7 @@ EOF
           decir "  -> TESORERIA v7: $TREASURY_QCH QCH BLOQUEADOS en el genesis, liberables por $TREASURY_AUTH (firma Release)"
         fi
       fi
-      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO $GB_V7
+      qrun qchain-genesis-build --manifests-dir manifests --genesis genesis.json --out-dir out --round-interval-ms "$RONDA_MS" $GB_COMPRIMIDO $GB_AUTH $GB_V7
       cp "$QCHAIN_HOME/out/node1.json" "$QCHAIN_HOME/config.json"
       rm -rf "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out" "$QCHAIN_HOME/genesis.json"
       mkdir -p "$QCHAIN_HOME/data"

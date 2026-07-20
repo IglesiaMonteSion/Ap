@@ -23,6 +23,7 @@
 //!    smaller on the wire and cheaper to (de)serialize than JSON's
 //!    text/hex encoding, with zero change to what's actually being sent.
 
+use crate::handshake::{client_handshake, server_handshake, AuthState};
 use crate::message::{Envelope, NetMessage};
 use qchain_core::ValidatorId;
 use std::collections::HashMap;
@@ -68,6 +69,17 @@ pub struct Network {
     /// fixed-membership network it is set once at startup and never changes.
     peers: StdRwLock<Vec<PeerInfo>>,
     connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
+    /// When `Some`, every connection — inbound and outbound — is
+    /// authenticated with a per-connection ML-DSA handshake before any
+    /// `Envelope` flows (task #176, see `handshake`). When `None` (the
+    /// default) the transport is byte-identical to the phase-1 unauthenticated
+    /// design: no handshake frames are ever sent, so a network running with
+    /// auth off behaves exactly as before this field existed. A network must
+    /// run all nodes with the same choice — an auth-on dialer's first frame is
+    /// a `HandshakeInit`, which an auth-off peer reads as a malformed
+    /// `Envelope` and drops, so a mismatch simply fails to connect (the
+    /// coordinated-cutover requirement for this wire-breaking change).
+    auth: Option<Arc<AuthState>>,
 }
 
 async fn read_envelope(stream: &mut TcpStream) -> anyhow::Result<Envelope> {
@@ -120,7 +132,26 @@ const FIRST_ENVELOPE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// messages once it's proven itself with at least one, and timing out
 /// *that* would fight the persistent-connection optimization instead of
 /// the actual attack (open many connections, send nothing, ever).
-async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration) {
+async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration, auth: Option<Arc<AuthState>>) {
+    // When authenticated transport is on, prove identities before a single
+    // envelope is read. A connection that fails the handshake (a non-member,
+    // a wrong-network peer, a bad signature, or a stall) is dropped here,
+    // never reaching the message loop. `authed_id` is the cryptographically
+    // established sender of every envelope on this connection - used in place
+    // of the spoofable `Envelope.from`, which strengthens attribution for
+    // even the message types whose payload isn't itself signed.
+    let authed_id: Option<ValidatorId> = match &auth {
+        Some(a) => match server_handshake(&mut stream, a).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::debug!("dropping an inbound connection that failed the handshake: {e}");
+                return;
+            }
+        },
+        None => None,
+    };
+    let attributed = |envelope: &Envelope| authed_id.unwrap_or(envelope.from);
+
     let first = match tokio::time::timeout(first_envelope_timeout, read_envelope(&mut stream)).await {
         Ok(Ok(envelope)) => envelope,
         Ok(Err(e)) => {
@@ -132,14 +163,15 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
             return;
         }
     };
-    if tx.send((first.from, first.message)).await.is_err() {
+    if tx.send((attributed(&first), first.message)).await.is_err() {
         return; // engine shut down
     }
 
     loop {
         match read_envelope(&mut stream).await {
             Ok(envelope) => {
-                if tx.send((envelope.from, envelope.message)).await.is_err() {
+                let from = attributed(&envelope);
+                if tx.send((from, envelope.message)).await.is_err() {
                     return; // engine shut down
                 }
             }
@@ -155,11 +187,12 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     }
 }
 
-async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>) {
+async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>, auth: Option<Arc<AuthState>>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let tx = tx.clone();
-        tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT));
+        let auth = auth.clone();
+        tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT, auth));
     }
 }
 
@@ -172,10 +205,24 @@ impl Network {
         listen_addr: SocketAddr,
         peers: Vec<PeerInfo>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<(ValidatorId, NetMessage)>)> {
+        Self::start_with_auth(self_id, listen_addr, peers, None).await
+    }
+
+    /// Like `start`, but with an optional authenticated-transport handshake.
+    /// `auth: None` is byte-identical to `start` (phase-1 unauthenticated
+    /// transport). `auth: Some(_)` runs the per-connection ML-DSA handshake
+    /// (task #176) on every inbound and outbound connection before any
+    /// envelope flows.
+    pub async fn start_with_auth(
+        self_id: ValidatorId,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        auth: Option<Arc<AuthState>>,
+    ) -> anyhow::Result<(Self, mpsc::Receiver<(ValidatorId, NetMessage)>)> {
         let listener = TcpListener::bind(listen_addr).await?;
         let (tx, rx) = mpsc::channel(4096);
-        tokio::spawn(accept_loop(listener, tx));
-        Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()) }, rx))
+        tokio::spawn(accept_loop(listener, tx, auth.clone()));
+        Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()), auth }, rx))
     }
 
     /// A snapshot of the current peer set.
@@ -248,9 +295,21 @@ impl Network {
         if let Some(conn) = self.connections.lock().await.get(&addr) {
             return Ok(conn.clone());
         }
-        let stream = tokio::time::timeout(SEND_TIMEOUT, TcpStream::connect(addr))
+        let mut stream = tokio::time::timeout(SEND_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow::anyhow!("timed out connecting to {addr} after {SEND_TIMEOUT:?}"))??;
+        // Authenticate before caching: a connection that fails the handshake
+        // (the dialed peer isn't an authorized validator, authenticates as a
+        // different id than we dialed this address for, is on a different
+        // network, or has a bad signature) is never cached or used - the
+        // caller treats the error like any other connect failure and retries
+        // on its next tick. Run outside the connections lock (like the
+        // connect itself) so a slow-to-handshake peer never blocks sends to
+        // any other peer - see `connection_for`'s doc comment.
+        if let Some(auth) = &self.auth {
+            let expected = self.addr_of_expected(addr);
+            client_handshake(&mut stream, auth, expected).await?;
+        }
         let mut conns = self.connections.lock().await;
         if let Some(conn) = conns.get(&addr) {
             return Ok(conn.clone());
@@ -258,6 +317,25 @@ impl Network {
         let conn = Arc::new(Mutex::new(stream));
         conns.insert(addr, conn.clone());
         Ok(conn)
+    }
+
+    /// The validator id this node expects to find at `addr`, from its current
+    /// peer set — so the dialer can require the peer to authenticate as
+    /// exactly that id (anti-misrouting), not merely as *some* authorized
+    /// validator. `None` if the address isn't a known peer (the handshake
+    /// then only requires authorized-membership).
+    fn addr_of_expected(&self, addr: SocketAddr) -> Option<ValidatorId> {
+        self.peers.read().expect("peers lock not poisoned").iter().find(|p| p.addr == addr).map(|p| p.id)
+    }
+
+    /// Replace the set of validator identities this node will accept over the
+    /// authenticated transport (phase-3.3 rotation). A no-op if auth is off.
+    /// The caller keeps this in lock-step with `set_peers` so the dial set and
+    /// the accept set never drift.
+    pub fn set_authorized(&self, authorized: std::collections::HashSet<ValidatorId>) {
+        if let Some(auth) = &self.auth {
+            auth.set_authorized(authorized);
+        }
     }
 
     /// Sends over a reused, persistent connection to `addr`, falling back
@@ -449,7 +527,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_inbound(stream, tx, std::time::Duration::from_millis(200)).await;
+            handle_inbound(stream, tx, std::time::Duration::from_millis(200), None).await;
         });
 
         // Connect but deliberately never write anything - the exact

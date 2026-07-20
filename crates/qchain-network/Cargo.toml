@@ -8,5 +8,6 @@ qchain-core = { path = "../qchain-core" }
 qchain-crypto = { path = "../qchain-crypto" }
 borsh.workspace = true
 tokio.workspace = true
+getrandom = "0.2"
 anyhow.workspace = true
 tracing.workspace = true

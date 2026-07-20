@@ -134,6 +134,21 @@ pub struct NodeConfig {
     /// set must be identical), keeping the sled files as a backup.
     #[serde(default = "default_storage_engine")]
     pub storage_engine: String,
+    /// Authenticated P2P transport (task #176). `false` (the default, every
+    /// existing network) is the phase-1 unauthenticated transport, byte-
+    /// identical to before this field existed. `true` runs a per-connection
+    /// mutual ML-DSA handshake (reusing the validator key) before any message
+    /// flows, so a non-member can't spoof a validator at the transport layer
+    /// and only real validators of THIS network can even connect. It is a
+    /// NETWORK-LAYER choice, NOT consensus/state: it is deliberately NOT folded
+    /// into `chain_id` (two nodes differing only on this flag have the same
+    /// chain_id). But it IS wire-breaking — an auth-on node and an auth-off
+    /// node cannot complete a connection — so every node in a network must set
+    /// it identically, and turning it on is a COORDINATED cutover (all nodes
+    /// together). No genesis change and no state change: an existing chain can
+    /// flip it on with a coordinated restart, no fresh genesis needed.
+    #[serde(default)]
+    pub authenticated_transport: bool,
     /// v7 economics (shares+index staking, per-quanto emission, the 45/45/10 fee
     /// split, the 500 QCH validator bond). `false` (default, every existing
     /// network) is the v6 economics — byte-identical, zero change. `true` is a
@@ -291,6 +306,7 @@ mod tests {
             epoch_rounds: None,
             compressed_state_tree: false,
             storage_engine: "sled".to_string(),
+            authenticated_transport: false,
             economics_v7: false,
             quanto_rate_fp: None,
             rounds_per_quanto: None,
