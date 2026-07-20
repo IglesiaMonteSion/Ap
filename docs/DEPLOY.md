@@ -112,6 +112,11 @@ sirve RPC). Qué pasa después depende de la red:
 
 ## Endurecimiento / hardening (aislamiento de servicios y RPC privado)
 
+> **Antes de ir a VALOR REAL**, seguí la checklist operativa completa en
+> [`PRE-LAUNCH.md`](PRE-LAUNCH.md): auditoría automática (`deploy/prelaunch-check.sh`),
+> RPC privado, bajar el dashboard, clave de tesorería en frío, endurecer SSH
+> (`deploy/harden-ssh.sh`), backups+monitoreo, y auth/cifrado P2P al sumar nodos.
+
 El instalador aplica varias defensas por defecto — no hay que configurar nada,
 pero conviene entender el modelo para no aflojarlo por accidente.
 
