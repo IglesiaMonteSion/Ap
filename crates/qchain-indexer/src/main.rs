@@ -42,6 +42,13 @@ struct Args {
     /// the postMessage bridge to accept requests. QScan never sees any key.
     #[arg(long)]
     wallet_url: Option<String>,
+    /// Pin the followed node's `chain_id` (QCH-QSCAN-002). When set, the indexer
+    /// fetches `GET /chain_id` at startup and REFUSES to start if it doesn't
+    /// match — so it never silently indexes a DIFFERENT network (e.g. the node
+    /// URL was repointed, or a wrong node was configured). Omit to skip the
+    /// check (follows whatever the node reports).
+    #[arg(long)]
+    expected_chain_id: Option<String>,
 }
 
 #[tokio::main]
@@ -58,6 +65,36 @@ async fn main() -> Result<()> {
         store.total_txs(),
         store.total_blocks()
     );
+
+    // QCH-QSCAN-002: pin the followed node's chain_id if the operator set one,
+    // so the indexer never silently ingests from a different network. Refuse to
+    // start on mismatch (the indexer is a read replica; a hard stop here is the
+    // safe choice — better than serving a wrong chain's data under this URL).
+    if let Some(expected) = args.expected_chain_id.as_deref() {
+        let url = format!("{}/chain_id", args.node.trim_end_matches('/'));
+        let got = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+            .get(&url)
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
+        let Some(resp) = got else {
+            anyhow::bail!("--expected-chain-id is set but the node at {} did not answer GET /chain_id; refusing to start", args.node);
+        };
+        let body = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+        // The node reports chain_id as a hex string (field `chain_id`) or bare.
+        let actual = body.get("chain_id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| body.as_str().unwrap_or("").to_string());
+        if actual != expected {
+            anyhow::bail!(
+                "chain_id mismatch: node {} reports '{}' but --expected-chain-id is '{}'; refusing to index a different network",
+                args.node, actual, expected
+            );
+        }
+        tracing::info!("chain_id pinned OK: node {} matches expected '{}'", args.node, expected);
+    }
 
     // Ingestion loop in the background.
     {
@@ -78,6 +115,8 @@ async fn main() -> Result<()> {
         node: args.node.clone(),
         http,
         node_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        inflight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        node_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(api::MAX_UPSTREAM_FETCHES)),
         wallet_url: args
             .wallet_url
             .clone()

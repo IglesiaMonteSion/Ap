@@ -27,6 +27,14 @@ const NODE_CACHE_TTL: Duration = Duration::from_millis(1500);
 /// Bound the distinct-key growth of the node cache (addresses are attacker-
 /// chosen); cleared wholesale past this size rather than tracking per-entry LRU.
 const NODE_CACHE_MAX: usize = 20_000;
+/// Cap on concurrent UPSTREAM fetches to the node across ALL requests
+/// (QCH-QSCAN-001): a flood of DISTINCT cold keys would otherwise open one node
+/// connection per request and amplify onto the validator's consensus lock. With
+/// the singleflight below, in practice only cold-key misses reach here.
+pub const MAX_UPSTREAM_FETCHES: usize = 16;
+/// Bound the in-flight singleflight map so a flood of distinct cold keys can't
+/// grow it without bound; past this we skip coalescing (still semaphore-bounded).
+const MAX_INFLIGHT_KEYS: usize = 4_096;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -34,6 +42,13 @@ pub struct ApiState {
     pub node: String,
     pub http: reqwest::Client,
     pub node_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
+    /// Singleflight (QCH-QSCAN-001): one per-key async lock coalesces a
+    /// cache-miss STAMPEDE — N concurrent requests for the same cold key make a
+    /// SINGLE upstream node fetch, not N. The first request holds the key's lock
+    /// while it fetches+caches; the rest wait, then find the fresh cache entry.
+    pub inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Global cap on concurrent upstream node fetches (`MAX_UPSTREAM_FETCHES`).
+    pub node_sem: Arc<tokio::sync::Semaphore>,
     /// Public URL of the non-custodial wallet to open for signing (deploy /
     /// interact). None = the deploy/interact UI is hidden (read-only contracts).
     pub wallet_url: Option<String>,
@@ -289,20 +304,48 @@ async fn search(State(st): State<ApiState>, Query(sq): Query<SearchQ>) -> Json<V
 /// Fetch a JSON value from the node, `null` on any failure (used for the live
 /// account/stake lookups an address page shows).
 async fn fetch_node(st: &ApiState, path: &str) -> Value {
-    // Serve from the short-TTL cache if fresh (never hold the std Mutex across
-    // the .await below).
-    {
-        let cache = st.node_cache.lock().unwrap();
-        if let Some((t, v)) = cache.get(path) {
-            if t.elapsed() < NODE_CACHE_TTL {
-                return v.clone();
-            }
+    // Fast path: serve from the short-TTL cache if fresh (never hold the std
+    // Mutex across an `.await`).
+    if let Some(v) = cache_get_fresh(st, path) {
+        return v;
+    }
+
+    // SINGLEFLIGHT (QCH-QSCAN-001): take a per-key async lock so a cache-miss
+    // stampede for the same cold key collapses to ONE upstream fetch. Bounded:
+    // past `MAX_INFLIGHT_KEYS` we skip coalescing (still semaphore-bounded).
+    let key_lock: Option<Arc<tokio::sync::Mutex<()>>> = {
+        let mut inflight = st.inflight.lock().unwrap();
+        if inflight.len() >= MAX_INFLIGHT_KEYS {
+            None
+        } else {
+            Some(inflight.entry(path.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone())
+        }
+    };
+    let _guard = match &key_lock {
+        Some(l) => Some(l.lock().await),
+        None => None,
+    };
+    // Re-check the cache: the request that held this lock before us may have
+    // just populated it, so we return without a second upstream fetch.
+    if key_lock.is_some() {
+        if let Some(v) = cache_get_fresh(st, path) {
+            drop(_guard);
+            st.inflight.lock().unwrap().remove(path);
+            return v;
         }
     }
-    let url = format!("{}{}", st.node.trim_end_matches('/'), path);
-    let val = match st.http.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
-        _ => Value::Null,
+
+    // Global cap on concurrent upstream fetches. If the semaphore is closed
+    // (never, in practice) treat as a miss.
+    let val = match st.node_sem.acquire().await {
+        Ok(_permit) => {
+            let url = format!("{}{}", st.node.trim_end_matches('/'), path);
+            match st.http.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+        Err(_) => Value::Null,
     };
     // Cache only successful lookups (don't pin a transient failure).
     if !val.is_null() {
@@ -312,5 +355,15 @@ async fn fetch_node(st: &ApiState, path: &str) -> Value {
         }
         cache.insert(path.to_string(), (Instant::now(), val.clone()));
     }
+    drop(_guard);
+    if key_lock.is_some() {
+        st.inflight.lock().unwrap().remove(path);
+    }
     val
+}
+
+/// Return the cached value for `path` if present and within the TTL.
+fn cache_get_fresh(st: &ApiState, path: &str) -> Option<Value> {
+    let cache = st.node_cache.lock().unwrap();
+    cache.get(path).filter(|(t, _)| t.elapsed() < NODE_CACHE_TTL).map(|(_, v)| v.clone())
 }

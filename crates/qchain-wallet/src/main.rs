@@ -146,7 +146,15 @@ async fn main() -> anyhow::Result<()> {
         rpc: cli.rpc.trim_end_matches('/').to_string(),
         wallets_dir: cli.wallets_dir.clone(),
         fee_limit: cli.fee_limit,
-        http: reqwest::Client::new(),
+        // QCH-WALLET-004: bound every proxy call to the node with real timeouts,
+        // so a slow/hung node can't pin a wallet request (and thus a browser
+        // connection) open indefinitely. A default `Client::new()` has NO
+        // timeout at all.
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
         password: password.clone(),
         custodial_enabled,
         loopback_bound,

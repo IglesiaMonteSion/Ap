@@ -932,6 +932,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("qchain-node {self_id} up: p2p={}, rpc={}", config.listen_addr, config.rpc_addr);
+    // QCH-RPC-001: the JSON-RPC has no authentication, so a PUBLIC bind
+    // (non-loopback `rpc_addr`) with no per-IP rate limit lets anyone flood it
+    // (submit txs, hammer read endpoints) unbounded. Warn loudly when exposed
+    // without a limit so an operator doesn't ship an open, unmetered RPC by
+    // accident. We warn rather than refuse to start, so a legitimate setup that
+    // fronts the RPC with its own rate limiting (nginx/Cloudflare) isn't broken;
+    // the actionable fix is `rpc_rate_limit_per_10s` in the config (see #196).
+    if !config.rpc_addr.ip().is_loopback() && config.rpc_rate_limit_per_10s.filter(|&n| n > 0).is_none() {
+        tracing::warn!(
+            "SECURITY: rpc_addr {} is PUBLIC (non-loopback) but no per-IP rate limit is set - the unauthenticated RPC is exposed unmetered. Set `rpc_rate_limit_per_10s` in the config, or front the RPC with your own rate limiting, or bind rpc_addr to 127.0.0.1 and reach it via a tunnel.",
+            config.rpc_addr
+        );
+    }
     let flush_engine = engine.clone();
     let app = rpc::router(engine, config.rpc_rate_limit_per_10s);
     // `into_make_service_with_connect_info` so the (opt-in) per-IP rate limiter
