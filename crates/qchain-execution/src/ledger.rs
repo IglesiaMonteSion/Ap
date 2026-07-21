@@ -115,10 +115,44 @@ pub fn register_standard_programs(ledger: &mut Ledger, economics_v7: bool) {
 /// a wallet shows the user BEFORE authorizing a broadcast. `fee` is the real fee
 /// the transaction would be charged; `changes` are the (address, before, after)
 /// balances of every seeded account whose balance the dry-run moved.
+/// How a simulated transaction ended, so a wallet can show the HONEST outcome
+/// (re-audit QCH-SIMULATE, MED/HIGH). A failed transaction is NOT free: real
+/// execution charges the byte fee (and updates the nonce) before running the
+/// instructions, and a WASM contract that consumes gas and then traps is billed
+/// that gas directly from persistent state. So "failed" must distinguish a tx
+/// rejected before any charge from one that failed AFTER already costing money.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimStatus {
+    /// The transaction would execute successfully.
+    Ok,
+    /// Rejected before anything is charged — the pre-checks (chain_id / size /
+    /// signature) or an admission failure (e.g. `InsufficientFunds` for the
+    /// upfront fee, `FeeExceedsLimit`) that never touches the payer's balance.
+    RejectedBeforeCharge,
+    /// Execution failed AFTER the payer was already charged — the byte fee was
+    /// taken and/or a contract consumed gas before trapping. The `fee`/`changes`
+    /// reflect the real money that would be lost.
+    ExecutionFailedAfterCharge,
+}
+
+impl SimStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SimStatus::Ok => "ok",
+            SimStatus::RejectedBeforeCharge => "rejected_before_charge",
+            SimStatus::ExecutionFailedAfterCharge => "execution_failed_after_charge",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SimOutcome {
     pub ok: bool,
     pub error: Option<String>,
+    /// The fee/charge the transaction would actually cost. For `Ok` this is the
+    /// real fee; for `ExecutionFailedAfterCharge` it is the money that WOULD be
+    /// lost (byte fee + gas billed before the trap); for `RejectedBeforeCharge`
+    /// it is 0 (nothing is charged).
     pub fee: u64,
     pub payer_before: u64,
     pub payer_after: u64,
@@ -127,13 +161,26 @@ pub struct SimOutcome {
     /// QCH-SIMULATE economics): lets the caller show/verify which height the
     /// preview reflects, since fee/economics depend on the round.
     pub round: u64,
+    /// Classifies a failure as "charged nothing" vs "already cost money" so the
+    /// wallet never shows a misleading fee-0 for a tx that would in fact burn
+    /// the byte fee + gas (re-audit QCH-SIMULATE).
+    pub status: SimStatus,
 }
 
 impl SimOutcome {
     /// A rejection produced by the `/simulate` pre-checks (chain_id / size /
     /// signature) BEFORE any dry-run runs — see `Engine::simulate_transaction`.
     pub fn rejected(error: impl Into<String>) -> Self {
-        SimOutcome { ok: false, error: Some(error.into()), fee: 0, payer_before: 0, payer_after: 0, changes: vec![], round: 0 }
+        SimOutcome {
+            ok: false,
+            error: Some(error.into()),
+            fee: 0,
+            payer_before: 0,
+            payer_after: 0,
+            changes: vec![],
+            round: 0,
+            status: SimStatus::RejectedBeforeCharge,
+        }
     }
 }
 
@@ -455,12 +502,19 @@ impl Ledger {
                     payer_after: payer_before,
                     changes: vec![],
                     round,
+                    status: SimStatus::RejectedBeforeCharge,
                 }
             }
         };
         register_standard_programs(&mut sim, economics_v7);
 
         let result = sim.apply_transaction_presigned(tx, fee_collector, round);
+        // The REAL post-execution balance of the payer in the scratch ledger.
+        // This reflects what actually stuck: on success the fee; on a mid-flight
+        // failure the byte fee already taken and/or gas billed by a WASM trap
+        // (`bill_trapped_wasm_fuel` writes the charge to state before returning
+        // Err); on an admission rejection (InsufficientFunds/FeeExceedsLimit)
+        // nothing was written so it equals `payer_before`.
         let payer_after = sim.get_balance(&tx.message.payer);
         let mut changes: Vec<(Pubkey, u64, u64)> = before
             .iter()
@@ -474,8 +528,23 @@ impl Ledger {
             .collect();
         changes.sort_by(|a, b| a.0.cmp(&b.0));
         match result {
-            Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes, round },
-            Err(e) => SimOutcome { ok: false, error: Some(e.to_string()), fee: 0, payer_before, payer_after: payer_before, changes: vec![], round },
+            Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes, round, status: SimStatus::Ok },
+            // FAILURE IS NOT FREE (re-audit QCH-SIMULATE): report the REAL state
+            // the scratch ledger ended in, not a misleading fee-0 / no-change.
+            // The charge that actually stuck is `payer_before - payer_after`; if
+            // it's > 0 the tx failed AFTER costing money (byte fee + gas), so the
+            // wallet can warn the user their funds would be burned. If it's 0 the
+            // tx was rejected before any charge. `changes` keeps the real moves
+            // (e.g. a partial contract effect that was billed before the trap).
+            Err(e) => {
+                let charged = payer_before.saturating_sub(payer_after);
+                let status = if charged > 0 {
+                    SimStatus::ExecutionFailedAfterCharge
+                } else {
+                    SimStatus::RejectedBeforeCharge
+                };
+                SimOutcome { ok: false, error: Some(e.to_string()), fee: charged, payer_before, payer_after, changes, round, status }
+            }
         }
     }
 
@@ -2173,6 +2242,7 @@ mod tests {
         let tx = mk(5 * qchain_core::UNITS_PER_QCH, &alice);
         let sim = l.simulate(&tx, &proposer, 1);
         assert!(sim.ok, "a fundable transfer must simulate ok, got {:?}", sim.error);
+        assert_eq!(sim.status, SimStatus::Ok, "a successful sim is status Ok");
         assert!(sim.fee > 0, "the simulated fee must be non-zero");
         assert_eq!(sim.payer_before, alice_before);
         assert_eq!(sim.payer_after, alice_before - 5 * qchain_core::UNITS_PER_QCH - sim.fee, "predicted payer balance = before - amount - fee");
@@ -2191,6 +2261,12 @@ mod tests {
         let sim2 = l.simulate(&doomed, &proposer, 2);
         assert!(!sim2.ok, "a transfer the payer can't afford must simulate as failing");
         assert!(sim2.error.is_some(), "a failing simulation reports why");
+        // HONEST FAILURE ACCOUNTING (re-audit QCH-SIMULATE): a broke payer can't
+        // even afford the upfront byte fee, so nothing is charged — the outcome is
+        // classified RejectedBeforeCharge with fee 0 and payer_after == before.
+        assert_eq!(sim2.status, SimStatus::RejectedBeforeCharge, "an unaffordable tx is rejected before any charge");
+        assert_eq!(sim2.fee, 0, "a tx rejected before charge costs nothing");
+        assert_eq!(sim2.payer_after, sim2.payer_before, "a rejected-before-charge tx leaves the payer untouched");
     }
 
     /// A v7-economics ledger: shares+index staking (StakingV7Program) + quanto
@@ -4176,6 +4252,55 @@ mod tests {
         let result = ledger.apply_transaction(&call_tx, &validator, 0);
         assert!(result.is_err(), "a WASM instruction naming the same account twice must be rejected (aliasing mint)");
         assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive the rejected aliasing call");
+    }
+
+    /// A contract that BURNS gas in a tight loop and then TRAPS (`unreachable`).
+    /// Real execution charges the consumed fuel via `bill_trapped_wasm_fuel` even
+    /// though the tx fails — so a `/simulate` of a call to it must report a
+    /// NON-ZERO charge and classify it `ExecutionFailedAfterCharge`, not the
+    /// misleading fee-0 the re-audit flagged.
+    const GAS_BURN_TRAP_WAT: &str = r#"
+        (module
+            (func (export "burn") (param i64)
+                (local $i i64)
+                (local.set $i (i64.const 300000))
+                (block
+                    (loop
+                        (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                        (br_if 1 (i64.eqz (local.get $i)))
+                        (br 0)))
+                (unreachable)))
+    "#;
+
+    /// HONEST FAILURE ACCOUNTING (re-audit QCH-SIMULATE, MED/HIGH): a simulation
+    /// of a tx that FAILS after consuming gas must NOT report fee 0 / no change —
+    /// it must show the real money that would be lost (byte fee + billed gas) and
+    /// classify the outcome `ExecutionFailedAfterCharge`, matching what the live
+    /// ledger would actually charge.
+    #[test]
+    fn a_failed_wasm_simulation_reports_the_real_charge_not_zero() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 200_000_000);
+        let program_pk = deploy_wat(&mut ledger, GAS_BURN_TRAP_WAT, "burn", &deployer, &validator);
+
+        let caller = Keypair::generate().unwrap();
+        ledger.credit(caller.pubkey(), 100_000_000);
+        let caller_before = ledger.get_balance(&caller.pubkey());
+
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(&0i64.to_le_bytes());
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![caller.pubkey()], data: call_data };
+        let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+
+        let sim = ledger.simulate(&call_tx, &validator, 0);
+        assert!(!sim.ok, "the trapping call must simulate as failing");
+        assert_eq!(sim.status, SimStatus::ExecutionFailedAfterCharge, "a gas-burning trap fails AFTER being charged");
+        assert!(sim.fee > 0, "a tx that burns gas before trapping must report a NON-ZERO charge, not the old misleading fee-0");
+        assert!(sim.payer_after < sim.payer_before, "the simulated payer balance must reflect the real charge");
+        // The dry-run must NOT have mutated the live ledger.
+        assert_eq!(ledger.get_balance(&caller.pubkey()), caller_before, "simulate never touches the live ledger");
     }
 
     /// SDK v0.2 — estado estructurado (`host_set_data`). Escribe 3 bytes en la

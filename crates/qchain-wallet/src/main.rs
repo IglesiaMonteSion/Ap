@@ -210,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/staking_activity/:address", get(staking_activity))
         .route("/api/validators", get(validators))
         .route("/api/programs", get(programs))
+        .route("/api/program/:address", get(program_ep))
         .route("/api/proposal/:address", get(proposal_ep))
         .route("/api/economics", get(economics))
         .route("/api/faucet", post(faucet_request));
@@ -823,6 +824,24 @@ async fn validators(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiE
 async fn programs(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let resp = st.http.get(format!("{}/programs?limit=1000", st.rpc)).send().await.map_err(ApiError::internal)?;
     let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(body))
+}
+
+/// One deployed contract's metadata (read-only proxy of the node's
+/// `/program/:address`): `code_hash`, `entry_point`, `size_bytes`, `deployer`
+/// (who deployed it) and `balance`. The WalletConnect approval modal shows the
+/// code_hash + deployer so the user can confirm the contract they're authorizing
+/// is the one they expect, not a look-alike (re-audit QCH-WALLET, MED). The
+/// address is parsed to a `Pubkey` before it's interpolated into the node URL
+/// (no path injection).
+async fn program_ep(State(st): State<Arc<AppState>>, Path(address): Path<String>) -> Result<Json<Value>, ApiError> {
+    let pk: Pubkey = address.parse().map_err(|_| ApiError::bad("dirección de contrato inválida".to_string()))?;
+    let resp = st.http.get(format!("{}/program/{}", st.rpc, pk)).send().await.map_err(ApiError::internal)?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(ApiError::internal)?;
+    if !status.is_success() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "contrato no encontrado".to_string()));
+    }
     Ok(Json(body))
 }
 

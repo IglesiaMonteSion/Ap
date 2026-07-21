@@ -224,22 +224,31 @@ async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction
 /// it can show the user the real fee + resulting balances + whether it would
 /// succeed — instead of signing/broadcasting blind. Read-only: runs on a scratch
 /// ledger, never touches consensus/state (see `Ledger::simulate`).
-async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Json<serde_json::Value> {
-    let sim = engine.simulate_transaction(&tx).await;
+async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // `None` = the node is at its simulation-concurrency cap. Respond 429 (Too
+    // Many Requests) so the caller backs off instead of the node queueing an
+    // unbounded backlog of expensive dry-runs (re-audit QCH-SIMULATE DoS).
+    let Some(sim) = engine.simulate_transaction(&tx).await else {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "simulation server busy - retry shortly".to_string()));
+    };
     let changes: Vec<serde_json::Value> = sim
         .changes
         .iter()
         .map(|(pk, before, after)| json!({ "address": pk.to_string(), "before": before.to_string(), "after": after.to_string() }))
         .collect();
-    Json(json!({
+    Ok(Json(json!({
         "ok": sim.ok,
+        // "ok" | "rejected_before_charge" | "execution_failed_after_charge"
+        // (re-audit QCH-SIMULATE): a failed tx is NOT necessarily free — this
+        // tells the wallet whether the shown `fee` would actually be lost.
+        "status": sim.status.as_str(),
         "error": sim.error,
         "fee": sim.fee.to_string(),
         "payer_before": sim.payer_before.to_string(),
         "payer_after": sim.payer_after.to_string(),
         "changes": changes,
         "round": sim.round,
-    }))
+    })))
 }
 
 async fn get_account(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<Account>, (StatusCode, String)> {

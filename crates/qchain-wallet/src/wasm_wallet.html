@@ -3120,20 +3120,43 @@ function bridgeApprove(title, lines, opts){
 }
 
 // Simula una tx ya firmada contra el nodo (dry-run, no compromete nada) vía el
-// proxy read-only de la wallet. Devuelve {ok,error,fee,changes,...} o null si no
-// se pudo simular.
+// proxy read-only de la wallet. Devuelve el resultado {ok,status,fee,changes,...}
+// o, si NO se pudo simular, un marcador {unavailable:true, busy:<429?>} — nunca
+// null — para que el llamador falle CERRADO (re-audit QCH-WALLET fail-open): sin
+// una simulación exitosa NO se habilita "Aprobar y enviar".
 async function bridgeSimulate(txJson){
   try{
     const r=await fetch("/api/simulate",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
-    if(!r.ok) return null;
+    if(r.status===429) return { unavailable:true, busy:true };
+    if(!r.ok) return { unavailable:true, busy:false };
     return await r.json();
-  }catch(e){ return null; }
+  }catch(e){ return { unavailable:true, busy:false }; }
+}
+// ¿Se puede aprobar esta acción de contrato? SÓLO si la simulación existió y dio
+// ok===true (re-audit QCH-WALLET fail-open, HIGH). Simulación no disponible / 429 /
+// fallida ⇒ BLOQUEADO: para un contrato con fondos reales no se firma a ciegas.
+function bridgeSimBlocked(sim){ return !(sim && sim.ok===true); }
+// Mensaje honesto según por qué está (o no) bloqueado.
+function bridgeSimNote(sim){
+  if(sim && sim.ok===true) return null;
+  if(sim && sim.unavailable && sim.busy) return "El nodo está ocupado (429): no se puede simular ahora. NO se firma a ciegas — reintentá en unos segundos.";
+  if(sim && sim.unavailable) return "No se pudo simular la transacción. Por seguridad, para un contrato con fondos NO se firma sin ver el resultado — reintentá.";
+  if(sim && sim.ok===false){
+    let m="La simulación indica que FALLARÍA: "+esc(sim.error||"motivo desconocido")+".";
+    if(sim.status==="execution_failed_after_charge"){
+      try{ m+=" ⚠ Aun fallando, PERDERÍAS "+qchDisp(BigInt(sim.fee||"0"))+" QCH (fee + gas ya cobrados)."; }catch(e){}
+    }
+    return m+" No se enviará.";
+  }
+  return "No se pudo simular. No se firmará a ciegas.";
 }
 // Filas de detalle a partir de una simulación: fee REAL + cada cambio de saldo
 // (dirección → antes/después), para que el usuario vea EXACTAMENTE qué mueve la tx.
 function bridgeSimLines(sim){
   const out=[];
-  if(!sim) return out;
+  // Only a real, successful simulation produces balance-change detail. A marker
+  // ({unavailable:true}) or a failed sim must NOT render a fake "0" fee.
+  if(!sim || sim.ok!==true) return out;
   try{ out.push(["Fee real", qchDisp(BigInt(sim.fee||"0"))]); }catch(e){}
   (sim.changes||[]).forEach(c=>{
     try{ out.push(["Δ "+short(c.address), qchDisp(BigInt(c.before))+" → "+qchDisp(BigInt(c.after))]); }catch(e){}
@@ -3177,15 +3200,17 @@ async function bridgeSignAndSubmit(tx){
     const paddr=fp.addr;
     const txJson=signDeployProgram(SEED, fp.index, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000));
     const sim=await bridgeSimulate(txJson);
-    const blocked = !!(sim && sim.ok===false);
-    const note = blocked ? ("La simulación indica que FALLARÍA: "+(sim.error||"error")) : (sim?null:"No se pudo simular; se muestra el fee estimado. Revisá con cuidado antes de aprobar.");
+    // FAIL-CLOSED (re-audit QCH-WALLET, HIGH): sólo una simulación ok===true
+    // habilita aprobar. No disponible / 429 / fallida ⇒ bloqueado.
+    const blocked = bridgeSimBlocked(sim);
+    const note = bridgeSimNote(sim);
     const lines=[
       ["Acción","Desplegar un contrato WASM"],
       ["Tamaño", kb+" KB"],
       ["Entry point", tx.entryPoint||"run"],
       ["Dirección del contrato", paddr],
       ["Firmando como", short(me)],
-    ].concat(sim?bridgeSimLines(sim):[["Fee de red aprox", qchDisp(bfpb*BigInt(bytes.length+300))]]);
+    ].concat(bridgeSimLines(sim));
     const ok=await bridgeApprove("Desplegar contrato", lines, {blocked, note});
     if(!ok) return { rejected:true };
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
@@ -3201,15 +3226,30 @@ async function bridgeSignAndSubmit(tx){
     // se debita y hacia dónde) — cierra la firma ciega (re-audit QCH-WALLET).
     const txJson=signCallProgram(SEED, pid, accountsCsv, argsCsv, nonce, chainId, BigInt(node.fee_limit||10000000));
     const sim=await bridgeSimulate(txJson);
-    const blocked = !!(sim && sim.ok===false);
-    const note = blocked ? ("La simulación indica que FALLARÍA: "+(sim.error||"error")) : (sim?null:"No se pudo simular; revisá con cuidado antes de aprobar (no se muestran los cambios de saldo reales).");
+    // FAIL-CLOSED (re-audit QCH-WALLET, HIGH): sólo una simulación ok===true habilita aprobar.
+    const blocked = bridgeSimBlocked(sim);
+    let note = bridgeSimNote(sim);
+    // PROCEDENCIA DEL CONTRATO (re-audit QCH-WALLET, MED): mostrar el code_hash y
+    // el deployer del contrato que se va a llamar, para que el usuario confirme
+    // que la dirección es el proyecto que cree, no un look-alike. El code_hash lo
+    // FUERZA el nodo contra el bytecode ejecutado (v6.26.2). Si el contrato no
+    // existe on-chain, avisar (llamar una dirección sin programa fallaría igual).
+    let prog=null;
+    try{ prog=await api("/api/program/"+encodeURIComponent(pid)); }catch(e){ prog=null; }
+    const provenance = prog ? [
+      ["Code hash", short(prog.code_hash||"")],
+      ["Desplegado por", short(prog.deployer||"")],
+      ["Tamaño del código", ((Number(prog.size_bytes||0))/1024).toFixed(1)+" KB"],
+    ] : [["Contrato","⚠ NO existe un contrato desplegado en esta dirección"]];
+    if(!prog && !note) note="No hay un contrato desplegado en esa dirección — la llamada fallaría. Verificá la dirección.";
     const lines=[
       ["Acción","Llamar un contrato"],
       ["Contrato", pid],
+    ].concat(provenance).concat([
       ["Cuentas", accountsCsv||"—"],
       ["Args (i64)", argsCsv||"—"],
       ["Firmando como", short(me)],
-    ].concat(sim?bridgeSimLines(sim):[["Fee de red aprox", qchDisp(bfpb*6000n)]]);
+    ]).concat(bridgeSimLines(sim));
     const ok=await bridgeApprove("Interactuar con contrato", lines, {blocked, note});
     if(!ok) return { rejected:true };
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});

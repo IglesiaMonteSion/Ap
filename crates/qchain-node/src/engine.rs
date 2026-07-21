@@ -367,13 +367,20 @@ const MAX_CONCURRENT_SNAPSHOTS: usize = 2;
 static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SNAPSHOTS);
 
 /// Caps concurrent `/simulate` dry-runs (re-audit QCH-SIMULATE DoS). A dry-run
-/// can compile+run WASM and holds the state lock while seeding the scratch
-/// store, so an unbounded fan-out of concurrent simulations could pin cores and
-/// starve consensus of the lock. Excess callers queue for a permit, same pattern
-/// as `MAX_CONCURRENT_STARK_PROOFS`. Combined with the mandatory
-/// chain_id/size/signature gate applied BEFORE this permit, only a
-/// genuinely-signed, chain-bound tx ever reaches the expensive dry-run, and at
-/// most this many at once.
+/// deserializes the tx, verifies its hybrid PQC signature, and can compile+run
+/// WASM, so an unbounded fan-out could pin cores and starve consensus of the
+/// lock. This permit is taken with `try_acquire` (NON-blocking) and BEFORE the
+/// expensive signature verification, so:
+///   - a caller who finds all permits busy gets an immediate 429 instead of
+///     QUEUEING (bounded waiting = zero — closing the "reuse one public signed
+///     tx to fill an unbounded wait queue" replay vector the re-audit flagged);
+///   - the costly PQC verify + WASM run only ever happens while holding a permit,
+///     so at most this many run at once regardless of how many identical signed
+///     transactions an attacker replays.
+///
+/// The cheap chain_id/size checks stay BEFORE the permit (free field reads —
+/// junk for another chain is rejected without consuming a slot). For a public
+/// RPC, also enable the per-IP rate limiter (`rpc_rate_limit_per_10s`).
 const MAX_CONCURRENT_SIMULATIONS: usize = 4;
 static SIMULATE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SIMULATIONS);
 
@@ -2001,30 +2008,38 @@ impl Engine {
     /// fixed DUMMY distinct from the payer — never the payer. Using the payer
     /// would credit the validator commission back to them, understating the true
     /// cost shown in the preview.
-    pub async fn simulate_transaction(&self, tx: &qchain_core::Transaction) -> qchain_execution::SimOutcome {
+    /// Returns `None` when the server is at its simulation-concurrency cap (the
+    /// caller should get an HTTP 429, NOT queue) — see `SIMULATE_PERMITS`.
+    /// `Some(outcome)` is a real answer (which may itself be `ok:false`).
+    pub async fn simulate_transaction(&self, tx: &qchain_core::Transaction) -> Option<qchain_execution::SimOutcome> {
         // A placeholder validator address that is never a real payer (no keypair
         // derives it) and is not a protocol singleton, so it can safely absorb
         // the simulated commission without touching the payer's outcome.
         const SIM_FEE_COLLECTOR: qchain_crypto::Pubkey = qchain_crypto::Pubkey::new([0xFDu8; 32]);
-        // DoS GATE (re-audit QCH-SIMULATE, HIGH): cheap checks BEFORE any lock or
-        // expensive work — reject a tx for another chain, an oversized tx, or one
-        // whose signature doesn't verify (the same gate admission applies). So
-        // the scratch-ledger dry-run (which can compile+run WASM) only ever runs
-        // for a genuinely-signed, chain-bound, size-bounded transaction, closing
-        // the "unauthenticated free arbitrary WASM under the state lock" hole.
+        // CHEAP gate BEFORE any permit or crypto (re-audit QCH-SIMULATE): reject a
+        // tx for another chain or an oversized one with free field reads, so junk
+        // never even consumes a concurrency slot.
         if tx.message.chain_id != self.chain_id {
-            return qchain_execution::SimOutcome::rejected("transaction's chain_id does not match this network");
+            return Some(qchain_execution::SimOutcome::rejected("transaction's chain_id does not match this network"));
         }
         if tx.byte_size() > MAX_TRANSACTION_BYTES {
-            return qchain_execution::SimOutcome::rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size()));
+            return Some(qchain_execution::SimOutcome::rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size())));
         }
+        // ADMISSION SEMAPHORE — BEFORE the expensive signature verify (re-audit
+        // QCH-SIMULATE DoS/replay, HIGH): `try_acquire` is non-blocking, so when
+        // all permits are busy we return `None` (→ 429) instead of queueing an
+        // unbounded backlog. Because the permit is held ACROSS the PQC verify +
+        // dry-run, replaying one public signed tv can never spin up more than
+        // `MAX_CONCURRENT_SIMULATIONS` costly verifications at once.
+        let Ok(_permit) = SIMULATE_PERMITS.try_acquire() else {
+            return None;
+        };
+        // Verify the hybrid PQC signature now that we hold a permit (same admission
+        // gate a broadcast tx faces — only a genuinely-signed tx reaches the
+        // scratch-ledger dry-run that can compile+run WASM).
         if !tx.verify_signature() {
-            return qchain_execution::SimOutcome::rejected("invalid transaction signature");
+            return Some(qchain_execution::SimOutcome::rejected("invalid transaction signature"));
         }
-        // Bound concurrent dry-runs so a flood of validly-signed simulations
-        // can't pin every core (excess callers queue for a permit). Held for the
-        // whole off-lock dry-run so the CPU cap is real.
-        let _permit = SIMULATE_PERMITS.acquire().await;
         // LATENCY (re-audit QCH-SIMULATE): take only a CHEAP snapshot under the
         // consensus lock, then RELEASE it — the dry-run itself can compile and
         // run arbitrary WASM (a DeployProgram+call preview), which must never
@@ -2037,9 +2052,10 @@ impl Engine {
             (state.ledger.simulate_snapshot(tx, &SIM_FEE_COLLECTOR), round)
         };
         let tx = tx.clone();
-        tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
+        let outcome = tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
             .await
-            .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"))
+            .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"));
+        Some(outcome)
     }
 
     /// v7 reward/unbonding timing for the wallet's staking progress bars:

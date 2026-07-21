@@ -26,8 +26,8 @@
 #![no_std]
 
 use qchain_sdk::{
-    abort, deposit, entrypoint, get_data, log, pda_transfer, pubkey, read_u64, require, require_signer, set_data,
-    use_pda, write_u64,
+    abort, deposit, entrypoint, get_data, log, pda_transfer, pubkey, read_u64, require, require_deployer,
+    require_signer, set_data, use_pda, write_u64,
 };
 
 const VAULT_SEED: &[u8] = b"vault";
@@ -42,10 +42,17 @@ fn dispatch([sel, x, _y, _z]: [i64; 4]) {
     let initialized = n >= STATE_LEN;
 
     match sel {
-        // init: fija al firmante como admin. Sólo una vez.
+        // init: fija al DEPLOYER como admin. Sólo una vez, y SÓLO el deployer.
+        // ANTI INIT-TAKEOVER (re-auditoría): sin `require_deployer()`, cualquier
+        // tercero podía llamar `init` primero tras el despliegue y quedar como
+        // admin de la bóveda (y luego drenar todos los depósitos). `require_deployer`
+        // exige que accounts[0] sea el firmante Y la dirección que desplegó el
+        // contrato (ligada a la dirección del programa por construcción), cerrando
+        // el front-run. Reemplaza al viejo `require_signer(0)` (que sólo probaba
+        // que alguien firmó, no QUIÉN).
         1 => {
             require!(!initialized, "la bóveda ya está inicializada");
-            require_signer(0);
+            require_deployer();
             let admin = pubkey(0);
             buf[0..32].copy_from_slice(&admin);
             write_u64(&mut buf, 32, 0); // total_deposited = 0
