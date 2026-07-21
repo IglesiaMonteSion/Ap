@@ -143,7 +143,9 @@ impl SimValidator {
         // One signature, reused for both the wire-level `author_signature`
         // and this validator's own self-vote - mirrors
         // `qchain-node::engine::propose_round`'s identical reuse.
-        let sig = self.keypair.sign(&digest[..]).expect("signing never fails in this harness");
+        // #187: envelope de voto etiquetado por dominio, idéntico al real
+        // (`qchain-node::engine`) para que el DST siga siendo fiel.
+        let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]).expect("signing never fails in this harness");
         self.own_pending_vertex = Some((vertex.clone(), sig.clone()));
         self.next_round = round + 1;
         self.voted_for.insert((round, self.id), digest);
@@ -160,7 +162,7 @@ impl SimValidator {
 
         if self.behavior == ByzantineBehavior::Equivocator && !peers.is_empty() {
             let evil_vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [1u8; 32])], parents };
-            let evil_signature = self.keypair.sign(&evil_vertex.digest()[..]).expect("signing never fails in this harness");
+            let evil_signature = qchain_crypto::sign_vertex_vote(&self.keypair, &evil_vertex.digest()[..]).expect("signing never fails in this harness");
             let half = peers.len() / 2;
             for &peer in &peers[..half.max(1)] {
                 out.push((peer, SimMessage::VertexProposal { vertex: evil_vertex.clone(), author_signature: evil_signature.clone() }));
@@ -219,7 +221,7 @@ impl SimValidator {
                     return vec![];
                 };
                 let digest = vertex.digest();
-                if !qchain_crypto::verify(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &digest[..], &author_signature) {
                     return vec![];
                 }
                 let key = (vertex.round, vertex.author);
@@ -253,7 +255,7 @@ impl SimValidator {
                         self.voted_for.insert(key, digest);
                     }
                 }
-                let sig = self.keypair.sign(&digest[..]).expect("signing never fails in this harness");
+                let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]).expect("signing never fails in this harness");
                 out.push((from, SimMessage::Vote { vertex_digest: digest, signature: sig }));
                 out
             }

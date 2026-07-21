@@ -42,7 +42,9 @@ pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool
         let Some(info) = validators.get(validator_id) else {
             continue;
         };
-        if qchain_crypto::verify(&info.pubkey_bundle, &digest[..], sig) {
+        // #187: la firma de un voto va etiquetada por dominio
+        // (`VERTEX_VOTE_V1 ‖ digest`), no sobre el digest pelado.
+        if qchain_crypto::verify_vertex_vote(&info.pubkey_bundle, &digest[..], sig) {
             // saturating_add for policy consistency (release builds run with
             // overflow-checks=true, where a plain `+` overflow is a
             // deterministic panic-halt). Unreachable here - this sums a subset
@@ -294,7 +296,7 @@ mod tests {
     fn certify(vertex: Vertex, signers: &[TestValidator]) -> Certificate {
         let digest = vertex.digest();
         let signatures: Vec<(qchain_core::ValidatorId, MultiSignature)> =
-            signers.iter().map(|v| (v.id, v.keypair.sign(&digest[..]).unwrap())).collect();
+            signers.iter().map(|v| (v.id, qchain_crypto::sign_vertex_vote(&v.keypair, &digest[..]).unwrap())).collect();
         Certificate { vertex, signatures }
     }
 
@@ -491,7 +493,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != silent_idx)
-                    .map(|(_, signer)| (signer.id, signer.keypair.sign(&digest[..]).unwrap()))
+                    .map(|(_, signer)| (signer.id, qchain_crypto::sign_vertex_vote(&signer.keypair, &digest[..]).unwrap()))
                     .collect();
                 let cert = Certificate { vertex, signatures };
                 this_round_digests.push(dag.insert(cert));

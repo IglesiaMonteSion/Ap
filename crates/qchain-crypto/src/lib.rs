@@ -371,6 +371,46 @@ pub fn verify(bundle: &PublicKeyBundle, msg: &[u8], signature: &MultiSignature) 
     true
 }
 
+/// Firma `domain ‖ msg` con el keypair (**envelope etiquetado por dominio**,
+/// tarea #187, QCH-CRY-001/3.6). El prefijo de dominio de largo fijo hace la
+/// preimagen inequívoca: dos objetos con dominios distintos NUNCA comparten
+/// preimagen, así una firma de un tipo no puede reinterpretarse como la de otro
+/// (defensa contra confusión entre protocolos), incluso si sus mensajes crudos
+/// coincidieran. La concatenación es segura porque `domain` es una constante
+/// conocida de largo fijo que TODO verificador antepone idéntico.
+pub fn sign_domain(kp: &Keypair, domain: &[u8], msg: &[u8]) -> anyhow::Result<MultiSignature> {
+    let mut buf = Vec::with_capacity(domain.len() + msg.len());
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(msg);
+    kp.sign(&buf)
+}
+
+/// Verifica una firma sobre `domain ‖ msg` (contraparte de [`sign_domain`]).
+pub fn verify_domain(bundle: &PublicKeyBundle, domain: &[u8], msg: &[u8], signature: &MultiSignature) -> bool {
+    let mut buf = Vec::with_capacity(domain.len() + msg.len());
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(msg);
+    verify(bundle, &buf, signature)
+}
+
+/// Firma la **atestación de un voto/vértice** sobre el digest de un vértice
+/// (tarea #187): firma `VERTEX_VOTE_V1 ‖ digest`. Es el ÚNICO punto por el que
+/// debe pasar todo firmante de un vértice — el autor en su auto-voto y cada
+/// votante — para que un `Certificate` trate todas las firmas de forma uniforme
+/// y ninguna se pueda confundir con una firma de transacción. La evidencia de
+/// equivocación se verifica bajo el mismo dominio (sus firmas SON votos del
+/// autor). `digest` es el `Vertex::digest()` de `qchain-core` (32 B) — se toma
+/// como `&[u8]` para no acoplar `qchain-crypto` a `qchain-core`.
+pub fn sign_vertex_vote(kp: &Keypair, digest: &[u8]) -> anyhow::Result<MultiSignature> {
+    sign_domain(kp, domains::VERTEX_VOTE_V1, digest)
+}
+
+/// Verifica una firma de voto/vértice sobre `VERTEX_VOTE_V1 ‖ digest`
+/// (contraparte de [`sign_vertex_vote`]).
+pub fn verify_vertex_vote(bundle: &PublicKeyBundle, digest: &[u8], signature: &MultiSignature) -> bool {
+    verify_domain(bundle, domains::VERTEX_VOTE_V1, digest, signature)
+}
+
 /// Verify just the Ed25519 half against a raw 32-byte public key. Exposed
 /// standalone (not just via the hybrid `verify`) because contracts doing
 /// custom authorization logic (e.g. a smart-contract multisig) may need to
@@ -526,6 +566,31 @@ mod tests {
         let kp = Keypair::generate().unwrap();
         let sig = kp.sign(b"hello qchain").unwrap();
         assert!(!verify(&kp.public_key_bundle(), b"goodbye qchain", &sig));
+    }
+
+    /// #187: el envelope etiquetado por dominio hace que una firma de un dominio
+    /// NUNCA verifique bajo otro, aunque el mensaje crudo sea idéntico — la
+    /// defensa contra confusión entre protocolos (tx vs voto/vértice).
+    #[test]
+    fn domain_tagged_signatures_do_not_cross_verify() {
+        let kp = Keypair::generate().unwrap();
+        let bundle = kp.public_key_bundle();
+        let digest = [7u8; 32]; // mismo mensaje crudo en ambos dominios
+
+        // Firmada como transacción, NO verifica como voto de vértice (y vice).
+        let tx_sig = sign_domain(&kp, domains::TX_SIG_V1, &digest).unwrap();
+        assert!(verify_domain(&bundle, domains::TX_SIG_V1, &digest, &tx_sig));
+        assert!(!verify_vertex_vote(&bundle, &digest, &tx_sig), "una firma de tx no debe verificar como voto");
+
+        // Firmada como voto de vértice, NO verifica como transacción.
+        let vote_sig = sign_vertex_vote(&kp, &digest).unwrap();
+        assert!(verify_vertex_vote(&bundle, &digest, &vote_sig));
+        assert!(!verify_domain(&bundle, domains::TX_SIG_V1, &digest, &vote_sig), "un voto no debe verificar como tx");
+
+        // Una firma cruda sobre el digest pelado (sin dominio) tampoco cuenta
+        // como voto — el dominio es obligatorio.
+        let raw_sig = kp.sign(&digest).unwrap();
+        assert!(!verify_vertex_vote(&bundle, &digest, &raw_sig), "una firma sin dominio no debe verificar como voto");
     }
 
     #[test]

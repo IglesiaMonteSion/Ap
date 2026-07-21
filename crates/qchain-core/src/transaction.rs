@@ -135,8 +135,11 @@ impl Transaction {
             valid_until_round,
             instructions,
         };
+        // Envelope etiquetado por dominio (#187): se firma `TX_SIG_V1 ‖ borsh(msg)`
+        // (antes se firmaba `borsh(msg)` pelado) → una firma de tx nunca puede
+        // reinterpretarse como la de un voto/vértice. Wire-breaking de FIRMA.
         let bytes = borsh::to_vec(&message).expect("message always serializes");
-        let signature = payer.sign(&bytes)?;
+        let signature = qchain_crypto::sign_domain(payer, qchain_crypto::domains::TX_SIG_V1, &bytes)?;
         Ok(Transaction { message, signature })
     }
 
@@ -150,7 +153,14 @@ impl Transaction {
             return false;
         }
         match borsh::to_vec(&self.message) {
-            Ok(bytes) => qchain_crypto::verify(&self.message.payer_keys, &bytes, &self.signature),
+            // Verifica sobre `TX_SIG_V1 ‖ borsh(msg)` — el mismo envelope que
+            // firma `new_signed_full` (#187).
+            Ok(bytes) => qchain_crypto::verify_domain(
+                &self.message.payer_keys,
+                qchain_crypto::domains::TX_SIG_V1,
+                &bytes,
+                &self.signature,
+            ),
             Err(_) => false,
         }
     }
@@ -302,6 +312,25 @@ mod tests {
         assert!(borsh::from_slice::<Transaction>(&trailing).is_err(), "Borsh debe rechazar bytes sobrantes");
         // Truncada → rechazada.
         assert!(borsh::from_slice::<Transaction>(&bytes[..bytes.len() - 1]).is_err(), "una entrada truncada debe rechazarse");
+    }
+
+    /// #187: la firma de una transacción real NO verifica como un voto de
+    /// vértice sobre los mismos bytes (ni al revés) — la separación tx/consenso
+    /// ahora es por dominio explícito, no sólo por longitud/estructura.
+    #[test]
+    fn tx_signature_is_not_a_vertex_vote() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let ix = sample_ix(payer.pubkey(), to);
+        let tx = Transaction::new_signed(&payer, 0, [0u8; 32], 1_000, vec![ix]).unwrap();
+        assert!(tx.verify_signature());
+        let msg_bytes = borsh::to_vec(&tx.message).unwrap();
+        // La firma de la tx (dominio TX_SIG_V1) no verifica como voto de vértice
+        // (dominio VERTEX_VOTE_V1) sobre los mismos bytes del mensaje.
+        assert!(
+            !qchain_crypto::verify_vertex_vote(&tx.message.payer_keys, &msg_bytes, &tx.signature),
+            "una firma de tx no debe pasar como voto de vértice"
+        );
     }
 
     #[test]

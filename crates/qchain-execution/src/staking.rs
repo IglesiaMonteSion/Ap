@@ -526,10 +526,13 @@ impl NativeProgram for StakingProgram {
                 // accusation: both signatures must independently verify
                 // under the accused's own registered bundle, each over its
                 // own vertex's digest.
-                if !qchain_crypto::verify(&evidence.author_bundle, &evidence.vertex_a.digest(), &evidence.signature_a) {
+                // #187: las firmas de la evidencia SON votos del autor sobre
+                // dos vértices en conflicto → se verifican bajo el mismo dominio
+                // `VERTEX_VOTE_V1` que produjo el proponente.
+                if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_a.digest(), &evidence.signature_a) {
                     return Err(ExecError::ProgramError("evidence signature_a does not verify".into()));
                 }
-                if !qchain_crypto::verify(&evidence.author_bundle, &evidence.vertex_b.digest(), &evidence.signature_b) {
+                if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_b.digest(), &evidence.signature_b) {
                     return Err(ExecError::ProgramError("evidence signature_b does not verify".into()));
                 }
 
@@ -1106,8 +1109,8 @@ mod tests {
     fn conflicting_evidence(author_kp: &qchain_crypto::Keypair, round: qchain_core::Round) -> EquivocationEvidence {
         let vertex_a = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
         let vertex_b = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
-        let signature_a = author_kp.sign(&vertex_a.digest()[..]).unwrap();
-        let signature_b = author_kp.sign(&vertex_b.digest()[..]).unwrap();
+        let signature_a = qchain_crypto::sign_vertex_vote(author_kp, &vertex_a.digest()[..]).unwrap();
+        let signature_b = qchain_crypto::sign_vertex_vote(author_kp, &vertex_b.digest()[..]).unwrap();
         EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: author_kp.public_key_bundle() }
     }
 
@@ -1372,8 +1375,8 @@ mod tests {
 
         let vertex_a = qchain_core::Vertex { round: 7, author: validator, batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
         let vertex_b = qchain_core::Vertex { round: 8, author: validator, batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
-        let signature_a = validator_kp.sign(&vertex_a.digest()[..]).unwrap();
-        let signature_b = validator_kp.sign(&vertex_b.digest()[..]).unwrap();
+        let signature_a = qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_a.digest()[..]).unwrap();
+        let signature_b = qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_b.digest()[..]).unwrap();
         let evidence = EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: validator_kp.public_key_bundle() };
         let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
         let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);

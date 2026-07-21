@@ -2599,7 +2599,7 @@ impl Engine {
                     tracing::warn!("dropping vertex proposal from unknown validator {from}");
                     return;
                 };
-                if !qchain_crypto::verify(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &digest[..], &author_signature) {
                     tracing::warn!("dropping vertex proposal from {from} - author_signature does not verify");
                     return;
                 }
@@ -2769,7 +2769,7 @@ impl Engine {
                     tracing::warn!("dropping vote from unknown validator {from}");
                     return;
                 };
-                if !qchain_crypto::verify(&voter_info.pubkey_bundle, &vertex_digest[..], &signature) {
+                if !qchain_crypto::verify_vertex_vote(&voter_info.pubkey_bundle, &vertex_digest[..], &signature) {
                     tracing::warn!("dropping vote from {from} whose signature does not verify over the voted digest");
                     return;
                 }
@@ -2982,7 +2982,8 @@ impl Engine {
     /// the vertex's worker batches are locally available (the availability
     /// gate).
     async fn cast_vote(&self, digest: Digest, to: ValidatorId) {
-        let sig = match self.keypair.sign(&digest[..]) {
+        // #187: el voto va etiquetado por dominio (`VERTEX_VOTE_V1 ‖ digest`).
+        let sig = match qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to sign vote: {e}");
@@ -3985,7 +3986,9 @@ impl Engine {
             // are mathematically the same thing: this validator's
             // signature over this vertex's digest.
             let digest = vertex.digest();
-            let sig = match self.keypair.sign(&digest[..]) {
+            // #187: la firma-de-autor es el auto-voto del proponente sobre su
+            // propio vértice → mismo dominio `VERTEX_VOTE_V1` que cualquier voto.
+            let sig = match qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to sign proposed vertex: {e}");
