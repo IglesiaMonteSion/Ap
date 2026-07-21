@@ -1357,6 +1357,50 @@ async function decryptSeed(store, password){
   return new Uint8Array(pt);
 }
 
+// --- Endurecimiento de la wallet (tarea #197) ---
+// Cifra la semilla Y re-descifra para CONFIRMAR el round-trip antes de entregar
+// el respaldo — así un archivo corrupto/mal cifrado nunca se le da al usuario
+// (si esto no round-trippea, el respaldo sería irrecuperable). AES-GCM ya
+// autentica, pero esta re-decodificación explícita atrapa cualquier bug de
+// codificación/serialización del blob.
+async function encryptSeedConfirmed(seed, password){
+  const store=await encryptSeed(seed, password);
+  const back=await decryptSeed(store, password);
+  if(back.length!==seed.length || !back.every((b,i)=>b===seed[i]))
+    throw new Error("el respaldo cifrado no se pudo re-descifrar — abortado por seguridad");
+  return store;
+}
+
+// Rechaza semillas OBVIAMENTE débiles al RESTAURAR una semilla provista por el
+// usuario (una creada con getRandomValues nunca es débil). No pretende medir
+// entropía real (cualquier 32 bytes es una clave válida), solo atrapar los
+// errores catastróficos: todo ceros, todo el mismo byte, o 0,1,2,…,31.
+function isWeakSeed(seed){
+  if(!seed || seed.length!==32) return true;
+  if(seed.every(b=>b===seed[0])) return true;          // todo el mismo byte (incl. todo 0)
+  if(seed.every((b,i)=>b===(i&0xff))) return true;     // 0,1,2,…,31
+  if(seed.every((b,i)=>b===((31-i)&0xff))) return true;// 31,30,…,0
+  return false;
+}
+
+// Lockout anti fuerza-bruta del desbloqueo local: tras varios intentos fallidos
+// de contraseña se impone una espera creciente antes del próximo intento. El
+// atacante que ya tiene el blob cifrado igual paga el PBKDF2 de 600k por cada
+// intento, pero esto frena además un ataque interactivo en el propio navegador.
+const LOCK_KEY="qchain_unlock_lock_v1", LOCK_FREE=4; // 4 intentos libres, luego backoff
+function unlockLockState(){ try{ return JSON.parse(localStorage.getItem(LOCK_KEY))||{fails:0,until:0}; }catch(e){ return {fails:0,until:0}; } }
+function unlockLockedMs(){ const s=unlockLockState(); return Math.max(0, (s.until||0)-Date.now()); }
+function noteUnlockFail(){
+  const s=unlockLockState(); s.fails=(s.fails||0)+1;
+  if(s.fails>LOCK_FREE){
+    const over=s.fails-LOCK_FREE;
+    const wait=Math.min(5*60*1000, 5000*Math.pow(2, Math.min(over-1,6))); // 5s,10s,20s…máx 5min
+    s.until=Date.now()+wait;
+  }
+  localStorage.setItem(LOCK_KEY, JSON.stringify(s));
+}
+function clearUnlockFails(){ localStorage.removeItem(LOCK_KEY); }
+
 // ---- Shamir Secret Sharing sobre GF(256) ----
 // Parte la semilla en N fragmentos donde K reconstruyen y K-1 no revelan NADA.
 // Todo pasa en el navegador; la semilla nunca sale de acá. Formato de fragmento:
@@ -1973,7 +2017,7 @@ async function downloadEncryptedBackup(){
   let pw=PW;
   if(!pw){ pw=prompt("Contraseña para cifrar el respaldo (mínimo 8):")||""; if(pw.length<8){ toast("contraseña muy corta"); return; } }
   const addr=master0Addr();   // identidad de la wallet (cuenta 0)
-  const store=await encryptSeed(MASTER, pw);   // { v, salt, iv, ct } — respalda la MAESTRA (todas las cuentas)
+  const store=await encryptSeedConfirmed(MASTER, pw);   // re-descifra para confirmar el round-trip (#197) — nunca entrega un respaldo irrecuperable
   const data=JSON.stringify({ type:"qchain-wallet-encrypted-backup", version:2, address:addr,
     kdf:"PBKDF2-SHA256", cipher:"AES-256-GCM", ...store,
     note:"Respaldo CIFRADO de una wallet QCHAIN no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
@@ -1995,8 +2039,9 @@ $("c-btn").onclick=async()=>{
   $("c-btn").disabled=true;
   try{
     const seed=crypto.getRandomValues(new Uint8Array(32));       // entropía real del navegador
-    const store=await encryptSeed(seed, p);
+    const store=await encryptSeedConfirmed(seed, p);             // re-descifra para confirmar el round-trip (#197)
     localStorage.setItem(LS_KEY, JSON.stringify(store));
+    clearUnlockFails();
     MASTER=seed; PW=p; disableBiometric(); bootAccounts();
     showView("backup");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo crear: "+e.message; }
@@ -2064,8 +2109,12 @@ $("i-btn").onclick=async()=>{
       seed=await seedFromSeedMode(msg, p);
     }
     if(p.length<8) throw new Error("la contraseña debe tener al menos 8 caracteres");
-    const store=await encryptSeed(seed, p);
+    // Rechazo de semillas obviamente débiles (#197) — solo al RESTAURAR (una
+    // creada por getRandomValues nunca lo es).
+    if(isWeakSeed(seed)) throw new Error("esa semilla es insegura (todo ceros / repetida / secuencial) — no se restaura");
+    const store=await encryptSeedConfirmed(seed, p);   // re-descifra para confirmar el round-trip
     localStorage.setItem(LS_KEY, JSON.stringify(store));
+    clearUnlockFails();
     MASTER=seed; PW=p; disableBiometric(); bootAccounts();
     toast("wallet restaurada"); showView("home");
   }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
@@ -2113,16 +2162,25 @@ $("shamir-dl").onclick=()=>{
 
 // desbloquear
 $("u-btn").onclick=async()=>{
-  const p=$("u-pass").value, msg=$("u-msg"); msg.className="msg"; msg.textContent="";
+  const p=$("u-pass").value, msg=$("u-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="";
+  // Lockout anti fuerza-bruta (#197): si hay una espera activa, no intentar.
+  const lockedMs=unlockLockedMs();
+  if(lockedMs>0){ msg.className="msg err"; msg.textContent="demasiados intentos — esperá "+Math.ceil(lockedMs/1000)+" s"; return; }
   $("u-btn").disabled=true;
   try{
     const store=JSON.parse(localStorage.getItem(LS_KEY));
     MASTER=await decryptSeed(store, p);
     PW=p;
+    clearUnlockFails();
     bootAccounts();
     $("u-pass").value="";
     showView("home");
-  }catch(e){ msg.className="msg err"; msg.textContent="contraseña incorrecta"; }
+  }catch(e){
+    noteUnlockFail();
+    const w=unlockLockedMs();
+    msg.className="msg err";
+    msg.textContent = w>0 ? ("contraseña incorrecta — demasiados intentos, esperá "+Math.ceil(w/1000)+" s") : "contraseña incorrecta";
+  }
   $("u-btn").disabled=false;
 };
 // Muestra el botón de biométrico en la pantalla de bloqueo solo si está activado.
