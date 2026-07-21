@@ -312,6 +312,8 @@ mod tests {
             self.credit(VALIDATOR_BOND_ESCROW_ID, VALIDATOR_BOND_ATOMS);
             self.registry.validators.push(ValidatorV7Entry {
                 address: addr,
+                operator_address: addr,
+                withdrawal_address: addr,
                 moniker: format!("v{}", addr.0[0]),
                 pubkey_bundle: PublicKeyBundle { components: vec![] },
                 p2p_address: "1.2.3.4:9000".into(),

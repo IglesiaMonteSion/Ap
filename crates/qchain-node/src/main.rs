@@ -462,8 +462,16 @@ async fn main() -> anyhow::Result<()> {
                     moniker = format!("founder-{i}-{k}");
                 }
                 used_monikers.insert(moniker.clone());
+                let consensus_addr = v.pubkey_bundle.to_address();
                 founders.push(ValidatorV7Entry {
-                    address: v.pubkey_bundle.to_address(),
+                    address: consensus_addr,
+                    // At genesis a founder controls its own consensus key (no cold
+                    // operator was posted), so the operator defaults to the consensus
+                    // address; the WITHDRAWAL address routes bond + fee earnings to the
+                    // configured cold address (#193-B) when set, else the consensus key
+                    // (byte-identical to a network that doesn't separate the funds key).
+                    operator_address: consensus_addr,
+                    withdrawal_address: v.withdrawal_address.unwrap_or(consensus_addr),
                     moniker,
                     pubkey_bundle: v.pubkey_bundle.clone(),
                     p2p_address: v.addr.to_string(),

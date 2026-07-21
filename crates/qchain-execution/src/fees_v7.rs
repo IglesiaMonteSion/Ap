@@ -59,9 +59,15 @@ pub fn is_eligible(entry: &ValidatorV7Entry, quanto: u64) -> bool {
         && entry.participation_bps() >= VALIDATOR_MIN_PARTICIPATION_BPS
 }
 
-/// The eligible validator addresses for `quanto`, in registry order (deterministic).
+/// The eligible validators' **withdrawal (cold) addresses** for `quanto`, in
+/// registry order (deterministic). The fee commissions accrue to the offline
+/// withdrawal address — NOT the online consensus key — so a leak of the block-
+/// signing key can't spend what the validator earned (role separation, #193-B).
+/// (`withdrawal_address` defaults to the operator at registration; genesis
+/// founders default it to their own consensus address unless a cold withdrawal
+/// address is configured.)
 pub fn eligible_addresses(registry: &ValidatorV7Registry, quanto: u64) -> Vec<Pubkey> {
-    registry.validators.iter().filter(|v| is_eligible(v, quanto)).map(|v| v.address).collect()
+    registry.validators.iter().filter(|v| is_eligible(v, quanto)).map(|v| v.withdrawal_address).collect()
 }
 
 fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, amount: u64) {
@@ -127,6 +133,10 @@ mod tests {
     fn entry(addr: Pubkey, state: ValidatorV7State, credits: u64, opps: u64, activation: u64) -> ValidatorV7Entry {
         ValidatorV7Entry {
             address: addr,
+            // In these tests operator == withdrawal == the consensus address, so
+            // eligible_addresses (which returns withdrawal_address) yields `addr`.
+            operator_address: addr,
+            withdrawal_address: addr,
             moniker: "n".into(),
             pubkey_bundle: PublicKeyBundle { components: vec![] },
             p2p_address: "1.2.3.4:9000".into(),

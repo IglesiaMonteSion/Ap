@@ -257,12 +257,41 @@ impl DoubleSignGuard {
         Ok(())
     }
 
+    /// Persiste el estado con DURABILIDAD real (persist-before-sign de verdad).
+    /// `std::fs::write` sólo escribe al page-cache: sobrevive un reinicio normal
+    /// del proceso pero NO un corte de energía / crash del kernel, así que la
+    /// guardia podría "olvidar" que firmó una ronda y permitir una doble-firma
+    /// tras un apagado abrupto. Por eso: (1) archivo temporal 0600 (el material
+    /// de la guardia no debe ser world-readable), (2) `sync_all()` = fsync del
+    /// archivo (bytes + metadata durables), (3) rename atómico, (4) fsync del
+    /// DIRECTORIO padre para que el propio rename sea durable (un rename se puede
+    /// perder ante un corte si el directorio no se sincroniza). Para un HSM real
+    /// la defensa definitiva es un contador anti-rollback en el hardware.
     fn persist(&self, st: &GuardState) -> anyhow::Result<()> {
+        use std::io::Write;
         let bytes = borsh::to_vec(st)?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        // rename atómico sobre el archivo final.
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?; // fsync del archivo: durable antes del rename.
+        }
         std::fs::rename(&tmp, &self.path)?;
+        // fsync del directorio padre → el rename es durable ante un corte.
+        // Best-effort: en una plataforma que no permita abrir/fsync un dir, el
+        // fsync del archivo de arriba ya cubre el caso común de reinicio.
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 }
@@ -330,16 +359,20 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
             Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
         },
         SignerRequest::SignRaw { msg } => {
-            // #193-B (D1): the consensus signer is a BLOCK signer, never a value
-            // signer. `sign_raw` exists only for the P2P handshake transcript
-            // (domained `qchain-p2p-auth-v1`). A payer's value transfer signs
-            // `TX_SIG_V1 ‖ borsh(Message)` (#187). If an attacker who reached the
-            // socket asked the signer to sign a transaction envelope, it would
-            // become a value-transfer oracle. Refuse anything domained TX_SIG_V1
-            // → the consensus key structurally CANNOT authorize a transfer, so a
-            // compromised node process can equivocate (slashable) but never spend.
-            if msg.starts_with(qchain_crypto::domains::TX_SIG_V1) {
-                let reason = "refusing SignRaw of a TX_SIG_V1-domained message: the consensus signer never signs value transactions (#193-B)".to_string();
+            // #193-B (D1) — ALLOWLIST estricta (endurecido tras auditoría). El
+            // firmante de consenso es un firmante de BLOQUES, jamás de valor.
+            // `sign_raw` existe ÚNICAMENTE para el transcript del handshake P2P,
+            // que se firma como `P2P_AUTH_V1 ‖ transcript` (#176). En vez de una
+            // BLACKLIST (negar sólo `TX_SIG_V1`), que quedaría débil ante un tipo
+            // de tx / dominio / protocolo NUEVO agregado después, se exige que el
+            // mensaje empiece EXACTAMENTE por el dominio del handshake — todo lo
+            // demás (una tx `TX_SIG_V1`, un voto, cualquier bytes arbitrario) se
+            // RECHAZA por defecto. Así la clave de consenso remota no puede
+            // autorizar una transferencia de valor NI ningún objeto futuro,
+            // aunque el proceso del nodo esté comprometido: puede equivocar
+            // (slasheable) pero nunca gastar.
+            if !msg.starts_with(qchain_crypto::domains::P2P_AUTH_V1) {
+                let reason = "refusing SignRaw: only a P2P_AUTH_V1-domained handshake transcript is signable via sign_raw; the consensus signer never signs value/other objects (#193-B allowlist)".to_string();
                 tracing::error!("signer: {reason}");
                 return SignerResponse::Refused(reason);
             }
@@ -381,8 +414,9 @@ mod tests {
         assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 6, digest: d2 }, &kp, &g), SignerResponse::Signature(_)));
         // Un VOTO DE PEER con un digest cualquiera para una ronda vieja → OK (sin guardia).
         assert!(matches!(respond(&SignerRequest::SignPeerVote { digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
-        // SignRaw → OK.
-        assert!(matches!(respond(&SignerRequest::SignRaw { msg: b"handshake".to_vec() }, &kp, &g), SignerResponse::Signature(_)));
+        // SignRaw de un transcript de handshake (dominio P2P) → OK.
+        let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript"].concat();
+        assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -405,8 +439,21 @@ mod tests {
             matches!(respond(&SignerRequest::SignRaw { msg: tx_msg }, &kp, &g), SignerResponse::Refused(_)),
             "the consensus signer must refuse to sign a TX_SIG_V1-domained message (no value oracle)"
         );
-        // The real handshake transcript (a different domain) is still signed.
-        let hs = b"qchain-p2p-auth-v1 transcript...".to_vec();
+        // ALLOWLIST: anything that is NOT a handshake transcript is refused too —
+        // arbitrary bytes, a future/unknown domain, a vote-domained digest — not
+        // just the tx domain. "todo lo no permitido está prohibido".
+        for bad in [
+            b"arbitrary bytes".to_vec(),
+            qchain_crypto::domains::VERTEX_VOTE_V1.to_vec(),
+            b"qchain-some-future-protocol-v1 ...".to_vec(),
+        ] {
+            assert!(
+                matches!(respond(&SignerRequest::SignRaw { msg: bad }, &kp, &g), SignerResponse::Refused(_)),
+                "the consensus signer only signs raw bytes that are a P2P_AUTH_V1 handshake transcript"
+            );
+        }
+        // The real handshake transcript (the ONLY permitted raw domain) is signed.
+        let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript..."].concat();
         assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();

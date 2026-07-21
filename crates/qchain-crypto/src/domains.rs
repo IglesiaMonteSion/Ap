@@ -39,7 +39,25 @@ pub const TX_SIG_V1: &[u8] = b"qchain-tx-sig-v1";
 /// (content-address del DAG), sólo la preimagen que se firma.
 pub const VERTEX_VOTE_V1: &[u8] = b"qchain-vertex-vote-v1";
 
-// NOTA: el handshake P2P autenticado (`qchain-network::handshake`) ya usa su
-// propio dominio explícito (`b"qchain-p2p-auth-v1"` sobre un transcript de 179 B)
-// desde #176, así que ya está separado de tx/voto/vértice por construcción y no
-// se toca aquí.
+/// Dominio del handshake P2P autenticado (`qchain-network::handshake`, #176): un
+/// transcript de ~179 B se firma como `P2P_AUTH_V1 ‖ transcript`. Se expone como
+/// constante compartida (antes vivía sólo dentro de `handshake.rs`) para que el
+/// firmante remoto pueda hacer una **allowlist ESTRICTA** de `SignRaw`: el
+/// firmante de consenso sólo debe firmar bytes crudos que sean EXACTAMENTE un
+/// transcript de handshake — cualquier otra cosa (una tx, un dominio futuro, un
+/// protocolo nuevo) se rechaza por defecto, en vez de una blacklist que sólo
+/// niega los dominios que ya conocemos. Es la separación de dominios llevada a
+/// "todo lo no permitido está prohibido".
+pub const P2P_AUTH_V1: &[u8] = b"qchain-p2p-auth-v1";
+
+/// **Proof-of-possession de una clave de consenso al registrar un validador v7**
+/// (separación de roles de clave, #193-B — la parte on-chain). Cuando una clave
+/// FRÍA de operador (el pagador) registra un validador, la clave de CONSENSO
+/// (caliente, distinta) firma `VALIDATOR_POP_V1 ‖ operator ‖ withdrawal ‖ moniker`
+/// para PROBAR que quien registra realmente posee la clave de consenso y para
+/// ATARLA a ese operador/retiro/moniker exactos. Sin esto, un atacante podría
+/// registrar la clave de consenso de otro (front-run) o reusar un PoP para otro
+/// operador. Es la contraparte on-chain de "consenso ≠ fondos": la clave caliente
+/// puede firmar bloques (slasheable) pero jamás controla el bono ni las ganancias,
+/// que quedan bajo la clave fría de retiro.
+pub const VALIDATOR_POP_V1: &[u8] = b"qchain-v7-validator-pop-v1";

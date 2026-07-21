@@ -1963,12 +1963,24 @@ mod tests {
         let ix = Instruction {
             program_id: crate::ids::VALIDATOR_V7_PROGRAM_ID,
             accounts: vec![v.pubkey(), crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, crate::ids::VALIDATOR_BOND_ESCROW_ID, crate::ids::STAKING_GLOBAL_ID],
-            data: borsh::to_vec(&crate::validator_v7::ValidatorV7Instruction::BondAndRegister {
-                moniker: "alice".into(),
-                pubkey_bundle: v.public_key_bundle(),
-                p2p_address: "1.2.3.4:9000".into(),
-            })
-            .unwrap(),
+            data: {
+                // Simple case: operator == consensus == v; the consensus key signs
+                // its own proof-of-possession over (operator, withdrawal=operator, moniker).
+                let norm = crate::economics_v7::normalize_moniker("alice");
+                let mut pop_msg = Vec::new();
+                pop_msg.extend_from_slice(&v.pubkey().0);
+                pop_msg.extend_from_slice(&v.pubkey().0);
+                pop_msg.extend_from_slice(norm.as_bytes());
+                let pop = qchain_crypto::sign_domain(&v, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_msg).unwrap();
+                borsh::to_vec(&crate::validator_v7::ValidatorV7Instruction::BondAndRegister {
+                    moniker: "alice".into(),
+                    pubkey_bundle: v.public_key_bundle(),
+                    p2p_address: "1.2.3.4:9000".into(),
+                    withdrawal_address: None,
+                    consensus_pop: pop,
+                })
+                .unwrap()
+            },
         };
         let tx = Transaction::new_signed(&v, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         l.apply_transaction(&tx, &proposer, 0).unwrap();
@@ -2079,6 +2091,8 @@ mod tests {
         let vjail = Pubkey::new([23; 32]);
         let mk = |addr: Pubkey, state: ValidatorV7State| ValidatorV7Entry {
             address: addr,
+            operator_address: addr,
+            withdrawal_address: addr,
             moniker: "n".into(),
             pubkey_bundle: PublicKeyBundle { components: vec![] },
             p2p_address: "1.2.3.4:9000".into(),
@@ -2176,6 +2190,8 @@ mod tests {
         let vc = Pubkey::new([22; 32]);
         let mk = |addr: Pubkey| ValidatorV7Entry {
             address: addr,
+            operator_address: addr,
+            withdrawal_address: addr,
             moniker: "n".into(),
             pubkey_bundle: PublicKeyBundle { components: vec![] },
             p2p_address: "1.2.3.4:9000".into(),

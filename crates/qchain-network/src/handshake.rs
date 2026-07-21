@@ -68,7 +68,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const HANDSHAKE_DOMAIN: &[u8] = b"qchain-p2p-auth-v1";
+// Single source of truth (shared with the remote signer's SignRaw allowlist).
+const HANDSHAKE_DOMAIN: &[u8] = qchain_crypto::domains::P2P_AUTH_V1;
 const ROLE_CLIENT: u8 = 0x01;
 const ROLE_SERVER: u8 = 0x02;
 

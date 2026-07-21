@@ -206,11 +206,23 @@ enum Command {
         fee_limit: u64,
     },
     /// v7: bond 500 QCH and register as a validator (economics_v7 networks only).
+    /// `--keypair` is the OPERATOR (cold) key that funds + controls the validator
+    /// and signs the tx. `--consensus-keypair` (optional, defaults to `--keypair`)
+    /// is the SEPARATE block-signing key whose possession is proven on-chain; its
+    /// bundle is what participates in consensus. `--withdrawal-address` (optional,
+    /// defaults to the operator) is the cold address the bond + fee earnings go to.
     V7BondRegister {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
+        /// The OPERATOR (cold) keypair — funds the bond, controls the lifecycle, signs the tx.
         #[arg(short, long)]
         keypair: PathBuf,
+        /// The CONSENSUS (block-signing) keypair. Defaults to `--keypair` (operator == consensus).
+        #[arg(long)]
+        consensus_keypair: Option<PathBuf>,
+        /// Cold WITHDRAWAL address for the bond + fee earnings (base58). Defaults to the operator.
+        #[arg(long)]
+        withdrawal_address: Option<String>,
         /// Public validator moniker (3-32 chars, [a-z0-9_-], unique on-chain).
         #[arg(long)]
         moniker: String,
@@ -223,22 +235,37 @@ enum Command {
         fee_limit: u64,
     },
     /// v7: begin exiting - move the bond to the unbonding pool and start the clock.
+    /// `--keypair` is the OPERATOR (cold) key. `--consensus-address` names which
+    /// validator to exit (defaults to the operator's own address for the simple
+    /// operator == consensus case).
     V7BeginExit {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
         #[arg(short, long)]
         keypair: PathBuf,
+        /// The consensus address of the validator to exit (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
     /// v7: withdraw the bond after the unbonding + evidence window elapses.
+    /// `--keypair` is the OPERATOR (cold) key. `--consensus-address` names the
+    /// validator; `--withdrawal-address` must be its recorded cold withdrawal
+    /// address (both default to the operator's own address).
     V7WithdrawBond {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
         #[arg(short, long)]
         keypair: PathBuf,
+        /// The consensus address of the validator (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The validator's recorded cold withdrawal address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        withdrawal_address: Option<String>,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -1272,54 +1299,87 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("submitted: {body}");
         }
-        Command::V7BondRegister { rpc, keypair, moniker, p2p_address, nonce, fee_limit } => {
-            let validator = qchain_crypto::read_keypair_file(&keypair)?;
+        Command::V7BondRegister { rpc, keypair, consensus_keypair, withdrawal_address, moniker, p2p_address, nonce, fee_limit } => {
+            // The OPERATOR (cold) key funds + controls + signs the tx.
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            // The CONSENSUS (block-signing) key; defaults to the operator (simple case).
+            let consensus = match &consensus_keypair {
+                Some(p) => qchain_crypto::read_keypair_file(p)?,
+                None => qchain_crypto::read_keypair_file(&keypair)?,
+            };
+            let withdrawal: Option<qchain_crypto::Pubkey> = match &withdrawal_address {
+                Some(s) => Some(s.parse().map_err(|e| anyhow::anyhow!("invalid --withdrawal-address: {e}"))?),
+                None => None,
+            };
+            // Proof-of-possession: the consensus key signs VALIDATOR_POP_V1 ‖ operator
+            // ‖ withdrawal ‖ normalized-moniker, proving it consents to this binding.
+            let norm = qchain_execution::economics_v7::normalize_moniker(&moniker);
+            let wd = withdrawal.unwrap_or(operator.pubkey());
+            let mut pop_msg = Vec::with_capacity(64 + norm.len());
+            pop_msg.extend_from_slice(&operator.pubkey().0);
+            pop_msg.extend_from_slice(&wd.0);
+            pop_msg.extend_from_slice(norm.as_bytes());
+            let pop = qchain_crypto::sign_domain(&consensus, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_msg)?;
             let data = borsh::to_vec(&ValidatorV7Instruction::BondAndRegister {
                 moniker: moniker.clone(),
-                pubkey_bundle: validator.public_key_bundle(),
+                pubkey_bundle: consensus.public_key_bundle(),
                 p2p_address,
+                withdrawal_address: withdrawal,
+                consensus_pop: pop,
             })?;
             let body = submit_instruction(
                 &rpc,
-                &validator,
+                &operator,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_GLOBAL_ID],
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_GLOBAL_ID],
                 data,
                 nonce,
                 fee_limit,
             )?;
             println!("submitted: {body}");
-            println!("bonded 500 QCH and registered v7 validator {} as '{moniker}' (active next quanto)", validator.pubkey());
+            println!("bonded 500 QCH (operator {}) and registered v7 consensus key {} as '{moniker}' → bond/fees to {} (active next quanto)", operator.pubkey(), consensus.pubkey(), wd);
         }
-        Command::V7BeginExit { rpc, keypair, nonce, fee_limit } => {
-            let validator = qchain_crypto::read_keypair_file(&keypair)?;
-            let data = borsh::to_vec(&ValidatorV7Instruction::BeginExit)?;
+        Command::V7BeginExit { rpc, keypair, consensus_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::BeginExit { consensus_address: target })?;
             let body = submit_instruction(
                 &rpc,
-                &validator,
+                &operator,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
                 data,
                 nonce,
                 fee_limit,
             )?;
             println!("submitted: {body}");
-            println!("began exit for v7 validator {} - bond moved to the unbonding pool (still slashable until the window elapses)", validator.pubkey());
+            println!("began exit for v7 validator {target} - bond moved to the unbonding pool (still slashable until the window elapses)");
         }
-        Command::V7WithdrawBond { rpc, keypair, nonce, fee_limit } => {
-            let validator = qchain_crypto::read_keypair_file(&keypair)?;
-            let data = borsh::to_vec(&ValidatorV7Instruction::WithdrawBond)?;
+        Command::V7WithdrawBond { rpc, keypair, consensus_address, withdrawal_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let wd: qchain_crypto::Pubkey = match &withdrawal_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --withdrawal-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::WithdrawBond { consensus_address: target })?;
             let body = submit_instruction(
                 &rpc,
-                &validator,
+                &operator,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![validator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, wd],
                 data,
                 nonce,
                 fee_limit,
             )?;
             println!("submitted: {body}");
-            println!("withdrew the 500 QCH bond for v7 validator {} (removed from the registry)", validator.pubkey());
+            println!("withdrew the 500 QCH bond for v7 validator {target} to {wd} (removed from the registry)");
         }
         Command::TreasuryRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
             let authority = qchain_crypto::read_keypair_file(&keypair)?;

@@ -603,6 +603,8 @@ async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json
             json!({
                 "moniker": v.moniker,
                 "address": v.address.to_string(),
+                "operator_address": v.operator_address.to_string(),
+                "withdrawal_address": v.withdrawal_address.to_string(),
                 "p2p_address": v.p2p_address,
                 "bond": v.bond,
                 "state": format!("{:?}", v.state),
