@@ -122,10 +122,12 @@ fn main() -> anyhow::Result<()> {
             print!("{}", qchain_wasm::program_pda(&args[2], &seed_bytes)?);
         }
         Some("deploy-program") => {
-            // deploy-program <seed> <program_addr> <wasm_file> <entry_point> <nonce> <chain_id_hex> <fee_limit>
+            // deploy-program <seed> <index> <wasm_file> <entry_point> <nonce> <chain_id_hex> <fee_limit>
+            // (re-audit #2: the address is derived from the payer + index/salt,
+            // not passed in — same as programAddressFromSeed(seed, index).)
             let s = seed(&args[2])?;
             let module = std::fs::read(&args[4])?;
-            print!("{}", qchain_wasm::sign_deploy_program_json(&s, &args[3], &module, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+            print!("{}", qchain_wasm::sign_deploy_program_json(&s, args[3].parse()?, &module, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
         }
         Some("call-program") => {
             // call-program <seed> <program_id> <accounts_csv> <args_csv> <nonce> <chain_id_hex> <fee_limit>

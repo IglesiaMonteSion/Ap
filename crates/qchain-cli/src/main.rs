@@ -951,9 +951,11 @@ const STRESS_NOOP_WAT: &str = r#"(module (func (export "run") (param i64) (resul
 /// exists on-chain, returning its address.
 fn deploy_noop_contract(rpc: &str, bank: &Keypair, chain_id: [u8; 32]) -> anyhow::Result<Pubkey> {
     let module_bytes = wat::parse_str(STRESS_NOOP_WAT).map_err(|e| anyhow::anyhow!("compiling stress contract: {e}"))?;
-    let program_pk = Keypair::generate()?.pubkey();
-    let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "run".to_string() })?;
     let nonce = fetch_account(rpc, &bank.pubkey())?.map(|a| a.nonce).unwrap_or(0);
+    // Re-audit #2: derive the program address from the payer + salt (the nonce).
+    let salt = nonce.to_le_bytes().to_vec();
+    let program_pk = qchain_execution::native::derive_program_address(&bank.pubkey(), &salt);
+    let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "run".to_string(), salt })?;
     let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![program_pk], data };
     let tx = Transaction::new_signed(bank, nonce, chain_id, 100_000_000, vec![ix])?;
     let client = reqwest::blocking::Client::new();
@@ -2483,12 +2485,16 @@ fn main() -> anyhow::Result<()> {
         Command::DeployProgram { rpc, keypair, wasm_file, entry_point, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
             let module_bytes = std::fs::read(&wasm_file)?;
-            // Only needs a fresh, unique address - nobody ever signs *as*
-            // a program account (see `native.rs`'s `DeployProgram`), so
-            // the private key is discarded immediately, same pattern as
-            // `stake-delegate`'s stake account.
-            let program_pk = Keypair::generate()?.pubkey();
-            let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point })?;
+            // Re-audit #2: the program address MUST derive from the PAYER + salt,
+            // so nobody can front-run this deploy to an address someone else
+            // derived. Fixed salt 0 (this payer's first contract); the node
+            // verifies `accounts[0] == derive_program_address(payer, salt)` and
+            // reclaims the address if a squatter took it. Re-deploying more
+            // contracts from the same key would use distinct salts (not exposed
+            // as a flag yet — the wallet drives multi-contract via its index).
+            let salt = 0u32.to_le_bytes().to_vec();
+            let program_pk = qchain_execution::native::derive_program_address(&payer.pubkey(), &salt);
+            let data = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point, salt })?;
             let body = submit_instruction(&rpc, &payer, Pubkey::system_program_id(), vec![program_pk], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("program address: {program_pk}");

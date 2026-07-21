@@ -39,13 +39,16 @@ fn transfer_instruction_data(amount: u64) -> Vec<u8> {
 /// Transfer=1, DeployProgram=2), guarded by
 /// `deploy_program_instruction_encoding_is_stable` in qchain-execution.
 /// `[2]` ++ Vec<u8>(u32 LE len ++ bytes) ++ String(u32 LE len ++ utf8).
-fn deploy_program_instruction_data(module_bytes: &[u8], entry_point: &str) -> Vec<u8> {
-    let mut data = Vec::with_capacity(1 + 4 + module_bytes.len() + 4 + entry_point.len());
+fn deploy_program_instruction_data(module_bytes: &[u8], entry_point: &str, salt: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(1 + 4 + module_bytes.len() + 4 + entry_point.len() + 4 + salt.len());
     data.push(2u8);
     data.extend_from_slice(&(module_bytes.len() as u32).to_le_bytes());
     data.extend_from_slice(module_bytes);
     data.extend_from_slice(&(entry_point.len() as u32).to_le_bytes());
     data.extend_from_slice(entry_point.as_bytes());
+    // Re-audit #2: the DeployProgram salt (Borsh `Vec<u8>` = u32 LE len ++ bytes).
+    data.extend_from_slice(&(salt.len() as u32).to_le_bytes());
+    data.extend_from_slice(salt);
     data
 }
 
@@ -378,19 +381,31 @@ pub fn sign_transfer_json(
     Ok(serde_json::to_string(&tx)?)
 }
 
-/// Derive a fresh, recoverable **program (contract) address** from the master
-/// seed + an index. Domain-separated (`"qchain-program-account-v1"`) so it can
-/// never collide with the wallet address or a stake account. A program account
-/// is program-owned (nobody signs *as* it), so its address just needs to be
-/// unique and reproducible — deriving it from the seed means a restored wallet
-/// can re-find the contracts it deployed. Deploy-once: pick the next unused
-/// index (the node's `/programs` / `/account` says which exist).
+/// The salt bytes a wallet uses for its `index`-th deployed contract: the index
+/// as u32 LE. MUST match what `sign_deploy_program_json` puts in the instruction
+/// and what the node hashes (`native::derive_program_address`).
+fn program_salt(index: u32) -> [u8; 4] {
+    index.to_le_bytes()
+}
+
+/// Derive a **program (contract) address** bound to its DEPLOYER (re-audit #2).
+/// `address = SHA3-256("qchain-program-account-v2" ‖ payer(32) ‖ salt)`, where
+/// `payer` is the wallet address derived from `seed` and `salt = index LE`. This
+/// is the SAME formula the node verifies (`native::derive_program_address`), so
+/// only the deployer's key can produce this address — nobody can front-run a
+/// deploy to it. Still recoverable: a restored wallet re-finds its contracts by
+/// iterating `index` for its own address. Deploy-once: pick the next unused
+/// index (the node's `/programs` says which exist).
 pub fn program_address_from_seed(seed: &[u8; 32], index: u32) -> String {
     use sha3::{Digest, Sha3_256};
+    let payer = match Keypair::generate_from_seed(seed) {
+        Ok(kp) => kp.pubkey(),
+        Err(_) => return String::new(),
+    };
     let mut hasher = Sha3_256::new();
-    hasher.update(b"qchain-program-account-v1");
-    hasher.update(seed);
-    hasher.update(index.to_le_bytes());
+    hasher.update(b"qchain-program-account-v2");
+    hasher.update(payer.to_bytes());
+    hasher.update(program_salt(index));
     let digest: [u8; 32] = hasher.finalize().into();
     Pubkey::new(digest).to_string()
 }
@@ -418,7 +433,7 @@ pub fn program_pda(program_id: &str, seed: &[u8]) -> anyhow::Result<String> {
 /// the byte fee (bigger `.wasm` = proportionally bigger fee).
 pub fn sign_deploy_program_json(
     seed: &[u8; 32],
-    program_address: &str,
+    index: u32,
     module_bytes: &[u8],
     entry_point: &str,
     nonce: u64,
@@ -426,11 +441,19 @@ pub fn sign_deploy_program_json(
     fee_limit: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
-    let program_pk: Pubkey = program_address.trim().parse().map_err(|e| anyhow::anyhow!("program address invalid: {e}"))?;
+    // Re-audit #2: derive the target address from the PAYER + salt, exactly like
+    // the node, so on-chain and off-chain agree by construction (no mismatch).
+    let salt = program_salt(index);
+    use sha3::{Digest, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"qchain-program-account-v2");
+    hasher.update(payer.pubkey().to_bytes());
+    hasher.update(salt);
+    let program_pk = Pubkey::new(hasher.finalize().into());
     let ix = Instruction {
         program_id: Pubkey::system_program_id(),
         accounts: vec![program_pk],
-        data: deploy_program_instruction_data(module_bytes, entry_point),
+        data: deploy_program_instruction_data(module_bytes, entry_point, &salt),
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
@@ -544,9 +567,11 @@ mod tests {
         let chain = [9u8; 32];
         let prog = program_address_from_seed(&seed, 0);
         let module = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-        // Deploy signs and round-trips as JSON.
-        let dep = sign_deploy_program_json(&seed, &prog, &module, "run", 0, &chain, 10_000_000).unwrap();
+        // Deploy signs and round-trips as JSON. The address is derived from the
+        // payer + index (re-audit #2), so it matches `programAddressFromSeed`.
+        let dep = sign_deploy_program_json(&seed, 0, &module, "run", 0, &chain, 10_000_000).unwrap();
         assert!(dep.contains("signature"), "deploy tx must be a signed tx json");
+        assert!(dep.contains(&prog), "the signed deploy targets the payer-derived address for index 0");
         // Call signs with i64 args + accounts.
         let call = sign_call_program_json(&seed, &prog, &format!("{prog}"), "1,2,3", 1, &chain, 10_000_000).unwrap();
         assert!(call.contains("signature"), "call tx must be a signed tx json");
@@ -739,19 +764,21 @@ mod wasm {
         Ok(super::program_address_from_seed(&as32(seed, "seed")?, index))
     }
 
-    /// `signDeployProgram(seed, programAddress, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`
+    /// `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`.
+    /// `index` selects the payer-derived contract address (re-audit #2): the same
+    /// value passed to `programAddressFromSeed(seed, index)` for display.
     #[wasm_bindgen(js_name = signDeployProgram)]
     #[allow(clippy::too_many_arguments)]
     pub fn sign_deploy_program(
         seed: &[u8],
-        program_address: &str,
+        index: u32,
         module_bytes: &[u8],
         entry_point: &str,
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
     ) -> Result<String, JsValue> {
-        super::sign_deploy_program_json(&as32(seed, "seed")?, program_address, module_bytes, entry_point, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_deploy_program_json(&as32(seed, "seed")?, index, module_bytes, entry_point, nonce, &as32(chain_id, "chain_id")?, fee_limit)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

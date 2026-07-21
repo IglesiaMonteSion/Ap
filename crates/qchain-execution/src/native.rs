@@ -22,14 +22,39 @@ use std::collections::HashMap;
 /// a hypothetical one.
 pub const MAX_PROGRAM_BYTECODE_BYTES: usize = 256 * 1024;
 
+/// Domain separator for deriving a contract's on-chain address from its
+/// DEPLOYER (re-audit #2 contract-squatting): `address = SHA3-256(DOMAIN ‖
+/// payer(32) ‖ salt)`. The `v2` distinguishes it from the old seed-based
+/// derivation (`qchain-program-account-v1`, which the ledger could not verify
+/// because it hashed the deployer's SECRET seed). Binding the address to the
+/// PUBLIC payer key lets the ledger VERIFY the target on `DeployProgram`, so
+/// nobody can deploy to an address that doesn't derive from their own key.
+pub const PROGRAM_ACCOUNT_DOMAIN: &[u8] = b"qchain-program-account-v2";
+
+/// Derive a contract's address from its deployer (`payer`) + a client-chosen
+/// `salt`. Same formula the client uses off-chain (`qchain_wasm::
+/// program_address_from_seed`). Because `payer` enters the hash and SHA3 is
+/// preimage-resistant, an attacker with a different key can NEVER produce this
+/// address → a contract's address is bound to whoever deployed it.
+pub fn derive_program_address(payer: &Pubkey, salt: &[u8]) -> Pubkey {
+    let mut h = Sha3_256::new();
+    h.update(PROGRAM_ACCOUNT_DOMAIN);
+    h.update(payer.0);
+    h.update(salt);
+    Pubkey::new(h.finalize().into())
+}
+
 /// What a `DeployProgram`-created account's `data` holds - the WASM
 /// module bytes plus which export to call, read back by
 /// `Ledger::apply_transaction`'s dispatch fallback on every later
-/// instruction naming this program as `program_id`.
+/// instruction naming this program as `program_id`. `deployer` records who
+/// deployed it (re-audit #2): provenance a user can check, and the anchor a
+/// future "only the deployer may initialize" rule builds on.
 #[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct WasmProgramData {
     pub entry_point: String,
     pub module_bytes: Vec<u8>,
+    pub deployer: Pubkey,
 }
 
 pub trait NativeProgram: Send + Sync {
@@ -54,14 +79,16 @@ pub enum SystemInstruction {
     CreateAccount { units: u64, owner: Pubkey },
     /// accounts[0] = from, accounts[1] = to.
     Transfer { amount: u64 },
-    /// accounts[0] = the fresh address this program will live at - must
-    /// not already hold an account (deploy-once, same "create if absent"
-    /// discipline `CreateAccount` already follows; this never overwrites
-    /// an existing wallet or program). No separate deploy fee: the
-    /// existing byte-scaled base fee already charges proportionally more
-    /// for a larger `module_bytes`, since it's part of this instruction's
-    /// data and therefore of `tx.byte_size()`.
-    DeployProgram { module_bytes: Vec<u8>, entry_point: String },
+    /// accounts[0] = the address this program will live at, which MUST equal
+    /// `derive_program_address(payer, salt)` (re-audit #2): the target is bound
+    /// to the deployer, so nobody can front-run a deploy to an address that
+    /// doesn't derive from their own key. If a squatter pre-created a
+    /// (non-program) account there, the deploy RECLAIMS it (only the payer has a
+    /// legitimate claim to a payer-derived address), preserving any balance. A
+    /// spot already holding a deployed program is deploy-once → rejected. No
+    /// separate deploy fee: the byte-scaled base fee already charges more for a
+    /// larger `module_bytes` (part of this instruction's data / `tx.byte_size()`).
+    DeployProgram { module_bytes: Vec<u8>, entry_point: String, salt: Vec<u8> },
 }
 
 pub struct SystemProgram;
@@ -123,34 +150,50 @@ impl NativeProgram for SystemProgram {
                 }
                 Self::transfer_internal(accounts, from, to, amount)?;
             }
-            SystemInstruction::DeployProgram { module_bytes, entry_point } => {
+            SystemInstruction::DeployProgram { module_bytes, entry_point, salt } => {
                 if module_bytes.len() > MAX_PROGRAM_BYTECODE_BYTES {
                     return Err(ExecError::ProgramError(format!(
                         "program bytecode too large: {} bytes (max {MAX_PROGRAM_BYTECODE_BYTES})",
                         module_bytes.len()
                     )));
                 }
-                let program_pubkey = instruction
+                let program_pubkey = *instruction
                     .accounts
                     .first()
                     .ok_or_else(|| ExecError::ProgramError("DeployProgram requires accounts[0]".into()))?;
-                // Working-set membership here means exactly "an account
-                // already exists at this address in the persisted store"
-                // (see `Ledger::apply_transaction`'s working-set
-                // construction) - reject rather than silently overwrite
-                // whatever's already there, whether a wallet or another
-                // deployed program.
-                if accounts.contains_key(program_pubkey) {
-                    return Err(ExecError::ProgramError(
-                        "an account already exists at the target program address".into(),
+                // SECURITY (re-audit #2): the target address MUST derive from the
+                // PAYER + salt. This binds the contract's address to whoever
+                // deploys it — an attacker with a different key can never produce
+                // it (SHA3 preimage-resistant), so a deploy cannot be front-run to
+                // an address someone else derived, and no one can deploy their
+                // bytecode at another party's derived address.
+                let expected = derive_program_address(payer, &salt);
+                if program_pubkey != expected {
+                    return Err(ExecError::Unauthorized(
+                        "DeployProgram target address is not derived from the payer + salt".into(),
                     ));
                 }
+                // Deploy-once vs. reclaim: if a program is ALREADY deployed here
+                // (LOADER-owned), reject. Otherwise the address is fresh, or was
+                // squatted by a non-program account (a CreateAccount front-run) —
+                // and since the address provably belongs to the payer, we RECLAIM
+                // it: preserve any balance (the program's treasury), discard the
+                // squatter's owner/data, and deploy the program.
+                let preserved_balance = match accounts.get(&program_pubkey) {
+                    Some(existing) if existing.owner == LOADER_PROGRAM_ID => {
+                        return Err(ExecError::ProgramError(
+                            "a program is already deployed at this address (deploy-once)".into(),
+                        ));
+                    }
+                    Some(existing) => existing.balance,
+                    None => 0,
+                };
                 let code_hash: [u8; 32] = Sha3_256::digest(&module_bytes).into();
-                let data = borsh::to_vec(&WasmProgramData { entry_point, module_bytes })
+                let data = borsh::to_vec(&WasmProgramData { entry_point, module_bytes, deployer: *payer })
                     .map_err(|e| ExecError::ProgramError(format!("failed to encode program data: {e}")))?;
                 accounts.insert(
-                    *program_pubkey,
-                    Account { code_hash, data, owner: LOADER_PROGRAM_ID, ..Account::new_wallet(LOADER_PROGRAM_ID) },
+                    program_pubkey,
+                    Account { balance: preserved_balance, code_hash, data, owner: LOADER_PROGRAM_ID, ..Account::new_wallet(LOADER_PROGRAM_ID) },
                 );
             }
         }
@@ -185,14 +228,74 @@ mod tests {
     fn deploy_program_instruction_encoding_is_stable() {
         let module_bytes = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         let entry_point = "run".to_string();
-        let encoded = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: module_bytes.clone(), entry_point: entry_point.clone() }).unwrap();
-        // `[2]` ++ u32 LE len(module) ++ module ++ u32 LE len(entry) ++ entry utf8.
+        let salt = 7u32.to_le_bytes().to_vec();
+        let encoded = borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: module_bytes.clone(), entry_point: entry_point.clone(), salt: salt.clone() }).unwrap();
+        // `[2]` ++ u32 LE len(module) ++ module ++ u32 LE len(entry) ++ entry utf8
+        // ++ u32 LE len(salt) ++ salt.
         let mut expected = vec![2u8];
         expected.extend_from_slice(&(module_bytes.len() as u32).to_le_bytes());
         expected.extend_from_slice(&module_bytes);
         expected.extend_from_slice(&(entry_point.len() as u32).to_le_bytes());
         expected.extend_from_slice(entry_point.as_bytes());
+        expected.extend_from_slice(&(salt.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&salt);
         assert_eq!(encoded, expected, "wasm wallet's hand-rolled DeployProgram encoding is out of sync");
+    }
+
+    /// SECURITY (re-audit #2 contract-squatting): a deploy whose target address
+    /// does NOT derive from the payer+salt is REJECTED — you can only deploy to
+    /// an address bound to your own key.
+    #[test]
+    fn deploy_to_an_address_not_derived_from_the_payer_is_rejected() {
+        let payer = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let mut accounts = HashMap::new();
+        accounts.insert(payer, Account { balance: 100_000_000, ..Account::new_wallet(Pubkey::system_program_id()) });
+        let salt = 0u32.to_le_bytes().to_vec();
+        // A random address, NOT derive_program_address(payer, salt).
+        let bogus = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![bogus],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: vec![0], entry_point: "run".into(), salt }).unwrap(),
+        };
+        let r = SystemProgram.process(&mut accounts, &ix, &payer, 0);
+        assert!(matches!(r, Err(ExecError::Unauthorized(_))), "a non-derived target must be rejected");
+    }
+
+    /// SECURITY (re-audit #2): a third party who front-runs by CreateAccount-ing
+    /// the payer's derived program address must NOT lock the deploy out. The
+    /// deploy RECLAIMS it (the address provably belongs to the payer),
+    /// preserving any balance and installing the program.
+    #[test]
+    fn a_squatted_program_address_is_reclaimed_by_the_rightful_deployer() {
+        let payer = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let salt = 3u32.to_le_bytes().to_vec();
+        let addr = derive_program_address(&payer, &salt);
+        let mut accounts = HashMap::new();
+        accounts.insert(payer, Account { balance: 100_000_000, ..Account::new_wallet(Pubkey::system_program_id()) });
+        // A squatter occupies the derived address first: foreign owner + balance.
+        accounts.insert(addr, Account { balance: 555, ..Account::new_wallet(Pubkey::new([0x55u8; 32])) });
+
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![addr],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: vec![1, 2, 3], entry_point: "run".into(), salt }).unwrap(),
+        };
+        SystemProgram.process(&mut accounts, &ix, &payer, 0).unwrap();
+        let prog = &accounts[&addr];
+        assert_eq!(prog.owner, LOADER_PROGRAM_ID, "reclaimed as a program");
+        assert_eq!(prog.balance, 555, "any balance at the address is preserved across the reclaim");
+        let pdata = WasmProgramData::try_from_slice(&prog.data).unwrap();
+        assert_eq!(pdata.deployer, payer, "the deployer is recorded");
+
+        // Deploy-once: a second deploy to the SAME (now program) address is rejected.
+        let ix2 = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![addr],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: vec![9], entry_point: "run".into(), salt: 3u32.to_le_bytes().to_vec() }).unwrap(),
+        };
+        let r = SystemProgram.process(&mut accounts, &ix2, &payer, 0);
+        assert!(matches!(r, Err(ExecError::ProgramError(_))), "deploy-once must reject re-deploying over a program");
     }
 
     #[test]

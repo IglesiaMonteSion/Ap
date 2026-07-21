@@ -3145,12 +3145,15 @@ function bridgeSimLines(sim){
 // un contrato desplegado — deploy-once necesita una fresca. Se compara contra la
 // lista real de contratos del nodo (/api/programs), no contra /api/account (que
 // no distingue un slot vacío de una cuenta program-owned).
+// Re-audit #2: the contract address is derived from the PAYER + index (salt).
+// Returns {index, addr} for the first index whose derived address has no
+// deployed program yet — deploy-once picks the next free slot.
 async function freshProgramAddr(){
   let deployed=new Set();
   try{ const r=await api("/api/programs"); (r.programs||[]).forEach(p=>deployed.add(p.address)); }catch(e){}
   for(let i=0;i<64;i++){
     const a=programAddressFromSeed(SEED, i);
-    if(!deployed.has(a)) return a;
+    if(!deployed.has(a)) return { index:i, addr:a };
   }
   throw new Error("no encontré un índice de programa libre");
 }
@@ -3168,9 +3171,11 @@ async function bridgeSignAndSubmit(tx){
     if(!bytes.length) throw new Error("el .wasm está vacío");
     const kb=(bytes.length/1024).toFixed(1);
     // FIRMAR primero (sin transmitir), luego SIMULAR la tx firmada, y recién
-    // mostrar la aprobación con el resultado real (fee + cambios de saldo).
-    const paddr=await freshProgramAddr();
-    const txJson=signDeployProgram(SEED, paddr, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000));
+    // mostrar la aprobación con el resultado real (fee + cambios de saldo). La
+    // dirección se deriva del payer + índice (re-audit #2).
+    const fp=await freshProgramAddr();
+    const paddr=fp.addr;
+    const txJson=signDeployProgram(SEED, fp.index, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000));
     const sim=await bridgeSimulate(txJson);
     const blocked = !!(sim && sim.ok===false);
     const note = blocked ? ("La simulación indica que FALLARÍA: "+(sim.error||"error")) : (sim?null:"No se pudo simular; se muestra el fee estimado. Revisá con cuidado antes de aprobar.");

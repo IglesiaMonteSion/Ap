@@ -1504,7 +1504,7 @@ impl Ledger {
             // failure (the fee epoch already ticked above at
             // `advance_dynamic_fee`; `working` is discarded).
             if ix.program_id == Pubkey::system_program_id() {
-                if let Ok(SystemInstruction::DeployProgram { module_bytes, entry_point }) = SystemInstruction::try_from_slice(&ix.data) {
+                if let Ok(SystemInstruction::DeployProgram { module_bytes, entry_point, .. }) = SystemInstruction::try_from_slice(&ix.data) {
                     // Enforce the size cap BEFORE compiling, so an oversized
                     // module is rejected cheaply (never handed to Cranelift).
                     // The native `DeployProgram` handler enforces it too; doing
@@ -3774,12 +3774,13 @@ mod tests {
     "#;
 
     fn deploy_i64_transfer_contract(ledger: &mut Ledger, deployer: &Keypair, validator: &Pubkey) -> Pubkey {
-        let program_pk = Keypair::generate().unwrap().pubkey();
+        let salt = 0u32.to_le_bytes().to_vec();
+        let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
         let module_bytes = wat::parse_str(I64_TRANSFER_WAT).unwrap();
         let deploy_ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![program_pk],
-            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into(), salt }).unwrap(),
         };
         let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
         ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
@@ -3906,12 +3907,14 @@ mod tests {
     "#;
 
     fn deploy_wat(ledger: &mut Ledger, wat: &str, entry_point: &str, deployer: &Keypair, validator: &Pubkey) -> Pubkey {
-        let program_pk = Keypair::generate().unwrap().pubkey();
+        // Re-audit #2: the program address MUST derive from the deployer + salt.
+        let salt = 0u32.to_le_bytes().to_vec();
+        let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
         let module_bytes = wat::parse_str(wat).unwrap();
         let deploy_ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![program_pk],
-            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: entry_point.into() }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: entry_point.into(), salt }).unwrap(),
         };
         let deploy_tx = Transaction::new_signed(deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
         ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
@@ -4178,11 +4181,14 @@ mod tests {
         let victim = Keypair::generate().unwrap().pubkey();
         ledger.credit(victim, 5_000_000);
 
+        // The victim address is NOT derived from the deployer, so the deploy is
+        // rejected by the payer-binding check (re-audit #2) — you can only deploy
+        // to an address that derives from your own key.
         let module_bytes = wat::parse_str(I64_TRANSFER_WAT).unwrap();
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![victim],
-            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into() }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "transfer".into(), salt: 0u32.to_le_bytes().to_vec() }).unwrap(),
         };
         let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
@@ -4198,12 +4204,13 @@ mod tests {
         let validator = Keypair::generate().unwrap().pubkey();
         ledger.credit(deployer.pubkey(), 1_000_000_000);
 
-        let program_pk = Keypair::generate().unwrap().pubkey();
+        let salt = 0u32.to_le_bytes().to_vec();
+        let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
         let oversized = vec![0u8; crate::native::MAX_PROGRAM_BYTECODE_BYTES + 1];
         let ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![program_pk],
-            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: oversized, entry_point: "x".into() }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes: oversized, entry_point: "x".into(), salt }).unwrap(),
         };
         let tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
         let result = ledger.apply_transaction(&tx, &validator, 0);
@@ -4261,12 +4268,13 @@ mod tests {
             let validator = Keypair::generate().unwrap().pubkey();
             ledger.credit(deployer.pubkey(), 50_000_000);
 
-            let program_pk = Keypair::generate().unwrap().pubkey();
+            let salt = 0u32.to_le_bytes().to_vec();
+            let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
             let module_bytes = wat::parse_str(wat_src).unwrap();
             let deploy_ix = Instruction {
                 program_id: Pubkey::system_program_id(),
                 accounts: vec![program_pk],
-                data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into() }).unwrap(),
+                data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into(), salt }).unwrap(),
             };
             let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
             ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();
@@ -4305,12 +4313,13 @@ mod tests {
         let validator = Keypair::generate().unwrap().pubkey();
         let deployer = Keypair::generate().unwrap();
         ledger.credit(deployer.pubkey(), 50_000_000);
-        let program_pk = Keypair::generate().unwrap().pubkey();
+        let salt = 0u32.to_le_bytes().to_vec();
+        let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
         let module_bytes = wat::parse_str(CHEAP_TRAP_WAT).unwrap();
         let deploy_ix = Instruction {
             program_id: Pubkey::system_program_id(),
             accounts: vec![program_pk],
-            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into() }).unwrap(),
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into(), salt }).unwrap(),
         };
         let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 50_000_000, vec![deploy_ix]).unwrap();
         ledger.apply_transaction(&deploy_tx, &validator, 0).unwrap();

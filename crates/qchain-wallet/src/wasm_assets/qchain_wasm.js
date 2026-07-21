@@ -259,9 +259,11 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
 }
 
 /**
- * `signDeployProgram(seed, programAddress, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`
+ * `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`.
+ * `index` selects the payer-derived contract address (re-audit #2): the same
+ * value passed to `programAddressFromSeed(seed, index)` for display.
  * @param {Uint8Array} seed
- * @param {string} program_address
+ * @param {number} index
  * @param {Uint8Array} module_bytes
  * @param {string} entry_point
  * @param {bigint} nonce
@@ -269,38 +271,36 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
  * @param {bigint} fee_limit
  * @returns {string}
  */
-export function signDeployProgram(seed, program_address, module_bytes, entry_point, nonce, chain_id, fee_limit) {
-    let deferred7_0;
-    let deferred7_1;
+export function signDeployProgram(seed, index, module_bytes, entry_point, nonce, chain_id, fee_limit) {
+    let deferred6_0;
+    let deferred6_1;
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passArray8ToWasm0(seed, wasm.__wbindgen_export);
         const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(program_address, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const ptr1 = passArray8ToWasm0(module_bytes, wasm.__wbindgen_export);
         const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passArray8ToWasm0(module_bytes, wasm.__wbindgen_export);
+        const ptr2 = passStringToWasm0(entry_point, wasm.__wbindgen_export, wasm.__wbindgen_export3);
         const len2 = WASM_VECTOR_LEN;
-        const ptr3 = passStringToWasm0(entry_point, wasm.__wbindgen_export, wasm.__wbindgen_export3);
+        const ptr3 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len3 = WASM_VECTOR_LEN;
-        const ptr4 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
-        const len4 = WASM_VECTOR_LEN;
-        wasm.signDeployProgram(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, nonce, ptr4, len4, fee_limit);
+        wasm.signDeployProgram(retptr, ptr0, len0, index, ptr1, len1, ptr2, len2, nonce, ptr3, len3, fee_limit);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
         var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
-        var ptr6 = r0;
-        var len6 = r1;
+        var ptr5 = r0;
+        var len5 = r1;
         if (r3) {
-            ptr6 = 0; len6 = 0;
+            ptr5 = 0; len5 = 0;
             throw takeObject(r2);
         }
-        deferred7_0 = ptr6;
-        deferred7_1 = len6;
-        return getStringFromWasm0(ptr6, len6);
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
-        wasm.__wbindgen_export2(deferred7_0, deferred7_1, 1);
+        wasm.__wbindgen_export2(deferred6_0, deferred6_1, 1);
     }
 }
 
