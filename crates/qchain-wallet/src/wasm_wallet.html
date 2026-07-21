@@ -526,6 +526,70 @@
   .promo-ar{flex:0 0 auto;color:var(--brand1)}
   .promo-ar svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
 
+  /* ============================================================
+     VISTA DE ESCRITORIO (PC). Layout de wallet de escritorio:
+     barra lateral de navegación + contenido centrado. Marca propia
+     de qchain (logo hexágono-Q, estética cuántica violeta). En móvil
+     todo esto queda oculto y la app sigue igual que antes.
+     ============================================================ */
+  .desknav{display:none}
+  @media (min-width:980px){
+    body.authed{display:flex;align-items:stretch;min-height:100vh}
+    /* barra lateral fija (solo con sesión iniciada) */
+    body.authed .desknav{display:flex;flex-direction:column;flex:0 0 264px;width:264px;
+      box-sizing:border-box;position:sticky;top:0;height:100vh;z-index:60;gap:4px;
+      padding:22px 14px 16px;border-right:1px solid var(--line);
+      background:
+        radial-gradient(420px 220px at 20% -10%, rgba(124,92,255,.12), transparent 60%),
+        var(--card-solid)}
+    .dn-brand{display:flex;align-items:center;gap:11px;padding:4px 8px 16px}
+    .dn-logo{width:34px;height:34px;filter:drop-shadow(0 4px 12px rgba(124,92,255,.4))}
+    .dn-brandtx b{display:block;font-size:15px;font-weight:800;letter-spacing:.4px}
+    .dn-brandtx span{display:block;font-size:10.5px;color:var(--muted);letter-spacing:.3px}
+    .dn-acct{display:flex;align-items:center;gap:9px;width:100%;box-sizing:border-box;
+      background:var(--field);border:1px solid var(--line);border-radius:12px;
+      padding:9px 11px;color:var(--ink);cursor:pointer;margin-bottom:10px;box-shadow:none}
+    .dn-acct:hover{border-color:rgba(140,120,255,.4)}
+    .dn-acct-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;
+      background:linear-gradient(135deg,#7c5cff,#4f74ff);box-shadow:0 0 8px rgba(124,92,255,.6)}
+    .dn-acct-name{flex:1;text-align:left;font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .dn-chev{color:var(--muted);font-size:18px;line-height:1}
+    .dn-list{display:flex;flex-direction:column;gap:2px;flex:1;min-height:0;overflow-y:auto}
+    .dnav{display:flex;align-items:center;gap:12px;width:100%;box-sizing:border-box;
+      background:none;border:0;border-radius:11px;padding:10px 12px;color:var(--muted);
+      font-size:14px;font-weight:600;cursor:pointer;box-shadow:none;text-align:left;transition:background .12s,color .12s}
+    .dnav svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
+    .dnav:hover{background:var(--field);color:var(--ink)}
+    .dnav.on{background:linear-gradient(90deg,rgba(124,92,255,.18),rgba(79,116,255,.08));color:var(--ink)}
+    .dnav.on svg{stroke:var(--brand1)}
+    .dn-foot{display:flex;gap:8px;padding-top:10px;border-top:1px solid var(--line);margin-top:4px}
+    .dn-fbtn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;
+      background:var(--field);border:1px solid var(--line);border-radius:10px;padding:9px 6px;
+      color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;box-shadow:none}
+    .dn-fbtn:hover{color:var(--ink);border-color:rgba(140,120,255,.4)}
+    .dn-fbtn svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    .dn-net{display:flex;align-items:center;gap:7px;padding:8px 10px 2px;font-size:11px;color:var(--muted)}
+    .dn-net i{width:7px;height:7px;border-radius:50%;background:#3ecf8e;box-shadow:0 0 7px #3ecf8e;flex:0 0 auto}
+    .dn-net.off i{background:#ff5470;box-shadow:0 0 7px #ff5470}
+    /* área principal: el .app pierde el marco de teléfono y centra el contenido */
+    body.authed .app{max-width:none;flex:1;min-height:100vh;border:0;
+      background:
+        radial-gradient(900px 460px at 50% -10%, rgba(124,92,255,.10), transparent 60%),
+        #080b14}
+    body.authed .view{max-width:640px;margin:0 auto;width:100%;
+      padding:30px 26px 40px}
+    /* la tabbar inferior no va en escritorio (la sidebar la reemplaza) */
+    body.authed .tabbar{display:none!important}
+    /* en escritorio el saldo grande respira un poco más */
+    body.authed .big-bal{font-size:1.05em}
+    /* las acciones rápidas del home se ven mejor un poco más anchas y centradas */
+    body.authed .acts{max-width:520px;margin-left:auto;margin-right:auto}
+  }
+  /* pantallas MUY anchas: un pelín más de aire, sin estirar de más */
+  @media (min-width:1360px){
+    body.authed .view{max-width:680px}
+  }
+
 </style>
 </head>
 <body>
@@ -573,6 +637,37 @@
     <path stroke="#fff" stroke-width="6" stroke-linecap="round" fill="none" d="M40 39 L52 51"/>
   </symbol>
 </defs></svg>
+
+<!-- ===== Barra lateral de ESCRITORIO (solo visible en pantallas anchas) =====
+     Reusa la MISMA navegación que la tabbar móvil (class="nav" + data-to →
+     showView), así no duplica lógica. En móvil queda display:none. -->
+<aside class="desknav" id="desknav" aria-label="Navegación">
+  <div class="dn-brand">
+    <svg viewBox="0 0 64 64" class="dn-logo" aria-hidden="true"><use href="#qlogo"/></svg>
+    <div class="dn-brandtx"><b>QCHAIN</b><span>Wallet · post-quantum</span></div>
+  </div>
+  <button class="dn-acct nav" data-to="accounts" title="Cambiar de cuenta">
+    <span class="dn-acct-dot"></span>
+    <span class="dn-acct-name" id="dn-acct-name">Cuenta 1</span>
+    <span class="dn-chev">›</span>
+  </button>
+  <nav class="dn-list">
+    <button class="dnav nav" data-view="home" data-to="home"><svg viewBox="0 0 24 24"><path d="M3 10.5L12 3l9 7.5M5 9.5V21h14V9.5"/></svg><span>Inicio</span></button>
+    <button class="dnav nav" data-view="accounts" data-to="accounts"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z"/></svg><span>Activos</span></button>
+    <button class="dnav nav" data-view="send" data-to="send"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg><span>Enviar</span></button>
+    <button class="dnav nav" data-view="receive" data-to="receive"><svg viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg><span>Recibir</span></button>
+    <button class="dnav nav" data-view="staking" data-to="staking"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg><span>Staking</span></button>
+    <button class="dnav nav" data-view="swap" data-to="swap"><svg viewBox="0 0 24 24"><path d="M7 10h11l-3-3M17 14H6l3 3"/></svg><span>Swap</span></button>
+    <button class="dnav nav" data-view="buy" data-to="buy"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg><span>Comprar</span></button>
+    <button class="dnav nav" data-view="contacts" data-to="contacts"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg><span>Contactos</span></button>
+    <button class="dnav nav" data-view="settings" data-to="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Ajustes</span></button>
+  </nav>
+  <div class="dn-foot">
+    <button class="dn-fbtn" id="dn-theme" title="Cambiar tema claro/oscuro"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg><span>Tema</span></button>
+    <button class="dn-fbtn" id="dn-lock" title="Bloquear la wallet"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Bloquear</span></button>
+  </div>
+  <div class="dn-net" id="dn-net"><i></i><span>conectando…</span></div>
+</aside>
 
 <div class="app">
   <canvas id="qwave"></canvas>
@@ -1421,6 +1516,13 @@ function showView(name){
     const t=tabFor(name);
     tb.querySelectorAll(".tab").forEach(b=>b.classList.toggle("on", b.dataset.tab===t));
   }
+  // Barra lateral de escritorio: resalta el ítem activo + refresca el nombre de
+  // cuenta. `body.authed` habilita el layout de escritorio (sidebar + contenido
+  // centrado) SOLO con sesión iniciada; sin sesión, welcome/unlock quedan
+  // centrados como en móvil. La sidebar solo aparece en pantallas anchas (CSS).
+  document.body.classList.toggle("authed", loggedIn && rooted);
+  document.querySelectorAll(".dnav").forEach(b=>b.classList.toggle("on", b.dataset.view===name));
+  try{ const dna=$("dn-acct-name"); if(dna && typeof accountName==="function") dna.textContent=accountName(ACCT); }catch(e){}
   if(name==="home"){ renderHome(); }
   if(name==="accounts") renderAccounts();
   if(name==="receive") renderReceive();
@@ -1434,6 +1536,13 @@ function showView(name){
 }
 document.querySelectorAll(".nav").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
 document.querySelectorAll(".tab").forEach(el=>el.addEventListener("click",()=>showView(el.dataset.to)));
+// Pie de la barra lateral de escritorio: tema claro/oscuro y bloquear.
+(function(){
+  const t=document.getElementById("dn-theme");
+  if(t) t.onclick=()=>{ const cur=localStorage.getItem("qchain_theme")||"dark"; const nx=cur==="dark"?"light":"dark"; localStorage.setItem("qchain_theme",nx); applyTheme(nx); };
+  const l=document.getElementById("dn-lock");
+  if(l) l.onclick=()=>{ const sl=$("set-lock"); if(sl) sl.click(); };  // reusa el bloqueo real de Ajustes
+})();
 // Campana de notificaciones: resume el estado del nodo / aviso de actualización.
 $("h-bell").onclick=async()=>{
   let txt="Todo en orden. Tu wallet está conectada al nodo.";
@@ -1463,11 +1572,14 @@ document.querySelectorAll("#theme-seg button").forEach(b=>b.addEventListener("cl
 async function loadNode(){
   // El punto rojo de la campana avisa: nodo caído o actualización disponible.
   const dot=$("bell-dot"); const show=(v)=>{ if(dot) dot.style.display = v ? "block" : "none"; };
+  // Estado de red en la barra lateral de escritorio (verde/rojo).
+  const setNet=(on)=>{ const n=$("dn-net"); if(!n) return; n.classList.toggle("off",!on);
+    const s=n.querySelector("span"); if(s) s.textContent = on ? "nodo conectado" : "sin conexión"; };
   try{
     const st=await api("/api/node");
-    if(st.online===false){ show(true); return; }
-    show(!!st.update_available);
-  }catch(e){ show(true); }
+    if(st.online===false){ show(true); setNet(false); return; }
+    show(!!st.update_available); setNet(true);
+  }catch(e){ show(true); setNet(false); }
 }
 
 // ---- cuentas HD (múltiples direcciones desde una semilla) ----
