@@ -131,6 +131,16 @@ igual paga el fee de su intento.
 | **`pubkey_eq(idx, &expected) -> bool`** | ¿la dirección de `accounts[idx]` es `expected`? |
 | **`pda_transfer(from, to, amount)`** | PAGA desde una PDA del programa (sin firma sobre el origen; SDK v0.4) |
 | **`deposit(from, to, amount)`** | DEPÓSITO en una tesorería (= `transfer`, con nombre de intención) |
+| **`add_u64(a,b)` / `sub_u64(a,b)`** | aritmética checkeada (abortan en over/underflow; SDK v0.5) |
+| **`read_pubkey/write_pubkey(buf, off[, pk])`** | lee/escribe una dirección (32B) en un buffer |
+| **`require_owner(&buf, off)`** | exige que el firmante sea el dueño guardado en `buf[off..off+32]` |
+| **`holder_seed(tag, &holder) -> [u8;33]`** | seed de PDA por-titular (`tag ‖ holder`) — "debitar sólo lo tuyo" por construcción |
+
+> **Escribiendo un contrato con dinero real?** Leé
+> [`CONTRACT-SECURITY.md`](CONTRACT-SECURITY.md) — la checklist de seguridad para
+> autores (qué garantiza el ledger vs qué tenés que hacer vos), y usá
+> `templates/token/` (token fungible endurecido, verificado en vivo contra ataques)
+> como punto de partida.
 
 ## Estado estructurado on-chain (SDK v0.2)
 

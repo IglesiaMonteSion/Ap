@@ -405,6 +405,99 @@ pub fn deposit(from: u32, to: u32, amount: i64) {
     transfer(from, to, amount);
 }
 
+// ============================================================================
+// SDK v0.5 — CAPA DE SEGURIDAD. Helpers que codifican los HALLAZGOS y LECCIONES
+// de la auditoría del proyecto para que un contrato de tercero los tenga "por
+// defecto" y sea difícil de escribir mal. Las tres lecciones que más rompen
+// contratos en el mundo real, hechas ergonómicas:
+//
+//   1) OVERFLOW-SAFETY: un `+`/`-` que desborda es la fuente #1 de acuñación/robo
+//      en tokens. `add_u64`/`sub_u64` abortan (nunca envuelven) con mensaje.
+//   2) AUTORIZACIÓN POR DUEÑO: `require_owner` compara el firmante contra un admin
+//      guardado (el patrón de v0.4, reusable) — para mint/config/roles.
+//   3) "DEBITAR SÓLO LO TUYO" POR CONSTRUCCIÓN: `holder_seed` deriva la PDA de
+//      saldo de un titular de SU dirección, así un contrato que usa `pubkey(0)`
+//      (el firmante) para el origen NO PUEDE tocar el saldo de otro — la
+//      autorización queda en la ESTRUCTURA, no en un chequeo que se pueda olvidar
+//      (la clase exacta del fix del borde WASM de v2.0.4, llevada al contrato).
+//
+// La garantía DURA sigue en el LEDGER (no acuñar, débito autorizado sólo si
+// firmante o program-owned, conservación) para TODO bytecode; estos helpers hacen
+// que el contrato ADEMÁS falle temprano, claro y por diseño.
+// ============================================================================
+
+/// Suma checkeada de `u64`: aborta (no envuelve) en overflow. En un ledger, un
+/// overflow que envuelve acuña valor de la nada — la lección de `overflow-checks`.
+#[inline]
+pub fn add_u64(a: u64, b: u64) -> u64 {
+    match a.checked_add(b) {
+        Some(v) => v,
+        None => {
+            log("qchain-sdk: overflow u64");
+            abort()
+        }
+    }
+}
+
+/// Resta checkeada de `u64`: aborta si `a < b` (underflow = saldo insuficiente /
+/// acuñación por wraparound). Usalo para debitar un saldo/supply de un token.
+#[inline]
+pub fn sub_u64(a: u64, b: u64) -> u64 {
+    match a.checked_sub(b) {
+        Some(v) => v,
+        None => {
+            log("qchain-sdk: underflow / saldo insuficiente");
+            abort()
+        }
+    }
+}
+
+/// Lee una dirección (32 bytes) de `buf[off..off+32]`; aborta si no entra.
+#[inline]
+pub fn read_pubkey(buf: &[u8], off: usize) -> [u8; 32] {
+    let mut a = [0u8; 32];
+    match buf.get(off..off + 32) {
+        Some(s) => a.copy_from_slice(s),
+        None => abort(),
+    }
+    a
+}
+
+/// Escribe una dirección (32 bytes) en `buf[off..off+32]`; aborta si no entra.
+#[inline]
+pub fn write_pubkey(buf: &mut [u8], off: usize, pk: &[u8; 32]) {
+    match buf.get_mut(off..off + 32) {
+        Some(s) => s.copy_from_slice(pk),
+        None => abort(),
+    }
+}
+
+/// Exige que el FIRMANTE (`accounts[0]`) sea el admin/dueño guardado en `buf` en
+/// `admin_off` (32 bytes). El chequeo de dueño de v0.4, reusable para mint
+/// authority / config / roles. Aborta si no coincide.
+#[inline]
+pub fn require_owner(buf: &[u8], admin_off: usize) {
+    if pubkey(0) != read_pubkey(buf, admin_off) {
+        log("qchain-sdk: solo el dueno");
+        abort();
+    }
+}
+
+/// Construye el seed de una PDA **por-titular**: `tag ‖ holder(32)` (33 bytes). La
+/// clave de seguridad de un token: la dirección de la PDA de saldo de un titular
+/// se deriva de SU dirección, así un contrato que usa `pubkey(0)` (el firmante)
+/// como titular del origen SÓLO puede debitar el saldo del firmante — un atacante
+/// que nombre la PDA de saldo de una víctima falla el `use_pda` (esa PDA no deriva
+/// de la dirección del atacante) y la tx se descarta. La autorización queda POR
+/// CONSTRUCCIÓN. El `tag` separa espacios de PDA (ej. `0x01` = saldos).
+#[inline]
+pub fn holder_seed(tag: u8, holder: &[u8; 32]) -> [u8; 33] {
+    let mut s = [0u8; 33];
+    s[0] = tag;
+    s[1..].copy_from_slice(holder);
+    s
+}
+
 /// Define el punto de entrada del contrato: exporta la función `run` con aridad
 /// fija de **4** enteros `i64` (`sel, a, b, c`) y la delega a `$handler`, que
 /// recibe `[i64; 4]`. Quien llama pasa SIEMPRE 4 args (rellená con 0 los que no

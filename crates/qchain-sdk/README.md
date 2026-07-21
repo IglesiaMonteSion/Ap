@@ -14,6 +14,9 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
 - **Tesorerías de programa + control de acceso por dueño (v0.4):** `pda_transfer`
   (paga fondos DESDE una PDA), `deposit`, `pubkey`/`pubkey_eq` (lee la dirección
   de una cuenta para exigir "el firmante es el admin guardado").
+- **Capa de seguridad (v0.5):** `add_u64`/`sub_u64` (aritmética checkeada),
+  `require_owner`, `holder_seed` ("debitar sólo lo tuyo" por construcción),
+  `read_pubkey`/`write_pubkey`. Ver [`docs/CONTRACT-SECURITY.md`](../../docs/CONTRACT-SECURITY.md).
 - Macro `entrypoint!` que exporta el punto de entrada `run` (4 args `i64`).
 
 **Ejemplos listos para compilar:**
@@ -24,6 +27,9 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
   programa que cualquiera incrementa (v0.3).
 - `templates/vault/` — **tesorería con dueño**: cualquiera deposita, sólo el admin
   retira (fondos en una PDA + control de acceso por `pubkey`, v0.4).
+- `templates/token/` — **token fungible ENDURECIDO**: mint autorizado + cap,
+  saldos en PDAs por-titular, transfer que debita al firmante por construcción
+  (v0.5, verificado en vivo contra ataques).
 
 Compilalos con:
 

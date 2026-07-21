@@ -104,6 +104,23 @@ fn main() -> anyhow::Result<()> {
             // program-pda <program_id> <seed_string>  — deriva la PDA de un programa
             print!("{}", qchain_wasm::program_pda(&args[2], args[3].as_bytes())?);
         }
+        Some("program-pda-hex") => {
+            // program-pda-hex <program_id> <seed_hex>  — PDA con seed BINARIO (para
+            // seeds que llevan bytes crudos, ej. una dirección). SDK v0.5.
+            let seed_bytes = hex::decode(args[3].trim()).map_err(|e| anyhow::anyhow!("seed hex inválido: {e}"))?;
+            print!("{}", qchain_wasm::program_pda(&args[2], &seed_bytes)?);
+        }
+        Some("token-balance-pda") => {
+            // token-balance-pda <program_id> <holder_base58>  — la PDA de saldo de
+            // un titular en un token del SDK v0.5: seed = 0x01 ‖ holder(32 bytes).
+            // MISMA fórmula que `holder_seed(0x01, holder)` on-chain.
+            let holder: qchain_crypto::Pubkey =
+                args[3].trim().parse().map_err(|e| anyhow::anyhow!("dirección de titular inválida: {e}"))?;
+            let mut seed_bytes = [0u8; 33];
+            seed_bytes[0] = 0x01;
+            seed_bytes[1..].copy_from_slice(&holder.to_bytes());
+            print!("{}", qchain_wasm::program_pda(&args[2], &seed_bytes)?);
+        }
         Some("deploy-program") => {
             // deploy-program <seed> <program_addr> <wasm_file> <entry_point> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
