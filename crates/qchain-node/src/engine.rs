@@ -1813,7 +1813,7 @@ impl Engine {
         if !tx.verify_signature() {
             anyhow::bail!("invalid transaction signature");
         }
-        let hash = tx.hash();
+        let hash = tx.txid();
         {
             let mut state = self.state.lock().await;
             if !payer_can_afford_admission(&state, &tx) {

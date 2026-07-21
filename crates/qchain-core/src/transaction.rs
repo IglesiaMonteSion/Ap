@@ -130,8 +130,27 @@ impl Transaction {
         qchain_crypto::combo_from_components(&schemes)
     }
 
-    /// Content-addressed id, used as the transaction's handle in RPC
-    /// responses and as the digest included in a Narwhal batch.
+    /// **Identificador canónico de la transacción (txid)** — QCH-CRY-004,
+    /// tarea #186. Se hashea SOLO el `Message` canónico (con separador de
+    /// dominio `TXID_V1`), **sin las firmas**, así el txid es ESTABLE frente a
+    /// la maleabilidad de la firma (un componente ML-DSA re-codificado
+    /// válidamente no cambia el txid). El anti-doble-gasto ya depende del
+    /// `nonce` dentro del `Message`, no del txid. Es el id que se expone en RPC
+    /// y se usa como manija user-facing de la transacción.
+    pub fn txid(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(qchain_crypto::domains::TXID_V1);
+        if let Ok(bytes) = borsh::to_vec(&self.message) {
+            hasher.update(bytes);
+        }
+        hasher.finalize().into()
+    }
+
+    /// Hash de CONTENIDO del sobre firmado (mensaje **+** firmas) — es el
+    /// content-address de los bytes exactos, usado como digest de la tx dentro
+    /// de un `Batch` de Narwhal: dos codificaciones distintas de firma producen
+    /// batches distintos, evitando la maleabilidad del batch. NO usar como txid
+    /// user-facing (para eso está [`txid`](Self::txid), que es canónico).
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         if let Ok(bytes) = borsh::to_vec(&self.message) {
@@ -185,6 +204,25 @@ mod tests {
         let mut tx = Transaction::new_signed(&payer, 0, [0u8; 32], 1_000, vec![ix]).unwrap();
         tx.message.nonce = 999;
         assert!(!tx.verify_signature());
+    }
+
+    /// QCH-CRY-004 / tarea #186: el txid canónico es función SOLO del mensaje
+    /// (estable frente a la maleabilidad de la firma), mientras que el hash de
+    /// contenido (para el batch) SÍ cambia si cambian las firmas.
+    #[test]
+    fn txid_is_canonical_and_ignores_the_signature() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let ix = sample_ix(payer.pubkey(), to);
+        let mut tx = Transaction::new_signed(&payer, 0, [0u8; 32], 1_000, vec![ix]).unwrap();
+        let txid_before = tx.txid();
+        let hash_before = tx.hash();
+        // Mutar los BYTES de la firma (simula una re-codificación maleada).
+        tx.signature.components[0].bytes[0] ^= 0xff;
+        assert_eq!(tx.txid(), txid_before, "el txid NO debe cambiar al cambiar la firma");
+        assert_ne!(tx.hash(), hash_before, "el hash de contenido (batch) SÍ cambia con la firma");
+        // El txid liga el dominio + el mensaje canónico.
+        assert_ne!(tx.txid(), tx.hash(), "txid (canónico) y hash (contenido) son distintos");
     }
 
     #[test]

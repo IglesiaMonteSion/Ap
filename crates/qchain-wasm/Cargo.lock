@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "6.10.0"
+version = "6.11.0"
 dependencies = [
  "anyhow",
  "borsh",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "6.10.0"
+version = "6.11.0"
 dependencies = [
  "anyhow",
  "borsh",
@@ -448,6 +448,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]

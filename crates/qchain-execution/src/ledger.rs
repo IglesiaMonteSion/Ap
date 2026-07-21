@@ -1202,7 +1202,7 @@ impl Ledger {
             && tx.message.instructions[0].program_id == STAKING_PROGRAM_ID
         {
             let ix = &tx.message.instructions[0];
-            let tx_hash = tx.hash();
+            let tx_hash = tx.txid();
             let sys = Pubkey::system_program_id();
             match crate::staking::StakingInstruction::try_from_slice(&ix.data) {
                 Ok(crate::staking::StakingInstruction::Delegate { validator, amount }) => Some(StakingEvent {
@@ -1424,7 +1424,7 @@ impl Ledger {
                     _ => unreachable!("a ledger's tree kind is fixed; all four captured proofs share one variant"),
                 };
             self.transfer_receipts.push(TransferReceipt {
-                tx_hash: tx.hash(),
+                tx_hash: tx.txid(),
                 round: current_round,
                 from,
                 to,
@@ -3261,7 +3261,7 @@ mod tests {
         let receipts = ledger.transfer_receipts();
         assert_eq!(receipts.len(), 1);
         let r = &receipts[0];
-        assert_eq!(r.tx_hash, tx.hash());
+        assert_eq!(r.tx_hash, tx.txid());
         assert_eq!(r.from, alice.pubkey());
         assert_eq!(r.to, bob);
         assert_eq!(r.amount, 2_000_000);

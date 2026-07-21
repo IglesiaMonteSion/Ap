@@ -29,6 +29,7 @@
 //! without it, two different combos that happened to produce
 //! same-length/same-byte component keys could collide.
 
+pub mod domains;
 pub mod kem;
 pub mod registry;
 pub mod slh_dsa;
@@ -209,6 +210,19 @@ pub struct Keypair {
     mldsa_pk: Vec<u8>,
     mldsa_sk: Vec<u8>,
     slh_dsa: Option<SlhDsaKeypair>,
+}
+
+// QCH-3.1 / S10 (tarea #188): borrar el material secreto de la memoria al
+// dropear. `ed25519_dalek::SigningKey` ya hace zeroize-on-drop internamente;
+// `mldsa_sk` (la clave secreta ML-DSA, o la semilla en el backend `pure`) y la
+// clave SLH-DSA se limpian explícitamente. Sin esto, la clave de firma
+// persistía en memoria hasta el free normal (riesgo de core dump / swap).
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.mldsa_sk.zeroize();
+        // `slh_dsa` se limpia por su propio Drop (abajo).
+    }
 }
 
 impl Keypair {

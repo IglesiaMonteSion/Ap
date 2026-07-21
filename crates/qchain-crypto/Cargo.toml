@@ -20,6 +20,9 @@ bs58.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 sha3.workspace = true
+# Borrado seguro de material secreto de la memoria (QCH-3.1, tarea #188).
+# Compatible con wasm32 (el backend `pure` del navegador).
+zeroize = "1"
 oqs = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ml-dsa = { version = "0.1", default-features = false, features = ["alloc"], optional = true }

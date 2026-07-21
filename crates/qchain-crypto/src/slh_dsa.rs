@@ -34,6 +34,14 @@ pub struct SlhDsaKeypair {
     sk: Vec<u8>,
 }
 
+// QCH-3.1 (tarea #188): borrar la clave secreta SLH-DSA de memoria al dropear.
+impl Drop for SlhDsaKeypair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.sk.zeroize();
+    }
+}
+
 impl SlhDsaKeypair {
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.pk

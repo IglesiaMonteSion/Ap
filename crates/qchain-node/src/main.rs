@@ -97,9 +97,40 @@ struct Cli {
 /// size instead of "however large the pending backlog happens to grow."
 const MAX_CONCURRENT_MESSAGE_HANDLERS: usize = 256;
 
+/// QCH-3.1 / S10 (tarea #188): endurecer el proceso ANTES de leer la clave del
+/// validador — deshabilitar core dumps (para que un crash/OOM no vuelque la
+/// clave privada a un archivo), y best-effort `mlockall` para que las páginas
+/// con secretos no vayan a swap. Linux-only; best-effort (loguea si no puede,
+/// no aborta — p.ej. `mlockall` suele fallar bajo `RLIMIT_MEMLOCK` bajo).
+#[cfg(target_os = "linux")]
+fn harden_process() {
+    // Deshabilitar core dumps: RLIMIT_CORE = 0 + PR_SET_DUMPABLE = 0.
+    unsafe {
+        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::setrlimit(libc::RLIMIT_CORE, &zero) != 0 {
+            tracing::warn!("no se pudo deshabilitar core dumps (RLIMIT_CORE)");
+        }
+        // PR_SET_DUMPABLE=0: el proceso no es volcable (ni ptrace de otro usuario).
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            tracing::warn!("no se pudo setear PR_SET_DUMPABLE=0");
+        }
+        // Best-effort: fijar todas las páginas en RAM (evita swap de secretos).
+        // Falla común bajo RLIMIT_MEMLOCK bajo → solo se loguea.
+        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
+            tracing::info!("mlockall no disponible (RLIMIT_MEMLOCK); core dumps sí deshabilitados");
+        } else {
+            tracing::info!("process hardening: core dumps OFF + páginas fijadas en RAM (mlockall)");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harden_process() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    harden_process();
     let cli = Cli::parse();
     let config = NodeConfig::load(&cli.config)?;
 

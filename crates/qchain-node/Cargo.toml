@@ -8,6 +8,7 @@ name = "qchain-node"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 qchain-core = { path = "../qchain-core" }
 qchain-crypto = { path = "../qchain-crypto" }
 qchain-storage = { path = "../qchain-storage" }
