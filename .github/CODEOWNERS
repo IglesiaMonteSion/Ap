@@ -1,0 +1,27 @@
+# Code owners (task #198, QCH-S11). GitHub requires a review from the listed
+# owner before a pull request touching these paths can merge — a supply-chain
+# control so no change to consensus, crypto, execution, or the deploy tooling
+# lands without the maintainer's explicit approval.
+#
+# Replace `@owner` with the real GitHub handle(s) of the maintainer(s). Enforcement
+# also needs branch protection on the default branch with "Require review from
+# Code Owners" enabled (repo Settings → Branches).
+
+# Default: everything is owned by the maintainer.
+*                       @owner
+
+# Security-critical subsystems — consensus, crypto, the execution/ledger boundary,
+# and the STARK light-client. A change here should get extra scrutiny.
+/crates/qchain-consensus/    @owner
+/crates/qchain-crypto/       @owner
+/crates/qchain-execution/    @owner
+/crates/qchain-stark/        @owner
+/crates/qchain-node/         @owner
+
+# Supply-chain surfaces: the lockfile, the pinned toolchain, CI, the Dockerfile,
+# and the deploy tooling that runs on real hosts.
+/Cargo.lock             @owner
+/rust-toolchain.toml    @owner
+/.github/               @owner
+/Dockerfile             @owner
+/deploy/                @owner

@@ -1,0 +1,13 @@
+# Toolchain PINNED for reproducible builds (task #198, QCH-S11).
+#
+# rustup honors this file for every build in this workspace (local, Docker, CI),
+# so the exact same compiler produces the artifact regardless of what's installed
+# by default. Combined with the committed `Cargo.lock` + `--locked` (already
+# enforced in the Dockerfile and CI), this pins BOTH the toolchain and every
+# dependency version — the two inputs that otherwise make a build non-reproducible.
+#
+# To bump: change `channel` here, rebuild, run the test suite, and record the new
+# version in the same commit so the change is auditable.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]

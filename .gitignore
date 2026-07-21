@@ -10,3 +10,7 @@
 
 # Per-host image attestation manifest (deploy/attest-image.sh) - runtime artifact
 image-attestation.json
+
+# Supply-chain release artifacts (deploy/sign-release.sh, deploy/gen-sbom.sh)
+/release/
+sbom.cdx.json

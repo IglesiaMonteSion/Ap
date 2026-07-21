@@ -201,6 +201,31 @@ alguien la cambió), pensado para un cron de monitoreo o un gate de CI. Avisa si
 grabaste con el repo sucio (`git_dirty`) — esa imagen no es reproducible desde el
 commit solo (la firma/reproducibilidad de artefactos es su propia tarea, #198).
 
+**Cadena de suministro (tarea #198).** Varias piezas que hacen auditable de dónde
+salió el binario:
+
+- **Toolchain pinneado + `Cargo.lock` + `--locked`** → build reproducible. El
+  `rust-toolchain.toml` fija la versión EXACTA del compilador (1.94.1) que rustup
+  instala en cualquier máquina/Docker/CI, y el `Dockerfile` usa `rust:1.94-bookworm`
+  + `cargo build --locked` (deps pinneadas al `Cargo.lock` committeado).
+- **SBOM** (`deploy/gen-sbom.sh`) → inventario CycloneDX de TODA dependencia
+  transitiva con versión y checksum SHA-256, derivado sólo del `Cargo.lock`
+  (determinista, sin red). CI lo genera y lo sube como artefacto; a mano:
+  `deploy/gen-sbom.sh -o sbom.cdx.json`.
+- **CI de seguridad** (`.github/workflows/ci.yml`): build `--locked` + `clippy -D
+  warnings` + toda la suite (incl. DST 9/9 y ataques WASM) + **`cargo audit`**
+  (RustSec) + el SBOM.
+- **CODEOWNERS** (`.github/CODEOWNERS`): un cambio a consenso/cripto/ejecución/CI/
+  deploy exige la revisión del maintainer (necesita branch protection con "Require
+  review from Code Owners"). Reemplazá `@owner` por tu handle real de GitHub.
+- **Firmas GPG** (`deploy/sign-release.sh`): firma un manifiesto (hashes del
+  `Cargo.lock` + `Dockerfile` + SBOM) y, opcional, la tag. **Requiere tu clave GPG**
+  (la firma es humana). Activá también `git config --global commit.gpgsign true`.
+
+**Pendiente honesto:** la reproducibilidad **bit-for-bit** completa necesita además
+`SOURCE_DATE_EPOCH` + un entorno de build determinista; y la auditoría externa +
+bug bounty (tarea #203) es un proceso humano con terceros.
+
 ## Respaldos automáticos (`deploy/backup-node.sh`)
 
 Lo ÚNICO irreemplazable de un validador es su `keypair.json` (la clave que firma

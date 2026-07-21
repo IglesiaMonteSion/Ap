@@ -15,7 +15,13 @@
 # (which isn't available to later stages), they're copied out to /out in the
 # same RUN. Requires BuildKit (default in modern Docker; the deploy scripts set
 # DOCKER_BUILDKIT=1 to be safe).
-FROM rust:bookworm AS builder
+# PINNED to an exact Rust minor for reproducible builds (task #198, QCH-S11) -
+# `rust:bookworm` floats to whatever's latest at build time, which makes the
+# artifact non-reproducible. `rust-toolchain.toml` pins the exact patch (1.94.1)
+# that rustup installs on top of this base, so the compiler is fully pinned; the
+# base tag just needs to be close enough to avoid a re-download. Combined with
+# the committed Cargo.lock + `--locked` below, both build inputs are pinned.
+FROM rust:1.94-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake clang libclang-dev pkg-config \

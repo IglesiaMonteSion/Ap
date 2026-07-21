@@ -74,3 +74,19 @@ jobs:
       # Falla si hay una vulnerabilidad conocida en una dependencia.
       - name: cargo audit
         run: cargo audit
+
+  sbom:
+    name: SBOM CycloneDX (inventario de dependencias)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # gen-sbom.sh deriva el SBOM SOLO del Cargo.lock committeado (determinista,
+      # sin toolchain de Rust ni red), así que es rápido y reproducible.
+      - name: Generar SBOM
+        run: bash deploy/gen-sbom.sh -o sbom.cdx.json
+      - name: Subir SBOM como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: qchain-sbom-cyclonedx
+          path: sbom.cdx.json
