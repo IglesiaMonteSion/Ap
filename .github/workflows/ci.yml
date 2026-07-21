@@ -66,6 +66,54 @@ jobs:
       - name: Tests del workspace
         run: cargo test --workspace --locked
 
+  sdk:
+    name: SDK de contratos (qchain-sdk + templates a wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # qchain-sdk y las plantillas de contrato están EXCLUIDAS del workspace
+    # (targetean wasm32/no_std), así que `cargo test --workspace` NUNCA las
+    # compila. Sin este job, un cambio a la capa de seguridad del SDK o a una
+    # plantilla que rompa la compilación (o el fix anti init-takeover de la
+    # bóveda) pasaría el CI sin ser detectado. Este job cierra ese hueco:
+    # compila el SDK y CADA plantilla a wasm32 + clippy como puerta.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Toolchain de Rust (stable + clippy + target wasm32)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/qchain-sdk
+            crates/qchain-sdk/templates/token
+            crates/qchain-sdk/templates/vault
+            crates/qchain-sdk/templates/payments
+            crates/qchain-sdk/templates/counter
+            crates/qchain-sdk/templates/shared_counter
+      # El SDK es no_std + sin dependencias (sólo `core` + los syscalls del host):
+      # compila a wasm32 Y en host (stubs inertes para que clippy corra).
+      - name: Clippy qchain-sdk (host, -D warnings)
+        run: cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy qchain-sdk (wasm32, -D warnings)
+        run: cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - name: Build del SDK a wasm32
+        run: cargo build --manifest-path crates/qchain-sdk/Cargo.toml --release --target wasm32-unknown-unknown
+      # Cada plantilla de ejemplo (token/vault/payments/counter/shared_counter)
+      # DEBE compilar a wasm32 — así el fix anti init-takeover de la bóveda
+      # (require_deployer en init) y toda la capa de seguridad del SDK quedan
+      # bajo CI.
+      - name: Build de cada plantilla de contrato a wasm32
+        run: |
+          set -e
+          for t in token vault payments counter shared_counter; do
+            echo "==> compilando plantilla $t"
+            cargo build --manifest-path "crates/qchain-sdk/templates/$t/Cargo.toml" \
+              --release --target wasm32-unknown-unknown
+          done
+
   audit:
     name: cargo-audit (advisories de dependencias)
     runs-on: ubuntu-latest

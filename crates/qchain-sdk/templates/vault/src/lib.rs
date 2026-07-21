@@ -18,7 +18,7 @@
 //!   accounts[2] = destino del retiro (a quién le paga la bóveda)  [sólo withdraw]
 //!
 //! Selectores (SIEMPRE 4 args i64: sel, x, _, _):
-//!   1 init()        : reclama la bóveda y fija al firmante (accounts[0]) como admin. Falla si ya está inicializada.
+//!   1 init()        : reclama la bóveda y fija al DEPLOYER (accounts[0]) como admin. SÓLO el deployer, una vez (require_deployer).
 //!   2 deposit(x)    : CUALQUIERA mueve x de su cuenta (accounts[0]) a la bóveda.
 //!   3 withdraw(x)   : SÓLO el admin mueve x de la bóveda a accounts[2].
 //!
