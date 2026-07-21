@@ -68,6 +68,7 @@ CIFRADO=0
 # para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
 FONDEAR_ADDR=""
+WITHDRAWAL_ADDR=""
 FONDEAR_QCH=""
 TREASURY_AUTH=""
 TREASURY_QCH=""
@@ -106,6 +107,14 @@ Opciones:
   --rpc-port <puerto>    Puerto RPC a usar en modo "solo" (por defecto 8080).
   --nombre <texto>       (modo "solo") nombre visible del validador, para que
                          las wallets lo muestren al elegir dónde hacer staking.
+  --withdrawal-address <dir>
+                         (modo "solo") dirección FRÍA de retiro (#193-B): las
+                         comisiones de fee que gane este validador se acreditan
+                         AHÍ en vez de a su dirección de consenso, así la clave
+                         online (que firma bloques) NO controla los fondos. Se
+                         pliega en el chain_id (decisión de génesis; una red que
+                         la use es distinta). Sin ella, las ganancias van a la
+                         dirección de consenso (comportamiento previo).
   --round-interval <ms>  (modo "solo") ms entre rondas de consenso (por defecto
                          500). Bajarlo (p.ej. 250) sube el techo de TPS en una
                          red multi-nodo. TODOS los nodos deben usar el mismo
@@ -171,6 +180,7 @@ while [ $# -gt 0 ]; do
     --listen-port) LISTEN_PORT_ARG="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT_ARG="${2:-}"; shift 2 ;;
     --nombre) NOMBRE_VALIDADOR="${2:-}"; shift 2 ;;
+    --withdrawal-address) WITHDRAWAL_ADDR="${2:-}"; shift 2 ;;
     --round-interval) RONDA_MS="${2:-}"; shift 2 ;;
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
     --autenticado|--authenticated) AUTENTICADO=1; shift ;;
@@ -408,17 +418,25 @@ if [ "$SALTAR_CONFIGURACION" -eq 0 ]; then
       fi
 
       mkdir -p "$QCHAIN_HOME/manifests" "$QCHAIN_HOME/out"
+      # Campos opcionales del manifiesto (name, withdrawal_address), agregados
+      # sólo cuando se pidieron, así el config es byte-idéntico al de antes si no.
+      EXTRA_FIELDS=""
       if [ -n "${NOMBRE_VALIDADOR:-}" ]; then
         # Escapar comillas/backslashes para un JSON válido.
         NOMBRE_JSON="$(printf '%s' "$NOMBRE_VALIDADOR" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-        cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
-{"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE, "name": "$NOMBRE_JSON"}
-EOF
-      else
-        cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
-{"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE}
-EOF
+        EXTRA_FIELDS="$EXTRA_FIELDS, \"name\": \"$NOMBRE_JSON\""
       fi
+      if [ -n "${WITHDRAWAL_ADDR:-}" ]; then
+        # #193-B: validar como base58 antes de interpolarla (anti-inyección JSON),
+        # igual que --fondear.
+        if ! printf '%s' "$WITHDRAWAL_ADDR" | grep -Eq '^[1-9A-HJ-NP-Za-km-z]{32,44}$'; then
+          error "--withdrawal-address: dirección inválida (se espera base58 de 32-44 chars); recibí: '$WITHDRAWAL_ADDR'"
+        fi
+        EXTRA_FIELDS="$EXTRA_FIELDS, \"withdrawal_address\": \"$WITHDRAWAL_ADDR\""
+      fi
+      cat > "$QCHAIN_HOME/manifests/validador1.json" <<EOF
+{"pubkey_bundle": $BUNDLE_JSON, "listen_addr": "$LISTEN_ADDR", "rpc_addr": "$RPC_ADDR", "stake": $STAKE$EXTRA_FIELDS}
+EOF
       GENESIS_ALLOCS="{\"address\": \"$WALLET_DIRECCION\", \"balance\": $FONDO_WALLET_PRUEBA}"
       if [ -n "$FONDEAR_ADDR" ]; then
         if ! printf '%s' "$FONDEAR_QCH" | grep -Eq '^[0-9]+$'; then

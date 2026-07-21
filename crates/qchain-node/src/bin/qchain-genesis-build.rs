@@ -129,6 +129,13 @@ struct ValidatorManifest {
     /// shared config so wallets can show a named list. Absent = no name.
     #[serde(default)]
     name: Option<String>,
+    /// Optional cold WITHDRAWAL/operator address (tarea #193-B). When set, this
+    /// validator's fee earnings are credited here instead of its consensus id,
+    /// so a compromised consensus key can't spend them. Carried into the shared
+    /// config; folds into `chain_id` only when present. Absent = earnings go to
+    /// the consensus address (byte-identical to a pre-#193-B network).
+    #[serde(default)]
+    withdrawal_address: Option<qchain_crypto::Pubkey>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -177,7 +184,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let validators: Vec<ValidatorConfig> =
-        manifests.iter().map(|m| ValidatorConfig { pubkey_bundle: m.pubkey_bundle.clone(), addr: m.listen_addr, stake: m.stake, name: m.name.clone() }).collect();
+        manifests.iter().map(|m| ValidatorConfig { pubkey_bundle: m.pubkey_bundle.clone(), addr: m.listen_addr, stake: m.stake, name: m.name.clone(), withdrawal_address: m.withdrawal_address }).collect();
 
     let genesis: Vec<GenesisAllocation> = match &cli.genesis {
         Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,

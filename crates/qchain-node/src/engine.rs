@@ -782,6 +782,16 @@ pub struct Engine {
     /// the key that signs blocks. Only consensus votes/vertices sign through it
     /// here; what gets signed is unchanged (the #187 domain-tagged preimages).
     pub signer: std::sync::Arc<dyn qchain_crypto::Signer>,
+    /// **Mapeo consenso→retiro** (tarea #193-B): la dirección de CONSENSO de un
+    /// validador → su dirección de RETIRO/operador fría, del config. Cuando un
+    /// validador tiene una, sus comisiones de fee se acreditan ahí en vez de a su
+    /// dirección de consenso — así la clave de consenso no controla los fondos.
+    /// Vacío por defecto (byte-idéntico: `fee_destination` devuelve el mismo id).
+    pub withdrawal_map: std::collections::HashMap<ValidatorId, Pubkey>,
+    /// La dirección donde ESTE nodo recibe sus propias ganancias (su
+    /// `withdrawal_address` si la tiene, si no su `self_id`) — para reportar el
+    /// balance/comisión propios en el dashboard.
+    pub self_fee_dest: Pubkey,
     /// The consensus committee currently in effect (this epoch). Under fixed
     /// membership (rotation off) it never changes; under phase-3.3 rotation the
     /// epoch ratchet in `try_commit` swaps it at each boundary. Used for
@@ -2322,7 +2332,10 @@ impl Engine {
         use qchain_execution::ids::STAKING_REWARDS_POOL_ID;
         let state = self.state.lock().await;
         let params = state.ledger.current_params();
-        let validator_balance = state.ledger.store().get(&self.self_id).map(|a| a.balance).unwrap_or(0);
+        // #193-B: the balance/commission this node reports as "its earnings" is
+        // read from its fee DESTINATION (the cold withdrawal address if set, else
+        // its consensus id) — that's where the fee commission actually lands now.
+        let validator_balance = state.ledger.store().get(&self.self_fee_dest).map(|a| a.balance).unwrap_or(0);
         let reward_pool_balance = state.ledger.store().get(&STAKING_REWARDS_POOL_ID).map(|a| a.balance).unwrap_or(0);
         EconomicsResponse {
             validator: self.self_id.to_string(),
@@ -2332,7 +2345,7 @@ impl Engine {
             fee_burned: state.ledger.fee_burned,
             dust_burned: state.ledger.dust_burned,
             validator_earned: state.ledger.validator_earned,
-            own_commission: state.ledger.commission_of(&self.self_id),
+            own_commission: state.ledger.commission_of(&self.self_fee_dest),
             pool_earned: state.ledger.pool_earned,
             reward_pool_balance,
             total_emitted: state.ledger.total_emitted,
@@ -2348,6 +2361,20 @@ impl Engine {
             dag_certificates: state.dag.len(),
             peer_count: self.committee().len().saturating_sub(1),
         }
+    }
+
+    /// **Destino de las ganancias de fee de un validador** — tarea #193-B.
+    /// Devuelve la dirección de RETIRO/operador (fría) configurada para el
+    /// validador `author`, o su propia dirección de consenso si no tiene una.
+    /// Así la clave de consenso (online) firma bloques pero las comisiones de
+    /// fee que ese proponente gana se acreditan a una dirección cuya clave FRÍA
+    /// el operador guarda offline → una fuga de la clave de consenso puede
+    /// equivocar (slasheable) pero NO gastar las ganancias. Determinista (el
+    /// mapa se deriva del config plegado en el `chain_id`), así que todo nodo
+    /// acredita la MISMA dirección para el mismo `author` comprometido → sin
+    /// fork. Con el mapa vacío (el default) devuelve `*author` → byte-idéntico.
+    fn fee_destination(&self, author: &ValidatorId) -> Pubkey {
+        self.withdrawal_map.get(author).copied().unwrap_or(*author)
     }
 
     /// QCH distribution / rich list (`GET /holders`). Computed from the same
@@ -3588,7 +3615,14 @@ impl Engine {
                 } else if tx.message.chain_id != self.chain_id {
                     Err(qchain_execution::ExecError::ProgramError("chain_id does not match this network".into()))
                 } else {
-                    state.ledger.apply_transaction_presigned(tx, &author, round)
+                    // #193-B: route this proposer's fee commission to its cold
+                    // WITHDRAWAL address if one is configured, so a compromised
+                    // consensus key can't spend the earnings. Deterministic:
+                    // `author` is the committed vertex author and the map is
+                    // config-derived (folded into chain_id), so every node
+                    // credits the SAME address → no fork.
+                    let fee_dest = self.fee_destination(&author);
+                    state.ledger.apply_transaction_presigned(tx, &fee_dest, round)
                 };
                 match result {
                     Ok(_) => {

@@ -189,10 +189,26 @@ comprometido — la propiedad de seguridad central de un firmante de validador.
 conflicto, y la clave nunca sale del daemon), así que corré el firmante en el
 MISMO host que el nodo (loopback). `--allow-non-loopback` es necesario a
 propósito para bindear una dirección pública (sólo sobre un enlace privado +
-firewall). **Límite honesto:** esto saca la clave del proceso del nodo (incremento
-A de #193); la separación on-chain de la clave de CONSENSO respecto de la clave de
-FONDOS/retiro (incremento B — una fuga del hot key no puede drenar el bono) es el
-siguiente incremento de #193.
+firewall). Esto saca la clave del proceso del nodo (incremento A de #193).
+
+**Separación de roles de clave — dirección FRÍA de retiro (`withdrawal_address`,
+tarea #193-B, incremento B).** La clave de consenso (online, en el nodo o en el
+firmante remoto) firma bloques, pero por defecto TAMBIÉN es la dirección donde se
+acreditan las comisiones de fee que gana el validador — así que una fuga de esa
+hot key deja gastar las ganancias. Con una dirección de retiro configurada, esas
+comisiones se acreditan a una dirección **cuya clave FRÍA guardás offline**: la
+clave de consenso puede firmar/equivocar (slasheable) pero NO puede gastar los
+fondos. **Cómo:** agregá `"withdrawal_address": "<base58>"` a la entrada de tu
+validador en `validators` (o pasá `--withdrawal-address <dir>` a
+`install-node.sh` en modo solo, o el campo homónimo del manifiesto de
+`qchain-genesis-build`). Refuerzo del firmante remoto: rechaza firmar cualquier
+mensaje del dominio de transacción (`qchain-tx-sig-v1`), así la clave de consenso
+NO puede autorizar una transferencia de valor aunque el proceso del nodo esté
+comprometido. **Es una decisión de génesis** (cambia DÓNDE se acredita el fee →
+se pliega en el `chain_id` sólo cuando está seteada): elegila al crear la red;
+una red sin ella conserva su `chain_id` exacto y las ganancias van a la dirección
+de consenso (comportamiento previo). Determinista → todos los nodos acreditan la
+misma dirección, sin fork.
 
 **Endurecimiento del contenedor.** Los cuatro servicios systemd corren con
 `--security-opt no-new-privileges` (un proceso dentro del contenedor no puede

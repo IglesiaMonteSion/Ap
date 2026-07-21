@@ -160,14 +160,25 @@ async fn main() -> anyhow::Result<()> {
     let mut validator_infos = Vec::new();
     let mut peers = Vec::new();
     let mut validator_directory = Vec::new();
+    // #193-B: consensus-id → cold withdrawal address, derived from the config
+    // (folded into chain_id when any is set → all nodes build the same map → no
+    // fork). A validator's fee commission is credited to its withdrawal address
+    // instead of its consensus id, so a compromised consensus key can't spend it.
+    let mut withdrawal_map: std::collections::HashMap<qchain_core::ValidatorId, qchain_crypto::Pubkey> = std::collections::HashMap::new();
     for v in &config.validators {
         let id = v.pubkey_bundle.to_address();
         validator_infos.push(ValidatorInfo { id, pubkey_bundle: v.pubkey_bundle.clone(), stake: v.stake });
         validator_directory.push(qchain_node::engine::ValidatorDirEntry { address: id, name: v.name.clone(), stake: v.stake });
+        if let Some(w) = v.withdrawal_address {
+            withdrawal_map.insert(id, w);
+        }
         if id != self_id {
             peers.push(PeerInfo { id, addr: v.addr });
         }
     }
+    // Where THIS node's own fee earnings land (its withdrawal address if set,
+    // else its consensus id) — used to report its own balance/commission.
+    let self_fee_dest = withdrawal_map.get(&self_id).copied().unwrap_or(self_id);
     // A fixed-membership node MUST be in its own configured validator set. A
     // rotation node need not be: a genuine newcomer joins by staking and
     // registering on-chain, so it runs with the *genesis* validators as its
@@ -788,6 +799,8 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(Engine {
         self_id,
         signer,
+        withdrawal_map,
+        self_fee_dest,
         validators: std::sync::RwLock::new(std::sync::Arc::new(current_committee)),
         validator_schedule: std::sync::RwLock::new(std::sync::Arc::new(validator_schedule)),
         validator_directory,

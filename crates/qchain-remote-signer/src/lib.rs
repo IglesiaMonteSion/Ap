@@ -329,10 +329,25 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
             Ok(sig) => SignerResponse::Signature(sig),
             Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
         },
-        SignerRequest::SignRaw { msg } => match keypair.sign(msg) {
-            Ok(sig) => SignerResponse::Signature(sig),
-            Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
-        },
+        SignerRequest::SignRaw { msg } => {
+            // #193-B (D1): the consensus signer is a BLOCK signer, never a value
+            // signer. `sign_raw` exists only for the P2P handshake transcript
+            // (domained `qchain-p2p-auth-v1`). A payer's value transfer signs
+            // `TX_SIG_V1 ‖ borsh(Message)` (#187). If an attacker who reached the
+            // socket asked the signer to sign a transaction envelope, it would
+            // become a value-transfer oracle. Refuse anything domained TX_SIG_V1
+            // → the consensus key structurally CANNOT authorize a transfer, so a
+            // compromised node process can equivocate (slashable) but never spend.
+            if msg.starts_with(qchain_crypto::domains::TX_SIG_V1) {
+                let reason = "refusing SignRaw of a TX_SIG_V1-domained message: the consensus signer never signs value transactions (#193-B)".to_string();
+                tracing::error!("signer: {reason}");
+                return SignerResponse::Refused(reason);
+            }
+            match keypair.sign(msg) {
+                Ok(sig) => SignerResponse::Signature(sig),
+                Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+            }
+        }
     }
 }
 
@@ -368,6 +383,31 @@ mod tests {
         assert!(matches!(respond(&SignerRequest::SignPeerVote { digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
         // SignRaw → OK.
         assert!(matches!(respond(&SignerRequest::SignRaw { msg: b"handshake".to_vec() }, &kp, &g), SignerResponse::Signature(_)));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// #193-B (D1): the consensus signer refuses to sign a `TX_SIG_V1`-domained
+    /// message, so it can never be turned into a value-transfer signing oracle —
+    /// a P2P-handshake (`qchain-p2p-auth-v1`) or any other non-tx raw message is
+    /// still signed normally.
+    #[test]
+    fn sign_raw_refuses_a_tx_domained_message_but_signs_others() {
+        let tmp = std::env::temp_dir().join(format!("qrs-txoracle-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let g = guard(&tmp);
+
+        // A message domained as a value transfer (what a payer signs, #187) → REFUSED.
+        let mut tx_msg = qchain_crypto::domains::TX_SIG_V1.to_vec();
+        tx_msg.extend_from_slice(b"...borsh(Message) would follow...");
+        assert!(
+            matches!(respond(&SignerRequest::SignRaw { msg: tx_msg }, &kp, &g), SignerResponse::Refused(_)),
+            "the consensus signer must refuse to sign a TX_SIG_V1-domained message (no value oracle)"
+        );
+        // The real handshake transcript (a different domain) is still signed.
+        let hs = b"qchain-p2p-auth-v1 transcript...".to_vec();
+        assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

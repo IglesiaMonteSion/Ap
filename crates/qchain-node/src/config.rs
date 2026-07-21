@@ -27,6 +27,21 @@ pub struct ValidatorConfig {
     /// network, made once up front.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// **Dirección de RETIRO / operador (fría)** — tarea #193-B (separación de
+    /// roles de clave). Cuando está seteada, las comisiones de fee que gana este
+    /// validador (su "valor") se acreditan a ESTA dirección en vez de a su
+    /// dirección de CONSENSO (la del `pubkey_bundle`). Así la clave de consenso
+    /// (online, en el nodo o en el firmante remoto) firma bloques pero NO
+    /// controla los fondos: una fuga de la clave de consenso puede equivocar
+    /// (slasheable) pero no puede gastar las ganancias, que viven en una
+    /// dirección cuya clave FRÍA el operador guarda offline. Como cambia DÓNDE
+    /// se acredita el fee (estado), se pliega en el `chain_id` SÓLO cuando está
+    /// seteada (`skip_serializing_if` → un config sin ella serializa idéntico, así
+    /// una red existente conserva su `chain_id` EXACTO; una red que la usa es una
+    /// red separada, decisión de génesis). Determinista: todos los nodos derivan
+    /// el mismo mapeo consenso→retiro del mismo config → sin fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal_address: Option<Pubkey>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -364,7 +379,7 @@ mod tests {
     #[test]
     fn chain_id_is_identical_across_validators_of_the_same_network_despite_differing_per_validator_fields() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
         let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
 
         let mut a = config_with(validators.clone(), genesis.clone());
@@ -385,7 +400,7 @@ mod tests {
     #[test]
     fn economics_v7_folds_into_chain_id_only_when_enabled() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
         let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
 
         let v6 = config_with(validators.clone(), genesis.clone());
@@ -409,7 +424,7 @@ mod tests {
     #[test]
     fn chain_id_differs_across_genuinely_different_networks() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None }];
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
 
         let network_a = config_with(validators.clone(), vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 1 }]);
         let network_b = config_with(validators, vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 2 }]);
@@ -426,7 +441,7 @@ mod tests {
     #[test]
     fn name_none_is_omitted_from_serialization_so_chain_id_is_unchanged() {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
-        let nameless = ValidatorConfig { pubkey_bundle: bundle.clone(), addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None };
+        let nameless = ValidatorConfig { pubkey_bundle: bundle.clone(), addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None };
         let named = ValidatorConfig { name: Some("Alice".into()), ..nameless.clone() };
 
         let nameless_json = serde_json::to_string(&nameless).unwrap();
@@ -435,5 +450,24 @@ mod tests {
         let c_nameless = config_with(vec![nameless], vec![]);
         let c_named = config_with(vec![named], vec![]);
         assert_ne!(c_nameless.chain_id(), c_named.chain_id(), "setting a name folds it into the network's own chain_id");
+    }
+
+    /// #193-B: a cold withdrawal address is chain_id-safe when unset (a config
+    /// without one serializes byte-identical, so an existing network keeps its
+    /// exact chain_id), and setting one folds into the network's own chain_id
+    /// (so a network that separates the funds key is a distinct chain).
+    #[test]
+    fn withdrawal_address_none_is_omitted_so_chain_id_is_unchanged() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let plain = ValidatorConfig { pubkey_bundle: bundle.clone(), addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None };
+        let cold = Keypair::generate().unwrap().pubkey();
+        let with_withdrawal = ValidatorConfig { withdrawal_address: Some(cold), ..plain.clone() };
+
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("withdrawal_address"), "a validator with no withdrawal address must serialize with no `withdrawal_address` key (byte-identical to pre-#193-B configs, preserving chain_id)");
+
+        let c_plain = config_with(vec![plain], vec![]);
+        let c_cold = config_with(vec![with_withdrawal], vec![]);
+        assert_ne!(c_plain.chain_id(), c_cold.chain_id(), "setting a withdrawal address folds it into the network's own chain_id");
     }
 }
