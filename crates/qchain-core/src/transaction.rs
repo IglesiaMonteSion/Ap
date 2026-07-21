@@ -58,6 +58,21 @@ pub struct Message {
     /// transactions first. `0` (the default via `new_signed`) means no tip.
     /// Signed as part of the message, so it can't be altered in flight.
     pub priority_fee: u64,
+    /// **Expiración de la transacción (max-height)** — tarea #191, QCH-S4. La
+    /// última ronda de consenso en la que esta tx puede EJECUTARSE. `0` = SIN
+    /// expiración (comportamiento histórico; el default de `new_signed`). Con un
+    /// valor `> 0`, la tx se rechaza —tanto en ADMISIÓN como en EJECUCIÓN— si
+    /// `current_round > valid_until_round`. Va FIRMADO dentro del mensaje, así
+    /// que no se puede alterar en vuelo. Cierra dos problemas reales: (a) una tx
+    /// firmada no queda válida para siempre (una que se quedó en un mempool
+    /// puede caducar en vez de ejecutarse semanas después a un fee/estado que el
+    /// firmante ya no espera), y (b) da una ventana de validez acotada como la
+    /// `lastValidBlockHeight` de Solana / el `Expiration` de Cosmos. La
+    /// verificación en EJECUCIÓN es determinista (función pura de la ronda
+    /// comprometida, idéntica en todo validador) → sin fork; un proposer
+    /// Bizantino que incluya una tx ya caducada en un batch la ve rechazada por
+    /// todos igual.
+    pub valid_until_round: u64,
     pub instructions: Vec<Instruction>,
 }
 
@@ -80,12 +95,32 @@ impl Transaction {
 
     /// Like `new_signed` but with an explicit priority-fee tip (see
     /// `Message::priority_fee`). `new_signed` is exactly this with tip `0`.
+    /// Expiración desactivada (`valid_until_round = 0`) — usar
+    /// [`new_signed_full`](Self::new_signed_full) para acotar la validez.
     pub fn new_signed_with_priority(
         payer: &Keypair,
         nonce: u64,
         chain_id: [u8; 32],
         fee_limit: u64,
         priority_fee: u64,
+        instructions: Vec<Instruction>,
+    ) -> anyhow::Result<Self> {
+        Self::new_signed_full(payer, nonce, chain_id, fee_limit, priority_fee, 0, instructions)
+    }
+
+    /// Constructor completo — firma un mensaje con TIP de prioridad y
+    /// EXPIRACIÓN explícitos (tarea #191). `valid_until_round = 0` significa sin
+    /// expiración; un valor `> 0` es la última ronda en que la tx puede
+    /// ejecutarse (rechazada en admisión y ejecución si `current_round` la pasa).
+    /// `new_signed`/`new_signed_with_priority` son este mismo con `0`/`0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed_full(
+        payer: &Keypair,
+        nonce: u64,
+        chain_id: [u8; 32],
+        fee_limit: u64,
+        priority_fee: u64,
+        valid_until_round: u64,
         instructions: Vec<Instruction>,
     ) -> anyhow::Result<Self> {
         let payer_keys = payer.public_key_bundle();
@@ -97,6 +132,7 @@ impl Transaction {
             chain_id,
             fee_limit,
             priority_fee,
+            valid_until_round,
             instructions,
         };
         let bytes = borsh::to_vec(&message).expect("message always serializes");
@@ -223,6 +259,49 @@ mod tests {
         assert_ne!(tx.hash(), hash_before, "el hash de contenido (batch) SÍ cambia con la firma");
         // El txid liga el dominio + el mensaje canónico.
         assert_ne!(tx.txid(), tx.hash(), "txid (canónico) y hash (contenido) son distintos");
+    }
+
+    /// #191: `valid_until_round` va FIRMADO — mutar el campo invalida la firma
+    /// (un atacante no puede extender ni acortar la ventana de validez en vuelo)
+    /// y un round-trip Borsh lo preserva.
+    #[test]
+    fn valid_until_round_is_signed_and_round_trips() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let ix = sample_ix(payer.pubkey(), to);
+        let tx = Transaction::new_signed_full(&payer, 0, [0u8; 32], 1_000, 0, 12_345, vec![ix]).unwrap();
+        assert!(tx.verify_signature(), "la tx con expiración verifica");
+        assert_eq!(tx.message.valid_until_round, 12_345);
+        // Round-trip Borsh preserva el campo.
+        let bytes = borsh::to_vec(&tx).unwrap();
+        let back: Transaction = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(back.message.valid_until_round, 12_345);
+        // Mutar el campo rompe la firma (está dentro del mensaje firmado).
+        let mut tampered = tx.clone();
+        tampered.message.valid_until_round = 999_999;
+        assert!(!tampered.verify_signature(), "cambiar la expiración debe invalidar la firma");
+    }
+
+    /// #192: la deserialización Borsh es CANÓNICA — rechaza bytes sobrantes
+    /// (trailing) y una entrada truncada, así un atacante no puede colar bytes
+    /// extra tras una tx válida ni presentar dos codificaciones del mismo
+    /// contenido (maleabilidad de encoding).
+    #[test]
+    fn transaction_deserialization_is_canonical_no_trailing_bytes() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let ix = sample_ix(payer.pubkey(), to);
+        let tx = Transaction::new_signed(&payer, 0, [0u8; 32], 1_000, vec![ix]).unwrap();
+        let bytes = borsh::to_vec(&tx).unwrap();
+        // Round-trip exacto OK.
+        let round: Transaction = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(round.txid(), tx.txid());
+        // UN byte extra al final → rechazado (no canónico).
+        let mut trailing = bytes.clone();
+        trailing.push(0u8);
+        assert!(borsh::from_slice::<Transaction>(&trailing).is_err(), "Borsh debe rechazar bytes sobrantes");
+        // Truncada → rechazada.
+        assert!(borsh::from_slice::<Transaction>(&bytes[..bytes.len() - 1]).is_err(), "una entrada truncada debe rechazarse");
     }
 
     #[test]

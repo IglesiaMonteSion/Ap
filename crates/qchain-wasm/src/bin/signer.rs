@@ -35,6 +35,26 @@ fn main() -> anyhow::Result<()> {
             let fee_limit: u64 = args[7].parse()?;
             print!("{}", qchain_wasm::sign_transfer_json(&s, to, amount, nonce, &chain_id, fee_limit)?);
         }
+        // sign-expiring <seed> <to> <amount> <nonce> <chain_id_hex> <fee_limit> <valid_until_round>
+        // Signs a transfer with an explicit `valid_until_round` (task #191) — used
+        // to verify the node rejects an ALREADY-EXPIRED transaction at admission.
+        Some("sign-expiring") => {
+            use qchain_core::{Instruction, Transaction};
+            use qchain_crypto::{Keypair, Pubkey};
+            let s = seed(&args[2])?;
+            let to_pk: Pubkey = args[3].trim().parse().map_err(|e| anyhow::anyhow!("bad to: {e}"))?;
+            let amount: u64 = args[4].parse()?;
+            let nonce: u64 = args[5].parse()?;
+            let chain_id = seed(&args[6])?;
+            let fee_limit: u64 = args[7].parse()?;
+            let valid_until: u64 = args[8].parse()?;
+            let payer = Keypair::generate_from_seed(&s)?;
+            let mut data = vec![1u8]; // SystemInstruction::Transfer discriminant (CreateAccount=0, Transfer=1)
+            data.extend_from_slice(&amount.to_le_bytes());
+            let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![payer.pubkey(), to_pk], data };
+            let tx = Transaction::new_signed_full(&payer, nonce, chain_id, fee_limit, 0, valid_until, vec![ix])?;
+            print!("{}", serde_json::to_string(&tx)?);
+        }
         // Governance-path helpers, exercising the exact browser signing code.
         Some("delegate") => {
             // delegate <seed> <validator> <amount> <stake_account> <nonce> <chain_id_hex> <fee_limit>

@@ -1067,6 +1067,19 @@ impl Ledger {
         // no-op when economics_v7 is off.
         self.close_due_quantos(current_round);
 
+        // EXPIRACIÓN (#191): una tx con ventana de validez acotada que ya caducó
+        // se rechaza AQUÍ, determinísticamente — `current_round` es la ronda
+        // COMPROMETIDA, idéntica en todo validador, así que un proposer Bizantino
+        // que incluya una tx caducada en su batch la ve rechazada por todos igual
+        // (sin fork). Se tickea el fee (0 bytes) como los otros early-returns para
+        // no pinnear el base fee bajo un flood de txs caducadas. No consume nonce
+        // (retorna Err antes del bump) → una expiración es permanente, la tx nunca
+        // volverá a ser válida (a diferencia de un nonce-too-high transitorio).
+        if tx.message.valid_until_round != 0 && current_round > tx.message.valid_until_round {
+            self.advance_dynamic_fee(current_round, 0);
+            return Err(ExecError::Expired { valid_until: tx.message.valid_until_round, current: current_round });
+        }
+
         let params = self.current_params();
         // Charge the EFFECTIVE base fee for this round - the stored
         // `base_fee_per_byte` rolled forward through every empty round since the
@@ -1833,6 +1846,42 @@ mod tests {
         let mut ledger = Ledger::new_with_tree(Box::new(InMemoryStore::new()), true).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    /// #191: una tx cuya ventana de validez (`valid_until_round`) ya pasó se
+    /// rechaza en EJECUCIÓN de forma determinista (misma ronda comprometida en
+    /// todo nodo → sin fork), sin tocar el estado; una tx en el borde exacto
+    /// (`current_round == valid_until_round`) o sin expiración (`0`) ejecuta.
+    #[test]
+    fn an_expired_transaction_is_rejected_at_execution() {
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let mut l = new_test_ledger();
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let before = l.get_balance(&alice.pubkey());
+
+        let mk = |valid_until: u64| {
+            let transfer = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+            };
+            Transaction::new_signed_full(&alice, 0, [0u8; 32], 50_000_000, 0, valid_until, vec![transfer]).unwrap()
+        };
+
+        // Caducada: valid_until_round = 10, ejecutándose en la ronda 11.
+        let expired = mk(10);
+        let res = l.apply_transaction(&expired, &proposer, 11);
+        assert!(matches!(res, Err(ExecError::Expired { valid_until: 10, current: 11 })), "una tx caducada debe rechazarse, got {res:?}");
+        assert_eq!(l.get_balance(&alice.pubkey()), before, "el balance del pagador no cambia (rechazo antes de tocar estado)");
+        assert_eq!(l.get_balance(&bob), 0, "el destinatario no recibe nada");
+
+        // Borde exacto (current_round == valid_until_round) ejecuta (la comparación
+        // es `>`, no `>=`), y el nonce sigue en 0 porque la caducada no lo bumpeó.
+        let at_edge = mk(11);
+        l.apply_transaction(&at_edge, &proposer, 11).unwrap();
+        assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH, "en el borde exacto (<=) ejecuta");
     }
 
     /// A v7-economics ledger: shares+index staking (StakingV7Program) + quanto

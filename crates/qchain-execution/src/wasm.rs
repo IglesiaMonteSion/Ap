@@ -138,6 +138,23 @@ impl WasmExecutor {
     pub fn new() -> anyhow::Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        // DETERMINISMO entre arquitecturas (ARM/x86) — QCH S8, tarea #195. Sin
+        // esto, un contrato que use floats podría producir patrones de bits NaN
+        // DISTINTOS entre x86 y ARM (los dos que ofrecen Oracle/Contabo) → estado
+        // divergente → FORK entre validadores de arquitecturas distintas.
+        //   - `cranelift_nan_canonicalization(true)`: unifica todo NaN al NaN
+        //     canónico de WebAssembly (0x7ff8… para f64), determinista en todas
+        //     las arquitecturas. Los contratos de referencia son de enteros → no
+        //     los afecta; solo hace determinista a uno que use floats.
+        //   - `wasm_relaxed_simd(false)`: la propuesta "relaxed SIMD" es
+        //     NO-determinista por diseño (deja al backend elegir el resultado) →
+        //     se desactiva del todo.
+        //   - `max_wasm_stack`: límite de pila EXPLÍCITO (no el default del motor)
+        //     — una recursión profunda hace trap acotado en vez de depender del
+        //     default. 512 KB es holgado para los contratos reales.
+        config.cranelift_nan_canonicalization(true);
+        config.wasm_relaxed_simd(false);
+        config.max_wasm_stack(512 * 1024);
         let engine = Engine::new(&config)?;
         Ok(WasmExecutor { engine })
     }
@@ -518,6 +535,36 @@ mod tests {
         let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 5_000_000).unwrap();
         assert!(result.trap.is_some(), "growing memory past MAX_CONTRACT_MEMORY_BYTES must trap, not succeed");
         assert!(result.fuel_consumed < 100, "the trap must fire on the grow itself, not after real work - got {} fuel", result.fuel_consumed);
+    }
+
+    /// QCH S8 / tarea #195: la canonicalización de NaN está ACTIVA — un NaN de
+    /// float se unifica al patrón canónico de WebAssembly, igual en toda
+    /// arquitectura (ARM/x86), evitando un fork por bits de NaN divergentes.
+    #[test]
+    fn nan_is_canonicalized_for_cross_arch_determinism() {
+        // `$x / $x` con `$x = 0.0` produce NaN en TIEMPO DE EJECUCIÓN (param, no
+        // constante plegable), así se ejercita la canonicalización del backend.
+        let wat = r#"(module (func (export "nan") (param $x f64) (result i64)
+            (i64.reinterpret_f64 (f64.div (local.get $x) (local.get $x)))))"#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
+        let linker = executor.build_linker().unwrap();
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let mut store = wasmtime::Store::new(
+            &executor.engine,
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], limits },
+        );
+        store.set_fuel(1_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let func = instance.get_func(&mut store, "nan").unwrap();
+        let mut results = [wasmtime::Val::I64(0)];
+        func.call(&mut store, &[wasmtime::Val::F64(0)], &mut results).unwrap();
+        let bits = results[0].unwrap_i64() as u64;
+        assert_eq!(
+            bits, 0x7ff8_0000_0000_0000,
+            "el NaN debe ser el canónico de WebAssembly (determinismo ARM/x86) - fue {bits:#018x}"
+        );
     }
 
     const IS_SIGNER_WAT: &str = r#"

@@ -77,6 +77,12 @@ enum Command {
         /// transfer under congestion. Default 0 (no tip).
         #[arg(long, default_value_t = 0)]
         priority_fee: u64,
+        /// Optional EXPIRATION window (task #191): if set, the transfer is only
+        /// valid for the next N committed rounds — the node computes
+        /// `valid_until_round = current_round + N` and rejects it (at admission
+        /// and execution) once that round passes. Default: unset = never expires.
+        #[arg(long)]
+        valid_for_rounds: Option<u64>,
     },
     /// Bond funds to a validator, opening a new stake account (prints its
     /// address - save it, it's needed for `stake-undelegate` and `vote`).
@@ -1078,7 +1084,15 @@ fn submit_instruction(
     nonce: Option<u64>,
     fee_limit: u64,
 ) -> anyhow::Result<serde_json::Value> {
-    submit_instruction_p(rpc, payer, program_id, accounts, data, nonce, fee_limit, 0)
+    submit_instruction_p(rpc, payer, program_id, accounts, data, nonce, fee_limit, 0, 0)
+}
+
+/// Current committed round (`next_round`) from the node's `/status` — used to
+/// turn a relative `--valid-for-rounds N` into an absolute `valid_until_round`
+/// (task #191).
+fn fetch_current_round(rpc: &str) -> anyhow::Result<u64> {
+    let v: serde_json::Value = reqwest::blocking::get(format!("{rpc}/status"))?.error_for_status()?.json()?;
+    Ok(v["next_round"].as_u64().unwrap_or(0))
 }
 
 /// Like `submit_instruction` but with an explicit EIP-1559-style priority tip
@@ -1093,6 +1107,7 @@ fn submit_instruction_p(
     nonce: Option<u64>,
     fee_limit: u64,
     priority_fee: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<serde_json::Value> {
     let nonce = match nonce {
         Some(n) => n,
@@ -1100,7 +1115,7 @@ fn submit_instruction_p(
     };
     let ix = Instruction { program_id, accounts, data };
     let chain_id = fetch_chain_id(rpc)?;
-    let tx = Transaction::new_signed_with_priority(payer, nonce, chain_id, fee_limit, priority_fee, vec![ix])?;
+    let tx = Transaction::new_signed_full(payer, nonce, chain_id, fee_limit, priority_fee, valid_until_round, vec![ix])?;
 
     let resp = reqwest::blocking::Client::new().post(format!("{rpc}/tx")).json(&tx).send()?;
     if !resp.status().is_success() {
@@ -1145,11 +1160,17 @@ fn main() -> anyhow::Result<()> {
                 None => println!("0 (account not found)"),
             }
         }
-        Command::Transfer { rpc, keypair, to, amount, nonce, fee_limit, priority_fee } => {
+        Command::Transfer { rpc, keypair, to, amount, nonce, fee_limit, priority_fee, valid_for_rounds } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;
             let to_pk: Pubkey = to.parse()?;
             let data = borsh::to_vec(&SystemInstruction::Transfer { amount })?;
-            let body = submit_instruction_p(&rpc, &payer, Pubkey::system_program_id(), vec![payer.pubkey(), to_pk], data, nonce, fee_limit, priority_fee)?;
+            // Relative expiry (#191): turn `--valid-for-rounds N` into an absolute
+            // `valid_until_round = current_round + N`. Unset = 0 = never expires.
+            let valid_until_round = match valid_for_rounds {
+                Some(n) => fetch_current_round(&rpc)?.saturating_add(n),
+                None => 0,
+            };
+            let body = submit_instruction_p(&rpc, &payer, Pubkey::system_program_id(), vec![payer.pubkey(), to_pk], data, nonce, fee_limit, priority_fee, valid_until_round)?;
             println!("submitted: {body}");
         }
         Command::StakeDelegate { rpc, keypair, validator, amount, nonce, fee_limit } => {

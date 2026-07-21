@@ -39,4 +39,11 @@ pub enum ExecError {
     /// round), the later one just re-queues instead of being dropped.
     #[error("nonce too high: account is at {account}, transaction has {tx} (predecessors pending)")]
     NonceTooHigh { account: u64, tx: u64 },
+    /// The transaction declared a `valid_until_round` window and the committed
+    /// round is past it — it EXPIRED (task #191). Permanent (unlike a too-high
+    /// nonce): an expired transaction can never become valid again, so the node
+    /// drops it rather than re-queueing. Deterministic (a pure function of the
+    /// committed round), so every validator rejects it identically — no fork.
+    #[error("transaction expired: valid until round {valid_until}, current round is {current}")]
+    Expired { valid_until: u64, current: u64 },
 }

@@ -285,6 +285,18 @@ pub const MAX_INMEM_STAKING_EVENTS: usize = 5_000;
 /// transaction's size instead of "however many the attacker cares to send."
 const MAX_MEMPOOL_TXS_PER_PAYER: usize = 4_096;
 
+/// Tope de tamaño de UNA transacción, en bytes, aplicado en ADMISIÓN (RPC +
+/// gossip) — tarea #192, QCH-S4. Defensa en profundidad contra una tx-basura
+/// gigante que infle el mempool / amplifique el ancho de banda del gossip antes
+/// de que la ejecución la rechace. Es holgado a propósito: acomoda un
+/// `DeployProgram` con el bytecode máximo (`MAX_PROGRAM_BYTECODE_BYTES` = 256
+/// KB) más ~64 KB de sobrecarga de firma/keys/otras instrucciones, muy por
+/// debajo del tope de frame del transporte (64 MB). Una tx normal pesa ~5,5 KB,
+/// así que esto nunca estorba al tráfico real. Enforced en los DOS puntos de
+/// entrada (igual que `payer_can_afford_admission`) para que el bound no se
+/// aplique en uno y se olvide en el otro.
+const MAX_TRANSACTION_BYTES: usize = 320 * 1024;
+
 /// How many nonces past a payer's COMMITTED nonce `drain_ready_transactions`
 /// will propose while earlier ones are still in flight (nonce pipelining). This
 /// bounds how far a single payer can run ahead of its own executed state, so a
@@ -1467,6 +1479,15 @@ pub enum StarkProofError {
 /// still be affordable by the time its turn comes, only that an account
 /// with no funds at all can never get even one transaction into any
 /// validator's mempool, which is what the demonstrated attack needed.
+/// Whether `tx`'s signed validity window (`valid_until_round`, task #191) has
+/// already passed at `current_round`. `0` means "no expiry" (the historical
+/// default) and always returns `false`. Used at BOTH admission entry points to
+/// early-reject a stale transaction; execution enforces the same thing
+/// deterministically on the committed round (see `Ledger::apply_transaction`).
+fn tx_is_expired(tx: &Transaction, current_round: Round) -> bool {
+    tx.message.valid_until_round != 0 && current_round > tx.message.valid_until_round
+}
+
 fn payer_can_afford_admission(state: &EngineState, tx: &Transaction) -> bool {
     let balance = state.ledger.store().get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
     // Use the EFFECTIVE base fee at the node's current round, not the stale
@@ -1810,12 +1831,22 @@ impl Engine {
         if tx.message.chain_id != self.chain_id {
             anyhow::bail!("transaction's chain_id does not match this network");
         }
+        // Tope de tamaño de tx (#192) — barato, antes del verify PQC de ~150µs.
+        if tx.byte_size() > MAX_TRANSACTION_BYTES {
+            anyhow::bail!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size());
+        }
         if !tx.verify_signature() {
             anyhow::bail!("invalid transaction signature");
         }
         let hash = tx.txid();
         {
             let mut state = self.state.lock().await;
+            // Expiración (#191): no admitir una tx cuya ventana de validez ya pasó
+            // en la ronda actual del nodo — early-reject barato (la ejecución la
+            // rechazaría igual, de forma determinista).
+            if tx_is_expired(&tx, state.next_round) {
+                anyhow::bail!("transaction expired: valid until round {}, current round is {}", tx.message.valid_until_round, state.next_round);
+            }
             if !payer_can_afford_admission(&state, &tx) {
                 anyhow::bail!("payer cannot afford this transaction's byte fee");
             }
@@ -2383,11 +2414,23 @@ impl Engine {
                     tracing::warn!("dropping gossiped transaction from {from} with a mismatched chain_id");
                     return;
                 }
+                // Tope de tamaño de tx (#192) — mismo bound que la admisión RPC,
+                // antes del verify PQC.
+                if tx.byte_size() > MAX_TRANSACTION_BYTES {
+                    tracing::warn!("dropping gossiped transaction from {from}: too large ({} bytes)", tx.byte_size());
+                    return;
+                }
                 if !tx.verify_signature() {
                     tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
                     return;
                 }
                 let mut state = self.state.lock().await;
+                // Expiración (#191): no admitir una tx ya caducada en la ronda
+                // actual — mismo early-reject que la admisión RPC.
+                if tx_is_expired(&tx, state.next_round) {
+                    tracing::warn!("dropping gossiped transaction from {from}: expired (valid until round {})", tx.message.valid_until_round);
+                    return;
+                }
                 // Same admission check `submit_transaction` applies to its
                 // own RPC-submitted transactions (see
                 // `payer_can_afford_admission`'s doc comment) - a peer
