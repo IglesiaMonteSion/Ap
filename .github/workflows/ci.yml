@@ -12,6 +12,12 @@ on:
   push:
   pull_request:
 
+# Menor privilegio para el GITHUB_TOKEN: estos jobs sólo compilan/testean, no
+# escriben nada al repo ni usan secrets. (QCH-CI: defensa-en-profundidad contra
+# un build.rs/test de un PR que intente usar un token con permisos amplios.)
+permissions:
+  contents: read
+
 # Cancela una corrida vieja del mismo ref si llega un push nuevo.
 concurrency:
   group: ci-${{ github.ref }}
@@ -29,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # liboqs (firmas post-cuánticas) se compila desde fuente vía la crate oqs:
       # necesita cmake + un compilador C/C++, y bindgen necesita libclang.
@@ -37,14 +43,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
 
       - name: Toolchain de Rust (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
         with:
           components: clippy
 
       # Cachea el registro de cargo + target para que las corridas siguientes no
       # recompilen liboqs/Winterfell desde cero.
       - name: Caché de cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Build reproducible desde el Cargo.lock committeado (falla ruidoso si el
       # lock quedó inconsistente, en vez de re-resolver a otra versión).
@@ -65,9 +71,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Toolchain de Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
       - name: Instalar cargo-audit
         run: cargo install cargo-audit --locked
       # Escanea el Cargo.lock contra la base de advisories de RustSec (RUSTSEC).
@@ -80,13 +86,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # gen-sbom.sh deriva el SBOM SOLO del Cargo.lock committeado (determinista,
       # sin toolchain de Rust ni red), así que es rápido y reproducible.
       - name: Generar SBOM
         run: bash deploy/gen-sbom.sh -o sbom.cdx.json
       - name: Subir SBOM como artefacto
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qchain-sbom-cyclonedx
           path: sbom.cdx.json

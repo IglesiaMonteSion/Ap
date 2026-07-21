@@ -13,9 +13,13 @@ vigilante de *runtime* en producción) es un incremento futuro aparte.
   No toca el consenso, ni las claves, ni producción.
 - **No guarda ninguna clave en el repo.** La API key vive como un *secret* del
   repositorio (variable de entorno en el runner), nunca en el código.
-- **Modelo de seguridad del propio agente** (de `CLAUDE.md`): el peor caso si se
-  comporta mal es "posteó un comentario equivocado" — jamás mueve fondos ni toca
-  el consenso.
+- **Modelo de seguridad del CI (QCH-CI-001 corregido):** el workflow corre bajo
+  `pull_request_target`, así que TANTO su definición COMO el script del auditor se
+  toman de la rama BASE de confianza, nunca del HEAD del PR; el job que tiene la
+  `ANTHROPIC_API_KEY` **nunca ejecuta el código del PR** (sólo lee el diff como
+  DATO con `git diff`). Un PR malicioso no puede modificar lo que corre ni
+  exfiltrar el secret. Como agente es read-only sobre el diff y advisory: nunca
+  bloquea el PR ni mueve fondos ni toca el consenso.
 - **Actualiza su propio comentario en el lugar** (marcador oculto) en vez de
   spammear uno nuevo por cada push.
 

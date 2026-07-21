@@ -3,12 +3,19 @@
 # Advisory only: it posts a comment with findings, it NEVER gates the PR.
 # INERT until you add the `ANTHROPIC_API_KEY` repo secret (Settings → Secrets and
 # variables → Actions). Without that secret the job runs and exits cleanly having
-# done nothing. Read-only over code; holds no keys in the repo; the worst case if
-# it misbehaves is a wrong comment. See docs/AI-SECURITY-REVIEW.md.
+# done nothing. See docs/AI-SECURITY-REVIEW.md.
+#
+# SECURITY (QCH-CI-001 fix): this uses `pull_request_target`, so BOTH this workflow
+# definition AND the auditor script (`.github/scripts/ai_security_review.py`) are
+# taken from the TRUSTED base branch, never the PR's HEAD. We NEVER checkout or
+# execute the PR's code in the job that holds `ANTHROPIC_API_KEY`/`GITHUB_TOKEN` —
+# we only read the PR diff as DATA (`git diff`), which runs no PR code. This closes
+# the "a malicious same-repo PR edits the script to exfiltrate the secret" path: a
+# PR cannot change the script that runs here nor the steps of this workflow.
 name: AI security review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
 
 # Least privilege: read the code, write PR comments. Nothing else.
@@ -25,16 +32,35 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history so we can diff against the base)
-        uses: actions/checkout@v4
+      # Checkout the BASE branch (trusted). Under pull_request_target the default
+      # ref is the base, so the auditor script we run below is the trusted copy —
+      # NOT the PR's version. Full history so we can diff.
+      - name: Checkout base (trusted auditor script)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - name: Run AI security review
+      # Fetch the PR's head commit as DATA only. We never check it out or run it;
+      # `git diff` below just reads its tree. SHAs are passed via env (not inlined
+      # into the shell) so a crafted branch name can't inject a command.
+      - name: Fetch PR head (data only, never executed)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags --depth=300 origin "$HEAD_SHA"
+
+      - name: Compute PR diff (git only — no PR code runs)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/pr.diff" || true
+
+      # Only THIS step has the secrets, and it runs the TRUSTED base script with the
+      # PR diff supplied strictly as a data file — no PR code is executed.
+      - name: Run AI security review (trusted script, diff as data)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE_REF: ${{ github.base_ref }}
+          PR_DIFF_FILE: ${{ runner.temp }}/pr.diff
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           # Overridable model id for the API call (a balanced default for a

@@ -10,8 +10,10 @@ that secret is unset the script is inert (prints a notice and exits 0), so the
 workflow can live in the repo without doing anything until the operator opts in.
 
 Security model of the agent itself (see CLAUDE.md's "Agente IA de seguridad"):
-read-only over code, no keys in the repo, no destructive power — the worst case
-if it misbehaves is a wrong comment, never moving funds or touching consensus.
+read-only over the diff, no keys in the repo, no destructive power. The workflow
+runs this script under `pull_request_target` from the TRUSTED base branch and
+feeds the PR diff as a data file (`PR_DIFF_FILE`) — it never executes the PR's
+code, so a malicious PR cannot exfiltrate `ANTHROPIC_API_KEY` (QCH-CI-001 fix).
 
 Stdlib only (urllib/json/subprocess) so the Action needs no `pip install`.
 """
@@ -168,13 +170,26 @@ def main():
               "Add the repo secret to enable it (see docs/AI-SECURITY-REVIEW.md).")
         return 0
 
-    base_ref = os.environ.get("BASE_REF", "").strip()
     repo = os.environ.get("REPO", "").strip()
     pr_number = os.environ.get("PR_NUMBER", "").strip()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     model = os.environ.get("CLAUDE_MODEL", "").strip() or DEFAULT_MODEL
 
-    diff = get_diff(base_ref) if base_ref else ""
+    # Preferred path: the workflow pre-computed the PR diff with `git` (no PR code
+    # executed) and handed it to us as a DATA file. This is what keeps the secret
+    # safe — we never run the PR's code. Fall back to computing it ourselves only
+    # for a local/manual run (BASE_REF set), which is not the secret-bearing path.
+    diff_file = os.environ.get("PR_DIFF_FILE", "").strip()
+    if diff_file:
+        try:
+            with open(diff_file, encoding="utf-8", errors="replace") as f:
+                diff = f.read()
+        except OSError as e:
+            print(f"could not read PR_DIFF_FILE ({e}) — nothing to review.")
+            return 0
+    else:
+        base_ref = os.environ.get("BASE_REF", "").strip()
+        diff = get_diff(base_ref) if base_ref else ""
     if not diff.strip():
         print("empty diff — nothing to review.")
         return 0
