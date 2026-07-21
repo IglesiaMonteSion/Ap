@@ -276,6 +276,7 @@ fn main() -> anyhow::Result<()> {
             state_sync_peers: Vec::new(),
             state_sync_trusted_root: None,
             state_sync_trusted_round: None,
+            require_state_sync_trust_anchor: false,
             validator_rotation: false,
             epoch_rounds: None,
             storage_engine: "sled".to_string(),

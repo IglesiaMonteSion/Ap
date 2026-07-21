@@ -652,6 +652,18 @@ solo acepta el snapshot si coincide exacto. Sin `state_sync_peers` el
 arranque es el de siempre (un nodo con `data_dir` existente resume normal;
 uno fresco siembra génesis y arranca desde la ronda 0).
 
+**Ancla OBLIGATORIA para producción/mainnet (tarea #194).** Por defecto el
+state-sync corre en *weak subjectivity* (confía en la raíz que reporta el par,
+suavizado por el cross-check + la consistencia interna). Para una red con valor
+real, poné **`"require_state_sync_trust_anchor": true`** en el `config.json`: con
+eso el nodo **se niega a sincronizar** salvo que estén fijados los DOS campos del
+ancla (`state_sync_trusted_root` + `state_sync_trusted_round`) y el snapshot
+coincida exacto — nunca confía en la raíz de un par, solo en un valor que vos
+obtuviste por fuera (p.ej. de un nodo tuyo ya sano). Es una **política node-LOCAL**
+(NO se pliega en el `chain_id`) y solo afecta el camino de state-sync, así que un
+nodo con `data_dir` propio nunca la toca. Falla temprano (antes de tocar la red)
+con un mensaje claro si falta el ancla.
+
 ## Actualizar un nodo (versiones y avisos de actualización)
 
 Cada nodo corre una **versión** (`MAJOR.MINOR.PATCH`, arranca en `1.0.0`,

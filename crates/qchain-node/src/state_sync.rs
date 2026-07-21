@@ -14,6 +14,15 @@
 //! root at the same round (a fork/attack tell), and (2) an optional operator
 //! trust anchor (`state_sync_trusted_root`/`_round`) turns it into a fully
 //! verified catch-up against a value obtained independently.
+//!
+//! **`#194`: the anchor can be made MANDATORY.** With
+//! `require_state_sync_trust_anchor` set, this node refuses to state-sync at all
+//! unless both anchor fields are pinned and the snapshot matches them — removing
+//! weak subjectivity entirely (it never trusts a source peer's claimed root).
+//! Default off keeps the opt-in model above byte-identical; on is the
+//! production/mainnet setting. It's a node-LOCAL policy (not folded into
+//! `chain_id`) and only touches the state-sync path, so a node with local state
+//! never reaches it.
 
 use qchain_node::config::NodeConfig;
 use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot, SNAPSHOT_PAGE_SIZE};
@@ -34,10 +43,36 @@ const MAX_SNAPSHOT_ACCOUNTS: usize = 10_000_000;
 /// response, rejected before it is accumulated.
 const MAX_ACCOUNTS_PER_PAGE: usize = SNAPSHOT_PAGE_SIZE;
 
+/// #194: enforce the operator's trust-anchor requirement BEFORE any network I/O.
+/// When `require` is set, a node refuses to state-sync unless BOTH the root and
+/// round are pinned (so the snapshot can be checked against a value obtained out
+/// of band, never trusting the source peer's claimed root) — the
+/// production/mainnet setting. `require=false` (the default) = weak
+/// subjectivity, byte-identical to before. Takes just the three relevant fields
+/// so it can be unit-tested without a network or async runtime.
+pub(crate) fn check_trust_anchor_requirement(require: bool, trusted_root: &Option<String>, trusted_round: &Option<u64>) -> anyhow::Result<()> {
+    if require && (trusted_root.is_none() || trusted_round.is_none()) {
+        anyhow::bail!(
+            "state-sync: `require_state_sync_trust_anchor` is set but no trust anchor is configured — \
+             set BOTH `state_sync_trusted_root` and `state_sync_trusted_round` to the pinned (round, root) \
+             obtained out of band, or unset the requirement to allow weak-subjectivity sync"
+        );
+    }
+    Ok(())
+}
+
 /// Fetch a state snapshot from the configured peers and verify it before the
 /// caller installs it. Returns an error (aborting node startup) rather than
 /// ever installing unverified or forked state.
 pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<StateSnapshot> {
+    // Fail fast, before any network I/O, if the operator requires an anchor but
+    // none is configured (#194).
+    check_trust_anchor_requirement(
+        config.require_state_sync_trust_anchor,
+        &config.state_sync_trusted_root,
+        &config.state_sync_trusted_round,
+    )?;
+
     // Bounded HTTP client: without an overall + connect timeout, a configured
     // peer that accepts the connection and never finishes hangs node startup
     // forever. Fail fast instead - a stuck peer must not wedge the sync.
@@ -287,5 +322,26 @@ mod tests {
         let mut snap = compressed_snapshot_of(vec![(Pubkey::new([1u8; 32]), 100), (Pubkey::new([2u8; 32]), 250)]);
         snap.accounts[0].account.balance = 999_999;
         assert!(verify_internal_consistency(&snap, true).is_err(), "a tampered compressed snapshot must be rejected");
+    }
+
+    /// #194: with `require_state_sync_trust_anchor` on, a node must refuse to
+    /// state-sync unless BOTH root and round are pinned (fail fast, before any
+    /// network I/O); off = weak subjectivity allowed, unchanged.
+    #[test]
+    fn a_required_trust_anchor_that_is_missing_or_partial_refuses_sync() {
+        let root = || Some("00".repeat(32));
+        // Off (the default) => always ok, even with no anchor (weak subjectivity).
+        assert!(check_trust_anchor_requirement(false, &None, &None).is_ok(), "off = weak subjectivity, no anchor needed");
+        // On + no anchor => refused.
+        assert!(check_trust_anchor_requirement(true, &None, &None).is_err(), "requiring the anchor with none set must refuse");
+        // On + only the root (no round) => still refused (both are required).
+        assert!(check_trust_anchor_requirement(true, &root(), &None).is_err(), "requiring the anchor with only the root set must refuse");
+        // On + only the round (no root) => still refused.
+        assert!(check_trust_anchor_requirement(true, &None, &Some(42)).is_err(), "requiring the anchor with only the round set must refuse");
+        // On + both root and round => allowed to proceed (the fetched snapshot is
+        // then still checked to match them exactly downstream).
+        assert!(check_trust_anchor_requirement(true, &root(), &Some(42)).is_ok(), "a full pinned anchor satisfies the requirement");
+        // Off but a full anchor present => ok (optional hardening path).
+        assert!(check_trust_anchor_requirement(false, &root(), &Some(42)).is_ok(), "off with an anchor set is still fine");
     }
 }

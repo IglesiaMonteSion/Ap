@@ -60,6 +60,37 @@ pub struct FaultPolicy {
     pub partition: Option<(Vec<usize>, Vec<usize>, u64)>,
 }
 
+/// A validator-set membership change at an epoch boundary — `#194`, the
+/// membership-change / rotation DST. `None` on a `Scenario` means fixed
+/// membership (a `single` schedule: every round resolves to the one committee,
+/// byte-identical to the phase-1/2 behavior the 9 base scenarios exercise).
+///
+/// When set, the driver builds a rotating `ValidatorSchedule`: epoch 0 is the
+/// committee of `epoch0` indices, epoch 1+ the committee of `epoch1` indices,
+/// with both installed and the resolvable frontier raised to epoch 1 (in a DST
+/// every node knows the whole rotation up front and identically — the exact
+/// "all honest nodes install byte-identical committees" premise the schedule's
+/// safety argument rests on). A small `epoch_rounds` makes the sim cross the
+/// boundary quickly. This is what exercises, end-to-end and under certificate
+/// loss, the two rotation fixes that were only ever verified live: v4.0.3
+/// (`direct_status` weighs round `r+1` support under `for_round(r+1)`, so a
+/// shrunk/rotated committee stays live across the boundary) and v4.0.4
+/// (`walk_causal_history` commits a leader atomically, so a *departed*
+/// validator's late-arriving epoch-boundary certificate can never reorder an
+/// already-committed prefix).
+#[derive(Clone, Debug)]
+pub struct Rotation {
+    /// Rounds per epoch — the boundary granularity. Keep small so the run
+    /// crosses at least one boundary within `ticks`.
+    pub epoch_rounds: u64,
+    /// Validator indices forming the epoch-0 (bootstrap) committee.
+    pub epoch0: Vec<usize>,
+    /// Validator indices forming the epoch-1-onward committee (the change): a
+    /// join is an index in `epoch1` but not `epoch0`; a departure is the
+    /// reverse. Overlap ≥ quorum keeps liveness across the boundary.
+    pub epoch1: Vec<usize>,
+}
+
 pub struct Scenario {
     pub validator_count: usize,
     /// Validator index -> non-default behavior. Absent indices are
@@ -67,6 +98,9 @@ pub struct Scenario {
     pub byzantine: HashMap<usize, ByzantineBehavior>,
     pub fault: FaultPolicy,
     pub ticks: u64,
+    /// Optional epoch-boundary committee change (`#194`). `None` = fixed
+    /// membership (a `single` schedule), the shape the 9 base scenarios use.
+    pub rotation: Option<Rotation>,
 }
 
 #[derive(Debug)]
@@ -92,6 +126,13 @@ pub struct SimReport {
     /// `ByzantineBehavior::Equivocator`, not just that the equivocation
     /// lock kept it from succeeding.
     pub equivocation_evidence_captured: bool,
+    /// The highest consensus round any honest validator has *committed* (the
+    /// max round among its committed certificates). Lets a membership-change
+    /// scenario (`#194`) assert its run genuinely crossed the epoch boundary
+    /// (committed a round `>= epoch_rounds`, i.e. under the *new* committee) —
+    /// so a "stayed safe" result isn't vacuously true because the sim never
+    /// actually rotated.
+    pub max_committed_round: u64,
 }
 
 fn is_prefix_consistent(a: &[Digest], b: &[Digest]) -> bool {
@@ -117,7 +158,27 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
         ids.push(id);
         sims.push(SimValidator::new(id, kp, behavior));
     }
-    let validators = ValidatorSet::new(infos);
+    // Build the validator schedule (the per-round committee resolver). Fixed
+    // membership => a `single` schedule (every round -> the one committee,
+    // byte-identical to the phase-1/2 single-`ValidatorSet` consensus, which is
+    // why the 9 base scenarios stay 9/9). A `rotation` scenario => a real
+    // rotating schedule with epoch 0 and epoch 1 committees installed and the
+    // frontier raised, so consensus resolves each round under its epoch's
+    // committee across a genuine boundary (#194).
+    let committee_of = |indices: &[usize]| -> ValidatorSet {
+        ValidatorSet::new(indices.iter().map(|&i| infos[i].clone()).collect())
+    };
+    let schedule = match &scenario.rotation {
+        None => qchain_consensus::ValidatorSchedule::single(ValidatorSet::new(infos.clone())),
+        Some(rot) => {
+            let mut s = qchain_consensus::ValidatorSchedule::new(rot.epoch_rounds, committee_of(&rot.epoch0));
+            s.install_epoch(1, committee_of(&rot.epoch1));
+            // Every node knows the whole (deterministic) rotation up front and
+            // identically, so both epochs are resolvable from the start.
+            s.set_frontier_epoch(1);
+            s
+        }
+    };
 
     // (deliver_tick, seq) -> (from_idx, to_idx, message). BTreeMap keeps
     // events ordered for deterministic delivery given a fixed seed.
@@ -156,7 +217,7 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
         #[allow(clippy::needless_range_loop)]
         for i in 0..scenario.validator_count {
             let peers: Vec<ValidatorId> = (0..scenario.validator_count).filter(|&j| j != i).map(|j| ids[j]).collect();
-            let outgoing = sims[i].maybe_propose(&validators, &peers);
+            let outgoing = sims[i].maybe_propose(&schedule, &peers);
             for (to_id, msg) in outgoing {
                 let to_idx = ids.iter().position(|x| *x == to_id).unwrap();
                 if let SimMessage::CertificateBroadcast(cert) = &msg {
@@ -174,7 +235,7 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
         for key in due_keys {
             let Some((from, to, msg)) = queue.remove(&key) else { continue };
             let peers: Vec<ValidatorId> = (0..scenario.validator_count).filter(|&j| j != to).map(|j| ids[j]).collect();
-            let outgoing = sims[to].handle_message(ids[from], msg, &validators, &peers);
+            let outgoing = sims[to].handle_message(ids[from], msg, &schedule, &peers);
             for (to_id, out_msg) in outgoing {
                 let to_idx = ids.iter().position(|x| *x == to_id).unwrap();
                 if let SimMessage::CertificateBroadcast(cert) = &out_msg {
@@ -182,7 +243,7 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
                 }
                 enqueue(&mut queue, &mut seq, tick, to, to_idx, out_msg, &mut rng);
             }
-            sims[to].try_commit(&validators);
+            sims[to].try_commit(&schedule);
         }
     }
 
@@ -212,8 +273,16 @@ pub fn run_simulation(scenario: &Scenario, seed: u64) -> SimReport {
     let made_progress = honest_committed_counts.iter().any(|&c| c > 0);
     let committed_orders: Vec<Vec<Digest>> = sims.iter().map(|s| s.committed_order.clone()).collect();
     let equivocation_evidence_captured = honest_indices.iter().any(|&i| !sims[i].equivocation_evidence.is_empty());
+    // Highest round any honest validator committed (the max round among its
+    // committed certificates, resolved through its DAG). A committed digest is
+    // never pruned in this harness, so it's always still resolvable.
+    let max_committed_round = honest_indices
+        .iter()
+        .map(|&i| sims[i].committed_order.iter().filter_map(|d| sims[i].dag.get(d).map(|c| c.vertex.round)).max().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
 
-    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress, committed_orders, equivocation_evidence_captured }
+    SimReport { safety_violation, equivocation_succeeded, honest_committed_counts, made_progress, committed_orders, equivocation_evidence_captured, max_committed_round }
 }
 
 #[cfg(test)]
@@ -222,7 +291,7 @@ mod tests {
 
     #[test]
     fn honest_network_no_faults_converges_safely_and_makes_progress() {
-        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault: FaultPolicy::default(), ticks: 60 };
+        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault: FaultPolicy::default(), ticks: 60, rotation: None };
         let report = run_simulation(&scenario, 1);
         assert!(report.safety_violation.is_none(), "{:?}", report.safety_violation);
         assert!(report.made_progress);
@@ -231,7 +300,7 @@ mod tests {
     #[test]
     fn honest_network_under_message_loss_and_delay_stays_safe() {
         let fault = FaultPolicy { drop_rate: 0.2, max_delay_ticks: 3, ..Default::default() };
-        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 150 };
+        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 150, rotation: None };
         for seed in 0..3 {
             let report = run_simulation(&scenario, seed);
             assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
@@ -245,7 +314,7 @@ mod tests {
         // the three honest validators).
         let mut byzantine = HashMap::new();
         byzantine.insert(3, ByzantineBehavior::Silent);
-        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 80 };
+        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 80, rotation: None };
         let report = run_simulation(&scenario, 7);
         assert!(report.safety_violation.is_none());
         assert!(report.made_progress, "3 honest validators (2f+1 for f=1) must still reach quorum without the 4th");
@@ -259,7 +328,7 @@ mod tests {
         // fully independent fault-injection schedule.
         let mut byzantine = HashMap::new();
         byzantine.insert(0, ByzantineBehavior::Equivocator);
-        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 80 };
+        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 80, rotation: None };
         for seed in 0..3 {
             let report = run_simulation(&scenario, seed);
             assert!(report.equivocation_succeeded.is_none(), "seed {seed}: {:?}", report.equivocation_succeeded);
@@ -279,7 +348,7 @@ mod tests {
         // Split 4 validators 2-2 for the first 30 ticks (neither side has
         // quorum alone - 2 < quorum_threshold of 3), then heal.
         let fault = FaultPolicy { drop_rate: 0.0, max_delay_ticks: 0, partition: Some((vec![0, 1], vec![2, 3], 30)), ..Default::default() };
-        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 100 };
+        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 100, rotation: None };
         let report = run_simulation(&scenario, 3);
         assert!(report.safety_violation.is_none());
         assert!(report.made_progress, "progress must resume once the partition heals");
@@ -319,7 +388,7 @@ mod tests {
     #[test]
     fn certificate_broadcast_loss_alone_stays_safe_but_liveness_needs_the_indirect_commit_rule() {
         let fault = FaultPolicy { drop_rate: 0.0, cert_drop_rate: Some(0.35), max_delay_ticks: 0, partition: None };
-        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 300 };
+        let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 300, rotation: None };
         for seed in 0..5 {
             let report = run_simulation(&scenario, seed);
             assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
@@ -339,8 +408,78 @@ mod tests {
         let mut byzantine = HashMap::new();
         byzantine.insert(0, ByzantineBehavior::Equivocator);
         byzantine.insert(1, ByzantineBehavior::Equivocator);
-        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 50 };
+        let scenario = Scenario { validator_count: 4, byzantine, fault: FaultPolicy::default(), ticks: 50, rotation: None };
         // No safety assertion here on purpose - f=2 of n=4 exceeds f<n/3.
         let _report = run_simulation(&scenario, 42);
+    }
+
+    /// **`#194` — membership-change / rotation DST under certificate loss.**
+    ///
+    /// The whole propose/vote/certify/commit state machine crosses a real
+    /// epoch boundary where the committee *rotates* — validator 0 leaves and
+    /// validator 4 joins (indices {0,1,2,3} → {1,2,3,4}, three overlap) — all
+    /// while certificate broadcasts are being dropped and delayed. This is the
+    /// assurance the audit (`#194`) asked for: the phase-3.3 rotation was only
+    /// ever verified *live* (v4.1.0/v4.2.2), never in the DST, because the
+    /// harness modeled a single fixed committee. It now threads a real
+    /// `ValidatorSchedule` (see `validator.rs`), so this exercises end-to-end,
+    /// under adversarial message loss, the two consensus fixes that make
+    /// rotation safe and were themselves found the hard way:
+    ///   - **v4.0.3** (`direct_status` weighs round `r+1` support under
+    ///     `for_round(r+1)`): a departed validator can never certify `r+1`, so
+    ///     counting its stake as "possible future support" would freeze the
+    ///     boundary leader forever. Liveness across the boundary depends on it.
+    ///   - **v4.0.4** (`walk_causal_history` commits a leader *atomically*): the
+    ///     departed validator's last-round certificate can arrive late via
+    ///     re-sync (exactly what `cert_drop_rate` + delay produce here); without
+    ///     the atomic commit it could reorder a prefix two honest nodes already
+    ///     committed → a fork. Asserted absent across a seed sweep.
+    ///
+    /// Non-vacuous: asserts the run actually committed a round `>= epoch_rounds`
+    /// (i.e. under the *new* committee), so "stayed safe" isn't true only
+    /// because the sim never rotated.
+    #[test]
+    fn a_committee_rotation_across_an_epoch_boundary_under_cert_loss_stays_safe() {
+        for seed in 0..5 {
+            let rotation = Rotation { epoch_rounds: 5, epoch0: vec![0, 1, 2, 3], epoch1: vec![1, 2, 3, 4] };
+            // Certificate loss + delay across the boundary is what makes a
+            // departed validator's boundary cert arrive late/out of order.
+            let fault = FaultPolicy { drop_rate: 0.0, cert_drop_rate: Some(0.2), max_delay_ticks: 2, partition: None };
+            let scenario = Scenario { validator_count: 5, byzantine: HashMap::new(), fault, ticks: 260, rotation: Some(rotation) };
+            let report = run_simulation(&scenario, seed);
+            assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
+            assert!(report.made_progress, "seed {seed}: no progress at all, counts {:?}", report.honest_committed_counts);
+            assert!(
+                report.max_committed_round >= 5,
+                "seed {seed}: the run must commit past the epoch boundary (>= epoch_rounds=5) or the rotation was never actually exercised; max committed round was {}",
+                report.max_committed_round
+            );
+        }
+    }
+
+    /// **`#194` — committee SHRINK across an epoch boundary under cert loss.**
+    ///
+    /// The harder rotation case and the one v4.0.3/v4.0.4 were specifically
+    /// found for: the committee *shrinks* at the boundary (validator 0 leaves,
+    /// {0,1,2,3} → {1,2,3}, quorum 3 → 2). A shrink is where "a departed
+    /// validator's late certificate reorders an already-committed prefix" and
+    /// "the boundary leader is held Undecided forever by a departed validator's
+    /// phantom future support" actually bite. Same adversarial cert loss, seed
+    /// sweep; safety must hold and progress must cross the boundary.
+    #[test]
+    fn a_committee_shrink_across_an_epoch_boundary_under_cert_loss_stays_safe() {
+        for seed in 0..5 {
+            let rotation = Rotation { epoch_rounds: 5, epoch0: vec![0, 1, 2, 3], epoch1: vec![1, 2, 3] };
+            let fault = FaultPolicy { drop_rate: 0.0, cert_drop_rate: Some(0.2), max_delay_ticks: 2, partition: None };
+            let scenario = Scenario { validator_count: 4, byzantine: HashMap::new(), fault, ticks: 260, rotation: Some(rotation) };
+            let report = run_simulation(&scenario, seed);
+            assert!(report.safety_violation.is_none(), "seed {seed}: {:?}", report.safety_violation);
+            assert!(report.made_progress, "seed {seed}: no progress at all, counts {:?}", report.honest_committed_counts);
+            assert!(
+                report.max_committed_round >= 5,
+                "seed {seed}: the run must commit past the shrink boundary (>= epoch_rounds=5); max committed round was {}",
+                report.max_committed_round
+            );
+        }
     }
 }

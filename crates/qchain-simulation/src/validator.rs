@@ -10,7 +10,7 @@
 //! validators, or `(0, [1u8; 32])` for an `Equivocator`'s second,
 //! conflicting vertex, purely so the two vertices hash differently.
 
-use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule, ValidatorSet};
+use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule};
 use qchain_core::{Certificate, Digest, EquivocationEvidence, Round, ValidatorId, Vertex};
 use qchain_crypto::{Keypair, MultiSignature};
 use std::collections::HashMap;
@@ -93,7 +93,17 @@ impl SimValidator {
     /// Mirrors `engine.rs`'s `propose_round`. Returns `(recipient,
     /// message)` pairs for the caller (the simulation driver) to enqueue
     /// on the simulated network.
-    pub fn maybe_propose(&mut self, validators: &ValidatorSet, peers: &[ValidatorId]) -> Vec<(ValidatorId, SimMessage)> {
+    ///
+    /// Takes a `ValidatorSchedule` (not a bare `ValidatorSet`) so it resolves
+    /// the committee *per round* exactly like the real engine — the proposing
+    /// gate weighs the previous round's certs under `for_round(prev_round)`.
+    /// For a `single` schedule (fixed membership) `for_round` returns the one
+    /// committee for every round, so behavior is byte-identical to passing the
+    /// bare set — the invariant that keeps the 9 fixed-membership scenarios at
+    /// 9/9. Under a rotating schedule (`#194` membership-change DST) this is
+    /// what lets a joiner build on the previous epoch's certs and a departed
+    /// validator's proposals be rejected receiver-side (see `handle_message`).
+    pub fn maybe_propose(&mut self, schedule: &ValidatorSchedule, peers: &[ValidatorId]) -> Vec<(ValidatorId, SimMessage)> {
         if self.behavior == ByzantineBehavior::Silent {
             return vec![];
         }
@@ -115,7 +125,12 @@ impl SimValidator {
         let round = self.next_round;
         if round > 0 {
             let prev = round - 1;
-            let quorum = validators.quorum_threshold();
+            // The gate is "did round `prev` certify?", weighted by the committee
+            // that certified it — `for_round(prev)`, exactly like the real
+            // engine. Under rotation this lets an epoch-1 joiner clear the gate
+            // on the previous epoch's (committee-A) certs it holds in its DAG.
+            let prev_committee = schedule.for_round(prev);
+            let quorum = prev_committee.quorum_threshold();
             // Mirrors the real fix in `qchain-node::engine::propose_round`
             // (see its doc comment for the full real-world reproduction):
             // a validator whose own stake alone already meets quorum can
@@ -124,8 +139,8 @@ impl SimValidator {
             // `next_round > 0` alone already proves a prior tick satisfied
             // this same gate. Does not change behavior when no single
             // validator's stake reaches quorum alone.
-            if validators.stake_of(&self.id) < quorum {
-                let stake: u64 = self.dag.certificates_in_round(prev).map(|c| validators.stake_of(&c.vertex.author)).sum();
+            if prev_committee.stake_of(&self.id) < quorum {
+                let stake: u64 = self.dag.certificates_in_round(prev).map(|c| prev_committee.stake_of(&c.vertex.author)).sum();
                 if stake < quorum {
                     return vec![];
                 }
@@ -154,7 +169,7 @@ impl SimValidator {
         for &peer in peers {
             out.push((peer, SimMessage::VertexProposal { vertex: vertex.clone(), author_signature: sig.clone() }));
         }
-        if let Some(cert) = self.record_vote(digest, self.id, sig, validators) {
+        if let Some(cert) = self.record_vote(digest, self.id, sig, schedule) {
             for &peer in peers {
                 out.push((peer, SimMessage::CertificateBroadcast(cert.clone())));
             }
@@ -204,7 +219,7 @@ impl SimValidator {
     }
 
     /// Mirrors `engine.rs`'s `handle_message`, synchronously.
-    pub fn handle_message(&mut self, from: ValidatorId, msg: SimMessage, validators: &ValidatorSet, peers: &[ValidatorId]) -> Vec<(ValidatorId, SimMessage)> {
+    pub fn handle_message(&mut self, from: ValidatorId, msg: SimMessage, schedule: &ValidatorSchedule, peers: &[ValidatorId]) -> Vec<(ValidatorId, SimMessage)> {
         if self.behavior == ByzantineBehavior::Silent {
             return vec![];
         }
@@ -216,10 +231,17 @@ impl SimValidator {
                 // Mirrors `engine.rs`'s `handle_message`: verify the
                 // author's signature before trusting anything about this
                 // vertex, since it's what makes equivocation evidence
-                // attributable at all.
-                let Some(author_info) = validators.get(&vertex.author) else {
+                // attributable at all. **Membership is enforced HERE, per
+                // round**: the author must be in the committee of the vertex's
+                // OWN round (`for_round(vertex.round)`). Under rotation this is
+                // exactly what rejects a departed validator's post-boundary
+                // proposals (its author is no longer in that round's committee)
+                // and admits a joiner's — without any self-membership gate at
+                // the proposer. For a `single` schedule it's the one committee.
+                let Some(author_info) = schedule.for_round(vertex.round).get(&vertex.author) else {
                     return vec![];
                 };
+                let author_info = author_info.clone();
                 let digest = vertex.digest();
                 if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &digest[..], &author_signature) {
                     return vec![];
@@ -260,14 +282,18 @@ impl SimValidator {
                 out
             }
             SimMessage::Vote { vertex_digest, signature } => {
-                if let Some(cert) = self.record_vote(vertex_digest, from, signature, validators) {
+                if let Some(cert) = self.record_vote(vertex_digest, from, signature, schedule) {
                     peers.iter().map(|&peer| (peer, SimMessage::CertificateBroadcast(cert.clone()))).collect()
                 } else {
                     vec![]
                 }
             }
             SimMessage::CertificateBroadcast(cert) => {
-                if verify_certificate(&cert, validators) {
+                // A certificate is verified against the committee of ITS OWN
+                // round (`for_round(cert.vertex.round)`), exactly like the real
+                // engine — so a cert from an epoch resolves under that epoch's
+                // committee even after a boundary. `single` = the one committee.
+                if verify_certificate(&cert, schedule.for_round(cert.vertex.round)) {
                     let parents = cert.vertex.parents.clone();
                     self.dag.insert(cert);
                     self.missing_parent_requests(&parents, from)
@@ -280,7 +306,7 @@ impl SimValidator {
                 None => vec![],
             },
             SimMessage::CertificateResponse(cert) => {
-                if verify_certificate(&cert, validators) {
+                if verify_certificate(&cert, schedule.for_round(cert.vertex.round)) {
                     let parents = cert.vertex.parents.clone();
                     self.dag.insert(cert);
                     self.missing_parent_requests(&parents, from)
@@ -291,14 +317,17 @@ impl SimValidator {
         }
     }
 
-    fn record_vote(&mut self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature, validators: &ValidatorSet) -> Option<Certificate> {
+    fn record_vote(&mut self, vertex_digest: Digest, voter: ValidatorId, sig: MultiSignature, schedule: &ValidatorSchedule) -> Option<Certificate> {
         self.pending_votes.entry(vertex_digest).or_default().insert(voter, sig);
         let (vertex, _) = self.own_pending_vertex.as_ref()?;
         if vertex.digest() != vertex_digest {
             return None;
         }
-        let stake: u64 = self.pending_votes[&vertex_digest].keys().map(|id| validators.stake_of(id)).sum();
-        if stake < validators.quorum_threshold() {
+        // Quorum for a vertex is weighted by the committee of the vertex's OWN
+        // round — `for_round(vertex.round)`, mirroring the real engine.
+        let committee = schedule.for_round(vertex.round);
+        let stake: u64 = self.pending_votes[&vertex_digest].keys().map(|id| committee.stake_of(id)).sum();
+        if stake < committee.quorum_threshold() {
             return None;
         }
         let (vertex, _) = self.own_pending_vertex.take().unwrap();
@@ -309,15 +338,13 @@ impl SimValidator {
     }
 
     /// Mirrors `engine.rs`'s `try_commit`: re-run Bullshark ordering and
-    /// record any newly-finalized digests.
-    pub fn try_commit(&mut self, validators: &ValidatorSet) {
-        // Phase-3.3 stage-1: `advance` now takes a `ValidatorSchedule`. The DST
-        // is a single static committee, so wrap the set in a single-committee
-        // schedule (cheap clone at this test-harness scale). Behavior is
-        // identical to passing the bare set — the reason the DST must still pass
-        // 9/9 unchanged.
-        let schedule = ValidatorSchedule::single(validators.clone());
-        let newly = self.consensus.advance(&self.dag, &schedule);
+    /// record any newly-finalized digests. Takes the same `ValidatorSchedule`
+    /// every other method does, so under a rotating schedule `advance` resolves
+    /// each round under its epoch's committee AND is held back by the
+    /// resolvable frontier (never commits a round of an uninstalled epoch) —
+    /// the two consensus-level rotation guards, now exercised end-to-end.
+    pub fn try_commit(&mut self, schedule: &ValidatorSchedule) {
+        let newly = self.consensus.advance(&self.dag, schedule);
         self.committed_order.extend(newly);
     }
 }
@@ -325,7 +352,7 @@ impl SimValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qchain_consensus::ValidatorInfo;
+    use qchain_consensus::{ValidatorInfo, ValidatorSet};
 
     /// The exact real bug this closes (see `maybe_propose`'s doc comment
     /// and `qchain-node::engine::propose_round`'s, and
@@ -341,6 +368,7 @@ mod tests {
         let kp = Keypair::generate().unwrap();
         let info = ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake: 1 };
         let validators = ValidatorSet::new(vec![info]);
+        let schedule = ValidatorSchedule::single(validators);
         let mut v = SimValidator::new(kp.pubkey(), kp, ByzantineBehavior::Honest);
 
         // Advance a few real rounds with no peers - a lone validator
@@ -352,7 +380,7 @@ mod tests {
         // up is the real, peer-independent signal that it proposed and
         // self-certified.
         for i in 0..3 {
-            v.maybe_propose(&validators, &[]);
+            v.maybe_propose(&schedule, &[]);
             assert_eq!(v.next_round, i + 1, "next_round must advance by one on every real proposal");
         }
 
@@ -362,7 +390,7 @@ mod tests {
         v.dag = DagStore::new();
         v.own_pending_vertex = None;
 
-        v.maybe_propose(&validators, &[]);
+        v.maybe_propose(&schedule, &[]);
         assert_eq!(v.next_round, 4, "a solo validator must keep proposing (next_round must actually advance) after resuming from a persisted round with no local certificate history - this is the real bug that was found live");
     }
 
@@ -383,11 +411,12 @@ mod tests {
         let kp = Keypair::generate().unwrap();
         let info = ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake: 1 };
         let validators = ValidatorSet::new(vec![info]);
+        let schedule = ValidatorSchedule::single(validators);
         let mut v = SimValidator::new(kp.pubkey(), kp, ByzantineBehavior::Honest);
 
         for _ in 0..3 {
-            v.maybe_propose(&validators, &[]);
-            v.try_commit(&validators);
+            v.maybe_propose(&schedule, &[]);
+            v.try_commit(&schedule);
         }
         let committed_before_restart = v.committed_order.len();
         assert!(committed_before_restart > 0, "at least one round must have genuinely committed before the simulated restart");
@@ -402,8 +431,8 @@ mod tests {
         v.consensus = ConsensusState::resuming_from(v.next_round);
 
         for _ in 0..3 {
-            v.maybe_propose(&validators, &[]);
-            v.try_commit(&validators);
+            v.maybe_propose(&schedule, &[]);
+            v.try_commit(&schedule);
         }
         assert!(
             v.committed_order.len() > committed_before_restart,

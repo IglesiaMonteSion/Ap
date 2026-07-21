@@ -96,6 +96,23 @@ pub struct NodeConfig {
     pub state_sync_trusted_root: Option<String>,
     #[serde(default)]
     pub state_sync_trusted_round: Option<u64>,
+    /// **Require the trust anchor for state-sync — tarea #194.** When `false`
+    /// (the default, byte-identical to every existing config), state-sync
+    /// accepts a snapshot on the weak-subjectivity path (internal consistency +
+    /// the cross-peer root cross-check), and the anchor above is an *optional*
+    /// hardening. When `true`, a node REFUSES to state-sync unless BOTH
+    /// `state_sync_trusted_root` and `state_sync_trusted_round` are set AND the
+    /// fetched snapshot matches them exactly — i.e. it never trusts a source
+    /// peer's claimed root, only a value the operator pinned out of band. This
+    /// is the setting a production/mainnet deployment should turn on (an
+    /// operator recovering a validator with a wiped `data_dir` pins the known
+    /// `(round, root)` first). It is a **node-LOCAL policy** choice — NOT folded
+    /// into `chain_id` (two nodes that differ only in this flag are the same
+    /// network; it only changes what THIS node accepts when it syncs), and it
+    /// only affects the state-sync path (a node with local state never syncs),
+    /// so it's inert for the user's running single-validator network.
+    #[serde(default)]
+    pub require_state_sync_trust_anchor: bool,
     /// **Opt-in dynamic validator rotation (phase 3.3).** When `false` (the
     /// default, and what every existing config resolves to), the validator set
     /// is fixed for the life of the network — exactly the phase-1/2 behavior,
@@ -355,6 +372,7 @@ mod tests {
             state_sync_peers: Vec::new(),
             state_sync_trusted_root: None,
             state_sync_trusted_round: None,
+            require_state_sync_trust_anchor: false,
             validator_rotation: false,
             epoch_rounds: None,
             compressed_state_tree: false,
