@@ -384,6 +384,42 @@ static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_
 const MAX_CONCURRENT_SIMULATIONS: usize = 4;
 static SIMULATE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SIMULATIONS);
 
+/// Round-scoped `/simulate` result cache (re-audit QCH-SIMULATE #3): maps a
+/// canonical txid to its `(round, outcome)`. A dry-run is a pure function of the
+/// message plus the committed round, so an identical tx replayed in the SAME
+/// round is served from here instead of re-running the WASM, closing the "replay
+/// one signed tx to force endless dry-runs" DoS. Bounded FIFO (evict oldest) so
+/// it cannot grow without limit; an entry from an older round is ignored
+/// (freshness is a round match), so nothing stale is ever returned.
+const SIM_CACHE_MAX: usize = 8192;
+struct SimCache {
+    map: std::collections::HashMap<[u8; 32], (u64, qchain_execution::SimOutcome)>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+static SIM_CACHE: std::sync::LazyLock<std::sync::Mutex<SimCache>> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(SimCache { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new() })
+});
+/// Cache hit ONLY when the cached entry is for the SAME round (never serve a
+/// stale-round preview). Returns a clone of the cached outcome.
+fn sim_cache_get(txid: &[u8; 32], round: u64) -> Option<qchain_execution::SimOutcome> {
+    let cache = SIM_CACHE.lock().ok()?;
+    match cache.map.get(txid) {
+        Some((r, out)) if *r == round => Some(out.clone()),
+        _ => None,
+    }
+}
+fn sim_cache_put(txid: [u8; 32], round: u64, outcome: &qchain_execution::SimOutcome) {
+    let Ok(mut cache) = SIM_CACHE.lock() else { return };
+    if cache.map.insert(txid, (round, outcome.clone())).is_none() {
+        cache.order.push_back(txid);
+        while cache.order.len() > SIM_CACHE_MAX {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+    }
+}
+
 /// How long a captured point-in-time snapshot stays servable before the node
 /// re-captures a fresh one (see `CachedSnapshot`). Long enough that a client
 /// can page through a large state within one snapshot without it rotating,
@@ -2051,10 +2087,24 @@ impl Engine {
             let round = state.next_round;
             (state.ledger.simulate_snapshot(tx, &SIM_FEE_COLLECTOR), round)
         };
+        // TXID CACHE (re-audit QCH-SIMULATE #3): a dry-run is a pure function of
+        // the MESSAGE + the committed round (`run_simulation` uses the presigned
+        // path — no signature in the result). So an identical tx replayed within
+        // the SAME round yields the identical outcome; serve it from a small
+        // round-scoped cache instead of re-compiling+running the WASM. This kills
+        // the "reuse one public signed tx to force endless identical dry-runs"
+        // vector — the expensive WASM work runs at most once per (txid, round).
+        // Keyed by the canonical txid (message hash, #186); scoped to `round` so
+        // a stale-round result is never served.
+        let txid = tx.txid();
+        if let Some(cached) = sim_cache_get(&txid, round) {
+            return Some(cached);
+        }
         let tx = tx.clone();
         let outcome = tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
             .await
             .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"));
+        sim_cache_put(txid, round, &outcome);
         Some(outcome)
     }
 

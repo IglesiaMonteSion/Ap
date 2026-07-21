@@ -129,7 +129,9 @@ export function programAddressFromSeed(seed, index) {
 }
 
 /**
- * `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit) -> string`
+ * `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit, validUntilRound) -> string`.
+ * `validUntilRound` (re-audit #4): 0 = no expiration; positive = expire at
+ * that round (short window for a contract call).
  * @param {Uint8Array} seed
  * @param {string} program_id
  * @param {string} accounts_csv
@@ -137,9 +139,10 @@ export function programAddressFromSeed(seed, index) {
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signCallProgram(seed, program_id, accounts_csv, args_csv, nonce, chain_id, fee_limit) {
+export function signCallProgram(seed, program_id, accounts_csv, args_csv, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred7_0;
     let deferred7_1;
     try {
@@ -154,7 +157,7 @@ export function signCallProgram(seed, program_id, accounts_csv, args_csv, nonce,
         const len3 = WASM_VECTOR_LEN;
         const ptr4 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len4 = WASM_VECTOR_LEN;
-        wasm.signCallProgram(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, nonce, ptr4, len4, fee_limit);
+        wasm.signCallProgram(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, nonce, ptr4, len4, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -259,9 +262,11 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
 }
 
 /**
- * `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`.
+ * `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit, validUntilRound) -> string`.
  * `index` selects the payer-derived contract address (re-audit #2): the same
  * value passed to `programAddressFromSeed(seed, index)` for display.
+ * `validUntilRound` (re-audit #4): 0 = no expiration; a positive value makes
+ * the tx expire at that committed round (the wallet passes a SHORT window).
  * @param {Uint8Array} seed
  * @param {number} index
  * @param {Uint8Array} module_bytes
@@ -269,9 +274,10 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signDeployProgram(seed, index, module_bytes, entry_point, nonce, chain_id, fee_limit) {
+export function signDeployProgram(seed, index, module_bytes, entry_point, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred6_0;
     let deferred6_1;
     try {
@@ -284,7 +290,7 @@ export function signDeployProgram(seed, index, module_bytes, entry_point, nonce,
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len3 = WASM_VECTOR_LEN;
-        wasm.signDeployProgram(retptr, ptr0, len0, index, ptr1, len1, ptr2, len2, nonce, ptr3, len3, fee_limit);
+        wasm.signDeployProgram(retptr, ptr0, len0, index, ptr1, len1, ptr2, len2, nonce, ptr3, len3, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);

@@ -75,7 +75,7 @@
     if (WALLET_URL) { try { WALLET_ORIGIN = new URL(WALLET_URL).origin; } catch (e) { WALLET_URL = null; WALLET_ORIGIN = null; } }
   }
   const Bridge = (function () {
-    let popup = null, seq = 0;
+    let popup = null, seq = 0, session = null; // session token issued by the wallet on connect (re-audit #5)
     const pending = new Map(); // id -> {resolve, reject}
     window.addEventListener("message", (ev) => {
       if (!WALLET_ORIGIN || ev.origin !== WALLET_ORIGIN) return; // strict origin allowlist
@@ -108,9 +108,12 @@
       });
     }
     return {
-      connect: () => send("connect").then((m) => { CONNECTED_ADDR = m.address || null; return CONNECTED_ADDR; }),
-      signAndSubmit: (tx) => send("signAndSubmit", { tx }),
-      disconnect: () => { CONNECTED_ADDR = null; if (popup && !popup.closed) popup.close(); popup = null; },
+      // The wallet returns a random session token on connect; echo it on every
+      // signAndSubmit so the wallet can require an active, matching session
+      // (re-audit #5).
+      connect: () => send("connect").then((m) => { CONNECTED_ADDR = m.address || null; session = m.session || null; return CONNECTED_ADDR; }),
+      signAndSubmit: (tx) => send("signAndSubmit", { tx, session }),
+      disconnect: () => { CONNECTED_ADDR = null; session = null; try { send("disconnect"); } catch (e) {} if (popup && !popup.closed) popup.close(); popup = null; },
     };
   })();
 

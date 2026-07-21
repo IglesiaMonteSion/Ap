@@ -3088,6 +3088,25 @@ function runBoot(){
 // qué se firma; (3) conectar = solo lectura de la dirección; cada firma
 // re-pregunta; (4) el bridge está APAGADO salvo que el server pase connect_origin.
 let CONNECT_ORIGIN = null;   // origen exacto autorizado (de /api/config), ej. https://scan.qchainhq.com
+// Ventana de validez CORTA para una tx de contrato (re-audit #4): expira ~120
+// rondas después de firmarla, así una tx firmada-pero-no-transmitida no se puede
+// reusar mucho más tarde contra un estado on-chain cambiado.
+const CONTRACT_TX_TTL_ROUNDS = 120n;
+// Límites de una tx de contrato para el puente (re-audit #5). El nodo y el signer
+// también los aplican; acá se rechaza temprano con un mensaje claro.
+const MAX_MODULE_BYTES = 256*1024, MAX_CALL_ACCOUNTS = 64, MAX_CALL_ARGS = 32;
+// PROCEDENCIA "verificada" (re-audit #6): code_hash SHA3-256 de las plantillas
+// OFICIALES del SDK de qchain. Si el contrato que se llama coincide, la wallet
+// muestra "✅ verificado: <nombre> oficial"; si no, "⚠ no verificado" (código
+// desconocido — no confíes en su identidad). Es el equivalente cliente-side de
+// un "verified source" sin registro on-chain de fuente publicada.
+const KNOWN_CONTRACTS = {
+  "bb30d4027ecd8947781305414778736ae2bae16eabec4baf5388273eaaf329f5":"token (fungible) oficial de qchain",
+  "6c0fd056350763b5c200d377a444cc57d386361ecd4db6ae3c27746b7a4eba34":"bóveda (vault) oficial de qchain",
+  "28ba3dcd0441ac046fe76fc94e511c62cf4e431365a9263bacdeabd6e681a447":"pagos/tesorería oficial de qchain",
+  "de8bb893d5a3e67d0681824b764a805ef718af607f47e7bcf45f13b49546903d":"contador oficial de qchain",
+  "fd8e366758ffa994b52fbe7c78fd92ae89f91c3c7dfe16232b84247333cb14f7":"contador compartido oficial de qchain",
+};
 
 // Modal de aprobación genérico: devuelve true si el usuario aprueba.
 // `opts.blocked` deshabilita el botón Aprobar (p.ej. la simulación dice que
@@ -3189,16 +3208,21 @@ async function bridgeSignAndSubmit(tx){
   const nonce=BigInt(acct.nonce||0);
   const node=await api("/api/node").catch(()=>({}));
   const bfpb=BigInt(node.base_fee_per_byte||180);
+  // Ventana de validez corta: expira ~120 rondas después de la ronda actual
+  // (re-audit #4). 0 = sin expiración sólo si el nodo no reporta la ronda.
+  const curRound=BigInt(node.next_round||0);
+  const validUntil = curRound>0n ? (curRound + CONTRACT_TX_TTL_ROUNDS) : 0n;
   if(tx.kind==="deployProgram"){
     const bytes=Uint8Array.from(tx.moduleBytes||[]);
     if(!bytes.length) throw new Error("el .wasm está vacío");
+    if(bytes.length>MAX_MODULE_BYTES) throw new Error("el .wasm supera el máximo de "+(MAX_MODULE_BYTES/1024)+" KB");
     const kb=(bytes.length/1024).toFixed(1);
     // FIRMAR primero (sin transmitir), luego SIMULAR la tx firmada, y recién
     // mostrar la aprobación con el resultado real (fee + cambios de saldo). La
     // dirección se deriva del payer + índice (re-audit #2).
     const fp=await freshProgramAddr();
     const paddr=fp.addr;
-    const txJson=signDeployProgram(SEED, fp.index, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000));
+    const txJson=signDeployProgram(SEED, fp.index, bytes, tx.entryPoint||"run", nonce, chainId, BigInt(node.fee_limit||10000000), validUntil);
     const sim=await bridgeSimulate(txJson);
     // FAIL-CLOSED (re-audit QCH-WALLET, HIGH): sólo una simulación ok===true
     // habilita aprobar. No disponible / 429 / fallida ⇒ bloqueado.
@@ -3210,6 +3234,7 @@ async function bridgeSignAndSubmit(tx){
       ["Entry point", tx.entryPoint||"run"],
       ["Dirección del contrato", paddr],
       ["Firmando como", short(me)],
+      ["Expira", validUntil>0n ? ("ronda "+validUntil.toString()+" (~"+CONTRACT_TX_TTL_ROUNDS+" rondas)") : "sin expiración"],
     ].concat(bridgeSimLines(sim));
     const ok=await bridgeApprove("Desplegar contrato", lines, {blocked, note});
     if(!ok) return { rejected:true };
@@ -3222,26 +3247,35 @@ async function bridgeSignAndSubmit(tx){
     const pid=String(tx.programId||"").trim(); if(!pid) throw new Error("falta la dirección del contrato");
     const accountsCsv=String(tx.accounts||"");
     const argsCsv=String(tx.args||"");
+    // Límites (re-audit #5): cuentas/args acotados (el signer/nodo también los aplican).
+    const nAcc=accountsCsv.split(',').map(s=>s.trim()).filter(Boolean).length;
+    const nArg=argsCsv.split(',').map(s=>s.trim()).filter(Boolean).length;
+    if(nAcc>MAX_CALL_ACCOUNTS) throw new Error("demasiadas cuentas (máx "+MAX_CALL_ACCOUNTS+")");
+    if(nArg>MAX_CALL_ARGS) throw new Error("demasiados argumentos (máx "+MAX_CALL_ARGS+")");
     // FIRMAR primero, SIMULAR, y mostrar los CAMBIOS DE SALDO reales (qué cuenta
     // se debita y hacia dónde) — cierra la firma ciega (re-audit QCH-WALLET).
-    const txJson=signCallProgram(SEED, pid, accountsCsv, argsCsv, nonce, chainId, BigInt(node.fee_limit||10000000));
+    const txJson=signCallProgram(SEED, pid, accountsCsv, argsCsv, nonce, chainId, BigInt(node.fee_limit||10000000), validUntil);
     const sim=await bridgeSimulate(txJson);
     // FAIL-CLOSED (re-audit QCH-WALLET, HIGH): sólo una simulación ok===true habilita aprobar.
     const blocked = bridgeSimBlocked(sim);
     let note = bridgeSimNote(sim);
-    // PROCEDENCIA DEL CONTRATO (re-audit QCH-WALLET, MED): mostrar el code_hash y
-    // el deployer del contrato que se va a llamar, para que el usuario confirme
-    // que la dirección es el proyecto que cree, no un look-alike. El code_hash lo
-    // FUERZA el nodo contra el bytecode ejecutado (v6.26.2). Si el contrato no
-    // existe on-chain, avisar (llamar una dirección sin programa fallaría igual).
+    // PROCEDENCIA COMPLETA DEL CONTRATO (re-audit #6): code_hash + deployer + si el
+    // código está VERIFICADO contra una compilación conocida (las plantillas
+    // oficiales del SDK). El code_hash lo FUERZA el nodo contra el bytecode
+    // ejecutado (v6.26.2). Si el contrato no existe on-chain, avisar.
     let prog=null;
     try{ prog=await api("/api/program/"+encodeURIComponent(pid)); }catch(e){ prog=null; }
+    const ch = prog ? String(prog.code_hash||"").toLowerCase() : "";
+    const known = KNOWN_CONTRACTS[ch];
+    const verified = known ? ("✅ verificado — "+known) : "⚠ NO verificado (código desconocido — no confíes en la identidad de este contrato)";
     const provenance = prog ? [
       ["Code hash", short(prog.code_hash||"")],
+      ["Verificación", verified],
       ["Desplegado por", short(prog.deployer||"")],
       ["Tamaño del código", ((Number(prog.size_bytes||0))/1024).toFixed(1)+" KB"],
     ] : [["Contrato","⚠ NO existe un contrato desplegado en esta dirección"]];
     if(!prog && !note) note="No hay un contrato desplegado en esa dirección — la llamada fallaría. Verificá la dirección.";
+    else if(prog && !known && !blocked && !note) note="El código de este contrato NO coincide con ninguna compilación conocida. Confirmá que confiás en quién lo desplegó antes de aprobar.";
     const lines=[
       ["Acción","Llamar un contrato"],
       ["Contrato", pid],
@@ -3249,6 +3283,7 @@ async function bridgeSignAndSubmit(tx){
       ["Cuentas", accountsCsv||"—"],
       ["Args (i64)", argsCsv||"—"],
       ["Firmando como", short(me)],
+      ["Expira", validUntil>0n ? ("ronda "+validUntil.toString()+" (~"+CONTRACT_TX_TTL_ROUNDS+" rondas)") : "sin expiración"],
     ]).concat(bridgeSimLines(sim));
     const ok=await bridgeApprove("Interactuar con contrato", lines, {blocked, note});
     if(!ok) return { rejected:true };
@@ -3260,32 +3295,52 @@ async function bridgeSignAndSubmit(tx){
   throw new Error("tipo de operación desconocido");
 }
 
+let BRIDGE_SESSION=null;   // token de sesión aleatorio, emitido al conectar (re-audit #5)
+let BRIDGE_BUSY=false;     // sólo una solicitud de firma activa a la vez (re-audit #5)
+function randToken(){ const a=new Uint8Array(16); crypto.getRandomValues(a); return Array.from(a).map(b=>b.toString(16).padStart(2,"0")).join(""); }
 async function initConnectBridge(){
   try{ const cfg=await api("/api/config"); CONNECT_ORIGIN=cfg.connect_origin||null; }catch(e){ CONNECT_ORIGIN=null; }
   if(!CONNECT_ORIGIN) return;   // bridge OFF salvo que el server lo configure
+  // La ÚNICA ventana autorizada a hablarnos es la que nos abrió (el popup lo abre
+  // QScan). Fijarla una vez y exigir `ev.source === opener` en cada mensaje cierra
+  // que otra ventana/iframe del mismo origen inyecte pedidos (re-audit #5).
+  const OPENER = window.opener;
   window.addEventListener("message", async (ev)=>{
     // INVARIANTE 3: allowlist de origen estricto, en CADA mensaje.
     if(ev.origin !== CONNECT_ORIGIN) return;
+    // La ventana emisora DEBE ser exactamente la que nos abrió (validación de source).
+    if(!OPENER || ev.source !== OPENER) return;
     const msg=ev.data||{};
     if(!msg || msg.v!==1 || !msg.type || !msg.id) return;
-    const reply=(obj)=>{ try{ (ev.source||window.opener)?.postMessage(Object.assign({v:1,id:msg.id},obj), CONNECT_ORIGIN); }catch(e){} };
+    const reply=(obj)=>{ try{ OPENER.postMessage(Object.assign({v:1,id:msg.id},obj), CONNECT_ORIGIN); }catch(e){} };
     try{
       if(msg.type==="connect"){
         if(!MASTER){ reply({type:"error", msg:"la wallet está bloqueada — desbloqueala y reintentá"}); return; }
         const ok=await bridgeApprove("Conectar", [["Sitio", CONNECT_ORIGIN],["Permiso","Ver tu dirección pública (solo lectura)"]]);
         if(!ok){ reply({type:"rejected"}); return; }
-        reply({type:"connected", address: myAddress()});
+        // Nueva sesión: emite un token que las solicitudes siguientes DEBEN traer.
+        BRIDGE_SESSION=randToken();
+        reply({type:"connected", address: myAddress(), session: BRIDGE_SESSION});
       } else if(msg.type==="signAndSubmit"){
-        const res=await bridgeSignAndSubmit(msg.tx||{});
-        if(res.rejected) reply({type:"rejected"});
-        else reply({type:"submitted", hash:res.hash, programAddress:res.programAddress});
+        // Exige una sesión ACTIVA con el token correcto (re-audit #5): sin conectar
+        // primero, o con un token que no coincide, no se firma nada.
+        if(!BRIDGE_SESSION || msg.session!==BRIDGE_SESSION){ reply({type:"error", msg:"sesión inválida — conectá primero"}); return; }
+        // Una sola solicitud de firma a la vez (evita aprobaciones superpuestas).
+        if(BRIDGE_BUSY){ reply({type:"error", msg:"ya hay una solicitud de firma en curso"}); return; }
+        BRIDGE_BUSY=true;
+        try{
+          const res=await bridgeSignAndSubmit(msg.tx||{});
+          if(res.rejected) reply({type:"rejected"});
+          else reply({type:"submitted", hash:res.hash, programAddress:res.programAddress});
+        } finally { BRIDGE_BUSY=false; }
       } else if(msg.type==="disconnect"){
+        BRIDGE_SESSION=null;   // cierra la sesión: futuros signAndSubmit se rechazan
         reply({type:"disconnected"});
       }
     }catch(e){ reply({type:"error", msg:String(e.message||e)}); }
   });
   // avisar a quien nos abrió que estamos listos
-  try{ window.opener?.postMessage({v:1,type:"ready"}, CONNECT_ORIGIN); }catch(e){}
+  try{ OPENER?.postMessage({v:1,type:"ready"}, CONNECT_ORIGIN); }catch(e){}
 }
 
 // ==================== arranque ====================

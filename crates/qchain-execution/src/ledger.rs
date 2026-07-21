@@ -145,6 +145,77 @@ impl SimStatus {
     }
 }
 
+/// A full before/after view of one account the simulated tx would change —
+/// re-audit QCH-SIMULATE #2: a preview must show more than balances. A contract
+/// that flips a PDA's `owner`, bumps a `nonce`, or rewrites the `data` that holds
+/// an admin/authority/permission changes NO balance, so a balance-only diff would
+/// hide the most security-relevant effects (e.g. "this call changes the vault's
+/// admin"). `data_hash` is SHA3-256 of the account's `data` bytes, so the wallet
+/// can show "data changed" without dumping raw bytes, and `owner`/`code_hash`
+/// surface a program-ownership or bytecode change.
+#[derive(Clone, Debug)]
+pub struct SimAccountChange {
+    pub address: Pubkey,
+    pub existed_before: bool,
+    pub exists_after: bool,
+    pub balance_before: u64,
+    pub balance_after: u64,
+    pub owner_before: Pubkey,
+    pub owner_after: Pubkey,
+    pub nonce_before: u64,
+    pub nonce_after: u64,
+    pub data_hash_before: [u8; 32],
+    pub data_hash_after: [u8; 32],
+    pub code_hash_before: [u8; 32],
+    pub code_hash_after: [u8; 32],
+}
+
+/// A compact summary of one account's security-relevant state, used to diff
+/// before/after in a simulation.
+#[derive(Clone)]
+struct AcctSummary {
+    existed: bool,
+    balance: u64,
+    owner: Pubkey,
+    nonce: u64,
+    data_hash: [u8; 32],
+    code_hash: [u8; 32],
+}
+
+impl AcctSummary {
+    fn of(a: Option<&Account>) -> Self {
+        use sha3::{Digest, Sha3_256};
+        match a {
+            Some(acc) => AcctSummary {
+                existed: true,
+                balance: acc.balance,
+                owner: acc.owner,
+                nonce: acc.nonce,
+                data_hash: Sha3_256::digest(&acc.data).into(),
+                code_hash: acc.code_hash,
+            },
+            None => AcctSummary {
+                existed: false,
+                balance: 0,
+                owner: Pubkey::new([0u8; 32]),
+                nonce: 0,
+                data_hash: Sha3_256::digest([]).into(),
+                code_hash: [0u8; 32],
+            },
+        }
+    }
+    /// Any security-relevant field differs (existence, balance, owner, nonce,
+    /// data, or code).
+    fn differs(&self, o: &AcctSummary) -> bool {
+        self.existed != o.existed
+            || self.balance != o.balance
+            || self.owner != o.owner
+            || self.nonce != o.nonce
+            || self.data_hash != o.data_hash
+            || self.code_hash != o.code_hash
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SimOutcome {
     pub ok: bool,
@@ -156,7 +227,10 @@ pub struct SimOutcome {
     pub fee: u64,
     pub payer_before: u64,
     pub payer_after: u64,
-    pub changes: Vec<(Pubkey, u64, u64)>,
+    /// Every account whose SECURITY-RELEVANT state (balance, owner, nonce, data,
+    /// or code) the tx would change — re-audit QCH-SIMULATE #2. Excludes the fee
+    /// collector (validator-commission noise, not visible to the contract).
+    pub changes: Vec<SimAccountChange>,
     /// The committed round the dry-run was evaluated against (re-audit
     /// QCH-SIMULATE economics): lets the caller show/verify which height the
     /// preview reflects, since fee/economics depend on the round.
@@ -192,7 +266,7 @@ impl SimOutcome {
 /// latency: keeps a slow simulation from stalling `try_commit`/`propose_round`.
 pub struct SimSnapshot {
     accounts: Vec<(Pubkey, Account)>,
-    before: HashMap<Pubkey, u64>,
+    before: HashMap<Pubkey, AcctSummary>,
     payer_before: u64,
     compressed: bool,
     economics_v7: bool,
@@ -447,19 +521,16 @@ impl Ledger {
             want.extend(ix.accounts.iter().copied());
         }
         let mut accounts: Vec<(Pubkey, Account)> = Vec::new();
-        let mut before: HashMap<Pubkey, u64> = HashMap::new();
+        let mut before: HashMap<Pubkey, AcctSummary> = HashMap::new();
         for pk in &want {
-            // Record the before-balance for EVERY candidate (0 if the account
-            // doesn't exist yet, e.g. a brand-new recipient) so `changes` below
-            // captures newly-created accounts too, not just pre-existing ones.
-            match self.store.get(pk) {
-                Some(a) => {
-                    before.insert(*pk, a.balance);
-                    accounts.push((*pk, a));
-                }
-                None => {
-                    before.entry(*pk).or_insert(0);
-                }
+            // Record the FULL before-state (balance/owner/nonce/data/code) for
+            // EVERY candidate (a fresh account for a not-yet-existing one) so
+            // `changes` below captures newly-created accounts AND owner/data/nonce
+            // changes, not just balance moves (re-audit QCH-SIMULATE #2).
+            let a = self.store.get(pk);
+            before.entry(*pk).or_insert_with(|| AcctSummary::of(a.as_ref()));
+            if let Some(acc) = a {
+                accounts.push((*pk, acc));
             }
         }
         let payer_before = self.store.get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
@@ -516,17 +587,38 @@ impl Ledger {
         // Err); on an admission rejection (InsufficientFunds/FeeExceedsLimit)
         // nothing was written so it equals `payer_before`.
         let payer_after = sim.get_balance(&tx.message.payer);
-        let mut changes: Vec<(Pubkey, u64, u64)> = before
+        // FULL STATE DIFF (re-audit QCH-SIMULATE #2): compare the complete
+        // security-relevant state (balance/owner/nonce/data/code) before vs after,
+        // so a change to an admin/authority stored in `data`, a PDA `owner` flip,
+        // a nonce bump, or a bytecode deploy is surfaced — not just balance moves.
+        // Excludes the fee collector: its credit is the validator's commission,
+        // which is economics noise the contract never sees (re-audit #1).
+        let mut changes: Vec<SimAccountChange> = before
             .iter()
-            // Exclude the fee collector: its balance change is the validator's
-            // commission credit, which is noise for the user's preview.
             .filter(|(pk, _)| *pk != fee_collector)
             .filter_map(|(pk, b)| {
-                let after = sim.get_balance(pk);
-                (after != *b).then_some((*pk, *b, after))
+                let a = AcctSummary::of(sim.store.get(pk).as_ref());
+                if !b.differs(&a) {
+                    return None;
+                }
+                Some(SimAccountChange {
+                    address: *pk,
+                    existed_before: b.existed,
+                    exists_after: a.existed,
+                    balance_before: b.balance,
+                    balance_after: a.balance,
+                    owner_before: b.owner,
+                    owner_after: a.owner,
+                    nonce_before: b.nonce,
+                    nonce_after: a.nonce,
+                    data_hash_before: b.data_hash,
+                    data_hash_after: a.data_hash,
+                    code_hash_before: b.code_hash,
+                    code_hash_after: a.code_hash,
+                })
             })
             .collect();
-        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        changes.sort_by(|a, b| a.address.cmp(&b.address));
         match result {
             Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes, round, status: SimStatus::Ok },
             // FAILURE IS NOT FREE (re-audit QCH-SIMULATE): report the REAL state
@@ -2246,7 +2338,7 @@ mod tests {
         assert!(sim.fee > 0, "the simulated fee must be non-zero");
         assert_eq!(sim.payer_before, alice_before);
         assert_eq!(sim.payer_after, alice_before - 5 * qchain_core::UNITS_PER_QCH - sim.fee, "predicted payer balance = before - amount - fee");
-        assert!(sim.changes.iter().any(|(pk, _, after)| *pk == bob && *after == 5 * qchain_core::UNITS_PER_QCH), "bob's predicted balance is the amount");
+        assert!(sim.changes.iter().any(|c| c.address == bob && c.balance_after == 5 * qchain_core::UNITS_PER_QCH), "bob's predicted balance is the amount");
         // NOTHING committed.
         assert_eq!(l.get_balance(&alice.pubkey()), alice_before, "simulate must NOT mutate the live ledger");
         assert_eq!(l.get_balance(&bob), 0, "simulate must NOT credit the recipient");
@@ -4301,6 +4393,41 @@ mod tests {
         assert!(sim.payer_after < sim.payer_before, "the simulated payer balance must reflect the real charge");
         // The dry-run must NOT have mutated the live ledger.
         assert_eq!(ledger.get_balance(&caller.pubkey()), caller_before, "simulate never touches the live ledger");
+    }
+
+    /// FULL STATE DIFF (re-audit QCH-SIMULATE #2): a simulation must surface an
+    /// account whose `data` changes even when its balance does NOT — the class of
+    /// change that stores an admin/authority/permission. Here a contract writes
+    /// bytes into the signer's `data`; the sim's `changes` must include that
+    /// account with `data_hash_before != data_hash_after`.
+    #[test]
+    fn simulate_reports_a_data_change_not_just_balance() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = deploy_wat(&mut ledger, SETDATA_WAT, "setd", &deployer, &validator);
+
+        let user = Keypair::generate().unwrap();
+        ledger.credit(user.pubkey(), 50_000_000);
+        // Call writes 3 bytes into accounts[0] (the signer's own data).
+        let call = Instruction {
+            program_id: program_pk,
+            accounts: vec![user.pubkey()],
+            data: 0i64.to_le_bytes().to_vec(),
+        };
+        let tx = Transaction::new_signed(&user, 0, [0u8; 32], 50_000_000, vec![call]).unwrap();
+
+        let sim = ledger.simulate(&tx, &validator, 0);
+        assert!(sim.ok, "the data-write call must simulate ok, got {:?}", sim.error);
+        let ch = sim
+            .changes
+            .iter()
+            .find(|c| c.address == user.pubkey())
+            .expect("the signer's account must appear in the sim's changes");
+        assert_ne!(ch.data_hash_before, ch.data_hash_after, "the sim must report the DATA change (admin/authority class), not just balances");
+        // The live ledger is untouched (dry-run).
+        assert!(ledger.store().get(&user.pubkey()).map(|a| a.data.is_empty()).unwrap_or(true), "simulate must not persist the data write");
     }
 
     /// SDK v0.2 — estado estructurado (`host_set_data`). Escribe 3 bytes en la

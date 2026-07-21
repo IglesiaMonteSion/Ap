@@ -431,6 +431,18 @@ pub fn program_pda(program_id: &str, seed: &[u8]) -> anyhow::Result<String> {
 /// callable via `entry_point`. accounts = [program_address], program_id =
 /// System Program (the loader runs on deploy). The payer (seed) signs and pays
 /// the byte fee (bigger `.wasm` = proportionally bigger fee).
+/// Max contract bytecode a deploy tx will sign (matches the node's
+/// `MAX_TRANSACTION_BYTES` headroom / on-chain deploy cap). Rejecting oversize
+/// here gives the user a clear error before signing (re-audit #5 size limit).
+const MAX_MODULE_BYTES: usize = 256 * 1024;
+/// Max declared accounts / i64 args a contract call will sign (re-audit #5).
+const MAX_CALL_ACCOUNTS: usize = 64;
+const MAX_CALL_ARGS: usize = 32;
+
+/// `valid_until_round == 0` means no expiration (the pre-#4 behavior); a positive
+/// value makes the tx expire at that committed round. Contract deploy/call txs
+/// should carry a SHORT window (re-audit #4) so a signed-but-not-broadcast tx
+/// can't be replayed much later against a changed on-chain state.
 pub fn sign_deploy_program_json(
     seed: &[u8; 32],
     index: u32,
@@ -439,7 +451,14 @@ pub fn sign_deploy_program_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
+    if module_bytes.is_empty() {
+        return Err(anyhow::anyhow!("el .wasm está vacío"));
+    }
+    if module_bytes.len() > MAX_MODULE_BYTES {
+        return Err(anyhow::anyhow!("el .wasm supera el máximo de {MAX_MODULE_BYTES} bytes ({} bytes)", module_bytes.len()));
+    }
     let payer = Keypair::generate_from_seed(seed)?;
     // Re-audit #2: derive the target address from the PAYER + salt, exactly like
     // the node, so on-chain and off-chain agree by construction (no mismatch).
@@ -455,7 +474,7 @@ pub fn sign_deploy_program_json(
         accounts: vec![program_pk],
         data: deploy_program_instruction_data(module_bytes, entry_point, &salt),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -473,19 +492,28 @@ pub fn sign_call_program_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let program_pk: Pubkey = program_id.trim().parse().map_err(|e| anyhow::anyhow!("program address invalid: {e}"))?;
     let mut accounts = Vec::new();
     for a in accounts_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         accounts.push(a.parse::<Pubkey>().map_err(|e| anyhow::anyhow!("account address '{a}' invalid: {e}"))?);
+        if accounts.len() > MAX_CALL_ACCOUNTS {
+            return Err(anyhow::anyhow!("demasiadas cuentas (máx {MAX_CALL_ACCOUNTS})"));
+        }
     }
     let mut data = Vec::new();
+    let mut nargs = 0usize;
     for arg in args_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         data.extend_from_slice(&arg.parse::<i64>().map_err(|e| anyhow::anyhow!("arg '{arg}' is not an i64: {e}"))?.to_le_bytes());
+        nargs += 1;
+        if nargs > MAX_CALL_ARGS {
+            return Err(anyhow::anyhow!("demasiados argumentos (máx {MAX_CALL_ARGS})"));
+        }
     }
     let ix = Instruction { program_id: program_pk, accounts, data };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -569,16 +597,16 @@ mod tests {
         let module = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         // Deploy signs and round-trips as JSON. The address is derived from the
         // payer + index (re-audit #2), so it matches `programAddressFromSeed`.
-        let dep = sign_deploy_program_json(&seed, 0, &module, "run", 0, &chain, 10_000_000).unwrap();
+        let dep = sign_deploy_program_json(&seed, 0, &module, "run", 0, &chain, 10_000_000, 0).unwrap();
         assert!(dep.contains("signature"), "deploy tx must be a signed tx json");
         assert!(dep.contains(&prog), "the signed deploy targets the payer-derived address for index 0");
         // Call signs with i64 args + accounts.
-        let call = sign_call_program_json(&seed, &prog, &format!("{prog}"), "1,2,3", 1, &chain, 10_000_000).unwrap();
+        let call = sign_call_program_json(&seed, &prog, &format!("{prog}"), "1,2,3", 1, &chain, 10_000_000, 0).unwrap();
         assert!(call.contains("signature"), "call tx must be a signed tx json");
         // A bad program address is rejected, not silently mis-encoded.
-        assert!(sign_call_program_json(&seed, "not-an-address", "", "", 0, &chain, 1).is_err());
+        assert!(sign_call_program_json(&seed, "not-an-address", "", "", 0, &chain, 1, 0).is_err());
         // A non-i64 arg is rejected.
-        assert!(sign_call_program_json(&seed, &prog, "", "abc", 0, &chain, 1).is_err());
+        assert!(sign_call_program_json(&seed, &prog, "", "abc", 0, &chain, 1, 0).is_err());
     }
 }
 
@@ -764,9 +792,11 @@ mod wasm {
         Ok(super::program_address_from_seed(&as32(seed, "seed")?, index))
     }
 
-    /// `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit) -> string`.
+    /// `signDeployProgram(seed, index, moduleBytes, entryPoint, nonce, chainId, feeLimit, validUntilRound) -> string`.
     /// `index` selects the payer-derived contract address (re-audit #2): the same
     /// value passed to `programAddressFromSeed(seed, index)` for display.
+    /// `validUntilRound` (re-audit #4): 0 = no expiration; a positive value makes
+    /// the tx expire at that committed round (the wallet passes a SHORT window).
     #[wasm_bindgen(js_name = signDeployProgram)]
     #[allow(clippy::too_many_arguments)]
     pub fn sign_deploy_program(
@@ -777,12 +807,15 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_deploy_program_json(&as32(seed, "seed")?, index, module_bytes, entry_point, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_deploy_program_json(&as32(seed, "seed")?, index, module_bytes, entry_point, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit) -> string`
+    /// `signCallProgram(seed, programId, accountsCsv, argsCsv, nonce, chainId, feeLimit, validUntilRound) -> string`.
+    /// `validUntilRound` (re-audit #4): 0 = no expiration; positive = expire at
+    /// that round (short window for a contract call).
     #[wasm_bindgen(js_name = signCallProgram)]
     #[allow(clippy::too_many_arguments)]
     pub fn sign_call_program(
@@ -793,8 +826,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_call_program_json(&as32(seed, "seed")?, program_id, accounts_csv, args_csv, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_call_program_json(&as32(seed, "seed")?, program_id, accounts_csv, args_csv, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

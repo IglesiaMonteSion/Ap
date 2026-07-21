@@ -127,12 +127,12 @@ fn main() -> anyhow::Result<()> {
             // not passed in — same as programAddressFromSeed(seed, index).)
             let s = seed(&args[2])?;
             let module = std::fs::read(&args[4])?;
-            print!("{}", qchain_wasm::sign_deploy_program_json(&s, args[3].parse()?, &module, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+            print!("{}", qchain_wasm::sign_deploy_program_json(&s, args[3].parse()?, &module, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?, args.get(9).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("call-program") => {
             // call-program <seed> <program_id> <accounts_csv> <args_csv> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_call_program_json(&s, &args[3], &args[4], &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+            print!("{}", qchain_wasm::sign_call_program_json(&s, &args[3], &args[4], &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?, args.get(9).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         _ => anyhow::bail!("usage: qchain-wasm-signer address|stake-addr|sign|delegate|vote|finalize|execute|v7-stake|v7-increase|v7-begin-unstake|v7-withdraw|program-addr|deploy-program|call-program ..."),
     }

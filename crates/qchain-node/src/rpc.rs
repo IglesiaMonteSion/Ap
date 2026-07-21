@@ -231,10 +231,37 @@ async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transacti
     let Some(sim) = engine.simulate_transaction(&tx).await else {
         return Err((StatusCode::TOO_MANY_REQUESTS, "simulation server busy - retry shortly".to_string()));
     };
+    // Rich per-account state diff (re-audit QCH-SIMULATE #2): balance AND
+    // owner/nonce/data-hash/code-hash before+after, plus `data_changed`/
+    // `owner_changed`/etc. booleans so the wallet can warn "this changes the
+    // contract's data/admin" even when no balance moves. `before`/`after` (the
+    // balance) are kept for backward compatibility with older wallet builds.
+    let hx = |b: &[u8; 32]| hex::encode(b);
     let changes: Vec<serde_json::Value> = sim
         .changes
         .iter()
-        .map(|(pk, before, after)| json!({ "address": pk.to_string(), "before": before.to_string(), "after": after.to_string() }))
+        .map(|c| {
+            json!({
+                "address": c.address.to_string(),
+                "existed_before": c.existed_before,
+                "exists_after": c.exists_after,
+                "before": c.balance_before.to_string(),
+                "after": c.balance_after.to_string(),
+                "balance_before": c.balance_before.to_string(),
+                "balance_after": c.balance_after.to_string(),
+                "owner_before": c.owner_before.to_string(),
+                "owner_after": c.owner_after.to_string(),
+                "owner_changed": c.owner_before != c.owner_after,
+                "nonce_before": c.nonce_before,
+                "nonce_after": c.nonce_after,
+                "data_hash_before": hx(&c.data_hash_before),
+                "data_hash_after": hx(&c.data_hash_after),
+                "data_changed": c.data_hash_before != c.data_hash_after,
+                "code_hash_before": hx(&c.code_hash_before),
+                "code_hash_after": hx(&c.code_hash_after),
+                "code_changed": c.code_hash_before != c.code_hash_after,
+            })
+        })
         .collect();
     Ok(Json(json!({
         "ok": sim.ok,
