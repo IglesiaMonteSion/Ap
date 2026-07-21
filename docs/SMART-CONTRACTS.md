@@ -262,8 +262,11 @@ quedan intactos, sólo pagó el fee de su intento).
 > esas garantías del ledger.
 
 Los syscalls crudos del host (`host_get_balance`, `host_set_balance`,
-`host_is_signer`, `host_get_pubkey`, `host_log`, `host_verify_signature`) siguen
-disponibles para casos avanzados; el SDK cubre el 99% de los contratos.
+`host_is_signer`, `host_get_pubkey`, `host_get_deployer`, `host_log`,
+`host_verify_signature`) siguen disponibles para casos avanzados; el SDK cubre el
+99% de los contratos. `host_get_deployer` (SDK `deployer()`/`require_deployer()`)
+copia la dirección que DESPLEGÓ el contrato — usalo en la `init` para exigir que
+el firmante sea el deployer y cerrar el front-run de init-takeover.
 
 ## Límites honestos
 

@@ -17,6 +17,9 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
 - **Capa de seguridad (v0.5):** `add_u64`/`sub_u64` (aritmética checkeada),
   `require_owner`, `holder_seed` ("debitar sólo lo tuyo" por construcción),
   `read_pubkey`/`write_pubkey`. Ver [`docs/CONTRACT-SECURITY.md`](../../docs/CONTRACT-SECURITY.md).
+- **Anti init-takeover (v0.6):** `deployer()` / `require_deployer()` — la `init`
+  de un contrato exige que el firmante sea la dirección que lo DESPLEGÓ, cerrando
+  el front-run donde un tercero llama `init` primero y se registra como admin.
 - Macro `entrypoint!` que exporta el punto de entrada `run` (4 args `i64`).
 
 **Ejemplos listos para compilar:**

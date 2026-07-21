@@ -32,8 +32,8 @@
 #![no_std]
 
 use qchain_sdk::{
-    abort, add_u64, entrypoint, get_data, holder_seed, log, pubkey, read_u64, require, require_owner, require_signer,
-    set_data, sub_u64, use_pda, write_pubkey, write_u64,
+    abort, add_u64, entrypoint, get_data, holder_seed, log, pubkey, read_u64, require, require_deployer, require_owner,
+    require_signer, set_data, sub_u64, use_pda, write_pubkey, write_u64,
 };
 
 const TAG_BAL: u8 = 0x01; // espacio de PDA de saldos
@@ -62,9 +62,13 @@ fn dispatch([sel, a, _b, _c]: [i64; 4]) {
 
     match sel {
         // init(cap): reclama la mint PDA y fija al firmante como authority.
+        // ANTI INIT-TAKEOVER (re-audit #2): `require_deployer()` exige que el
+        // firmante sea la dirección que DESPLEGÓ este contrato — sin esto, un
+        // tercero podía llamar `init` PRIMERO y quedarse como mint-authority
+        // (front-run del deploy). Con esto, sólo el deployer inicializa.
         1 => {
             require!(use_pda(1, b"mint"), "accounts[1] no es la mint PDA");
-            require_signer(0);
+            require_deployer();
             let mut m = [0u8; MINT_LEN];
             let n = get_data(1, &mut m);
             require!(n < MINT_LEN, "el token ya está inicializado");

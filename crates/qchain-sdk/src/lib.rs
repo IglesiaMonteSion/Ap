@@ -66,6 +66,8 @@ mod sys {
         pub fn host_use_pda(idx: i32, seed_ptr: i32, seed_len: i32) -> i32;
         // SDK v0.4 — lectura de la dirección (pubkey) de una cuenta declarada
         pub fn host_get_pubkey(idx: i32, ptr: i32, max_len: i32) -> i32;
+        // SDK v0.6 — dirección que DESPLEGÓ este contrato (anti init-takeover)
+        pub fn host_get_deployer(ptr: i32, max_len: i32) -> i32;
     }
 
     // Stubs para compilar en el host (nunca se ejecutan en un contrato real).
@@ -99,6 +101,10 @@ mod sys {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn host_get_pubkey(_idx: i32, _ptr: i32, _max_len: i32) -> i32 {
+        -1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_get_deployer(_ptr: i32, _max_len: i32) -> i32 {
         -1
     }
 }
@@ -379,6 +385,38 @@ pub fn pubkey(idx: u32) -> [u8; 32] {
 #[inline]
 pub fn pubkey_eq(idx: u32, expected: &[u8; 32]) -> bool {
     &pubkey(idx) == expected
+}
+
+/// La **dirección que DESPLEGÓ este contrato** (registrada on-chain por
+/// `DeployProgram` y ligada a la dirección del programa POR CONSTRUCCIÓN —
+/// re-auditoría #2). Devuelve `[0u8; 32]` para un programa registrado en génesis
+/// (sin deploy on-chain) o ante un fallo de memoria — una dirección que nunca es
+/// la de una cuenta real, así un chequeo de igualdad contra ella siempre falla
+/// (fail-closed).
+#[inline]
+pub fn deployer() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = unsafe { sys::host_get_deployer(out.as_mut_ptr() as i32, 32) };
+    if n != 32 {
+        return [0u8; 32];
+    }
+    out
+}
+
+/// **ANTI INIT-TAKEOVER**: exige que el FIRMANTE (`accounts[0]`) sea la dirección
+/// que desplegó este contrato. Se usa en la instrucción de `init` de un contrato
+/// para cerrar el front-run donde un tercero llama la `init` primero y se registra
+/// a sí mismo como admin. Aborta si el firmante no es el deployer.
+///
+/// Exige AMBAS cosas: (1) `accounts[0]` es el firmante autenticado
+/// ([`require_signer(0)`]) — sin esto, nadie prueba controlar la dirección —, y
+/// (2) esa dirección coincide con el deployer. El check de firma es esencial: el
+/// sentinela `[0u8;32]` de un programa de génesis (sin deployer) igual exige que
+/// el firmante sea la dirección cero, que nadie puede firmar → fail-closed.
+#[inline]
+pub fn require_deployer() {
+    require_signer(0);
+    require!(pubkey(0) == deployer());
 }
 
 /// **PAGO desde una tesorería del programa**: mueve `amount` (>= 0) de una cuenta

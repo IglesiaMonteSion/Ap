@@ -166,6 +166,18 @@ struct HostState {
     /// DoS the reclaim closes. Set by host code (the ledger's own trusted
     /// syscall), never by contract bytecode, so the boundary can rely on it.
     pda_claims: Vec<usize>,
+    /// The address that DEPLOYED this contract (`WasmProgramData.deployer`,
+    /// recorded by `SystemInstruction::DeployProgram` and bound to the program
+    /// address by construction — see `native::derive_program_address`). Exposed
+    /// to contracts via `host_get_deployer` so a contract's `init` can require
+    /// the caller to be the deployer (`require(is_signer && caller == deployer)`)
+    /// and CLOSE the init-takeover front-run: without it, any account could call
+    /// a freshly-deployed contract's `init` first and record ITSELF as the admin.
+    /// `Pubkey::new([0u8; 32])` (all-zero) for an in-memory registered program that was
+    /// never deployed via `DeployProgram` (no on-chain deployer concept) — a
+    /// contract MUST also check `host_is_signer` so the zero sentinel can't be
+    /// spoofed by an account that happens to be all-zero.
+    deployer: Pubkey,
     /// Enforces `MAX_CONTRACT_MEMORY_BYTES` - see that constant's doc
     /// comment for the real memory-bomb DoS this closes.
     limits: StoreLimits,
@@ -603,6 +615,33 @@ impl WasmExecutor {
             },
         )?;
 
+        // ANTI INIT-TAKEOVER (re-audit #2): copies the 32-byte address that
+        // DEPLOYED this contract into contract memory. A contract's `init` uses
+        // it to require the caller to be the deployer — closing the front-run
+        // where a third party calls a freshly-deployed contract's `init` first
+        // and records itself as admin. Read-only (the deployer address is public,
+        // recorded on-chain and bound to the program address by construction), so
+        // it authorizes nothing and changes no state — the contract must still
+        // pair it with `host_is_signer` to prove the caller IS that deployer.
+        // Returns the bytes copied, or -1 on a memory fault. Same shape/fuel as
+        // `host_get_pubkey`.
+        linker.func_wrap(
+            "env",
+            "host_get_deployer",
+            |mut caller: Caller<'_, HostState>, ptr: i32, max_len: i32| -> i32 {
+                let dep = caller.data().deployer.0;
+                let n = core::cmp::min(dep.len(), max_len.max(0) as usize);
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(n as u64))) {
+                    return -1;
+                }
+                if write_memory(&mut caller, ptr, &dep[..n]) {
+                    n as i32
+                } else {
+                    -1
+                }
+            },
+        )?;
+
         // Exposes the crypto-agility layer to contracts (ARCHITECTURE.md
         // §4): a contract can verify a signature against any registered
         // scheme individually, e.g. for custom multisig authorization
@@ -703,6 +742,7 @@ impl WasmExecutor {
         accounts: Vec<Account>,
         is_signer: Vec<bool>,
         current_round: u64,
+        deployer: Pubkey,
         fuel_limit: u64,
     ) -> anyhow::Result<WasmCallResult> {
         let code_hash: [u8; 32] = Sha3_256::digest(wasm_bytes).into();
@@ -710,7 +750,7 @@ impl WasmExecutor {
         let linker = self.build_linker()?;
 
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), log_bytes: 0, current_round, pda_claims: Vec::new(), limits };
+        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), log_bytes: 0, current_round, pda_claims: Vec::new(), deployer, limits };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
         store.limiter(|state| &mut state.limits);
@@ -794,6 +834,7 @@ mod tests {
                 accounts,
                 vec![true, false],
                 0,
+                Pubkey::new([0u8; 32]),
                 1_000_000,
             )
             .unwrap();
@@ -815,7 +856,7 @@ mod tests {
         // the call fails, to bill for fuel actually spent, not just detect
         // failure.
         let result = executor
-            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], Pubkey::new([9u8; 32]), vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])], accounts, vec![true, false], 0, 1)
+            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], Pubkey::new([9u8; 32]), vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])], accounts, vec![true, false], 0, Pubkey::new([0u8; 32]), 1)
             .unwrap();
         assert!(result.trap.is_some(), "1 unit of fuel must not be enough to complete a real call");
     }
@@ -846,7 +887,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(BURN_THEN_TRAP_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 1_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, Pubkey::new([0u8; 32]), 1_000_000).unwrap();
         assert!(result.trap.is_some(), "the deliberate `unreachable` must be reported as a trap");
         assert!(result.fuel_consumed > 0, "fuel spent looping before the trap must not be reported as zero");
     }
@@ -872,7 +913,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(MEMORY_BOMB_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, Pubkey::new([0u8; 32]), 5_000_000).unwrap();
         assert!(result.trap.is_some(), "growing memory past MAX_CONTRACT_MEMORY_BYTES must trap, not succeed");
         assert!(result.fuel_consumed < 100, "the trap must fire on the grow itself, not after real work - got {} fuel", result.fuel_consumed);
     }
@@ -893,7 +934,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], deployer: Pubkey::new([0u8; 32]), limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -924,7 +965,7 @@ mod tests {
         let linker = executor.build_linker().unwrap();
         let accounts = vec![wallet(0), wallet(0)];
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], deployer: Pubkey::new([0u8; 32]), limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let func = instance.get_func(&mut store, "check").unwrap();
@@ -965,7 +1006,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], deployer: Pubkey::new([0u8; 32]), limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -1051,7 +1092,7 @@ mod tests {
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys, accounts, is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys, accounts, is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], deployer: Pubkey::new([0u8; 32]), limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
@@ -1265,7 +1306,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![Pubkey::new([1u8; 32])], accounts: vec![big], is_signer: vec![false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![Pubkey::new([1u8; 32])], accounts: vec![big], is_signer: vec![false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], deployer: Pubkey::new([0u8; 32]), limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -1306,13 +1347,13 @@ mod tests {
         let executor = WasmExecutor::new().unwrap();
         // 200k host calls * 100 fuel = 20M fuel, far over the 5M budget → trap.
         let result = executor
-            .call(&wasm_bytes, "spin", &[Val::I64(200_000)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000)
+            .call(&wasm_bytes, "spin", &[Val::I64(200_000)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, Pubkey::new([0u8; 32]), 5_000_000)
             .unwrap();
         assert!(result.trap.is_some(), "an unbounded host-call loop must trap out-of-fuel, not run free");
         // A modest loop that fits the budget still completes (metering doesn't
         // break a legitimate contract that uses a few host calls).
         let ok = executor
-            .call(&wasm_bytes, "spin", &[Val::I64(10)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000)
+            .call(&wasm_bytes, "spin", &[Val::I64(10)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, Pubkey::new([0u8; 32]), 5_000_000)
             .unwrap();
         assert!(ok.trap.is_none(), "a small host-call loop must still complete within budget");
     }

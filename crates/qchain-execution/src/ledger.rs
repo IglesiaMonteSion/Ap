@@ -1521,7 +1521,12 @@ impl Ledger {
                 Some(Program::Wasm { module_bytes, entry_point }) => {
                     let module_bytes = module_bytes.clone();
                     let entry_point = entry_point.clone();
-                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round) {
+                    // In-memory registered program (genesis/native registration,
+                    // e.g. SDK templates) — no on-chain `DeployProgram`, so no
+                    // recorded deployer. Zero sentinel; `host_get_deployer`
+                    // returns all-zero and a contract pairs it with
+                    // `host_is_signer`, so the sentinel authorizes nothing.
+                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round, Pubkey::new([0u8; 32])) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
                     }
@@ -1551,6 +1556,10 @@ impl Ledger {
                         &mut working,
                         params.gas_price_per_fuel,
                         current_round,
+                        // ANTI INIT-TAKEOVER (re-audit #2): the recorded deployer,
+                        // exposed to the contract via `host_get_deployer` so its
+                        // `init` can require the caller to be the deployer.
+                        program_data.deployer,
                     ) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
@@ -1828,6 +1837,7 @@ impl Ledger {
         working: &mut HashMap<Pubkey, Account>,
         gas_price_per_fuel: u64,
         current_round: Round,
+        deployer: Pubkey,
     ) -> Result<u64, ExecError> {
         // SECURITY — reject ALIASED accounts (the same pubkey named twice in
         // `ix.accounts`). The conservation and debit-authorization checks below
@@ -1891,7 +1901,7 @@ impl Ledger {
         // spend fuel - real execution hasn't started yet.
         let result = self
             .wasm
-            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, current_round, DEFAULT_FUEL_LIMIT)
+            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, current_round, deployer, DEFAULT_FUEL_LIMIT)
             .map_err(|e| ExecError::Wasm { message: e.to_string(), fuel_consumed: 0 })?;
 
         // Real, live-confirmed vulnerability closed here (see
@@ -3980,6 +3990,65 @@ mod tests {
         // charged (no mint applied), so the balance never balloons.
         assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive a rejected mint");
         assert!(ledger.get_balance(&attacker.pubkey()) < 1_000_000_000_000, "the minted value must not have been committed");
+    }
+
+    /// ANTI INIT-TAKEOVER (re-audit #2, deferred part): a contract's `init`
+    /// requires the caller to be the DEPLOYER via `host_get_deployer` +
+    /// `host_is_signer`. This closes the front-run where a third party calls a
+    /// freshly-deployed contract's `init` first and records ITSELF as admin.
+    /// Traps unless `accounts[0]` is both the signer AND the recorded deployer.
+    const DEPLOYER_GATED_INIT_WAT: &str = r#"
+        (module
+            (import "env" "host_is_signer" (func $is_signer (param i32) (result i32)))
+            (import "env" "host_get_deployer" (func $get_deployer (param i32 i32) (result i32)))
+            (import "env" "host_get_pubkey" (func $get_pubkey (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "init")
+                (local $i i32)
+                (if (i32.eqz (call $is_signer (i32.const 0))) (then unreachable))
+                (if (i32.ne (call $get_deployer (i32.const 0) (i32.const 32)) (i32.const 32)) (then unreachable))
+                (if (i32.ne (call $get_pubkey (i32.const 0) (i32.const 32) (i32.const 32)) (i32.const 32)) (then unreachable))
+                (local.set $i (i32.const 0))
+                (block $done
+                    (loop $cmp
+                        (br_if $done (i32.ge_u (local.get $i) (i32.const 32)))
+                        (if (i32.ne (i32.load8_u (local.get $i)) (i32.load8_u (i32.add (local.get $i) (i32.const 32)))) (then unreachable))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br $cmp)
+                    )
+                )
+            )
+        )
+    "#;
+
+    #[test]
+    fn only_the_deployer_can_run_a_contracts_init() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 200_000_000);
+
+        let program_pk = deploy_wat(&mut ledger, DEPLOYER_GATED_INIT_WAT, "init", &deployer, &validator);
+
+        // The DEPLOYER runs init (nonce 1 — the deploy above used nonce 0):
+        // accepted, because it is BOTH the signer of the tx AND the recorded
+        // deployer (`host_get_deployer` == `host_get_pubkey(0)`).
+        let init_ix = Instruction { program_id: program_pk, accounts: vec![deployer.pubkey()], data: vec![] };
+        let init_tx = Transaction::new_signed(&deployer, 1, [0u8; 32], 50_000_000, vec![init_ix]).unwrap();
+        assert!(ledger.apply_transaction(&init_tx, &validator, 0).is_ok(), "the deployer must be able to run its own contract's init");
+
+        // An ATTACKER front-runs init: it IS the signer of its OWN tx (so a
+        // signer-only check would pass), but it is NOT the deployer -> the
+        // `host_get_deployer` comparison mismatches -> trap -> rejected. This
+        // is the init-takeover the deferred #2 item closes.
+        let attacker = Keypair::generate().unwrap();
+        ledger.credit(attacker.pubkey(), 50_000_000);
+        let atk_ix = Instruction { program_id: program_pk, accounts: vec![attacker.pubkey()], data: vec![] };
+        let atk_tx = Transaction::new_signed(&attacker, 0, [0u8; 32], 50_000_000, vec![atk_ix]).unwrap();
+        assert!(
+            ledger.apply_transaction(&atk_tx, &validator, 0).is_err(),
+            "a non-deployer must NOT be able to run init — init-takeover front-run closed"
+        );
     }
 
     /// Account ALIASING must be rejected on the WASM path. The v2.0.4

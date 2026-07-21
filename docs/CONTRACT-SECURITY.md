@@ -54,6 +54,12 @@ a quién). Eso es responsabilidad del contrato. Checklist:
   admin" sin comparar contra el dueño guardado.
 - Inicialización **una sola vez**: chequeá que el estado no exista ya
   (`require!(n < LEN, ...)`) o alguien re-inicializa y se roba el rol.
+- **Anti init-takeover (el front-run del deploy):** "una sola vez" no alcanza si
+  *cualquiera* puede ser ese único que inicializa — un tercero puede llamar tu
+  `init` ANTES que vos y quedarse como admin/authority. Cerralo con
+  **`require_deployer()`** en la `init`: exige que el firmante sea la dirección
+  que DESPLEGÓ el contrato (registrada on-chain por `DeployProgram` y ligada a la
+  dirección del programa por construcción). Sólo el deployer inicializa.
 
 ### 3. "Debitar sólo lo tuyo" — POR CONSTRUCCIÓN, no por un chequeo olvidable
 - Para un libro de saldos (token), guardá el saldo de cada titular en una **PDA
