@@ -136,6 +136,22 @@ impl SimOutcome {
     }
 }
 
+/// A cheap, `Send` snapshot of everything a `/simulate` dry-run needs — the
+/// accounts the tx can touch plus the ledger config — gathered under the state
+/// lock by [`Ledger::simulate_snapshot`] so the dry-run itself
+/// ([`Ledger::run_simulation`]) can run OFF the lock (and off the async runtime,
+/// via `spawn_blocking`, since it may compile/run WASM). Re-audit QCH-SIMULATE
+/// latency: keeps a slow simulation from stalling `try_commit`/`propose_round`.
+pub struct SimSnapshot {
+    accounts: Vec<(Pubkey, Account)>,
+    before: HashMap<Pubkey, u64>,
+    payer_before: u64,
+    compressed: bool,
+    economics_v7: bool,
+    quanto_rate_fp: u128,
+    rounds_per_quanto: u64,
+}
+
 /// Persistable snapshot of a `Ledger`'s running economic counters. Written to
 /// `data_dir/economics` by `qchain-node` and restored on startup so lifetime
 /// burn/earnings totals survive a restart. `validator_commissions` is a `Vec`
@@ -359,12 +375,21 @@ impl Ledger {
     /// the fee collector is excluded from `changes` (it's the validator's
     /// commission credit, noise for the user).
     pub fn simulate(&self, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
-        use qchain_storage::InMemoryStore;
-        // Seed the scratch store with everything `apply` can read for a wallet's
-        // transaction: the payer, the fee collector, EVERY protocol singleton,
-        // and each instruction's program account + declared accounts. This is
-        // O(tx-size), not O(state). A missed read only dents preview accuracy,
-        // never safety.
+        Self::run_simulation(self.simulate_snapshot(tx, fee_collector), tx, fee_collector, round)
+    }
+
+    /// CHEAP snapshot (re-audit QCH-SIMULATE latency): reads only the accounts
+    /// this tx can touch (O(tx-size), not O(state)) plus the ledger config. Run
+    /// this under the caller's state lock, then RELEASE the lock and hand the
+    /// snapshot to [`Ledger::run_simulation`] — the dry-run itself can compile
+    /// and run WASM, which must never happen while holding the consensus lock
+    /// (it would stall `try_commit`/`propose_round`) nor on the async runtime
+    /// thread (WASM compile/exec is CPU-blocking).
+    pub fn simulate_snapshot(&self, tx: &Transaction, fee_collector: &Pubkey) -> SimSnapshot {
+        // Seed with everything `apply` can read for a wallet's transaction: the
+        // payer, the fee collector, EVERY protocol singleton, and each
+        // instruction's program account + declared accounts. A missed read only
+        // dents preview accuracy, never safety.
         let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, crate::ids::TREASURY_ACCOUNT_ID];
         for i in 1u8..=15u8 {
             want.push(Pubkey::new([i; 32]));
@@ -373,7 +398,7 @@ impl Ledger {
             want.push(ix.program_id);
             want.extend(ix.accounts.iter().copied());
         }
-        let mut scratch = InMemoryStore::new();
+        let mut accounts: Vec<(Pubkey, Account)> = Vec::new();
         let mut before: HashMap<Pubkey, u64> = HashMap::new();
         for pk in &want {
             // Record the before-balance for EVERY candidate (0 if the account
@@ -382,7 +407,7 @@ impl Ledger {
             match self.store.get(pk) {
                 Some(a) => {
                     before.insert(*pk, a.balance);
-                    scratch.set(*pk, a);
+                    accounts.push((*pk, a));
                 }
                 None => {
                     before.entry(*pk).or_insert(0);
@@ -390,13 +415,34 @@ impl Ledger {
             }
         }
         let payer_before = self.store.get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
+        SimSnapshot {
+            accounts,
+            before,
+            payer_before,
+            compressed: self.is_compressed(),
+            economics_v7: self.is_economics_v7(),
+            quanto_rate_fp: self.quanto_rate_fp(),
+            rounds_per_quanto: self.rounds_per_quanto(),
+        }
+    }
+
+    /// The dry-run itself, run OFF the caller's lock (and off the async runtime
+    /// via `spawn_blocking`). Pure of `&self` — everything it needs is in the
+    /// [`SimSnapshot`] — so a slow WASM compile/exec never touches consensus.
+    pub fn run_simulation(snapshot: SimSnapshot, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
+        use qchain_storage::InMemoryStore;
+        let SimSnapshot { accounts, before, payer_before, compressed, economics_v7, quanto_rate_fp, rounds_per_quanto } = snapshot;
+        let mut scratch = InMemoryStore::new();
+        for (pk, a) in accounts {
+            scratch.set(pk, a);
+        }
 
         let mut sim = match Ledger::new_with_config(
             Box::new(scratch),
-            self.is_compressed(),
-            self.is_economics_v7(),
-            self.quanto_rate_fp(),
-            self.rounds_per_quanto(),
+            compressed,
+            economics_v7,
+            quanto_rate_fp,
+            rounds_per_quanto,
         ) {
             Ok(l) => l,
             Err(e) => {
@@ -411,7 +457,7 @@ impl Ledger {
                 }
             }
         };
-        register_standard_programs(&mut sim, self.is_economics_v7());
+        register_standard_programs(&mut sim, economics_v7);
 
         let result = sim.apply_transaction_presigned(tx, fee_collector, round);
         let payer_after = sim.get_balance(&tx.message.payer);

@@ -2017,12 +2017,24 @@ impl Engine {
             return qchain_execution::SimOutcome::rejected("invalid transaction signature");
         }
         // Bound concurrent dry-runs so a flood of validly-signed simulations
-        // can't pin every core or monopolize the state lock (excess callers queue
-        // for a permit). The permit is held only for the brief dry-run.
+        // can't pin every core (excess callers queue for a permit). Held for the
+        // whole off-lock dry-run so the CPU cap is real.
         let _permit = SIMULATE_PERMITS.acquire().await;
-        let state = self.state.lock().await;
-        let round = state.next_round;
-        state.ledger.simulate(tx, &SIM_FEE_COLLECTOR, round)
+        // LATENCY (re-audit QCH-SIMULATE): take only a CHEAP snapshot under the
+        // consensus lock, then RELEASE it — the dry-run itself can compile and
+        // run arbitrary WASM (a DeployProgram+call preview), which must never
+        // hold the lock (it would stall try_commit/propose_round) nor run on the
+        // async runtime (WASM compile/exec is CPU-blocking). So run it on a
+        // blocking thread with the lock already dropped.
+        let (snapshot, round) = {
+            let state = self.state.lock().await;
+            let round = state.next_round;
+            (state.ledger.simulate_snapshot(tx, &SIM_FEE_COLLECTOR), round)
+        };
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
+            .await
+            .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"))
     }
 
     /// v7 reward/unbonding timing for the wallet's staking progress bars:
