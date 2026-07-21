@@ -17,7 +17,9 @@ use borsh::BorshDeserialize;
 use qchain_core::Account;
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA};
 use sha3::{Digest, Sha3_256};
-use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use wasmtime::{Caller, Config, Engine, ExternType, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
 
 /// Separador de dominio para derivar una dirección de cuenta PROPIA DEL PROGRAMA
 /// (PDA, SDK v0.3): `pda = SHA3-256(PDA_DOMAIN ‖ program_id(32) ‖ seed)`. La
@@ -48,6 +50,67 @@ pub fn derive_pda(program_id: &Pubkey, seed: &[u8]) -> Pubkey {
 /// most) while making a bomb attempt fail cheaply instead of committing
 /// real memory.
 const MAX_CONTRACT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// HOST-CALL FUEL METERING (QCH-WASM-001).
+//
+// Wasmtime's fuel meter charges exactly 1 fuel per *wasm* instruction and
+// nothing for the native work a host call does (confirmed in wasmtime-27's
+// `fuel_before_op`). So an unmetered host call is FREE native CPU: a contract
+// could loop `host_verify_signature` (a ~150µs PQC verify) or `host_log`/
+// `host_set_data` with megabyte payloads for near-zero fuel — unbounded work
+// per transaction, one call at a time. We fix that by charging fuel from
+// inside each host call, proportional to the work it does. Fuel is a committed
+// part of the gas model, identical on every node → deterministic / fork-free.
+//
+// Charged BEFORE the work: if the contract can't afford it, we drain fuel to 0
+// (so its very next wasm instruction traps out-of-fuel) and skip the work,
+// returning the call's failure sentinel. Against `DEFAULT_FUEL_LIMIT`
+// (5,000,000) these caps bound e.g. a signature-verify loop to ~100 verifies
+// and a cheap-host-call loop to ~50k calls per transaction.
+const FUEL_PER_HOST_CALL: u64 = 100;
+/// Per byte moved across the wasm↔host boundary (read or written): bounds a
+/// huge memcpy in `host_log`/`host_get_data`/`host_set_data`/verify inputs.
+const FUEL_PER_BYTE: u64 = 1;
+/// Per byte hashed by `host_use_pda` (SHA3-256 over the seed).
+const FUEL_PER_SHA3_BYTE: u64 = 2;
+/// A single PQC signature verification is the most expensive host operation by
+/// far (~150µs measured); charge for it directly so a verify loop is bounded.
+const FUEL_PER_SIGNATURE_VERIFY: u64 = 50_000;
+
+// PER-INPUT CAPS (QCH-WASM-001 part 2): bound the size of any single seed,
+// message, key, signature, or log line a contract can hand a host call, so a
+// single call can't force an outsized native allocation/copy before the fuel
+// charge even applies.
+/// A PDA seed is a small tag + a 32-byte key at most in every real pattern.
+const MAX_PDA_SEED_LEN: usize = 128;
+/// Max message length `host_verify_signature` will hash+verify.
+const MAX_VERIFY_MSG_LEN: usize = 64 * 1024;
+/// Max public-key length (ML-DSA-65 pk ≈1952B; generous headroom).
+const MAX_VERIFY_PUBKEY_LEN: usize = 4096;
+/// Max signature length (SLH-DSA-256s sig ≈29.8KB is the largest real one).
+const MAX_VERIFY_SIG_LEN: usize = 64 * 1024;
+/// Max bytes of a single `host_log` line.
+const MAX_LOG_MSG_LEN: usize = 4096;
+/// Per-execution budget on total logged bytes — bounds `HostState.log` RAM
+/// regardless of how many times the contract calls `host_log` (the unbounded-
+/// Vec growth this closes). Once exceeded, further log lines are dropped.
+const MAX_LOG_TOTAL_BYTES: usize = 64 * 1024;
+
+/// Charge `amount` fuel for native host-side work. Returns `true` if the
+/// contract could afford it (fuel already deducted); `false` if not — in which
+/// case fuel is drained to 0 so the contract's next wasm instruction traps
+/// out-of-fuel, and the caller must skip the work and return its failure
+/// sentinel. Deterministic: reads/writes the committed fuel counter only.
+fn charge(caller: &mut Caller<'_, HostState>, amount: u64) -> bool {
+    let remaining = caller.get_fuel().unwrap_or(0);
+    if amount > remaining {
+        let _ = caller.set_fuel(0);
+        return false;
+    }
+    let _ = caller.set_fuel(remaining - amount);
+    true
+}
 
 pub struct WasmCallResult {
     pub accounts: Vec<Account>,
@@ -82,6 +145,14 @@ struct HostState {
     /// vulnerability this closed.
     is_signer: Vec<bool>,
     log: Vec<String>,
+    /// Running total of logged bytes this execution — enforces
+    /// `MAX_LOG_TOTAL_BYTES` so `log` can't grow without bound (QCH-WASM-001).
+    log_bytes: usize,
+    /// The committed round of the transaction being executed. Threaded in so
+    /// `host_verify_signature` can enforce the crypto-agility lifecycle
+    /// (activation height / retirement) against real committed height, exactly
+    /// like `Ledger::check_registry_status` (QCH-WASM-003).
+    current_round: u64,
     /// Enforces `MAX_CONTRACT_MEMORY_BYTES` - see that constant's doc
     /// comment for the real memory-bomb DoS this closes.
     limits: StoreLimits,
@@ -108,12 +179,28 @@ fn write_memory(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> b
 /// por-cuenta de un contrato (un token/perfil/contador entra en decenas de bytes).
 pub(crate) const MAX_CONTRACT_ACCOUNT_DATA: usize = 16 * 1024;
 
-/// See `host_verify_signature`'s doc comment for the `registry_account_idx`
-/// contract. Fails closed: a declared registry account that doesn't decode,
-/// or doesn't list `scheme_id`, rejects rather than falling back silently.
-fn scheme_acceptable(accounts: &[Account], registry_account_idx: i32, scheme_id: u16) -> bool {
+/// Decides whether `scheme_id` may be used by `host_verify_signature` right
+/// now. MANDATORY REGISTRY (QCH-WASM-003): a contract MUST declare the on-chain
+/// algorithm registry account (`registry_account_idx >= 0`, an index into the
+/// instruction's declared accounts). There is NO unconditional genesis
+/// fallback — the old `idx < 0 → accept Ed25519/ML-DSA` path bypassed the
+/// crypto-agility lifecycle entirely (a not-yet-active scheme verified early, a
+/// Retired scheme kept verifying). Fails closed: a bad index, a registry that
+/// doesn't decode, or a scheme that isn't listed all reject.
+///
+/// The status/height rules mirror `Ledger::check_registry_status` exactly, so a
+/// contract-side verify never accepts a scheme the base protocol would reject:
+///   - `activation_epoch > current_round` → reject (governance scheduled it for
+///     a future round; it does not take effect early);
+///   - `Retired` → reject (no longer valid for signing at all);
+///   - `Active` / `Deprecated` → accept (deprecation only turns away NEW key
+///     adoption; existing signatures keep verifying through the grace period).
+///
+/// Deterministic: a pure function of the committed `current_round` + committed
+/// registry account → every validator agrees, no fork.
+fn scheme_acceptable(accounts: &[Account], registry_account_idx: i32, scheme_id: u16, current_round: u64) -> bool {
     if registry_account_idx < 0 {
-        return scheme_id == ALGORITHM_ED25519.0 || scheme_id == ALGORITHM_ML_DSA_65.0;
+        return false;
     }
     let Some(account) = accounts.get(registry_account_idx as usize) else {
         return false;
@@ -121,11 +208,35 @@ fn scheme_acceptable(accounts: &[Account], registry_account_idx: i32, scheme_id:
     let Ok(registry) = Vec::<RegistryEntry>::try_from_slice(&account.data) else {
         return false;
     };
-    registry.iter().any(|e| e.id.0 == scheme_id && !matches!(e.status, AlgorithmStatus::Retired))
+    let Some(entry) = registry.iter().find(|e| e.id.0 == scheme_id) else {
+        return false;
+    };
+    if current_round < entry.activation_epoch {
+        return false;
+    }
+    !matches!(entry.status, AlgorithmStatus::Retired)
 }
+
+/// Bound on the compiled-module cache (QCH-WASM-002). Each entry is a compiled
+/// `Arc<Module>`; when full we clear wholesale (a crude bound, not an LRU — the
+/// cache is a pure perf optimization with zero consensus effect, so correctness
+/// is independent of eviction policy). 256 distinct deployed contracts warm at
+/// once is generous for this project's scale.
+const MAX_CACHED_MODULES: usize = 256;
 
 pub struct WasmExecutor {
     engine: Engine,
+    /// Compiled-module cache keyed by `code_hash` (SHA3-256 of the bytecode)
+    /// so a module compiles ONCE instead of on every call (QCH-WASM-002).
+    /// Cranelift compilation is expensive; recompiling per call was wasted work
+    /// and a DoS vector (a repeatedly-called contract paid full compilation
+    /// every time). Only successful compilations are cached, keyed by the exact
+    /// bytes, and compilation is deterministic for a fixed wasmtime version, so
+    /// the cache never changes execution results — two nodes with different
+    /// cache states produce identical output. `Mutex` gives interior
+    /// mutability under `&self` (`call` takes `&self`); a single `Ledger`'s
+    /// executor is never touched concurrently (`apply_transaction` is `&mut`).
+    module_cache: Mutex<HashMap<[u8; 32], Arc<Module>>>,
 }
 
 impl Default for WasmExecutor {
@@ -156,13 +267,54 @@ impl WasmExecutor {
         config.wasm_relaxed_simd(false);
         config.max_wasm_stack(512 * 1024);
         let engine = Engine::new(&config)?;
-        Ok(WasmExecutor { engine })
+        Ok(WasmExecutor { engine, module_cache: Mutex::new(HashMap::new()) })
+    }
+
+    /// Get the compiled `Module` for `wasm_bytes`, compiling+caching on a miss
+    /// (keyed by `code_hash`). See `module_cache`'s doc for the determinism
+    /// argument — the cache never changes execution results.
+    fn get_or_compile(&self, code_hash: [u8; 32], wasm_bytes: &[u8]) -> anyhow::Result<Arc<Module>> {
+        if let Ok(cache) = self.module_cache.lock() {
+            if let Some(m) = cache.get(&code_hash) {
+                return Ok(m.clone());
+            }
+        }
+        let module = Arc::new(Module::new(&self.engine, wasm_bytes)?);
+        if let Ok(mut cache) = self.module_cache.lock() {
+            if cache.len() >= MAX_CACHED_MODULES {
+                cache.clear();
+            }
+            cache.insert(code_hash, module.clone());
+        }
+        Ok(module)
+    }
+
+    /// DEPLOY-TIME VALIDATION (QCH-WASM-002). Reject at `DeployProgram` time a
+    /// module that doesn't compile or doesn't export its declared
+    /// `entry_point`, so a bad contract never persists (and every later call
+    /// isn't forced to re-fail compilation). Deterministic: the same wasmtime
+    /// on every node accepts/rejects the same bytes, adding no fork surface
+    /// beyond what execution already requires. Warms the module cache as a side
+    /// effect, so the first real call is already compiled.
+    pub fn validate_deploy(&self, wasm_bytes: &[u8], entry_point: &str) -> anyhow::Result<()> {
+        let code_hash: [u8; 32] = Sha3_256::digest(wasm_bytes).into();
+        let module = self
+            .get_or_compile(code_hash, wasm_bytes)
+            .map_err(|e| anyhow::anyhow!("contract bytecode does not compile: {e}"))?;
+        match module.get_export(entry_point) {
+            Some(ExternType::Func(_)) => Ok(()),
+            Some(_) => Err(anyhow::anyhow!("export '{entry_point}' exists but is not a function")),
+            None => Err(anyhow::anyhow!("contract has no exported function named '{entry_point}'")),
+        }
     }
 
     fn build_linker(&self) -> anyhow::Result<Linker<HostState>> {
         let mut linker = Linker::new(&self.engine);
 
-        linker.func_wrap("env", "host_get_balance", |caller: Caller<'_, HostState>, idx: i32| -> i64 {
+        linker.func_wrap("env", "host_get_balance", |mut caller: Caller<'_, HostState>, idx: i32| -> i64 {
+            if !charge(&mut caller, FUEL_PER_HOST_CALL) {
+                return -1;
+            }
             caller
                 .data()
                 .accounts
@@ -172,6 +324,9 @@ impl WasmExecutor {
         })?;
 
         linker.func_wrap("env", "host_set_balance", |mut caller: Caller<'_, HostState>, idx: i32, new_balance: i64| {
+            if !charge(&mut caller, FUEL_PER_HOST_CALL) {
+                return;
+            }
             if new_balance >= 0 {
                 if let Some(acc) = caller.data_mut().accounts.get_mut(idx as usize) {
                     acc.balance = new_balance as u64;
@@ -195,14 +350,30 @@ impl WasmExecutor {
         // own this account" semantics now can check `host_is_signer(idx)`
         // before debiting - it did not exist previously, so no prior
         // contract's logic could have relied on it.
-        linker.func_wrap("env", "host_is_signer", |caller: Caller<'_, HostState>, idx: i32| -> i32 {
+        linker.func_wrap("env", "host_is_signer", |mut caller: Caller<'_, HostState>, idx: i32| -> i32 {
+            if !charge(&mut caller, FUEL_PER_HOST_CALL) {
+                return 0;
+            }
             i32::from(caller.data().is_signer.get(idx as usize).copied().unwrap_or(false))
         })?;
 
         linker.func_wrap("env", "host_log", |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
+            // Cap a single line, and charge for the bytes copied (QCH-WASM-001).
+            let len = len.max(0).min(MAX_LOG_MSG_LEN as i32);
+            if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(len as u64))) {
+                return;
+            }
             if let Some(bytes) = read_memory(&mut caller, ptr, len) {
+                // Per-execution log-byte budget bounds `HostState.log` RAM no
+                // matter how many times the contract logs (QCH-WASM-001).
+                let used = caller.data().log_bytes;
+                if used.saturating_add(bytes.len()) > MAX_LOG_TOTAL_BYTES {
+                    return;
+                }
                 let msg = String::from_utf8_lossy(&bytes).to_string();
-                caller.data_mut().log.push(msg);
+                let state = caller.data_mut();
+                state.log_bytes = used.saturating_add(bytes.len());
+                state.log.push(msg);
             }
         })?;
 
@@ -213,7 +384,10 @@ impl WasmExecutor {
         // llamador está autorizado sobre ella (es el firmante, o el programa la
         // posee) — igual que el débito de saldo. Aquí solo se mueven bytes; el
         // borde de seguridad valida el cambio antes de comprometerlo.
-        linker.func_wrap("env", "host_data_len", |caller: Caller<'_, HostState>, idx: i32| -> i32 {
+        linker.func_wrap("env", "host_data_len", |mut caller: Caller<'_, HostState>, idx: i32| -> i32 {
+            if !charge(&mut caller, FUEL_PER_HOST_CALL) {
+                return -1;
+            }
             caller.data().accounts.get(idx as usize).map(|a| a.data.len() as i32).unwrap_or(-1)
         })?;
         linker.func_wrap(
@@ -225,6 +399,10 @@ impl WasmExecutor {
                     return -1;
                 };
                 let n = core::cmp::min(data.len(), max_len.max(0) as usize);
+                // Charge for the bytes copied out (QCH-WASM-001).
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(n as u64))) {
+                    return -1;
+                }
                 if write_memory(&mut caller, ptr, &data[..n]) {
                     n as i32
                 } else {
@@ -237,6 +415,10 @@ impl WasmExecutor {
             "host_set_data",
             |mut caller: Caller<'_, HostState>, idx: i32, ptr: i32, len: i32| -> i32 {
                 if len < 0 || len as usize > MAX_CONTRACT_ACCOUNT_DATA {
+                    return -1;
+                }
+                // Charge for the bytes copied in (QCH-WASM-001).
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(len as u64))) {
                     return -1;
                 }
                 let Some(bytes) = read_memory(&mut caller, ptr, len) else {
@@ -265,6 +447,13 @@ impl WasmExecutor {
             "env",
             "host_use_pda",
             |mut caller: Caller<'_, HostState>, idx: i32, seed_ptr: i32, seed_len: i32| -> i32 {
+                // Cap the seed and charge for hashing it (SHA3 over the seed).
+                if seed_len < 0 || seed_len as usize > MAX_PDA_SEED_LEN {
+                    return -1;
+                }
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_SHA3_BYTE.saturating_mul(seed_len as u64))) {
+                    return -1;
+                }
                 let Some(seed) = read_memory(&mut caller, seed_ptr, seed_len) else {
                     return -1;
                 };
@@ -308,6 +497,10 @@ impl WasmExecutor {
                     return -1;
                 };
                 let n = core::cmp::min(key.len(), max_len.max(0) as usize);
+                // Charge for the bytes copied out (QCH-WASM-001).
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(n as u64))) {
+                    return -1;
+                }
                 if write_memory(&mut caller, ptr, &key[..n]) {
                     n as i32
                 } else {
@@ -324,12 +517,12 @@ impl WasmExecutor {
         // base protocol uses. `registry_account_idx` is opportunistic: pass
         // the index (into this instruction's declared accounts, same
         // convention as `host_get_balance`) of the on-chain algorithm
-        // registry account to have this syscall actually consult its live
-        // Active/Deprecated/Retired status - or pass -1 to skip that and
-        // fall back to the two schemes valid unconditionally since genesis
-        // (Ed25519, ML-DSA-65). Without a declared registry account,
-        // SLH-DSA (or any future scheme) is never accepted here - a
-        // contract that wants it must declare the registry account.
+        // registry account. The registry is now MANDATORY (QCH-WASM-003): a
+        // contract MUST declare it (`registry_account_idx >= 0`); there is no
+        // unconditional genesis fallback. The scheme must be registered, past
+        // its `activation_epoch` for the current committed round, and not
+        // Retired — the same crypto-agility lifecycle the base protocol
+        // enforces (see `scheme_acceptable`). Passing -1 rejects everything.
         linker.func_wrap(
             "env",
             "host_verify_signature",
@@ -343,6 +536,24 @@ impl WasmExecutor {
              sig_len: i32,
              registry_account_idx: i32|
              -> i32 {
+                // Per-input caps (QCH-WASM-001): bound a single verify's key/
+                // message/signature so it can't force an outsized copy.
+                if pubkey_len < 0 || pubkey_len as usize > MAX_VERIFY_PUBKEY_LEN {
+                    return 0;
+                }
+                if msg_len < 0 || msg_len as usize > MAX_VERIFY_MSG_LEN {
+                    return 0;
+                }
+                if sig_len < 0 || sig_len as usize > MAX_VERIFY_SIG_LEN {
+                    return 0;
+                }
+                // Charge for the bytes copied AND for the PQC verify itself (the
+                // most expensive host op, ~150µs) BEFORE doing any of it, so a
+                // verify loop is fuel-bounded to ~100 verifies (QCH-WASM-001).
+                let copy_fuel = FUEL_PER_BYTE.saturating_mul((pubkey_len + msg_len + sig_len) as u64);
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(copy_fuel).saturating_add(FUEL_PER_SIGNATURE_VERIFY)) {
+                    return 0;
+                }
                 let Some(pubkey) = read_memory(&mut caller, pubkey_ptr, pubkey_len) else {
                     return 0;
                 };
@@ -352,7 +563,8 @@ impl WasmExecutor {
                 let Some(sig) = read_memory(&mut caller, sig_ptr, sig_len) else {
                     return 0;
                 };
-                if !scheme_acceptable(&caller.data().accounts, registry_account_idx, scheme_id as u16) {
+                let current_round = caller.data().current_round;
+                if !scheme_acceptable(&caller.data().accounts, registry_account_idx, scheme_id as u16, current_round) {
                     return 0;
                 }
                 let ok = if scheme_id as u16 == ALGORITHM_ED25519.0 {
@@ -379,7 +591,10 @@ impl WasmExecutor {
     /// instruction's declared accounts, in order, exposed to the contract
     /// only via `host_get_balance`/`host_set_balance` by index - never
     /// directly. `is_signer` (same length/order as `accounts`) is what
-    /// `host_is_signer` reports back to the contract.
+    /// `host_is_signer` reports back to the contract. `current_round` is the
+    /// committed round, used by `host_verify_signature` to enforce the
+    /// crypto-agility lifecycle. The compiled module is cached by code_hash so
+    /// a repeatedly-called contract compiles once (QCH-WASM-002).
     #[allow(clippy::too_many_arguments)]
     pub fn call(
         &self,
@@ -390,13 +605,15 @@ impl WasmExecutor {
         keys: Vec<Pubkey>,
         accounts: Vec<Account>,
         is_signer: Vec<bool>,
+        current_round: u64,
         fuel_limit: u64,
     ) -> anyhow::Result<WasmCallResult> {
-        let module = Module::new(&self.engine, wasm_bytes)?;
+        let code_hash: [u8; 32] = Sha3_256::digest(wasm_bytes).into();
+        let module = self.get_or_compile(code_hash, wasm_bytes)?;
         let linker = self.build_linker()?;
 
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), limits };
+        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), log_bytes: 0, current_round, limits };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
         store.limiter(|state| &mut state.limits);
@@ -479,6 +696,7 @@ mod tests {
                 vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])],
                 accounts,
                 vec![true, false],
+                0,
                 1_000_000,
             )
             .unwrap();
@@ -500,7 +718,7 @@ mod tests {
         // the call fails, to bill for fuel actually spent, not just detect
         // failure.
         let result = executor
-            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], Pubkey::new([9u8; 32]), vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])], accounts, vec![true, false], 1)
+            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], Pubkey::new([9u8; 32]), vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])], accounts, vec![true, false], 0, 1)
             .unwrap();
         assert!(result.trap.is_some(), "1 unit of fuel must not be enough to complete a real call");
     }
@@ -531,7 +749,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(BURN_THEN_TRAP_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 1_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 1_000_000).unwrap();
         assert!(result.trap.is_some(), "the deliberate `unreachable` must be reported as a trap");
         assert!(result.fuel_consumed > 0, "fuel spent looping before the trap must not be reported as zero");
     }
@@ -557,7 +775,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(MEMORY_BOMB_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 5_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000).unwrap();
         assert!(result.trap.is_some(), "growing memory past MAX_CONTRACT_MEMORY_BYTES must trap, not succeed");
         assert!(result.fuel_consumed < 100, "the trap must fire on the grow itself, not after real work - got {} fuel", result.fuel_consumed);
     }
@@ -578,7 +796,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -609,7 +827,7 @@ mod tests {
         let linker = executor.build_linker().unwrap();
         let accounts = vec![wallet(0), wallet(0)];
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let func = instance.get_func(&mut store, "check").unwrap();
@@ -650,7 +868,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -709,7 +927,7 @@ mod tests {
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![], log: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
@@ -741,6 +959,13 @@ mod tests {
         results[0].i32().unwrap()
     }
 
+    /// Build a declared account holding the genesis registry (Ed25519 +
+    /// ML-DSA-65, both Active from round 0) — the account a contract must now
+    /// declare to verify anything (mandatory registry, QCH-WASM-003).
+    fn genesis_registry_account() -> Account {
+        Account { data: borsh::to_vec(&qchain_crypto::registry::genesis_registry()).unwrap(), ..wallet(0) }
+    }
+
     #[test]
     fn contract_can_verify_a_signature_via_the_crypto_agility_syscall() {
         let executor = WasmExecutor::new().unwrap();
@@ -749,14 +974,31 @@ mod tests {
         let sig = kp.sign(msg).unwrap();
         let bundle = kp.public_key_bundle();
 
-        let result = call_verify_syscall(&executor, vec![], ALGORITHM_ED25519.0, &bundle.components[0].bytes, msg, &sig.components[0].bytes, -1);
+        // Declares the genesis registry at idx 0 (mandatory now). Ed25519 is
+        // Active from genesis there, so a real signature verifies.
+        let result =
+            call_verify_syscall(&executor, vec![genesis_registry_account()], ALGORITHM_ED25519.0, &bundle.components[0].bytes, msg, &sig.components[0].bytes, 0);
         assert_eq!(result, 1, "contract-side verification of a real signature must succeed");
     }
 
     #[test]
+    fn syscall_rejects_any_scheme_without_a_declared_registry_account() {
+        // MANDATORY REGISTRY (QCH-WASM-003): with no registry account (-1),
+        // EVERY scheme is rejected now — even a genesis-Active one like Ed25519.
+        // There is no unconditional fallback that bypasses the lifecycle.
+        let executor = WasmExecutor::new().unwrap();
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let msg = b"contract-checked message";
+        let sig = kp.sign(msg).unwrap();
+        let bundle = kp.public_key_bundle();
+
+        let result = call_verify_syscall(&executor, vec![], ALGORITHM_ED25519.0, &bundle.components[0].bytes, msg, &sig.components[0].bytes, -1);
+        assert_eq!(result, 0, "a genuinely valid Ed25519 signature must still be rejected with no declared registry");
+    }
+
+    #[test]
     fn syscall_rejects_slh_dsa_without_a_declared_registry_account() {
-        // No registry account declared (-1) falls back to the two schemes
-        // valid unconditionally since genesis - SLH-DSA isn't one of them.
+        // No registry account declared (-1) rejects everything now.
         let executor = WasmExecutor::new().unwrap();
         let kp = qchain_crypto::slh_dsa::SlhDsaKeypair::generate().unwrap();
         let msg = b"contract-checked message";
@@ -764,6 +1006,26 @@ mod tests {
 
         let result = call_verify_syscall(&executor, vec![], qchain_crypto::ALGORITHM_SLH_DSA.0, kp.public_key_bytes(), msg, &sig, -1);
         assert_eq!(result, 0, "SLH-DSA must not verify without an opted-in registry lookup");
+    }
+
+    #[test]
+    fn syscall_rejects_a_scheme_not_yet_active_at_the_current_round() {
+        // Crypto-agility activation height (QCH-WASM-003): a scheme scheduled to
+        // activate at a FUTURE round must not verify before then, even with a
+        // real signature and a declared registry.
+        let executor = WasmExecutor::new().unwrap();
+        let kp = qchain_crypto::slh_dsa::SlhDsaKeypair::generate().unwrap();
+        let msg = b"contract-checked message";
+        let sig = kp.sign(msg).unwrap();
+
+        // SLH-DSA registered to activate only at round 100.
+        let registry = vec![qchain_crypto::slh_dsa_registry_entry(100)];
+        let registry_account = Account { data: borsh::to_vec(&registry).unwrap(), ..wallet(0) };
+
+        // current_round defaults to 0 in call_verify_syscall's HostState → below
+        // the activation height → reject.
+        let result = call_verify_syscall(&executor, vec![registry_account], qchain_crypto::ALGORITHM_SLH_DSA.0, kp.public_key_bytes(), msg, &sig, 0);
+        assert_eq!(result, 0, "a scheme not yet active at the current round must be rejected");
     }
 
     #[test]
@@ -796,5 +1058,53 @@ mod tests {
         let result =
             call_verify_syscall(&executor, vec![registry_account], ALGORITHM_ED25519.0, &bundle.components[0].bytes, msg, &sig.components[0].bytes, 0);
         assert_eq!(result, 0, "a Retired scheme must be rejected by the syscall even though the raw signature is genuinely valid");
+    }
+
+    /// QCH-WASM-001: host calls are fuel-metered. A contract that loops a host
+    /// call far more times than the budget allows (FUEL_PER_HOST_CALL each) must
+    /// trap out-of-fuel — before this fix, host calls cost 0 fuel and the loop
+    /// would complete, i.e. unbounded free native CPU per transaction.
+    #[test]
+    fn a_host_call_loop_is_fuel_metered_and_traps_when_it_overspends() {
+        const HOST_CALL_LOOP_WAT: &str = r#"
+            (module
+                (import "env" "host_get_balance" (func $bal (param i32) (result i64)))
+                (func (export "spin") (param $n i64)
+                    (local $i i64)
+                    (block $done
+                        (loop $l
+                            (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+                            (drop (call $bal (i32.const 0)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $l)
+                        )
+                    )
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(HOST_CALL_LOOP_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        // 200k host calls * 100 fuel = 20M fuel, far over the 5M budget → trap.
+        let result = executor
+            .call(&wasm_bytes, "spin", &[Val::I64(200_000)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000)
+            .unwrap();
+        assert!(result.trap.is_some(), "an unbounded host-call loop must trap out-of-fuel, not run free");
+        // A modest loop that fits the budget still completes (metering doesn't
+        // break a legitimate contract that uses a few host calls).
+        let ok = executor
+            .call(&wasm_bytes, "spin", &[Val::I64(10)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, 5_000_000)
+            .unwrap();
+        assert!(ok.trap.is_none(), "a small host-call loop must still complete within budget");
+    }
+
+    /// QCH-WASM-002: a contract is validated at deploy — it must compile and
+    /// export its declared entry point, or it's rejected before it can persist.
+    #[test]
+    fn validate_deploy_accepts_a_real_module_and_rejects_bad_ones() {
+        let executor = WasmExecutor::new().unwrap();
+        let good = wat::parse_str(TRANSFER_WAT).unwrap();
+        assert!(executor.validate_deploy(&good, "transfer").is_ok(), "a real module exporting the entry point validates");
+        assert!(executor.validate_deploy(&good, "does_not_exist").is_err(), "a missing entry point is rejected at deploy");
+        assert!(executor.validate_deploy(b"\x00 not wasm", "transfer").is_err(), "non-wasm bytes are rejected at deploy");
     }
 }

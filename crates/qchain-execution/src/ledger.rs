@@ -1351,12 +1351,35 @@ impl Ledger {
 
         let mut total_gas_fee = 0u64;
         for ix in &tx.message.instructions {
+            // DEPLOY-TIME VALIDATION (QCH-WASM-002): a `DeployProgram` must
+            // carry bytecode that actually compiles and exports its declared
+            // entry point. Reject at DEPLOY so a bad contract never persists
+            // (and every later call isn't forced to re-fail compilation).
+            // Deterministic — the same wasmtime on every node accepts/rejects
+            // the same bytes, so this is fork-free and adds no new fork surface
+            // beyond what execution already requires; it also warms the module
+            // cache. Same early-`Err` semantics as any other instruction
+            // failure (the fee epoch already ticked above at
+            // `advance_dynamic_fee`; `working` is discarded).
+            if ix.program_id == Pubkey::system_program_id() {
+                if let Ok(SystemInstruction::DeployProgram { module_bytes, entry_point }) = SystemInstruction::try_from_slice(&ix.data) {
+                    // Enforce the size cap BEFORE compiling, so an oversized
+                    // module is rejected cheaply (never handed to Cranelift).
+                    // The native `DeployProgram` handler enforces it too; doing
+                    // it here first keeps the compile off the oversized path.
+                    if module_bytes.len() <= crate::native::MAX_PROGRAM_BYTECODE_BYTES {
+                        if let Err(e) = self.wasm.validate_deploy(&module_bytes, &entry_point) {
+                            return Err(ExecError::ProgramError(format!("invalid contract at deploy: {e}")));
+                        }
+                    }
+                }
+            }
             match self.programs.get(&ix.program_id) {
                 Some(Program::Native(native)) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
                 Some(Program::Wasm { module_bytes, entry_point }) => {
                     let module_bytes = module_bytes.clone();
                     let entry_point = entry_point.clone();
-                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel) {
+                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
                     }
@@ -1385,6 +1408,7 @@ impl Ledger {
                         &tx.message.payer,
                         &mut working,
                         params.gas_price_per_fuel,
+                        current_round,
                     ) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
@@ -1652,6 +1676,7 @@ impl Ledger {
         err
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_wasm_instruction(
         &self,
         module_bytes: &[u8],
@@ -1660,6 +1685,7 @@ impl Ledger {
         payer: &Pubkey,
         working: &mut HashMap<Pubkey, Account>,
         gas_price_per_fuel: u64,
+        current_round: Round,
     ) -> Result<u64, ExecError> {
         // SECURITY — reject ALIASED accounts (the same pubkey named twice in
         // `ix.accounts`). The conservation and debit-authorization checks below
@@ -1723,7 +1749,7 @@ impl Ledger {
         // spend fuel - real execution hasn't started yet.
         let result = self
             .wasm
-            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, DEFAULT_FUEL_LIMIT)
+            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, current_round, DEFAULT_FUEL_LIMIT)
             .map_err(|e| ExecError::Wasm { message: e.to_string(), fuel_consumed: 0 })?;
 
         // Real, live-confirmed vulnerability closed here (see
