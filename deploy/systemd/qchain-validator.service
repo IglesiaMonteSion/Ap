@@ -12,15 +12,34 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=/opt/qchain
 ExecStartPre=-/usr/bin/docker rm -f qchain-validator
+# Resource limits (task #199, QCH-S14). The workload runs INSIDE the container,
+# so the EFFECTIVE bounds are docker's own flags below (the container is in
+# docker's cgroup, not this unit's, so the systemd MemoryMax/TasksMax further
+# down bound only the docker client - they're documented defense-in-depth, and
+# apply on a bare-metal run). --memory caps RAM so a runaway (e.g. the historical
+# flood RAM blowup, now bounded in-code but this is a hard ceiling) can never
+# OOM the whole box; --pids-limit caps threads/processes (the 300k-task blowup
+# lesson); --ulimit nofile bounds open file descriptors (the slowloris fd-
+# exhaustion lesson). Generous defaults - a bigger deployment can raise them by
+# editing this line. Removed with --memory-swap == --memory to forbid swapping
+# secrets/state to disk.
 ExecStart=/usr/bin/docker run --rm --name qchain-validator \
   --network host \
   --security-opt no-new-privileges \
   --cap-drop ALL \
+  --memory 3g --memory-swap 3g \
+  --pids-limit 8192 \
+  --ulimit nofile=65536:65536 \
   -v /opt/qchain:/qchain -w /qchain \
   qchain:latest qchain-node --config config.json
 ExecStop=/usr/bin/docker stop qchain-validator
 Restart=on-failure
 RestartSec=5s
+# systemd-level limits (defense-in-depth; see the note on ExecStart above).
+LimitNOFILE=65536
+TasksMax=8192
+MemoryMax=3G
+MemoryHigh=2560M
 
 [Install]
 WantedBy=multi-user.target

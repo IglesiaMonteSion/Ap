@@ -7,3 +7,6 @@
 /deploy/compose/v2/
 /deploy/compose/v3/
 /deploy/compose/faucet/
+
+# Per-host image attestation manifest (deploy/attest-image.sh) - runtime artifact
+image-attestation.json

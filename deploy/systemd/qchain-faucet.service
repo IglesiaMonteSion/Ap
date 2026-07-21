@@ -18,10 +18,15 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=/opt/qchain-faucet
 ExecStartPre=-/usr/bin/docker rm -f qchain-faucet
+# Resource limits (task #199, QCH-S14) - see qchain-validator.service for the
+# full rationale. The faucet is a small hot-wallet web service; lighter caps.
 ExecStart=/usr/bin/docker run --rm --name qchain-faucet \
   --network host \
   --security-opt no-new-privileges \
   --cap-drop ALL \
+  --memory 1g --memory-swap 1g \
+  --pids-limit 2048 \
+  --ulimit nofile=16384:16384 \
   -v /opt/qchain-faucet:/qchain -w /qchain \
   qchain:latest qchain-faucet \
     --rpc http://127.0.0.1:8080 \
@@ -32,6 +37,10 @@ ExecStart=/usr/bin/docker run --rm --name qchain-faucet \
 ExecStop=/usr/bin/docker stop qchain-faucet
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=16384
+TasksMax=2048
+MemoryMax=1G
+MemoryHigh=768M
 
 [Install]
 WantedBy=multi-user.target

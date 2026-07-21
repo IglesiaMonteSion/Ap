@@ -172,6 +172,35 @@ instalador del nodo baja el script oficial de Docker a un archivo y recién ahí
 lo corre (en vez de un `curl | sh` a ciegas), y respeta `QCHAIN_DOCKER_VERSION`
 para fijar la versión de Docker.
 
+**Límites de recursos + rotación de logs (`deploy/install-limits.sh`).** Cada
+unidad systemd trae ya sus **límites de recursos**: los flags de docker
+`--memory` / `--pids-limit` / `--ulimit nofile` (los que acotan el CONTENEDOR de
+verdad — RAM, hilos y file descriptors, cerrando por config las clases de
+runaway que el código ya acota: el blowup de RAM del flood, el de 300k tareas, y
+el agotamiento de fd tipo slowloris) más los `MemoryMax` / `TasksMax` /
+`LimitNOFILE` a nivel de la unidad (defensa-en-profundidad). Valores por defecto
+generosos (validador 3G / 8192 hilos / 65536 fd; wallet/faucet/indexer más
+chicos) — un despliegue grande los sube editando la unidad. En una instalación
+FRESCA los toma solos; para un box YA desplegado corré
+`sudo ./deploy/install-limits.sh` (aplica los caps a las unidades existentes vía
+drop-in, sin reescribir su `ExecStart`; `--restart` para tomarlos ya, o se
+aplican en el próximo restart). Ese mismo script instala el **límite de tamaño
+del journal** (los servicios corren como `docker run` bajo systemd → su stdout
+va al journal; sin cota puede llenar el disco → se acota a 500M vía un drop-in de
+`journald`) y el **logrotate** de los `*.log` de archivo (install.log, backups,
+monitoreo). `--uninstall` revierte todo. `install-node.sh` lo corre solo al final.
+
+**Attestation de la imagen (`deploy/attest-image.sh`).** Como no hay registro
+remoto (la imagen `qchain:latest` se construye en cada host desde el
+`Dockerfile`), la attestation es local pero real: `record` graba en
+`image-attestation.json` la **id (digest) de la imagen desplegada + el commit
+git + el hash del Dockerfile + la fecha**; `verify` confirma que la imagen local
+y **cada contenedor qchain en ejecución** usan exactamente esa id (exit ≠ 0 si
+alguno corre otra imagen — p.ej. quedó una vieja tras un rebuild sin restart, o
+alguien la cambió), pensado para un cron de monitoreo o un gate de CI. Avisa si
+grabaste con el repo sucio (`git_dirty`) — esa imagen no es reproducible desde el
+commit solo (la firma/reproducibilidad de artefactos es su propia tarea, #198).
+
 ## Respaldos automáticos (`deploy/backup-node.sh`)
 
 Lo ÚNICO irreemplazable de un validador es su `keypair.json` (la clave que firma

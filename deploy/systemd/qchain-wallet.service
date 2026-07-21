@@ -16,16 +16,25 @@ Type=simple
 WorkingDirectory=/opt/qchain
 EnvironmentFile=/opt/qchain/wallet.env
 ExecStartPre=-/usr/bin/docker rm -f qchain-wallet
+# Resource limits (task #199, QCH-S14) - see qchain-validator.service for the
+# rationale. The wallet is a lightweight web server; lighter caps.
 ExecStart=/usr/bin/docker run --rm --name qchain-wallet \
   --network host \
   --security-opt no-new-privileges \
   --cap-drop ALL \
+  --memory 1g --memory-swap 1g \
+  --pids-limit 2048 \
+  --ulimit nofile=16384:16384 \
   -e QCHAIN_WALLET_PASSWORD \
   -v /opt/qchain/wallets:/wallets -w /qchain \
   qchain:latest qchain-wallet --rpc http://127.0.0.1:8080 --wallets-dir /wallets --bind 0.0.0.0 --port 8090
 ExecStop=/usr/bin/docker stop qchain-wallet
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=16384
+TasksMax=2048
+MemoryMax=1G
+MemoryHigh=768M
 
 [Install]
 WantedBy=multi-user.target

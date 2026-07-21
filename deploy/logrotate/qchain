@@ -1,0 +1,21 @@
+# logrotate config for qchain FILE-based logs (task #199, QCH-S14).
+#
+# The services themselves log to the systemd journal (bounded by
+# deploy/systemd/journald-qchain.conf). This covers the extra *.log FILES the
+# tooling writes next to the deployment - the installer's install.log, and any
+# node/monitor/backup log a future script drops there - so none can grow without
+# bound and fill the disk.
+#
+# Installed by `deploy/install-limits.sh` into /etc/logrotate.d/qchain.
+# `missingok` + `nocreate` so it's harmless when a given file doesn't exist.
+/opt/qchain/*.log /opt/qchain/logs/*.log /opt/qchain-faucet/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+    copytruncate
+    su root root
+}

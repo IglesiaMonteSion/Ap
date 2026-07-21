@@ -617,6 +617,15 @@ sed -i "s#WorkingDirectory=/opt/qchain#WorkingDirectory=$QCHAIN_HOME#" /etc/syst
 systemctl daemon-reload
 systemctl enable --now qchain-validator
 
+# Límites de recursos + rotación de logs (tarea #199): la unidad ya trae los
+# flags de --memory/--pids-limit/--ulimit y los caps systemd; esto agrega el
+# límite de tamaño del journal + logrotate (que no viven en la unidad). Best-
+# effort: si falla, el nodo igual quedó instalado y corriendo.
+if [ -x "$SCRIPT_DIR/install-limits.sh" ]; then
+  decir "Aplicando límites de recursos y rotación de logs"
+  "$SCRIPT_DIR/install-limits.sh" || echo "  (aviso: install-limits.sh reportó un problema; no es fatal — podés correrlo aparte luego)"
+fi
+
 decir "Comprobando que el nodo arrancó bien"
 NODO_OK=0
 for _ in $(seq 1 10); do
