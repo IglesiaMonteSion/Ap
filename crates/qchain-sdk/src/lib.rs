@@ -64,6 +64,8 @@ mod sys {
         pub fn host_set_data(idx: i32, ptr: i32, len: i32) -> i32;
         // SDK v0.3 — cuentas de estado propias del programa (PDAs)
         pub fn host_use_pda(idx: i32, seed_ptr: i32, seed_len: i32) -> i32;
+        // SDK v0.4 — lectura de la dirección (pubkey) de una cuenta declarada
+        pub fn host_get_pubkey(idx: i32, ptr: i32, max_len: i32) -> i32;
     }
 
     // Stubs para compilar en el host (nunca se ejecutan en un contrato real).
@@ -94,6 +96,10 @@ mod sys {
     #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn host_use_pda(_idx: i32, _seed_ptr: i32, _seed_len: i32) -> i32 {
         0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_get_pubkey(_idx: i32, _ptr: i32, _max_len: i32) -> i32 {
+        -1
     }
 }
 
@@ -332,6 +338,71 @@ pub fn write_u32(buf: &mut [u8], off: usize, v: u32) {
 #[inline]
 pub fn use_pda(idx: u32, seed: &[u8]) -> bool {
     unsafe { sys::host_use_pda(idx as i32, seed.as_ptr() as i32, seed.len() as i32) == 0 }
+}
+
+// ============================================================================
+// SDK v0.4 — TESORERÍAS DE PROGRAMA (fondos en una PDA) + control de acceso por
+// DUEÑO. Cierra el límite honesto de v0.3: mover fondos DE una cuenta propia del
+// programa (una PDA de tesorería) HACIA un usuario.
+//
+// Por qué hace falta un helper nuevo: [`transfer`] exige que el ORIGEN haya
+// FIRMADO — y NADIE firma como una PDA (no tiene clave privada). Así que
+// `transfer` sirve para DEPOSITAR en la tesorería (un usuario firma y manda),
+// pero NO para PAGAR desde ella. El ledger SÍ autoriza debitar una cuenta que el
+// programa posee (`owner == program_id`, el mismo borde de v2.0.4), así que un
+// contrato puede pagar desde su PDA — [`pda_transfer`] es ese primitivo, sin el
+// chequeo de firma sobre el origen. La garantía dura (no acuñar, no debitar lo
+// ajeno) sigue viviendo en el ledger para TODO bytecode.
+//
+// El control de acceso por dueño usa [`pubkey`]: un contrato guarda la dirección
+// de su admin en la `data` de la PDA al inicializar y, al retirar, exige que el
+// FIRMANTE (`accounts[0]`) coincida con esa dirección guardada.
+// ============================================================================
+
+/// Lee la **dirección** (pubkey de 32 bytes) de `accounts[idx]`. Las direcciones
+/// son públicas; esto habilita el control de acceso por dueño (comparar el
+/// firmante contra un admin guardado). Devuelve `[0u8; 32]` si `idx` está fuera
+/// de rango (una dirección que nunca es la de una cuenta real → un chequeo de
+/// igualdad contra ella siempre falla, fail-closed).
+#[inline]
+pub fn pubkey(idx: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = unsafe { sys::host_get_pubkey(idx as i32, out.as_mut_ptr() as i32, 32) };
+    if n != 32 {
+        return [0u8; 32];
+    }
+    out
+}
+
+/// `true` si la dirección de `accounts[idx]` es exactamente `expected`. Útil para
+/// "el firmante debe ser el admin guardado": `require!(pubkey_eq(0, &admin))`.
+#[inline]
+pub fn pubkey_eq(idx: u32, expected: &[u8; 32]) -> bool {
+    &pubkey(idx) == expected
+}
+
+/// **PAGO desde una tesorería del programa**: mueve `amount` (>= 0) de una cuenta
+/// que ESTE programa posee (una PDA ya reclamada con [`use_pda`]) hacia `to`.
+/// A diferencia de [`transfer`], NO exige firma sobre el origen — nadie firma
+/// como una PDA; el ledger autoriza el débito porque el programa la posee. Aborta
+/// si `amount < 0` o si la PDA no tiene saldo suficiente. Conserva el valor total.
+///
+/// **Importante:** llamá [`use_pda`] sobre `from` ANTES (para que el programa la
+/// posea); si `from` NO es una PDA del programa ni el firmante, el ledger
+/// RECHAZA el débito y la transacción entera se descarta (defensa del borde).
+#[inline]
+pub fn pda_transfer(from: u32, to: u32, amount: i64) {
+    debit(from, amount); // el borde del ledger exige que el programa posea `from`
+    credit(to, amount);
+}
+
+/// **DEPÓSITO en una tesorería**: un usuario firmante mueve `amount` de su propia
+/// cuenta (`from`, que debe haber firmado) hacia la PDA de tesorería `to`. Es
+/// exactamente [`transfer`] con nombre de intención; el usuario autoriza debitar
+/// lo suyo, y acreditar la PDA es un simple crédito.
+#[inline]
+pub fn deposit(from: u32, to: u32, amount: i64) {
+    transfer(from, to, amount);
 }
 
 /// Define el punto de entrada del contrato: exporta la función `run` con aridad

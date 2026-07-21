@@ -291,6 +291,31 @@ impl WasmExecutor {
             },
         )?;
 
+        // SDK v0.4 — LECTURA de la DIRECCIÓN (pubkey) de una cuenta declarada,
+        // por índice. Read-only: copia los 32 bytes de la dirección de
+        // `accounts[idx]` en la memoria del contrato y devuelve cuántos copió
+        // (-1 si `idx` está fuera de rango). Las direcciones son PÚBLICAS, así
+        // que exponerlas no autoriza nada ni cambia estado — solo habilita el
+        // control de acceso por DUEÑO (un contrato de tesorería guarda la
+        // dirección de su admin y, al retirar, exige que el firmante coincida
+        // con ella) y patrones tipo whitelist / PDA-por-usuario. Puramente
+        // aditivo: una tx que no lo llama es byte-idéntica.
+        linker.func_wrap(
+            "env",
+            "host_get_pubkey",
+            |mut caller: Caller<'_, HostState>, idx: i32, ptr: i32, max_len: i32| -> i32 {
+                let Some(key) = caller.data().keys.get(idx as usize).map(|k| k.0) else {
+                    return -1;
+                };
+                let n = core::cmp::min(key.len(), max_len.max(0) as usize);
+                if write_memory(&mut caller, ptr, &key[..n]) {
+                    n as i32
+                } else {
+                    -1
+                }
+            },
+        )?;
+
         // Exposes the crypto-agility layer to contracts (ARCHITECTURE.md
         // §4): a contract can verify a signature against any registered
         // scheme individually, e.g. for custom multisig authorization
@@ -598,6 +623,54 @@ mod tests {
         assert_eq!(call(&mut store, 0), 1, "index 0 is the real signer");
         assert_eq!(call(&mut store, 1), 0, "index 1 was only declared, never signed");
         assert_eq!(call(&mut store, 99), 0, "an out-of-range index must fail closed, not panic or trap");
+    }
+
+    // SDK v0.4 — reads the 32-byte address of a declared account into memory,
+    // returning bytes written (-1 out of range). Enables owner-based access
+    // control in contracts (compare the signer's pubkey to a stored admin).
+    const GET_PUBKEY_WAT: &str = r#"
+        (module
+            (import "env" "host_get_pubkey" (func $get_pubkey (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "read") (param $idx i32) (param $ptr i32) (param $max i32) (result i32)
+                (call $get_pubkey (local.get $idx) (local.get $ptr) (local.get $max))
+            )
+        )
+    "#;
+
+    #[test]
+    fn host_get_pubkey_reads_the_account_address_and_rejects_out_of_range() {
+        let wasm_bytes = wat::parse_str(GET_PUBKEY_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
+        let linker = executor.build_linker().unwrap();
+        let a0 = Pubkey::new([7u8; 32]);
+        let a1 = Pubkey::new([42u8; 32]);
+        let accounts = vec![wallet(0), wallet(0)];
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let mut store = wasmtime::Store::new(
+            &executor.engine,
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], limits },
+        );
+        store.set_fuel(1_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        let func = instance.get_func(&mut store, "read").unwrap();
+
+        let read = |store: &mut wasmtime::Store<HostState>, idx: i32| -> i32 {
+            let mut results = vec![Val::I32(0)];
+            func.call(&mut *store, &[Val::I32(idx), Val::I32(0), Val::I32(32)], &mut results).unwrap();
+            results[0].i32().unwrap()
+        };
+
+        assert_eq!(read(&mut store, 0), 32, "the address is exactly 32 bytes");
+        let mut buf = [0u8; 32];
+        memory.read(&store, 0, &mut buf).unwrap();
+        assert_eq!(buf, [7u8; 32], "reads the real address of accounts[0]");
+        assert_eq!(read(&mut store, 1), 32);
+        memory.read(&store, 0, &mut buf).unwrap();
+        assert_eq!(buf, [42u8; 32], "reads the real address of accounts[1]");
+        assert_eq!(read(&mut store, 99), -1, "an out-of-range index fails closed, not panic/trap");
     }
 
     const VERIFY_WAT: &str = r#"

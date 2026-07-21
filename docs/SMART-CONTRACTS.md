@@ -127,6 +127,10 @@ igual paga el fee de su intento.
 | **`read_u64/read_i64/read_u32(buf, off)`** | lee un entero LE del buffer |
 | **`write_u64/write_i64/write_u32(buf, off, v)`** | escribe un entero LE en el buffer |
 | **`use_pda(idx, seed) -> bool`** | reclama/usa `accounts[idx]` como PDA del programa (SDK v0.3) |
+| **`pubkey(idx) -> [u8;32]`** | dirección de `accounts[idx]` (para control de acceso por dueño, SDK v0.4) |
+| **`pubkey_eq(idx, &expected) -> bool`** | ¿la dirección de `accounts[idx]` es `expected`? |
+| **`pda_transfer(from, to, amount)`** | PAGA desde una PDA del programa (sin firma sobre el origen; SDK v0.4) |
+| **`deposit(from, to, amount)`** | DEPÓSITO en una tesorería (= `transfer`, con nombre de intención) |
 
 ## Estado estructurado on-chain (SDK v0.2)
 
@@ -203,15 +207,53 @@ derivación, **un programa nunca puede reclamar la PDA de otro** → sin
 front-running. Una vez reclamada, solo ese programa escribe su `data` (autorizado
 por `owner == program_id`, el mismo borde que los saldos).
 
-> **Límite v0.3:** la PDA arranca con saldo 0; para que un programa maneje fondos
-> propios (una tesorería on-chain), transferile QCH a la dirección de la PDA (es
-> una dirección normal) y el contrato los mueve con `transfer`/`debit` (el borde
-> ya autoriza debitar una cuenta program-owned). El SDK todavía no trae helpers de
-> alto nivel para eso — es el próximo incremento.
+## Tesorerías de programa + control de acceso por dueño (SDK v0.4)
+
+Una PDA puede guardar **fondos** además de estado — una **tesorería del
+programa**. Lo que faltaba en v0.3 era mover fondos DESDE la PDA: `transfer`
+exige que el ORIGEN haya firmado, y **nadie firma como una PDA**. `pda_transfer`
+es el pago desde una PDA (el ledger autoriza el débito porque el programa la
+posee, `owner == program_id` — el mismo borde de siempre), y `pubkey(idx)` lee la
+dirección de una cuenta para el **control de acceso por dueño** (guardá al admin
+en la data de la PDA y, al retirar, exigí que el firmante coincida).
+
+```rust
+// Bóveda con dueño: cualquiera deposita, sólo el admin retira.
+// accounts[0]=firmante  accounts[1]=PDA "vault"  accounts[2]=destino del retiro
+fn dispatch([sel, x, _, _]: [i64; 4]) {
+    require!(use_pda(1, b"vault"));
+    let mut buf = [0u8; 40];               // [admin: 32][total: u64 @32]
+    let n = get_data(1, &mut buf);
+    match sel {
+        1 => { // init: fija al firmante como admin (una vez)
+            require!(n < 40); require_signer(0);
+            buf[0..32].copy_from_slice(&pubkey(0)); set_data(1, &buf);
+        }
+        2 => { deposit(0, 1, x); }          // cualquiera deposita: firmante -> PDA
+        3 => {                              // sólo el admin retira: PDA -> accounts[2]
+            let mut admin = [0u8; 32]; admin.copy_from_slice(&buf[0..32]);
+            require!(pubkey(0) == admin, "sólo el admin");
+            pda_transfer(1, 2, x);
+        }
+        _ => abort(),
+    }
+}
+```
+
+Plantilla completa en `crates/qchain-sdk/templates/vault/`. **Verificado en vivo
+end-to-end** (nodo real): deploy → init (admin) → deposit 5 QCH (user1) → el admin
+retira 3 QCH a un destino → un **NO-admin es RECHAZADO** (los fondos de la bóveda
+quedan intactos, sólo pagó el fee de su intento).
+
+> **Seguridad:** la garantía dura sigue en el LEDGER: `pda_transfer` sólo funciona
+> si el programa POSEE el origen (si no, el borde rechaza el débito y descarta la
+> tx entera); acuñar sigue siendo imposible; `pubkey` es read-only (las direcciones
+> son públicas). El control de acceso por dueño lo hace el CONTRATO, respaldado por
+> esas garantías del ledger.
 
 Los syscalls crudos del host (`host_get_balance`, `host_set_balance`,
-`host_is_signer`, `host_log`, `host_verify_signature`) siguen disponibles para
-casos avanzados; el SDK cubre el 99% de los contratos de pagos/tokens.
+`host_is_signer`, `host_get_pubkey`, `host_log`, `host_verify_signature`) siguen
+disponibles para casos avanzados; el SDK cubre el 99% de los contratos.
 
 ## Límites honestos
 

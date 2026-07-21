@@ -11,6 +11,9 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
   helpers LE (`read_u64`/`write_i64`/…) para guardar structs en `account.data`.
 - **Estado compartido / PDAs (v0.3):** `use_pda` — cuentas de estado propias del
   programa (estilo PDA de Solana) que ningún usuario firma.
+- **Tesorerías de programa + control de acceso por dueño (v0.4):** `pda_transfer`
+  (paga fondos DESDE una PDA), `deposit`, `pubkey`/`pubkey_eq` (lee la dirección
+  de una cuenta para exigir "el firmante es el admin guardado").
 - Macro `entrypoint!` que exporta el punto de entrada `run` (4 args `i64`).
 
 **Ejemplos listos para compilar:**
@@ -19,6 +22,8 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
   usuario (v0.2).
 - `templates/shared_counter/` — contador **GLOBAL compartido** en una PDA del
   programa que cualquiera incrementa (v0.3).
+- `templates/vault/` — **tesorería con dueño**: cualquiera deposita, sólo el admin
+  retira (fondos en una PDA + control de acceso por `pubkey`, v0.4).
 
 Compilalos con:
 
