@@ -100,6 +100,30 @@ pub enum AlgorithmStatus {
     Retired,
 }
 
+/// One algorithm's on-chain registry record — the **crypto-agility** unit
+/// (tarea #201, QCH-S15). The four properties the audit asks to formalize map
+/// onto this record + its live enforcement in `qchain-execution::Ledger`:
+///
+/// * **`suite_id`** = [`id`](Self::id) ([`AlgorithmId`]). Identifies the EXACT
+///   parameterization (e.g. `ML-DSA-65` = `AlgorithmId(2)`, a specific FIPS-204
+///   param set). A re-parameterization would be a genuinely different suite and
+///   gets a NEW id — so an explicit separate `suite_version` field is subsumed
+///   by the id and deliberately not added (adding a field would be a
+///   state-format change for zero real gain; the id already versions the suite,
+///   and each signature declares its suite ids via its `KeyComponent.scheme`s).
+/// * **`activation_height`** = [`activation_epoch`](Self::activation_epoch).
+///   The first round a scheme may be used. **Enforced per-signature** at apply
+///   time (`Ledger::check_registry_status`, #201): a transaction whose payer
+///   combo includes a scheme with `activation_epoch > current_round` is
+///   rejected — a governance activation scheduled for the future does not take
+///   effect early. `0` (every genesis scheme) = active since genesis.
+/// * **`deprecation_height`** = the `retirement_epoch` inside
+///   [`AlgorithmStatus::Deprecated`]. Enforced: a `Deprecated` scheme turns
+///   away NEW accounts immediately and, once `current_round >= retirement_epoch`,
+///   governance can `Retire` it (after which no signature under it verifies).
+/// * **status lifecycle**: `Active` → `Deprecated{retirement_epoch}` → `Retired`,
+///   all via `Registry`-tier governance with a timelock (see
+///   `qchain-execution::governance`).
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct RegistryEntry {
     pub id: AlgorithmId,

@@ -987,7 +987,7 @@ impl Ledger {
     /// (existing accounts keep working through a scheme's deprecation
     /// grace period, matching `AlgorithmStatus::Deprecated`'s own
     /// documented semantics; only new accounts are turned away from it).
-    fn check_registry_status(&self, tx: &Transaction, is_new_account: bool) -> Result<(), ExecError> {
+    fn check_registry_status(&self, tx: &Transaction, is_new_account: bool, current_round: Round) -> Result<(), ExecError> {
         let Some(combo) = tx.resolved_combo() else {
             return Err(ExecError::AlgorithmNotAcceptable("payer key bundle does not resolve to any known combo".to_string()));
         };
@@ -995,17 +995,38 @@ impl Ledger {
             .ok_or_else(|| ExecError::AlgorithmNotAcceptable(format!("unknown combo {combo:?}")))?;
         let registry = self.current_registry();
         for scheme in components {
-            match registry.iter().find(|e| e.id == *scheme).map(|e| &e.status) {
-                None => return Err(ExecError::AlgorithmNotAcceptable(format!("scheme {scheme:?} is not registered"))),
-                Some(AlgorithmStatus::Retired) => {
+            let Some(entry) = registry.iter().find(|e| e.id == *scheme) else {
+                return Err(ExecError::AlgorithmNotAcceptable(format!("scheme {scheme:?} is not registered")));
+            };
+            match &entry.status {
+                AlgorithmStatus::Retired => {
                     return Err(ExecError::AlgorithmNotAcceptable(format!("scheme {scheme:?} is retired")))
                 }
-                Some(AlgorithmStatus::Deprecated { .. }) if is_new_account => {
+                AlgorithmStatus::Deprecated { .. } if is_new_account => {
                     return Err(ExecError::AlgorithmNotAcceptable(format!(
                         "scheme {scheme:?} is deprecated; no new accounts may adopt it"
                     )))
                 }
                 _ => {}
+            }
+            // Crypto-agility (tarea #201, QCH-S15): ENFORCE the **activation
+            // height**. A scheme can be registered via governance to take effect
+            // only from a FUTURE round (`activation_epoch`) — until now that
+            // height was stored but never checked, so a not-yet-active scheme was
+            // usable immediately. Deterministic (function of the committed
+            // `current_round` + committed registry) → every validator agrees, no
+            // fork. Byte-identical for every scheme active-since-genesis
+            // (`activation_epoch = 0`, so `current_round < 0` is never true).
+            // The deprecation height (`retirement_epoch` → `Retired`) is enforced
+            // above and by the governance retire transition; `suite_id` is the
+            // exact-parameterization `AlgorithmId` (a re-parameterization gets a
+            // new id, so an explicit `suite_version` is subsumed by it — see the
+            // registry module docs).
+            if current_round < entry.activation_epoch {
+                return Err(ExecError::AlgorithmNotAcceptable(format!(
+                    "scheme {scheme:?} is not active until round {} (current round {current_round})",
+                    entry.activation_epoch
+                )));
             }
         }
         Ok(())
@@ -1058,7 +1079,7 @@ impl Ledger {
         // the destination account with no signature/combo check at all)
         // long before it ever signs anything itself.
         let is_first_transaction_from_this_payer = payer_account.nonce == 0;
-        self.check_registry_status(tx, is_first_transaction_from_this_payer)?;
+        self.check_registry_status(tx, is_first_transaction_from_this_payer, current_round)?;
 
         // v7: close every reward quanto that has fully elapsed by this round,
         // BEFORE capturing any receipt root — so a transfer receipt captured this
@@ -3156,6 +3177,42 @@ mod tests {
 
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert_eq!(ledger.get_balance(&bob), 2_000_000, "the SLH-DSA-combo transaction must have actually executed");
+    }
+
+    /// #201 (QCH-S15, crypto-agility): the **activation height** is enforced.
+    /// A scheme registered to take effect only from a FUTURE round is rejected
+    /// before that round and accepted at/after it — deterministic on the
+    /// committed round, so every validator agrees.
+    #[test]
+    fn a_scheme_registered_to_activate_in_the_future_is_rejected_until_that_round() {
+        let mut ledger = new_test_ledger();
+        let mut registry = qchain_crypto::registry::genesis_registry();
+        // SLH-DSA activated to take effect only from round 100.
+        registry.push(qchain_crypto::slh_dsa_registry_entry(100));
+        ledger.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&registry).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+
+        let alice = Keypair::generate_with_slh_dsa().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 50_000_000);
+
+        let mk = |nonce: u64| {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 2_000_000 }).unwrap(),
+            };
+            Transaction::new_signed(&alice, nonce, [0u8; 32], 50_000_000, vec![ix]).unwrap()
+        };
+
+        // Round 50: BEFORE activation → rejected, bob untouched.
+        let err = ledger.apply_transaction(&mk(0), &validator, 50).unwrap_err();
+        assert!(matches!(err, ExecError::AlgorithmNotAcceptable(_)), "must be rejected before activation, got {err:?}");
+        assert_eq!(ledger.get_balance(&bob), 0, "a not-yet-active scheme must not move funds");
+
+        // Round 100: activation height reached → executes.
+        ledger.apply_transaction(&mk(0), &validator, 100).unwrap();
+        assert_eq!(ledger.get_balance(&bob), 2_000_000, "the scheme is usable from its activation round on");
     }
 
     /// A scheme that's been `Retired` must be rejected outright, even for
