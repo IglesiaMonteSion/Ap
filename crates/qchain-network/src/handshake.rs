@@ -61,7 +61,7 @@
 use crate::session::Session;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::ValidatorId;
-use qchain_crypto::{Keypair, MultiSignature, PublicKeyBundle};
+use qchain_crypto::{MultiSignature, PublicKeyBundle};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
@@ -95,7 +95,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// both be dialed *and* be accepted. For a fixed-membership network it is set
 /// once at startup and never changes.
 pub struct AuthState {
-    keypair: Arc<Keypair>,
+    /// The validator's consensus signer (tarea #193). Holds the identity key in
+    /// process (`Keypair`) or talks to an out-of-process remote/HSM signer — the
+    /// handshake signs its transcript through it either way (`sign_raw`), so a
+    /// fully-remote setup keeps the key out of the node process here too.
+    signer: Arc<dyn qchain_crypto::Signer>,
     network_id: [u8; 32],
     authorized: StdRwLock<HashSet<ValidatorId>>,
     /// When true, the handshake also runs an ML-KEM exchange and returns a
@@ -111,14 +115,14 @@ pub struct AuthState {
 impl AuthState {
     /// Authentication-only handshake (v6.4.x). Equivalent to
     /// `new_with_encryption(.., false)`.
-    pub fn new(keypair: Arc<Keypair>, network_id: [u8; 32], authorized: HashSet<ValidatorId>) -> Self {
-        Self::new_with_encryption(keypair, network_id, authorized, false)
+    pub fn new(signer: Arc<dyn qchain_crypto::Signer>, network_id: [u8; 32], authorized: HashSet<ValidatorId>) -> Self {
+        Self::new_with_encryption(signer, network_id, authorized, false)
     }
 
     /// Like `new`, but `encrypt` selects whether the handshake also performs
     /// the ML-KEM exchange and encrypts the channel.
-    pub fn new_with_encryption(keypair: Arc<Keypair>, network_id: [u8; 32], authorized: HashSet<ValidatorId>, encrypt: bool) -> Self {
-        AuthState { keypair, network_id, authorized: StdRwLock::new(authorized), encrypt }
+    pub fn new_with_encryption(signer: Arc<dyn qchain_crypto::Signer>, network_id: [u8; 32], authorized: HashSet<ValidatorId>, encrypt: bool) -> Self {
+        AuthState { signer, network_id, authorized: StdRwLock::new(authorized), encrypt }
     }
 
     /// Whether this node runs the encrypted (ML-KEM + AEAD) transport.
@@ -224,7 +228,7 @@ async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> anyhow::Resu
 /// for, or if any signature doesn't verify.
 pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected: Option<ValidatorId>) -> anyhow::Result<(ValidatorId, Option<Session>)> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let bundle_c = auth.keypair.public_key_bundle();
+        let bundle_c = auth.signer.bundle();
         let client_id = bundle_c.to_address();
         let nonce_c = fresh_nonce()?;
         // Encrypted transport: a fresh ephemeral ML-KEM keypair per connection.
@@ -267,7 +271,7 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
         }
 
         let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
-        let sig_c = auth.keypair.sign(&t_client)?;
+        let sig_c = auth.signer.sign_raw(&t_client)?;
         write_frame(stream, &HandshakeFinal { signature: sig_c }).await?;
 
         // Only after the transcript (which binds kem_pk/kem_ct) verified do we
@@ -310,11 +314,11 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
             (false, _) => (Vec::new(), Vec::new(), None),
         };
 
-        let bundle_s = auth.keypair.public_key_bundle();
+        let bundle_s = auth.signer.bundle();
         let server_id = bundle_s.to_address();
         let nonce_s = fresh_nonce()?;
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
-        let sig_s = auth.keypair.sign(&t_server)?;
+        let sig_s = auth.signer.sign_raw(&t_server)?;
         let kem_ct_field = if auth.encrypt { Some(kem_ct.clone()) } else { None };
         write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, kem_ct: kem_ct_field, signature: sig_s }).await?;
 
@@ -333,6 +337,7 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qchain_crypto::Keypair;
     use tokio::net::{TcpListener, TcpStream};
 
     fn auth_for(kp: &Arc<Keypair>, network_id: [u8; 32], authorized: &[ValidatorId]) -> AuthState {

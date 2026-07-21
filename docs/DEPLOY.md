@@ -159,6 +159,41 @@ que necesita, montado por volumen en su contenedor:
 Ningún servicio expuesto a internet (QScan, wallet, faucet) tiene acceso a la
 clave del validador.
 
+**Firmante remoto / HSM de la clave de validador (`remote_signer`, tarea #193).**
+Por defecto la clave que firma bloques vive DENTRO del proceso del nodo (el
+`keypair.json` que lee al arrancar) — cómodo, pero es la superficie más expuesta
+a internet (RPC, P2P, dashboard). Podés sacar esa clave a un **proceso separado**
+(o un HSM), estilo `tmkms` de Cosmos, para que comprometer el nodo **no filtre la
+clave**. El nodo le pide firmas por un socket local y nunca ve el material de
+clave.
+
+Cómo activarlo (OPT-IN; por defecto sigue todo en-proceso, byte-idéntico):
+
+1. **Mové** el `keypair.json` del validador de `/opt/qchain` a `/opt/qchain-signer`
+   (para que el nodo ya no lo tenga).
+2. **Arrancá el firmante** (bindea loopback — sólo el nodo del mismo host lo
+   alcanza): `sudo systemctl enable --now qchain-remote-signer` (unidad nueva
+   `deploy/systemd/qchain-remote-signer.service`), o a mano:
+   `qchain-remote-signer --keypair /opt/qchain-signer/keypair.json --listen 127.0.0.1:9200 --guard-file /opt/qchain-signer/guard.bin`
+3. **Poné** `"remote_signer": "127.0.0.1:9200"` en el `config.json` del nodo y
+   reiniciá el validador. En el arranque el nodo loguea
+   `consensus signer: REMOTE ... the block-signing key is NOT in this node process`.
+
+Es una migración **sin cambio de identidad**: el firmante sostiene la MISMA clave,
+así que el validador es el mismo (misma dirección, mismo registro on-chain, mismo
+`chain_id`) — no hay re-registro ni génesis nuevo. El firmante trae una **guardia
+anti-doble-firma persistida** (`guard.bin`): se niega a firmar dos vértices
+PROPIOS distintos para la misma ronda, aun si el proceso del nodo estuviera
+comprometido — la propiedad de seguridad central de un firmante de validador.
+**Confiá el socket:** quien lo alcance puede pedir firmas (nunca un auto-voto en
+conflicto, y la clave nunca sale del daemon), así que corré el firmante en el
+MISMO host que el nodo (loopback). `--allow-non-loopback` es necesario a
+propósito para bindear una dirección pública (sólo sobre un enlace privado +
+firewall). **Límite honesto:** esto saca la clave del proceso del nodo (incremento
+A de #193); la separación on-chain de la clave de CONSENSO respecto de la clave de
+FONDOS/retiro (incremento B — una fuga del hot key no puede drenar el bono) es el
+siguiente incremento de #193.
+
 **Endurecimiento del contenedor.** Los cuatro servicios systemd corren con
 `--security-opt no-new-privileges` (un proceso dentro del contenedor no puede
 ganar privilegios vía setuid) y `--cap-drop ALL` (se le quitan todas las

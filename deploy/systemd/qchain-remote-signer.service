@@ -1,0 +1,42 @@
+[Unit]
+# Firmante remoto / HSM de la clave de validador (tarea #193). Sostiene el
+# keypair.json del validador en un proceso SEPARADO del nodo, para que
+# comprometer el nodo (la superficie expuesta a internet) no filtre la clave que
+# firma bloques. El nodo se conecta con `remote_signer: "127.0.0.1:9200"` en su
+# config.json y deja de necesitar el keypair.json. Debe arrancar ANTES del nodo.
+Description=qchain remote validator signer (#193)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+# El validador depende de este servicio: el firmante levanta primero.
+Before=qchain-validator.service
+
+[Service]
+# Expects /opt/qchain-signer to contain keypair.json (la clave del validador,
+# MOVIDA acá desde /opt/qchain) y un guard.bin que persiste la ronda/vértice
+# propio más alto firmado (anti-doble-firma). Bindea LOOPBACK: sólo el nodo del
+# MISMO host lo alcanza. --network host para que 127.0.0.1:9200 sea el del host.
+Type=simple
+WorkingDirectory=/opt/qchain-signer
+ExecStartPre=-/usr/bin/docker rm -f qchain-remote-signer
+ExecStart=/usr/bin/docker run --rm --name qchain-remote-signer \
+  --network host \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --memory 512m --memory-swap 512m \
+  --pids-limit 256 \
+  --ulimit nofile=4096:4096 \
+  -v /opt/qchain-signer:/keys \
+  qchain:latest \
+  qchain-remote-signer --keypair /keys/keypair.json --listen 127.0.0.1:9200 --guard-file /keys/guard.bin
+ExecStop=/usr/bin/docker stop qchain-remote-signer
+Restart=on-failure
+RestartSec=3
+# Endurecimiento a nivel de la unidad (defensa-en-profundidad; el efectivo es el
+# cgroup de docker de arriba). Ver deploy/install-limits.sh / tarea #199.
+MemoryMax=768M
+TasksMax=512
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

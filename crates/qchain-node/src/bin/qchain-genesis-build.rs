@@ -280,6 +280,7 @@ fn main() -> anyhow::Result<()> {
             treasury_authority: treasury_authority.clone(),
             treasury_amount,
             rpc_rate_limit_per_10s: None,
+            remote_signer: None,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's

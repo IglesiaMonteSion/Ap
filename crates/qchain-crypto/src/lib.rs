@@ -393,6 +393,49 @@ pub fn verify_domain(bundle: &PublicKeyBundle, domain: &[u8], msg: &[u8], signat
     verify(bundle, &buf, signature)
 }
 
+/// **Firmante de la identidad de un validador** (tarea #193 — separación de
+/// claves / firmante remoto). Abstrae DE DÓNDE sale la firma: la clave puede
+/// vivir EN-PROCESO (`Keypair`, el default byte-idéntico) o FUERA del proceso
+/// del nodo, en un **firmante remoto/HSM** (`qchain-remote-signer`), para que
+/// comprometer el proceso del nodo — la superficie más expuesta a internet — no
+/// filtre la clave que firma bloques. **No cambia NADA de lo que se firma**
+/// (mismas preimágenes domain-tagged de #187); sólo cambia quién tiene la clave.
+/// Sólo el consenso (votos/vértices) y el handshake P2P firman por acá.
+pub trait Signer: Send + Sync {
+    /// El bundle de clave pública del validador (su identidad/dirección).
+    fn bundle(&self) -> PublicKeyBundle;
+    /// Firma el AUTO-VOTO del proposer sobre su PROPIO vértice (`VERTEX_VOTE_V1 ‖
+    /// digest`). En el firmante remoto está sujeto a la guardia ANTI-DOBLE-FIRMA
+    /// (una sola versión del propio vértice por ronda) — defensa-en-profundidad
+    /// sobre el candado `voted_for` del engine.
+    fn sign_own_vote(&self, round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
+    /// Firma un voto sobre el vértice de OTRO validador (`VERTEX_VOTE_V1 ‖
+    /// digest`). No es una auto-equivocación → sin guardia.
+    fn sign_peer_vote(&self, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
+    /// Firma exactamente estos bytes (el llamador ya los enmarcó/domainó — p.ej.
+    /// el transcript del handshake autenticado, que ya lleva su propio dominio).
+    /// Sin guardia (no es un voto de consenso).
+    fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature>;
+}
+
+/// El `Keypair` en-proceso ES un `Signer` (el default, byte-idéntico a antes de
+/// #193): las firmas de voto van por el mismo `sign_vertex_vote` de #187, sin
+/// guardia local (el candado `voted_for` del engine ya cubre la equivocación).
+impl Signer for Keypair {
+    fn bundle(&self) -> PublicKeyBundle {
+        self.public_key_bundle()
+    }
+    fn sign_own_vote(&self, _round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        sign_vertex_vote(self, digest)
+    }
+    fn sign_peer_vote(&self, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        sign_vertex_vote(self, digest)
+    }
+    fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
+        self.sign(msg)
+    }
+}
+
 /// Firma la **atestación de un voto/vértice** sobre el digest de un vértice
 /// (tarea #187): firma `VERTEX_VOTE_V1 ‖ digest`. Es el ÚNICO punto por el que
 /// debe pasar todo firmante de un vértice — el autor en su auto-voto y cada

@@ -15,6 +15,7 @@ qchain-storage = { path = "../qchain-storage" }
 qchain-execution = { path = "../qchain-execution" }
 qchain-consensus = { path = "../qchain-consensus" }
 qchain-network = { path = "../qchain-network" }
+qchain-remote-signer = { path = "../qchain-remote-signer" }
 qchain-stark = { path = "../qchain-stark" }
 serde.workspace = true
 serde_json.workspace = true

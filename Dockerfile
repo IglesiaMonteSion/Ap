@@ -37,14 +37,15 @@ COPY . .
 # in CLAUDE.md). A committed lock that builds locally now always builds here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --locked --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer && \
+    cargo build --locked --release -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer && \
     mkdir -p /out && \
     cp target/release/qchain-node \
        target/release/qchain-genesis-build \
        target/release/qchain \
        target/release/qchain-faucet \
        target/release/qchain-wallet \
-       target/release/qchain-indexer /out/
+       target/release/qchain-indexer \
+       target/release/qchain-remote-signer /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -56,6 +57,7 @@ COPY --from=builder /out/qchain /usr/local/bin/qchain
 COPY --from=builder /out/qchain-faucet /usr/local/bin/qchain-faucet
 COPY --from=builder /out/qchain-wallet /usr/local/bin/qchain-wallet
 COPY --from=builder /out/qchain-indexer /usr/local/bin/qchain-indexer
+COPY --from=builder /out/qchain-remote-signer /usr/local/bin/qchain-remote-signer
 
 # No fixed ENTRYPOINT/CMD - this image bundles several binaries (validator,
 # coordinator tool, wallet CLI, faucet, web wallet), each meant to be invoked

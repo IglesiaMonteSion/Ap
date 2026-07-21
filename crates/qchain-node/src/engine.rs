@@ -217,7 +217,7 @@ pub fn deserialize_committee(bytes: &[u8]) -> Option<ValidatorSet> {
     Some(ValidatorSet::new(entries.into_iter().map(|p| ValidatorInfo { id: p.id, pubkey_bundle: p.pubkey_bundle, stake: p.stake }).collect()))
 }
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
-use qchain_crypto::{MultiSignature, Keypair, Pubkey};
+use qchain_crypto::{MultiSignature, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
 use qchain_network::{NetMessage, Network, PeerInfo};
 use serde::{Deserialize, Serialize};
@@ -775,7 +775,13 @@ fn take_executable_prefix(
 
 pub struct Engine {
     pub self_id: ValidatorId,
-    pub keypair: std::sync::Arc<Keypair>,
+    /// The validator's consensus **signer** (tarea #193). Abstracts *where* the
+    /// block-signing key lives: an in-process `Keypair` (the default, byte-
+    /// identical to before) or an out-of-process **remote/HSM signer**
+    /// (`qchain-remote-signer`), so compromising this node process doesn't leak
+    /// the key that signs blocks. Only consensus votes/vertices sign through it
+    /// here; what gets signed is unchanged (the #187 domain-tagged preimages).
+    pub signer: std::sync::Arc<dyn qchain_crypto::Signer>,
     /// The consensus committee currently in effect (this epoch). Under fixed
     /// membership (rotation off) it never changes; under phase-3.3 rotation the
     /// epoch ratchet in `try_commit` swaps it at each boundary. Used for
@@ -2983,7 +2989,10 @@ impl Engine {
     /// gate).
     async fn cast_vote(&self, digest: Digest, to: ValidatorId) {
         // #187: el voto va etiquetado por dominio (`VERTEX_VOTE_V1 ‖ digest`).
-        let sig = match qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]) {
+        // #193: firmado por el `signer` (in-process o remoto/HSM). Es un voto
+        // sobre el vértice de OTRO validador → `sign_peer_vote` (sin guardia
+        // anti-doble-firma; esa sólo aplica al auto-voto del proposer).
+        let sig = match self.signer.sign_peer_vote(&digest) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to sign vote: {e}");
@@ -3988,7 +3997,11 @@ impl Engine {
             let digest = vertex.digest();
             // #187: la firma-de-autor es el auto-voto del proponente sobre su
             // propio vértice → mismo dominio `VERTEX_VOTE_V1` que cualquier voto.
-            let sig = match qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]) {
+            // #193: firmado por el `signer` como AUTO-VOTO (`sign_own_vote`) →
+            // en un firmante remoto pasa por la guardia anti-doble-firma (una
+            // sola versión del propio vértice por ronda), defensa-en-profundidad
+            // sobre el candado `voted_for`.
+            let sig = match self.signer.sign_own_vote(round, &digest) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to sign proposed vertex: {e}");

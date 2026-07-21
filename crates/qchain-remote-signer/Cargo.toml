@@ -1,0 +1,27 @@
+[package]
+name = "qchain-remote-signer"
+version.workspace = true
+edition.workspace = true
+
+# Firmante remoto / HSM de la clave de validador (tarea #193, separación de
+# claves + firmante remoto). La `lib` da el CLIENTE (`RemoteSigner`, que impl
+# `qchain_crypto::Signer`) y el SERVIDOR (`serve` + `DoubleSignGuard`); el `bin`
+# es el daemon que sostiene la clave y firma por socket, para que la clave que
+# firma bloques NO viva en el proceso del nodo (la superficie expuesta a
+# internet). Usa el backend liboqs de qchain-crypto, igual que el nodo.
+
+[lib]
+name = "qchain_remote_signer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qchain-remote-signer"
+path = "src/bin/qchain-remote-signer.rs"
+
+[dependencies]
+qchain-crypto = { path = "../qchain-crypto" }
+borsh.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

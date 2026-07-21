@@ -4,6 +4,7 @@
 //! server (`rpc.rs`) for wallet traffic. See `ARCHITECTURE.md` §1/§4 and
 //! the `blockchain-core-rust` skill.
 
+use anyhow::Context;
 use clap::Parser;
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSchedule, ValidatorSet};
 use qchain_execution::{
@@ -134,8 +135,27 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = NodeConfig::load(&cli.config)?;
 
-    let keypair = Arc::new(qchain_crypto::read_keypair_file(&config.keypair_path)?);
-    let self_id = keypair.pubkey();
+    // Consensus signer (tarea #193). `remote_signer` in the config selects an
+    // out-of-process remote/HSM signer that holds the block-signing key, so it
+    // never lives in this (internet-facing) process; `None` (the default) reads
+    // the key in-process from `keypair_path`, byte-identical to before. Either
+    // way the identity (self_id) is the SAME validator key — a local↔remote
+    // migration needs no re-registration and does not change `chain_id`.
+    let signer: Arc<dyn qchain_crypto::Signer> = match &config.remote_signer {
+        Some(endpoint) => {
+            let rs = qchain_remote_signer::RemoteSigner::connect(endpoint)
+                .with_context(|| format!("cannot connect to the remote signer at {endpoint}"))?;
+            tracing::info!(
+                "consensus signer: REMOTE at {endpoint} — the block-signing key is NOT in this node process (#193)"
+            );
+            Arc::new(rs) as Arc<dyn qchain_crypto::Signer>
+        }
+        None => {
+            let kp = qchain_crypto::read_keypair_file(&config.keypair_path)?;
+            Arc::new(kp) as Arc<dyn qchain_crypto::Signer>
+        }
+    };
+    let self_id = signer.bundle().to_address();
 
     let mut validator_infos = Vec::new();
     let mut peers = Vec::new();
@@ -181,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             tracing::info!("authenticated P2P transport: ENABLED (per-connection ML-DSA handshake)");
         }
-        Some(Arc::new(qchain_network::AuthState::new_with_encryption(keypair.clone(), config.chain_id(), authorized, config.encrypted_transport)))
+        Some(Arc::new(qchain_network::AuthState::new_with_encryption(signer.clone(), config.chain_id(), authorized, config.encrypted_transport)))
     } else {
         None
     };
@@ -767,7 +787,7 @@ async fn main() -> anyhow::Result<()> {
     // per-epoch map + resolvable frontier.
     let engine = Arc::new(Engine {
         self_id,
-        keypair,
+        signer,
         validators: std::sync::RwLock::new(std::sync::Arc::new(current_committee)),
         validator_schedule: std::sync::RwLock::new(std::sync::Arc::new(validator_schedule)),
         validator_directory,

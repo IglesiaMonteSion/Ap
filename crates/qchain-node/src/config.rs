@@ -212,6 +212,19 @@ pub struct NodeConfig {
     /// node-LOCAL policy: not folded into `chain_id`, no consensus/wire impact.
     #[serde(default)]
     pub rpc_rate_limit_per_10s: Option<u32>,
+
+    /// **Firmante remoto / HSM de la clave de consenso** (tarea #193). Cuando es
+    /// `Some("<host:puerto>")`, la clave que firma bloques NO se lee de
+    /// `keypair_path` ni vive en este proceso: el nodo se conecta a un
+    /// `qchain-remote-signer` (proceso aparte / HSM) que sostiene la clave y
+    /// firma por socket. `None` (el default, y lo que resuelve todo config
+    /// existente) = clave EN-PROCESO leída de `keypair_path`, byte-idéntico a
+    /// antes. Es una elección node-LOCAL de operación (qué firmante sirve la
+    /// MISMA identidad): **NO se pliega en `chain_id`** — un nodo con la clave
+    /// local y otro con la misma clave en un firmante remoto son el MISMO
+    /// validador, sin cambio de red/consenso/wire.
+    #[serde(default)]
+    pub remote_signer: Option<String>,
 }
 
 fn default_storage_engine() -> String {
@@ -339,6 +352,7 @@ mod tests {
             treasury_authority: None,
             treasury_amount: None,
             rpc_rate_limit_per_10s: None,
+            remote_signer: None,
         }
     }
 
