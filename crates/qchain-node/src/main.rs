@@ -783,6 +783,7 @@ async fn main() -> anyhow::Result<()> {
         economics_path,
         round_interval_ms: config.round_interval_ms,
         disk_size_cache: std::sync::Mutex::new(None),
+        sig_cache: std::sync::Mutex::new(qchain_node::engine::SigVerifyCache::new(qchain_node::engine::MAX_SIG_CACHE)),
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
@@ -891,7 +892,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("qchain-node {self_id} up: p2p={}, rpc={}", config.listen_addr, config.rpc_addr);
     let flush_engine = engine.clone();
-    let app = rpc::router(engine);
+    let app = rpc::router(engine, config.rpc_rate_limit_per_10s);
+    // `into_make_service_with_connect_info` so the (opt-in) per-IP rate limiter
+    // can read each client's address (task #196). Harmless when the limiter is
+    // off — no layer consults it.
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     let listener = tokio::net::TcpListener::bind(config.rpc_addr).await?;
     // Serve until a shutdown signal arrives; on SIGTERM/SIGINT flush every sled
     // store to disk BEFORE exiting, so the durable `round_checkpoint` is never

@@ -202,6 +202,16 @@ pub struct NodeConfig {
     /// `economics_v7` + `treasury_authority`; part of the network config hash.
     #[serde(default)]
     pub treasury_amount: Option<u64>,
+    /// Per-IP RPC rate limit (task #196, QCH-S6): max requests any single client
+    /// IP may make in a 10-second window before it's temporarily banned (60 s).
+    /// `None`/`0` (the default, and what every existing config resolves to)
+    /// disables it entirely — zero overhead, byte-identical behavior, no
+    /// interference with a loopback-private RPC or the operator's own tools. Set
+    /// it only when EXPOSING the RPC publicly (`--rpc-public`), where a per-IP
+    /// cap + temp ban blunts an unauthenticated request flood. It is a
+    /// node-LOCAL policy: not folded into `chain_id`, no consensus/wire impact.
+    #[serde(default)]
+    pub rpc_rate_limit_per_10s: Option<u32>,
 }
 
 fn default_storage_engine() -> String {
@@ -328,6 +338,7 @@ mod tests {
             rounds_per_quanto: None,
             treasury_authority: None,
             treasury_amount: None,
+            rpc_rate_limit_per_10s: None,
         }
     }
 

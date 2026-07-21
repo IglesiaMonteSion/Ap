@@ -891,6 +891,13 @@ pub struct Engine {
     /// recursive directory walk (hundreds of `stat` syscalls under a load test,
     /// on the async runtime). The walk runs at most once per `DISK_SIZE_TTL`.
     pub disk_size_cache: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
+    /// Cache of transaction content-hashes whose PQC signature already verified
+    /// true (task #196). Consulted at admission and at commit-time verification
+    /// to skip the redundant ~150µs hybrid verify for a transaction this node
+    /// already checked. Separate `std::sync::Mutex` (tiny critical sections: a
+    /// HashSet lookup/insert) so it never contends the async consensus state
+    /// lock. See `SigVerifyCache` for why a cache hit is safe.
+    pub sig_cache: std::sync::Mutex<SigVerifyCache>,
 }
 
 /// How long a `/resources` disk-size reading is reused before the `data_dir`
@@ -1580,6 +1587,50 @@ fn is_recoverable_exec_error(e: &qchain_execution::ExecError) -> bool {
 /// checks across all cores.
 const PARALLEL_VERIFY_THRESHOLD: usize = 16;
 
+/// Max entries in the signature-verification cache (task #196). ~200k × 32 B ≈
+/// 6.4 MB. Bounds memory while covering the realistic working set of recently
+/// seen transactions (a flood is far smaller than this).
+pub const MAX_SIG_CACHE: usize = 200_000;
+
+/// A bounded, FIFO set of the CONTENT hashes (`Transaction::hash()`, i.e. the
+/// message PLUS every signature component) of transactions whose hybrid PQC
+/// signature this node already verified TRUE (task #196, QCH-S6/S9).
+///
+/// Why it's safe for consensus: `verify_signature` is a pure function of the
+/// exact signed bytes, and the key is the content hash of those exact bytes, so
+/// a cache hit is a cryptographic guarantee that these precise bytes verified
+/// true (a hash collision would need to break SHA3-256). We ONLY ever insert a
+/// hash after a real `verify_signature()==true`, and never cache a negative, so
+/// the cache can only turn a "would re-verify" into "skip, already true" — it
+/// can never accept an unverified transaction. This closes the real
+/// gossip-amplification waste: the same transaction is verified once at
+/// admission (RPC or gossip) and then again when it lands in a committed batch;
+/// the cache lets the commit-time pass skip the redundant ~150µs PQC verify.
+pub struct SigVerifyCache {
+    seen: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+}
+
+impl SigVerifyCache {
+    pub fn new(cap: usize) -> Self {
+        Self { seen: std::collections::HashSet::new(), order: std::collections::VecDeque::new(), cap: cap.max(1) }
+    }
+    pub fn contains(&self, h: &[u8; 32]) -> bool {
+        self.seen.contains(h)
+    }
+    pub fn insert(&mut self, h: [u8; 32]) {
+        if self.seen.insert(h) {
+            self.order.push_back(h);
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+    }
+}
+
 /// Verify each transaction's signature, in parallel across cores when the batch
 /// is large enough to be worth it. This is THE hot-path optimization for a
 /// compressed-tree node: signature verification is ~65% of a compressed-mode
@@ -1611,6 +1662,43 @@ fn verify_signatures_maybe_parallel(txs: &[&Transaction]) -> Vec<bool> {
             });
         }
     });
+    out
+}
+
+/// Like `verify_signatures_maybe_parallel`, but first skips any transaction
+/// whose exact signed bytes this node already verified true (the
+/// `SigVerifyCache`, task #196). A cache HIT is treated as `true` without
+/// re-running the ~150µs PQC verify; a MISS is verified for real (in parallel
+/// when there are enough of them) and, if true, inserted so a later re-encounter
+/// is free. The cache is consulted/updated single-threaded around the parallel
+/// verify so the worker threads never touch the lock. Safe for consensus: see
+/// `SigVerifyCache`'s doc comment — the cache can only turn a re-verify into a
+/// skip, never accept an unverified transaction.
+fn verify_signatures_cached(txs: &[&Transaction], cache: &std::sync::Mutex<SigVerifyCache>) -> Vec<bool> {
+    // Content hash of each tx (message + all signature components) - the exact
+    // bytes the cache keys on. Cheaper than a PQC verify, so worth it.
+    let hashes: Vec<[u8; 32]> = txs.iter().map(|t| t.hash()).collect();
+    // Which ones do we already know verify true?
+    let mut out: Vec<bool> = {
+        let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        hashes.iter().map(|h| c.contains(h)).collect()
+    };
+    // Verify only the misses. Reuse the parallel path when there are enough.
+    let miss_idx: Vec<usize> = (0..txs.len()).filter(|&i| !out[i]).collect();
+    if !miss_idx.is_empty() {
+        let miss_txs: Vec<&Transaction> = miss_idx.iter().map(|&i| txs[i]).collect();
+        let verdicts = verify_signatures_maybe_parallel(&miss_txs);
+        for (k, &i) in miss_idx.iter().enumerate() {
+            out[i] = verdicts[k];
+        }
+        // Cache the newly-confirmed-true ones.
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, &i) in miss_idx.iter().enumerate() {
+            if verdicts[k] {
+                c.insert(hashes[i]);
+            }
+        }
+    }
     out
 }
 
@@ -1835,8 +1923,16 @@ impl Engine {
         if tx.byte_size() > MAX_TRANSACTION_BYTES {
             anyhow::bail!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size());
         }
-        if !tx.verify_signature() {
-            anyhow::bail!("invalid transaction signature");
+        // Verify the hybrid PQC signature, skipping it if we already verified
+        // these exact bytes true (the SigVerifyCache, #196), and caching a fresh
+        // pass so the commit-time verify can skip it too.
+        let content_hash = tx.hash();
+        let cached = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).contains(&content_hash);
+        if !cached {
+            if !tx.verify_signature() {
+                anyhow::bail!("invalid transaction signature");
+            }
+            self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(content_hash);
         }
         let hash = tx.txid();
         {
@@ -2420,9 +2516,17 @@ impl Engine {
                     tracing::warn!("dropping gossiped transaction from {from}: too large ({} bytes)", tx.byte_size());
                     return;
                 }
-                if !tx.verify_signature() {
-                    tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
-                    return;
+                // Verify (or skip via the SigVerifyCache, #196) + cache. Gossip
+                // sees the same tx from multiple peers, so the cache hit rate here
+                // is high — this is the main gossip-amplification saving.
+                let content_hash = tx.hash();
+                let cached = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).contains(&content_hash);
+                if !cached {
+                    if !tx.verify_signature() {
+                        tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
+                        return;
+                    }
+                    self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(content_hash);
                 }
                 let mut state = self.state.lock().await;
                 // Expiración (#191): no admitir una tx ya caducada en la ronda
@@ -3433,10 +3537,12 @@ impl Engine {
             }
             let ctxs: Vec<&Transaction> = cbatches.iter().flat_map(|b| b.transactions.iter()).collect();
             // Verify every signature in this certificate IN PARALLEL, off the
-            // sequential commit thread (see `verify_signatures_maybe_parallel`).
-            // Order-preserving and deterministic: `sig_ok[i]` is the verdict for
-            // `ctxs[i]`, identical to what an inline check would have returned.
-            let sig_ok = verify_signatures_maybe_parallel(&ctxs);
+            // sequential commit thread (see `verify_signatures_maybe_parallel`),
+            // skipping any whose exact bytes this node already verified true at
+            // admission (the `SigVerifyCache`, task #196). Order-preserving and
+            // deterministic: `sig_ok[i]` is the verdict for `ctxs[i]`, identical
+            // to what an inline check would have returned.
+            let sig_ok = verify_signatures_cached(&ctxs, &self.sig_cache);
             let author = cert.vertex.author;
             let round = cert.vertex.round;
             for (i, &tx) in ctxs.iter().enumerate() {
@@ -4212,6 +4318,53 @@ mod tests {
             small.iter().map(|t| t.verify_signature()).collect::<Vec<_>>()
         );
         assert!(verify_signatures_maybe_parallel(&[]).is_empty());
+    }
+
+    /// #196: `verify_signatures_cached` returns the SAME verdicts, index for
+    /// index, as the uncached verify — a cache hit only skips a redundant PQC
+    /// verify, never changes a verdict. And it never caches a NEGATIVE (an
+    /// invalid tx is re-verified, never falsely accepted from the cache).
+    #[test]
+    fn cached_signature_verification_matches_and_never_caches_a_negative() {
+        let mut owned: Vec<Transaction> = Vec::new();
+        for i in 0..40u64 {
+            let kp = Keypair::generate().unwrap();
+            let mut t = tx(&kp, i);
+            if i % 2 == 1 {
+                t.signature.components[0].bytes[0] ^= 0xFF; // invalid
+            }
+            owned.push(t);
+        }
+        let refs: Vec<&Transaction> = owned.iter().collect();
+        let ground_truth: Vec<bool> = refs.iter().map(|t| t.verify_signature()).collect();
+        let cache = std::sync::Mutex::new(SigVerifyCache::new(MAX_SIG_CACHE));
+        // First pass: fills the cache with the valid ones.
+        assert_eq!(verify_signatures_cached(&refs, &cache), ground_truth, "cached verdicts match uncached (cold cache)");
+        // Second pass: the valid ones now hit the cache; verdicts still identical.
+        assert_eq!(verify_signatures_cached(&refs, &cache), ground_truth, "cached verdicts match uncached (warm cache)");
+        // The invalid ones were NEVER cached: their content hash is absent.
+        let c = cache.lock().unwrap();
+        for (i, t) in owned.iter().enumerate() {
+            assert_eq!(c.contains(&t.hash()), ground_truth[i], "only valid txs are cached");
+        }
+    }
+
+    /// #196: the FIFO cache evicts the oldest entry once it exceeds its cap, and
+    /// reports membership correctly.
+    #[test]
+    fn sig_verify_cache_is_bounded_fifo() {
+        let mut c = SigVerifyCache::new(3);
+        let h = |b: u8| [b; 32];
+        c.insert(h(1));
+        c.insert(h(2));
+        c.insert(h(3));
+        assert!(c.contains(&h(1)) && c.contains(&h(2)) && c.contains(&h(3)));
+        c.insert(h(4)); // evicts the oldest (h(1))
+        assert!(!c.contains(&h(1)), "oldest entry evicted at cap");
+        assert!(c.contains(&h(2)) && c.contains(&h(3)) && c.contains(&h(4)));
+        // Re-inserting an existing key is a no-op (no spurious eviction).
+        c.insert(h(4));
+        assert!(c.contains(&h(2)), "re-insert must not evict");
     }
 
     /// The permanent-fork fix (see `EngineState::pending_execution`): a

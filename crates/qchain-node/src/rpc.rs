@@ -14,7 +14,90 @@ use qchain_execution::TransferReceipt;
 use serde_json::json;
 use std::sync::Arc;
 
-pub fn router(engine: Arc<Engine>) -> Router {
+/// Per-IP RPC rate limiter with a temporary ban (task #196, QCH-S6). A sliding
+/// 10-second window per client IP; once a single IP exceeds `limit` requests in
+/// a window it is banned for `BAN`. Opt-in via `NodeConfig::rpc_rate_limit_per_10s`
+/// (default off, zero overhead) — meant for a publicly exposed RPC, not the
+/// loopback-private default. The tracked-IP map is bounded (`MAX_TRACKED_IPS`)
+/// so the limiter can't itself be turned into an OOM by a spray of source IPs.
+#[derive(Clone)]
+struct RateLimiter {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, IpState>>>,
+    limit: u32,
+}
+
+struct IpState {
+    window_start: std::time::Instant,
+    count: u32,
+    banned_until: Option<std::time::Instant>,
+}
+
+const RL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const RL_BAN: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_TRACKED_IPS: usize = 100_000;
+
+impl RateLimiter {
+    fn new(limit: u32) -> Self {
+        Self { inner: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), limit }
+    }
+    /// `true` = allowed, `false` = throttled (429). Pure per-IP token counting.
+    fn allow(&self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound the map: if it's full and this is a new IP, drop entries whose
+        // window has elapsed and that aren't actively banned (cheap GC).
+        if m.len() >= MAX_TRACKED_IPS && !m.contains_key(&ip) {
+            m.retain(|_, s| s.banned_until.map(|b| now < b).unwrap_or(false) || now.duration_since(s.window_start) < RL_WINDOW);
+        }
+        let st = m.entry(ip).or_insert(IpState { window_start: now, count: 0, banned_until: None });
+        if let Some(b) = st.banned_until {
+            if now < b {
+                return false;
+            }
+            st.banned_until = None;
+            st.window_start = now;
+            st.count = 0;
+        }
+        if now.duration_since(st.window_start) >= RL_WINDOW {
+            st.window_start = now;
+            st.count = 0;
+        }
+        st.count = st.count.saturating_add(1);
+        if st.count > self.limit {
+            st.banned_until = Some(now + RL_BAN);
+            return false;
+        }
+        true
+    }
+}
+
+async fn rate_limit_mw(
+    State(rl): State<RateLimiter>,
+    conn: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // Without ConnectInfo (shouldn't happen once wired) fail open — never break
+    // the RPC because we couldn't read the peer address.
+    if let Some(axum::extract::ConnectInfo(addr)) = conn {
+        if !rl.allow(addr.ip()) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded - try again shortly").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+pub fn router(engine: Arc<Engine>, rpc_rate_limit_per_10s: Option<u32>) -> Router {
+    // Opt-in per-IP rate limiter (task #196). `None`/`0` → not layered at all.
+    let base = base_router(engine);
+    match rpc_rate_limit_per_10s.filter(|&n| n > 0) {
+        Some(limit) => base.layer(axum::middleware::from_fn_with_state(RateLimiter::new(limit), rate_limit_mw)),
+        None => base,
+    }
+}
+
+fn base_router(engine: Arc<Engine>) -> Router {
     Router::new()
         .route("/", get(explorer))
         .route("/tx", post(submit_tx))
@@ -107,8 +190,26 @@ async fn version(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
 /// Plain `fetch()` against this same origin's `/status`/`/root`/
 /// `/account/:address` - no build step, no dependency, works from the
 /// bare HTML file.
-async fn explorer() -> Html<&'static str> {
-    Html(include_str!("explorer.html"))
+async fn explorer() -> impl axum::response::IntoResponse {
+    // Security headers on the operator dashboard (task #196, QCH-S9), matching
+    // what the public QScan indexer already sets: a strict CSP that keeps the
+    // page same-origin only (no external script/style/img/connect, so a stored
+    // value can't exfiltrate or load a third-party payload), plus clickjacking
+    // (frame-ancestors/X-Frame-Options), MIME-sniffing (nosniff) and referrer
+    // hardening. `'unsafe-inline'` is required because the dashboard is a single
+    // self-contained HTML with inline <script>/<style> and no build step; the
+    // real protections here are `connect-src 'self'` (no exfil), `object-src` /
+    // `base-uri` / `frame-ancestors` = none.
+    const CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+    (
+        [
+            ("Content-Security-Policy", CSP),
+            ("X-Frame-Options", "DENY"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+        ],
+        Html(include_str!("explorer.html")),
+    )
 }
 
 async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -552,4 +653,26 @@ async fn active_validators(State(engine): State<Arc<Engine>>) -> Result<Json<ser
 /// the bytes" posture `/stark_proof` already established.
 async fn equivocation_evidence(State(engine): State<Arc<Engine>>) -> Json<Vec<qchain_core::EquivocationEvidence>> {
     Json(engine.equivocation_evidence().await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// #196: the per-IP limiter allows up to `limit` requests, then bans the IP
+    /// (subsequent requests are throttled), and a DIFFERENT IP is unaffected.
+    #[test]
+    fn rate_limiter_allows_up_to_limit_then_bans_per_ip() {
+        let rl = RateLimiter::new(3);
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        assert!(rl.allow(a), "1st allowed");
+        assert!(rl.allow(a), "2nd allowed");
+        assert!(rl.allow(a), "3rd allowed");
+        assert!(!rl.allow(a), "4th over the limit -> throttled");
+        assert!(!rl.allow(a), "still banned");
+        // A different IP has its own independent bucket.
+        assert!(rl.allow(b), "a separate IP is unaffected");
+    }
 }
