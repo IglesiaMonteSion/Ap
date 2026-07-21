@@ -395,6 +395,22 @@ pub fn program_address_from_seed(seed: &[u8; 32], index: u32) -> String {
     Pubkey::new(digest).to_string()
 }
 
+/// SDK v0.3 — deriva la dirección de una cuenta de estado PROPIA DEL PROGRAMA
+/// (PDA) a partir del `program_id` (base58) y una `seed` de bytes. MISMA fórmula
+/// que el nodo (`qchain_execution::wasm::derive_pda`): `SHA3-256("qchain-program-
+/// pda-v1" ‖ program_id(32) ‖ seed)`. El cliente la usa para incluir la
+/// dirección correcta en `accounts` al llamar a un contrato que usa `use_pda`.
+pub fn program_pda(program_id: &str, seed: &[u8]) -> anyhow::Result<String> {
+    use sha3::{Digest, Sha3_256};
+    let pid: Pubkey = program_id.trim().parse().map_err(|e| anyhow::anyhow!("program id invalid: {e}"))?;
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"qchain-program-pda-v1");
+    hasher.update(pid.to_bytes());
+    hasher.update(seed);
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(Pubkey::new(digest).to_string())
+}
+
 /// Sign a `DeployProgram` transaction: publish `module_bytes` (raw `.wasm`) as a
 /// contract at `program_address` (a fresh address, e.g. `programAddressFromSeed`),
 /// callable via `entry_point`. accounts = [program_address], program_id =
@@ -504,6 +520,22 @@ mod tests {
         // Distinct domain from the wallet address and the stake-account address.
         assert_ne!(program_address_from_seed(&seed, 0), address_from_seed(&seed).unwrap());
         assert_ne!(program_address_from_seed(&seed, 0), stake_address_from_seed(&seed, 0));
+    }
+
+    #[test]
+    fn program_pda_is_deterministic_and_separated_by_program_and_seed() {
+        let prog_a = program_address_from_seed(&[7u8; 32], 0);
+        let prog_b = program_address_from_seed(&[8u8; 32], 0);
+        // Determinista: mismo (program_id, seed) → misma PDA.
+        assert_eq!(program_pda(&prog_a, b"global").unwrap(), program_pda(&prog_a, b"global").unwrap());
+        // Separada por seed.
+        assert_ne!(program_pda(&prog_a, b"global").unwrap(), program_pda(&prog_a, b"other").unwrap());
+        // Separada por programa (sin front-running: A y B derivan PDAs distintas).
+        assert_ne!(program_pda(&prog_a, b"global").unwrap(), program_pda(&prog_b, b"global").unwrap());
+        // Distinta de la dirección de deploy del propio programa.
+        assert_ne!(program_pda(&prog_a, b"global").unwrap(), prog_a);
+        // Rechaza un program_id inválido.
+        assert!(program_pda("not-base58!!", b"x").is_err());
     }
 
     #[test]

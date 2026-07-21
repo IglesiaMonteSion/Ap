@@ -80,6 +80,10 @@ fn main() -> anyhow::Result<()> {
             let s = seed(&args[2])?;
             print!("{}", qchain_wasm::program_address_from_seed(&s, args[3].parse()?));
         }
+        Some("program-pda") => {
+            // program-pda <program_id> <seed_string>  — deriva la PDA de un programa
+            print!("{}", qchain_wasm::program_pda(&args[2], args[3].as_bytes())?);
+        }
         Some("deploy-program") => {
             // deploy-program <seed> <program_addr> <wasm_file> <entry_point> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;

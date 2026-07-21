@@ -62,6 +62,8 @@ mod sys {
         pub fn host_data_len(idx: i32) -> i32;
         pub fn host_get_data(idx: i32, ptr: i32, max_len: i32) -> i32;
         pub fn host_set_data(idx: i32, ptr: i32, len: i32) -> i32;
+        // SDK v0.3 — cuentas de estado propias del programa (PDAs)
+        pub fn host_use_pda(idx: i32, seed_ptr: i32, seed_len: i32) -> i32;
     }
 
     // Stubs para compilar en el host (nunca se ejecutan en un contrato real).
@@ -87,6 +89,10 @@ mod sys {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn host_set_data(_idx: i32, _ptr: i32, _len: i32) -> i32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_use_pda(_idx: i32, _seed_ptr: i32, _seed_len: i32) -> i32 {
         0
     }
 }
@@ -291,6 +297,41 @@ pub fn write_u32(buf: &mut [u8], off: usize, v: u32) {
         Some(s) => s.copy_from_slice(&v.to_le_bytes()),
         None => abort(),
     }
+}
+
+// ============================================================================
+// SDK v0.3 — CUENTAS DE ESTADO PROPIAS DEL PROGRAMA (PDAs).
+//
+// Para estado COMPARTIDO que ningún usuario firma (un contador global, un
+// supply, un libro de órdenes), el contrato usa una cuenta cuya dirección es
+// una **PDA** derivada de `program_id + seed`. El cliente incluye esa dirección
+// en `accounts`; el contrato la "usa" con [`use_pda`], que la reclama (la pone
+// `owner = program_id`) la primera vez y confirma que es suya. A partir de ahí
+// el contrato lee/escribe su `data` con [`get_data`]/[`set_data`] (autorizado
+// porque el programa la posee — nadie firma como la PDA).
+//
+// La dirección off-chain se deriva con la MISMA fórmula
+// `SHA3-256("qchain-program-pda-v1" ‖ program_id ‖ seed)` (en el nodo:
+// `qchain_execution::wasm::derive_pda`; para el cliente, `qchain_wasm::program_pda`).
+// Como `program_id` entra en el hash, un programa NUNCA puede reclamar la PDA de
+// otro → sin front-running.
+// ============================================================================
+
+/// Reclama/usa la cuenta `accounts[idx]` como PDA de ESTE programa para `seed`.
+/// Devuelve `true` si la cuenta es genuinamente la PDA del programa (recién
+/// reclamada o ya suya) y quedó lista para leer/escribir su `data`; `false` si
+/// la cuenta declarada no es esa PDA o está ocupada por otro. Patrón típico:
+///
+/// ```ignore
+/// require!(use_pda(1, b"global"));   // accounts[1] es nuestra PDA "global"
+/// let mut buf = [0u8; 8];
+/// get_data(1, &mut buf);
+/// // ... mutar ...
+/// set_data(1, &buf);
+/// ```
+#[inline]
+pub fn use_pda(idx: u32, seed: &[u8]) -> bool {
+    unsafe { sys::host_use_pda(idx as i32, seed.as_ptr() as i32, seed.len() as i32) == 0 }
 }
 
 /// Define el punto de entrada del contrato: exporta la función `run` con aridad

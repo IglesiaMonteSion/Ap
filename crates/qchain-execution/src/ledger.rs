@@ -1689,7 +1689,7 @@ impl Ledger {
         // spend fuel - real execution hasn't started yet.
         let result = self
             .wasm
-            .call(module_bytes, entry_point, &args, accounts, is_signer, DEFAULT_FUEL_LIMIT)
+            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, DEFAULT_FUEL_LIMIT)
             .map_err(|e| ExecError::Wasm { message: e.to_string(), fuel_consumed: 0 })?;
 
         // Real, live-confirmed vulnerability closed here (see
@@ -1756,15 +1756,31 @@ impl Ledger {
             //     que el débito de saldo. Sin esto, un contrato malicioso podría
             //     sobrescribir la `data` de una víctima nombrada en `accounts`
             //     (p.ej. corromper el estado de otra cuenta) sin su firma.
+            // Cambio de owner: el ÚNICO permitido es RECLAMAR una cuenta FRESCA
+            // como PDA de ESTE programa (system → program_id sobre una cuenta con
+            // saldo 0 y data vacía). `host_use_pda` ya verificó que la dirección
+            // == derive_pda(program_id, seed), así que solo una PDA genuina de
+            // este programa llega acá; el borde vuelve a exigir que sea fresca.
             if before_owners.get(i).map(|o| *o != account_after.owner).unwrap_or(false) {
-                return Err(ExecError::ProgramError(
-                    "a contract may not change an account's owner".into(),
-                ));
+                let is_pda_claim = before_owners.get(i).map(|o| *o == Pubkey::system_program_id()).unwrap_or(false)
+                    && account_after.owner == program_id
+                    && before_balances.get(i).copied().unwrap_or(0) == 0
+                    && before_data.get(i).map(|d| d.is_empty()).unwrap_or(true);
+                if !is_pda_claim {
+                    return Err(ExecError::ProgramError(
+                        "a contract may not change an account's owner (only a fresh PDA claim is allowed)".into(),
+                    ));
+                }
             }
             let data_changed = before_data.get(i).map(|d| d != &account_after.data).unwrap_or(!account_after.data.is_empty());
             if data_changed {
+                // Autorizado si es el firmante, si el programa ya la poseía, o si
+                // la cuenta ES del programa tras esta ejecución (PDA recién
+                // reclamada por `host_use_pda` — el chequeo de owner de arriba ya
+                // garantizó que ese cambio a program_id fue un claim válido).
                 let authorized = signer_flags.get(i).copied().unwrap_or(false)
-                    || before_owners.get(i).map(|o| *o == program_id).unwrap_or(false);
+                    || before_owners.get(i).map(|o| *o == program_id).unwrap_or(false)
+                    || account_after.owner == program_id;
                 if !authorized {
                     let who = ix.accounts.get(i).copied().unwrap_or_else(Pubkey::system_program_id);
                     return Err(ExecError::Unauthorized(format!(
@@ -3714,6 +3730,64 @@ mod tests {
             ledger.store().get(&victim.pubkey()).map(|a| a.data).unwrap_or_default().is_empty(),
             "la data de la víctima quedó intacta"
         );
+    }
+
+    /// SDK v0.3 — PDA (estado propio del programa). Reclama la PDA de este
+    /// programa para la semilla "state" (accounts[idx]) y escribe 4 bytes en ella.
+    const USE_PDA_WAT: &str = r#"
+        (module
+            (import "env" "host_use_pda" (func $use_pda (param i32 i32 i32) (result i32)))
+            (import "env" "host_set_data" (func $set_data (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "state")
+            (data (i32.const 16) "\11\22\33\44")
+            (func (export "go") (param $idx i64)
+                (if (i32.lt_s (call $use_pda (i32.wrap_i64 (local.get $idx)) (i32.const 0) (i32.const 5)) (i32.const 0))
+                    (then unreachable))
+                (drop (call $set_data (i32.wrap_i64 (local.get $idx)) (i32.const 16) (i32.const 4)))
+            )
+        )
+    "#;
+
+    /// Un contrato reclama su PDA (estado compartido que nadie firma), la reusa,
+    /// y OTRO programa NO puede tocar la PDA del primero (sin front-running).
+    #[test]
+    fn a_program_owns_its_pda_and_another_program_cannot_touch_it() {
+        let mut ledger = new_test_ledger();
+        let deployer_a = Keypair::generate().unwrap();
+        let deployer_b = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer_a.pubkey(), 100_000_000);
+        ledger.credit(deployer_b.pubkey(), 100_000_000);
+        // deploy_wat firma con nonce 0, así que cada programa usa su propio deployer.
+        let prog_a = deploy_wat(&mut ledger, USE_PDA_WAT, "go", &deployer_a, &validator);
+        let prog_b = deploy_wat(&mut ledger, USE_PDA_WAT, "go", &deployer_b, &validator);
+
+        // La PDA de A para "state" (cualquier cliente la deriva con la misma fórmula).
+        let pda_a = crate::wasm::derive_pda(&prog_a, b"state");
+
+        let user = Keypair::generate().unwrap();
+        ledger.credit(user.pubkey(), 100_000_000);
+
+        // (1) A reclama su PDA fresca y le escribe estado: OK.
+        let ix = Instruction { program_id: prog_a, accounts: vec![user.pubkey(), pda_a], data: 1i64.to_le_bytes().to_vec() };
+        let tx = Transaction::new_signed(&user, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+        assert!(ledger.apply_transaction(&tx, &validator, 0).is_ok(), "A debe poder reclamar su propia PDA");
+        let claimed = ledger.store().get(&pda_a).expect("la PDA existe");
+        assert_eq!(claimed.owner, prog_a, "la PDA quedó owned por el programa A");
+        assert_eq!(claimed.data, vec![0x11, 0x22, 0x33, 0x44], "el estado compartido quedó persistido en la PDA");
+
+        // (2) A reusa su PDA (ya suya): OK, sin re-reclamar.
+        let ix2 = Instruction { program_id: prog_a, accounts: vec![user.pubkey(), pda_a], data: 1i64.to_le_bytes().to_vec() };
+        let tx2 = Transaction::new_signed(&user, 1, [0u8; 32], 50_000_000, vec![ix2]).unwrap();
+        assert!(ledger.apply_transaction(&tx2, &validator, 0).is_ok(), "A debe poder reusar su PDA ya reclamada");
+
+        // (3) B intenta usar la PDA de A: `use_pda` ve address != derive_pda(B,"state")
+        //     → devuelve -1 → el contrato de B hace trap → rechazado; la PDA de A intacta.
+        let ix3 = Instruction { program_id: prog_b, accounts: vec![user.pubkey(), pda_a], data: 1i64.to_le_bytes().to_vec() };
+        let tx3 = Transaction::new_signed(&user, 2, [0u8; 32], 50_000_000, vec![ix3]).unwrap();
+        assert!(ledger.apply_transaction(&tx3, &validator, 0).is_err(), "B no puede tocar la PDA de A (front-running imposible)");
+        assert_eq!(ledger.store().get(&pda_a).map(|a| a.owner), Some(prog_a), "la PDA de A sigue siendo de A");
     }
 
     #[test]

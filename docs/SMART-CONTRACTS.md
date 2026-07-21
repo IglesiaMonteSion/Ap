@@ -126,6 +126,7 @@ igual paga el fee de su intento.
 | **`set_data(idx, &bytes)`** | escribe la `data` de `accounts[idx]` (autorizada por el ledger) |
 | **`read_u64/read_i64/read_u32(buf, off)`** | lee un entero LE del buffer |
 | **`write_u64/write_i64/write_u32(buf, off, v)`** | escribe un entero LE en el buffer |
+| **`use_pda(idx, seed) -> bool`** | reclama/usa `accounts[idx]` como PDA del programa (SDK v0.3) |
 
 ## Estado estructurado on-chain (SDK v0.2)
 
@@ -161,11 +162,52 @@ cambiar si el llamador está autorizado sobre ella — es el **firmante**, o el
 puede sobrescribir la `data` de una víctima que no firmó. Tope de escritura:
 **16 KB** por cuenta. Un `owner` de cuenta **nunca** cambia por un contrato.
 
-> **Límite v0.2:** el estado se guarda en la cuenta del **firmante**. Cuentas de
-> estado **propias del programa** (estilo PDA de Solana, `owner == program_id`,
-> para estado compartido que ningún usuario firma) necesitan asignación de owner
-> — es el próximo incremento del SDK. El borde de autorización ya lo contempla
-> (la rama "programa la posee"), así que landeará sin cambio de seguridad.
+## Estado COMPARTIDO en cuentas del programa — PDAs (SDK v0.3)
+
+Para estado que **ningún usuario firma** (un contador global, un supply, un
+libro de órdenes), el contrato usa una cuenta **propia del programa** cuya
+dirección es una **PDA** (Program-Derived Address) derivada de
+`program_id + seed`. Cualquier usuario puede llamar al contrato; el estado
+compartido vive en la PDA, no en la cuenta de nadie.
+
+```rust
+// Contador GLOBAL: cualquiera suma al mismo total, guardado en la PDA "global".
+// accounts[0] = usuario (firma) ; accounts[1] = pda(program_id, "global")
+fn dispatch([sel, x, _y, _z]: [i64; 4]) {
+    require!(use_pda(1, b"global"));   // accounts[1] ES nuestra PDA (la reclama la 1ª vez)
+    let mut buf = [0u8; 16];
+    let n = get_data(1, &mut buf);
+    let mut total = if n >= 8 { read_u64(&buf, 0) } else { 0 };
+    total = total.saturating_add(x as u64);
+    write_u64(&mut buf, 0, total);
+    set_data(1, &buf);                 // persiste en la PDA (program-owned)
+}
+```
+
+Ejemplo completo: `crates/qchain-sdk/templates/shared_counter/`.
+
+**El cliente deriva la dirección de la PDA off-chain** (con la MISMA fórmula) y
+la incluye en `accounts`:
+
+```
+pda = SHA3-256("qchain-program-pda-v1" ‖ program_id(32) ‖ seed)
+```
+
+Con el signer: `qchain-wasm-signer program-pda <program_id> <seed>`. En el nodo:
+`qchain_execution::wasm::derive_pda`; para JS/wallet: `qchain_wasm::program_pda`.
+
+**Seguridad:** `use_pda` verifica que la cuenta declarada sea genuinamente la PDA
+de ESTE programa (`address == derive(program_id, seed)`), y la reclama
+(`owner = program_id`) solo si está **fresca**. Como el `program_id` entra en la
+derivación, **un programa nunca puede reclamar la PDA de otro** → sin
+front-running. Una vez reclamada, solo ese programa escribe su `data` (autorizado
+por `owner == program_id`, el mismo borde que los saldos).
+
+> **Límite v0.3:** la PDA arranca con saldo 0; para que un programa maneje fondos
+> propios (una tesorería on-chain), transferile QCH a la dirección de la PDA (es
+> una dirección normal) y el contrato los mueve con `transfer`/`debit` (el borde
+> ya autoriza debitar una cuenta program-owned). El SDK todavía no trae helpers de
+> alto nivel para eso — es el próximo incremento.
 
 Los syscalls crudos del host (`host_get_balance`, `host_set_balance`,
 `host_is_signer`, `host_log`, `host_verify_signature`) siguen disponibles para

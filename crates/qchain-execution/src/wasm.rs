@@ -15,8 +15,26 @@
 
 use borsh::BorshDeserialize;
 use qchain_core::Account;
-use qchain_crypto::{AlgorithmStatus, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA};
+use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry, ALGORITHM_ED25519, ALGORITHM_ML_DSA_65, ALGORITHM_SLH_DSA};
+use sha3::{Digest, Sha3_256};
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
+
+/// Separador de dominio para derivar una dirección de cuenta PROPIA DEL PROGRAMA
+/// (PDA, SDK v0.3): `pda = SHA3-256(PDA_DOMAIN ‖ program_id(32) ‖ seed)`. La
+/// MISMA fórmula la usa el cliente off-chain (`qchain_wasm::program_pda`) para
+/// derivar la dirección que incluye en `ix.accounts`. Como el `program_id`
+/// entra en el hash, un programa NUNCA puede derivar (ni reclamar) la PDA de
+/// otro programa → sin front-running entre programas.
+pub(crate) const PDA_DOMAIN: &[u8] = b"qchain-program-pda-v1";
+
+/// Deriva la dirección PDA de `program_id` para `seed` (misma fórmula on/off-chain).
+pub fn derive_pda(program_id: &Pubkey, seed: &[u8]) -> Pubkey {
+    let mut h = Sha3_256::new();
+    h.update(PDA_DOMAIN);
+    h.update(program_id.0);
+    h.update(seed);
+    Pubkey::new(h.finalize().into())
+}
 
 /// A real, live-confirmed memory-bomb DoS this closes: fuel meters
 /// instructions, not the data volume they touch (confirmed in
@@ -47,6 +65,13 @@ pub struct WasmCallResult {
 }
 
 struct HostState {
+    /// El `program_id` de la instrucción en ejecución (SDK v0.3): la identidad
+    /// bajo la que se derivan/reclaman las PDAs (`host_use_pda`).
+    program_id: Pubkey,
+    /// Las DIRECCIONES de `accounts` (mismo orden). `accounts` son los `Account`
+    /// pero no llevan su propia clave; para comparar contra una PDA derivada se
+    /// necesitan las direcciones declaradas en la instrucción.
+    keys: Vec<Pubkey>,
     accounts: Vec<Account>,
     /// `is_signer[i]` is true when `accounts[i]` is the transaction's
     /// authenticated payer - the only notion of "signer" this single-signer
@@ -210,6 +235,45 @@ impl WasmExecutor {
             },
         )?;
 
+        // SDK v0.3 — cuentas de estado PROPIAS DEL PROGRAMA (PDAs). Verifica que
+        // `accounts[idx]` sea genuinamente la PDA de ESTE programa para `seed`
+        // (`address == derive_pda(program_id, seed)`), y si es una cuenta FRESCA
+        // (system-owned, saldo 0, data vacía) la RECLAMA poniendo su owner =
+        // program_id. Devuelve 0 si la cuenta ya es utilizable por el programa
+        // (recién reclamada o ya suya), -1 si no es la PDA o está ocupada por
+        // otro. Como `program_id` entra en la derivación, un programa jamás
+        // puede reclamar la PDA de otro (sin front-running). El borde del ledger
+        // vuelve a autorizar el cambio de owner (solo fresh system→program_id).
+        linker.func_wrap(
+            "env",
+            "host_use_pda",
+            |mut caller: Caller<'_, HostState>, idx: i32, seed_ptr: i32, seed_len: i32| -> i32 {
+                let Some(seed) = read_memory(&mut caller, seed_ptr, seed_len) else {
+                    return -1;
+                };
+                let program_id = caller.data().program_id;
+                let expected = derive_pda(&program_id, &seed);
+                let idx = idx as usize;
+                let Some(key) = caller.data().keys.get(idx).copied() else {
+                    return -1;
+                };
+                if key != expected {
+                    return -1; // la cuenta declarada NO es la PDA de este programa
+                }
+                let Some(acc) = caller.data_mut().accounts.get_mut(idx) else {
+                    return -1;
+                };
+                if acc.owner == program_id {
+                    return 0; // ya es nuestra, lista para usar
+                }
+                if acc.owner == Pubkey::system_program_id() && acc.balance == 0 && acc.data.is_empty() {
+                    acc.owner = program_id; // reclamar la cuenta fresca como PDA del programa
+                    return 0;
+                }
+                -1 // existe y no es nuestra (ocupada) — no reclamable
+            },
+        )?;
+
         // Exposes the crypto-agility layer to contracts (ARCHITECTURE.md
         // §4): a contract can verify a signature against any registered
         // scheme individually, e.g. for custom multisig authorization
@@ -274,11 +338,14 @@ impl WasmExecutor {
     /// only via `host_get_balance`/`host_set_balance` by index - never
     /// directly. `is_signer` (same length/order as `accounts`) is what
     /// `host_is_signer` reports back to the contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn call(
         &self,
         wasm_bytes: &[u8],
         entry_point: &str,
         params: &[Val],
+        program_id: Pubkey,
+        keys: Vec<Pubkey>,
         accounts: Vec<Account>,
         is_signer: Vec<bool>,
         fuel_limit: u64,
@@ -287,7 +354,7 @@ impl WasmExecutor {
         let linker = self.build_linker()?;
 
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let host_state = HostState { accounts, is_signer, log: Vec::new(), limits };
+        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), limits };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
         store.limiter(|state| &mut state.limits);
@@ -366,6 +433,8 @@ mod tests {
                 &wasm_bytes,
                 "transfer",
                 &[Val::I32(0), Val::I32(1), Val::I64(300)],
+                Pubkey::new([9u8; 32]),
+                vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])],
                 accounts,
                 vec![true, false],
                 1_000_000,
@@ -389,7 +458,7 @@ mod tests {
         // the call fails, to bill for fuel actually spent, not just detect
         // failure.
         let result = executor
-            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], accounts, vec![true, false], 1)
+            .call(&wasm_bytes, "transfer", &[Val::I32(0), Val::I32(1), Val::I64(300)], Pubkey::new([9u8; 32]), vec![Pubkey::new([1u8; 32]), Pubkey::new([2u8; 32])], accounts, vec![true, false], 1)
             .unwrap();
         assert!(result.trap.is_some(), "1 unit of fuel must not be enough to complete a real call");
     }
@@ -420,7 +489,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(BURN_THEN_TRAP_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], vec![], vec![], 1_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "burn_then_trap", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 1_000_000).unwrap();
         assert!(result.trap.is_some(), "the deliberate `unreachable` must be reported as a trap");
         assert!(result.fuel_consumed > 0, "fuel spent looping before the trap must not be reported as zero");
     }
@@ -446,7 +515,7 @@ mod tests {
         let wasm_bytes = wat::parse_str(MEMORY_BOMB_WAT).unwrap();
         let executor = WasmExecutor::new().unwrap();
 
-        let result = executor.call(&wasm_bytes, "bomb", &[], vec![], vec![], 5_000_000).unwrap();
+        let result = executor.call(&wasm_bytes, "bomb", &[], Pubkey::system_program_id(), vec![], vec![], vec![], 5_000_000).unwrap();
         assert!(result.trap.is_some(), "growing memory past MAX_CONTRACT_MEMORY_BYTES must trap, not succeed");
         assert!(result.fuel_consumed < 100, "the trap must fire on the grow itself, not after real work - got {} fuel", result.fuel_consumed);
     }
@@ -468,7 +537,7 @@ mod tests {
         let linker = executor.build_linker().unwrap();
         let accounts = vec![wallet(0), wallet(0)];
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![true, false], log: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let func = instance.get_func(&mut store, "check").unwrap();
@@ -520,7 +589,7 @@ mod tests {
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { accounts, is_signer: vec![], log: vec![], limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![], log: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
