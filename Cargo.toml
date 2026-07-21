@@ -20,10 +20,10 @@ members = [
 # workspace so `cargo build --workspace` never unifies its `pure` crypto
 # feature with the node's `liboqs` feature (the two backends are mutually
 # exclusive). Build it with: cd crates/qchain-wasm && wasm-pack build / cargo build.
-exclude = ["crates/qchain-wasm"]
+exclude = ["crates/qchain-wasm", "crates/qchain-sdk"]
 
 [workspace.package]
-version = "6.8.1"
+version = "6.9.0"
 edition = "2021"
 
 # Defense-in-depth for a ledger: catch integer overflow/underflow as a loud

@@ -1,0 +1,16 @@
+[package]
+name = "qchain-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "SDK de alto nivel para escribir contratos inteligentes de Qchain en Rust (compila a wasm32)."
+license = "MIT OR Apache-2.0"
+
+# Su propio workspace: se compila aparte del workspace principal (targetea wasm32
+# / no_std), igual que qchain-wasm. No debe entrar en `cargo build --workspace`.
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+# Sin dependencias: es no_std y solo usa `core` + los syscalls del host.
+[dependencies]

@@ -1,0 +1,21 @@
+[package]
+name = "payments"
+version = "0.1.0"
+edition = "2021"
+
+# Contrato de ejemplo standalone (su propio workspace, se compila a wasm32 aparte).
+[workspace]
+
+[lib]
+# cdylib = produce el .wasm cargable por el ledger.
+crate-type = ["cdylib"]
+
+[dependencies]
+qchain-sdk = { path = "../.." }
+
+[profile.release]
+opt-level = "z"   # optimizar para TAMAÑO (los contratos tienen tope de 256 KB)
+lto = true
+panic = "abort"   # sin unwinding: un panic = trap, más chico
+strip = true
+codegen-units = 1
