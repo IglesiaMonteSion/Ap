@@ -101,6 +101,7 @@ fn base_router(engine: Arc<Engine>) -> Router {
     Router::new()
         .route("/", get(explorer))
         .route("/tx", post(submit_tx))
+        .route("/simulate", post(simulate_tx))
         .route("/account/:address", get(get_account))
         .route("/stake/:address", get(get_stake))
         .route("/stake_v7/:address", get(get_stake_v7))
@@ -215,6 +216,28 @@ async fn explorer() -> impl axum::response::IntoResponse {
 async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let hash = engine.submit_transaction(tx).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(json!({ "hash": hex::encode(hash) })))
+}
+
+/// DRY-RUN a transaction and report its predicted outcome WITHOUT committing
+/// (QCH-WALLET-001): a wallet POSTs the (signed) tx here before broadcasting so
+/// it can show the user the real fee + resulting balances + whether it would
+/// succeed — instead of signing/broadcasting blind. Read-only: runs on a scratch
+/// ledger, never touches consensus/state (see `Ledger::simulate`).
+async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Json<serde_json::Value> {
+    let sim = engine.simulate_transaction(&tx).await;
+    let changes: Vec<serde_json::Value> = sim
+        .changes
+        .iter()
+        .map(|(pk, before, after)| json!({ "address": pk.to_string(), "before": before.to_string(), "after": after.to_string() }))
+        .collect();
+    Json(json!({
+        "ok": sim.ok,
+        "error": sim.error,
+        "fee": sim.fee.to_string(),
+        "payer_before": sim.payer_before.to_string(),
+        "payer_after": sim.payer_after.to_string(),
+        "changes": changes,
+    }))
 }
 
 async fn get_account(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<Account>, (StatusCode, String)> {

@@ -1212,8 +1212,10 @@
     <p class="msub">Revisá los datos. Una transferencia es <b>irreversible</b>.</p>
     <div class="cf-row"><span class="cf-k">Para</span><span class="cf-v" id="cf-to">—</span></div>
     <div class="cf-row"><span class="cf-k">Monto</span><span class="cf-v" id="cf-amt">—</span></div>
-    <div class="cf-row"><span class="cf-k">Fee de red (aprox)</span><span class="cf-v" id="cf-fee">—</span></div>
-    <div class="cf-row cf-total"><span class="cf-k">Total aprox</span><span class="cf-v" id="cf-total">—</span></div>
+    <div class="cf-row"><span class="cf-k">Fee de red</span><span class="cf-v" id="cf-fee">—</span></div>
+    <div class="cf-row"><span class="cf-k">Saldo después</span><span class="cf-v" id="cf-after">—</span></div>
+    <div class="cf-row cf-total"><span class="cf-k">Total</span><span class="cf-v" id="cf-total">—</span></div>
+    <p class="hint" id="cf-sim" style="margin-top:10px;display:none"></p>
     <div style="display:flex;gap:10px;margin-top:18px">
       <button class="btn-sec" id="cf-cancel" style="flex:1">Cancelar</button>
       <button class="btn-block" id="cf-ok" style="flex:1;margin:0">Confirmar y enviar</button>
@@ -2241,43 +2243,66 @@ $("s-max").onclick=async()=>{
 let pendingSend=null;
 function closeConfirm(){ $("confirm-bg").classList.remove("show"); }
 
-// Paso 1: validar y mostrar la pantalla de confirmación con el fee estimado.
-// Enviar es IRREVERSIBLE — una confirmación explícita evita errores caros.
+// Paso 1: validar → FIRMAR en el navegador → SIMULAR en el nodo (dry-run, sin
+// comprometer nada) → mostrar la confirmación con el resultado REAL (fee exacto,
+// saldo después, y si fallaría). QCH-WALLET-001: el usuario ve exactamente qué
+// va a pasar ANTES de autorizar el envío, en vez de firmar/enviar a ciegas.
+// Enviar es IRREVERSIBLE.
 $("s-btn").onclick=async()=>{
   const to=$("s-to").value.trim(), amt=$("s-amount").value.trim(), msg=$("s-msg"); msg.className="msg"; msg.textContent="";
   if(!to){ msg.className="msg err"; msg.style.display="block"; msg.textContent="poné la dirección de destino"; return; }
   let amount; try{ amount=qchToUnits(amt); }catch(e){ msg.className="msg err"; msg.style.display="block"; msg.textContent="monto inválido (ej: 1,5)"; return; }
   if(amount<=0n){ msg.className="msg err"; msg.style.display="block"; msg.textContent="el monto debe ser mayor a 0"; return; }
-  // Fee estimado: base_fee_per_byte (vivo) × tamaño real de una transferencia
-  // firmada — la misma cuenta que usa el botón "máx".
-  let fee;
-  try{ const node=await api("/api/node"); fee=BigInt(node.base_fee_per_byte||180)*TX_BYTES; }catch(e){ fee=BigInt(180)*TX_BYTES; }
-  const nm=contactName(to);
-  $("cf-to").innerHTML = nm ? `${esc(nm)}<small class="mono">${esc(short(to))}</small>` : `<span class="mono">${esc(short(to))}</span>`;
-  $("cf-amt").textContent=qchDisp(amount);
-  $("cf-fee").textContent="≈ "+qchDisp(fee);
-  $("cf-total").textContent="≈ "+qchDisp(amount+fee);
-  pendingSend={to, amount, amt};
-  $("confirm-bg").classList.add("show");
-};
-$("cf-cancel").onclick=closeConfirm;
-$("confirm-bg").onclick=(e)=>{ if(e.target===$("confirm-bg")) closeConfirm(); };
-
-// Paso 2: firmar en el navegador y difundir al nodo (tras confirmar).
-$("cf-ok").onclick=async()=>{
-  if(!pendingSend) return closeConfirm();
-  const {to, amount, amt}=pendingSend; const msg=$("s-msg");
-  closeConfirm();
-  $("s-btn").disabled=true; $("cf-ok").disabled=true;
-  msg.className="msg"; msg.style.display="block"; msg.textContent="firmando en tu navegador…";
+  $("s-btn").disabled=true;
+  msg.className="msg"; msg.style.display="block"; msg.textContent="preparando y simulando…";
   try{
     const seed=sendFromSeed();          // cuenta origen elegida (default = activa)
     const addr=addressFromSeed(seed);
     const acct=await api("/api/account/"+encodeURIComponent(addr));
     const cid=await api("/api/chain_id");
     const chainId=fromHex(cid.chain_id);
+    // Firmar en el navegador (la semilla nunca sale). Nada se difunde todavía.
     const txJson=signTransfer(seed, to, amount, BigInt(acct.nonce), chainId, 10000000n);
-    msg.textContent="enviando al nodo…";
+    // DRY-RUN contra el nodo (no compromete nada): trae fee exacto + resultado.
+    let sim=null;
+    try{ const r=await fetch("/api/simulate",{method:"POST",headers:{"content-type":"application/json"},body:txJson}); if(r.ok) sim=await r.json(); }catch(e){}
+    // Fee: el exacto de la simulación; si el nodo no soporta /simulate, se cae al estimado.
+    const fee = (sim && sim.fee!=null) ? BigInt(sim.fee) : (BigInt((await api("/api/node").catch(()=>({}))).base_fee_per_byte||180)*TX_BYTES);
+    const nm=contactName(to);
+    $("cf-to").innerHTML = nm ? `${esc(nm)}<small class="mono">${esc(short(to))}</small>` : `<span class="mono">${esc(short(to))}</span>`;
+    $("cf-amt").textContent=qchDisp(amount);
+    $("cf-fee").textContent=qchDisp(fee);
+    $("cf-total").textContent=qchDisp(amount+fee);
+    const simNote=$("cf-sim"); const okBtn=$("cf-ok");
+    if(sim && sim.ok===false){
+      // La simulación dice que FALLARÍA — mostrar el motivo real y bloquear el envío.
+      $("cf-after").textContent="—";
+      simNote.style.display="block"; simNote.className="msg err"; simNote.style.display="block";
+      simNote.textContent="⚠ Esta transferencia FALLARÍA: "+esc(sim.error||"motivo desconocido")+". No se enviará.";
+      okBtn.disabled=true;
+    } else {
+      if(sim && sim.payer_after!=null){ $("cf-after").textContent=qchDisp(BigInt(sim.payer_after)); }
+      else { $("cf-after").textContent="—"; }
+      simNote.style.display = sim ? "block" : "none";
+      if(sim){ simNote.className="hint"; simNote.textContent="✓ Simulado contra el nodo: se ejecutaría correctamente."; }
+      okBtn.disabled=false;
+    }
+    pendingSend={txJson, to, amt};
+    $("confirm-bg").classList.add("show");
+  }catch(e){ msg.className="msg err"; msg.textContent=e.message||"no se pudo preparar la transferencia"; }
+  $("s-btn").disabled=false;
+};
+$("cf-cancel").onclick=closeConfirm;
+$("confirm-bg").onclick=(e)=>{ if(e.target===$("confirm-bg")) closeConfirm(); };
+
+// Paso 2: difundir la tx YA firmada+simulada al nodo (tras confirmar).
+$("cf-ok").onclick=async()=>{
+  if(!pendingSend||!pendingSend.txJson) return closeConfirm();
+  const {txJson, to, amt}=pendingSend; const msg=$("s-msg");
+  closeConfirm();
+  $("s-btn").disabled=true; $("cf-ok").disabled=true;
+  msg.className="msg"; msg.style.display="block"; msg.textContent="enviando al nodo…";
+  try{
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
     const body=await r.json().catch(()=>({}));
     if(!r.ok) throw new Error(body.error||("error "+r.status));

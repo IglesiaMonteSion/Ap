@@ -1975,6 +1975,18 @@ impl Engine {
         state.ledger.store().get(pk)
     }
 
+    /// DRY-RUN a transaction against committed state WITHOUT committing anything
+    /// (QCH-WALLET-001) — the `/simulate` endpoint. Runs on a throwaway scratch
+    /// ledger, so it can never touch consensus/state; used by a wallet to show
+    /// the real predicted outcome (fee, resulting balances, success/failure)
+    /// before the user authorizes broadcasting. The fee collector doesn't affect
+    /// the payer's outcome, so we use the payer as a harmless placeholder.
+    pub async fn simulate_transaction(&self, tx: &qchain_core::Transaction) -> qchain_execution::SimOutcome {
+        let state = self.state.lock().await;
+        let round = state.next_round;
+        state.ledger.simulate(tx, &tx.message.payer, round)
+    }
+
     /// v7 reward/unbonding timing for the wallet's staking progress bars:
     /// `(current committed round, rounds per quanto, round interval ms)`. The
     /// wallet uses these to draw "next reward in ~Xh" and the unbonding

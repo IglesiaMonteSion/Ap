@@ -8,7 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use qchain_consensus::{ConsensusState, DagStore, ValidatorInfo, ValidatorSchedule, ValidatorSet};
 use qchain_execution::{
-    genesis_params_account_data, genesis_registry_account_data, GovernanceProgram, Ledger, Program, RewardPoolData, StakingProgram, SystemProgram,
+    genesis_params_account_data, genesis_registry_account_data, Ledger, RewardPoolData,
     GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
 use qchain_network::{Network, PeerInfo};
@@ -314,30 +314,9 @@ async fn main() -> anyhow::Result<()> {
             config.rounds_per_quanto()
         );
     }
-    ledger.register_program(qchain_crypto::Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
-    // v7 replaces the v6 shares-per-reward staking program with the shares+index
-    // `StakingV7Program` under the same well-known id. (Dispatching the v7
-    // validator instructions — `ValidatorV7Program`, whose id collides — is the
-    // next wiring sub-step.)
-    if config.economics_v7 {
-        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(qchain_execution::staking_v7::StakingV7Program)));
-        // The v7 validator program lives under its OWN id (both v7 instruction
-        // enums start at discriminant 0, so they can't share one id — see
-        // `VALIDATOR_V7_PROGRAM_ID`).
-        ledger.register_program(
-            qchain_execution::ids::VALIDATOR_V7_PROGRAM_ID,
-            Program::Native(Box::new(qchain_execution::validator_v7::ValidatorV7Program)),
-        );
-        // The v7 treasury program (also its own id): releases the genesis-locked
-        // treasury supply only on an authority-signed `Release`.
-        ledger.register_program(
-            qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
-            Program::Native(Box::new(qchain_execution::treasury_v7::TreasuryV7Program)),
-        );
-    } else {
-        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(StakingProgram)));
-    }
-    ledger.register_program(GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(GovernanceProgram)));
+    // Register the standard native programs (chosen by economics_v7). Shared
+    // with `Ledger::simulate` so a dry-run dispatches exactly like the live node.
+    qchain_execution::register_standard_programs(&mut ledger, config.economics_v7);
     if is_fresh {
         for alloc in &config.genesis {
             ledger.credit(alloc.address, alloc.balance);

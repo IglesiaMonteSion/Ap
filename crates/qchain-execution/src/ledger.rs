@@ -95,6 +95,35 @@ pub enum Program {
     Wasm { module_bytes: Vec<u8>, entry_point: String },
 }
 
+/// Register the standard native programs a node runs, chosen by `economics_v7`.
+/// Shared by `qchain-node`'s genesis wiring AND `Ledger::simulate`, so a dry-run
+/// dispatches exactly like the live ledger (same programs under the same ids).
+pub fn register_standard_programs(ledger: &mut Ledger, economics_v7: bool) {
+    ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(crate::native::SystemProgram)));
+    if economics_v7 {
+        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(crate::staking_v7::StakingV7Program)));
+        ledger.register_program(crate::ids::VALIDATOR_V7_PROGRAM_ID, Program::Native(Box::new(crate::validator_v7::ValidatorV7Program)));
+        ledger.register_program(crate::ids::TREASURY_V7_PROGRAM_ID, Program::Native(Box::new(crate::treasury_v7::TreasuryV7Program)));
+    } else {
+        ledger.register_program(STAKING_PROGRAM_ID, Program::Native(Box::new(crate::staking::StakingProgram)));
+    }
+    ledger.register_program(crate::ids::GOVERNANCE_PROGRAM_ID, Program::Native(Box::new(crate::governance::GovernanceProgram)));
+}
+
+/// Outcome of a non-committing `Ledger::simulate` dry-run (QCH-WALLET-001): what
+/// a wallet shows the user BEFORE authorizing a broadcast. `fee` is the real fee
+/// the transaction would be charged; `changes` are the (address, before, after)
+/// balances of every seeded account whose balance the dry-run moved.
+#[derive(Clone, Debug)]
+pub struct SimOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub fee: u64,
+    pub payer_before: u64,
+    pub payer_after: u64,
+    pub changes: Vec<(Pubkey, u64, u64)>,
+}
+
 /// Persistable snapshot of a `Ledger`'s running economic counters. Written to
 /// `data_dir/economics` by `qchain-node` and restored on startup so lifetime
 /// burn/earnings totals survive a restart. `validator_commissions` is a `Vec`
@@ -288,6 +317,95 @@ impl Ledger {
     /// tally (§21.2).
     pub fn rounds_per_quanto(&self) -> u64 {
         self.rounds_per_quanto
+    }
+
+    /// Genesis-baked per-quanto compounding rate — needed to build a matching
+    /// scratch ledger for `simulate`.
+    pub fn quanto_rate_fp(&self) -> u128 {
+        self.quanto_rate_fp
+    }
+
+    /// DRY-RUN a transaction against a SCRATCH copy of committed state, WITHOUT
+    /// committing anything (QCH-WALLET-001). Used by the node's `/simulate`
+    /// endpoint so a wallet can show the real predicted outcome — exact fee,
+    /// resulting balances, and whether it would succeed — BEFORE the user
+    /// authorizes broadcasting it, instead of signing blind.
+    ///
+    /// SAFETY: this runs on a brand-new throwaway `Ledger` over an in-memory
+    /// store seeded from committed state; it can NEVER touch the live ledger,
+    /// its tree, or consensus — so it cannot fork or move funds. Worst case is a
+    /// slightly-off preview (a state read the scratch store didn't seed), never
+    /// a correctness/safety issue. Signature verification is skipped
+    /// (`apply_transaction_presigned`): it's a preview, and the real admission +
+    /// commit paths still verify for real.
+    pub fn simulate(&self, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
+        use qchain_storage::InMemoryStore;
+        // Seed the scratch store with everything `apply` can read for a wallet's
+        // transaction: the payer, the fee collector, EVERY protocol singleton,
+        // and each instruction's program account + declared accounts. This is
+        // O(tx-size), not O(state). A missed read only dents preview accuracy,
+        // never safety.
+        let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, crate::ids::TREASURY_ACCOUNT_ID];
+        for i in 1u8..=15u8 {
+            want.push(Pubkey::new([i; 32]));
+        }
+        for ix in &tx.message.instructions {
+            want.push(ix.program_id);
+            want.extend(ix.accounts.iter().copied());
+        }
+        let mut scratch = InMemoryStore::new();
+        let mut before: HashMap<Pubkey, u64> = HashMap::new();
+        for pk in &want {
+            // Record the before-balance for EVERY candidate (0 if the account
+            // doesn't exist yet, e.g. a brand-new recipient) so `changes` below
+            // captures newly-created accounts too, not just pre-existing ones.
+            match self.store.get(pk) {
+                Some(a) => {
+                    before.insert(*pk, a.balance);
+                    scratch.set(*pk, a);
+                }
+                None => {
+                    before.entry(*pk).or_insert(0);
+                }
+            }
+        }
+        let payer_before = self.store.get(&tx.message.payer).map(|a| a.balance).unwrap_or(0);
+
+        let mut sim = match Ledger::new_with_config(
+            Box::new(scratch),
+            self.is_compressed(),
+            self.is_economics_v7(),
+            self.quanto_rate_fp(),
+            self.rounds_per_quanto(),
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                return SimOutcome {
+                    ok: false,
+                    error: Some(format!("simulation init failed: {e}")),
+                    fee: 0,
+                    payer_before,
+                    payer_after: payer_before,
+                    changes: vec![],
+                }
+            }
+        };
+        register_standard_programs(&mut sim, self.is_economics_v7());
+
+        let result = sim.apply_transaction_presigned(tx, fee_collector, round);
+        let payer_after = sim.get_balance(&tx.message.payer);
+        let mut changes: Vec<(Pubkey, u64, u64)> = before
+            .iter()
+            .filter_map(|(pk, b)| {
+                let after = sim.get_balance(pk);
+                (after != *b).then_some((*pk, *b, after))
+            })
+            .collect();
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        match result {
+            Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes },
+            Err(e) => SimOutcome { ok: false, error: Some(e.to_string()), fee: 0, payer_before, payer_after: payer_before, changes: vec![] },
+        }
     }
 
     /// Close every reward quanto that has fully elapsed by `current_round`,
@@ -1929,6 +2047,53 @@ mod tests {
         let at_edge = mk(11);
         l.apply_transaction(&at_edge, &proposer, 11).unwrap();
         assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH, "en el borde exacto (<=) ejecuta");
+    }
+
+    /// QCH-WALLET-001: `simulate` is a DRY-RUN — it reports the real outcome
+    /// (ok, fee, resulting balances) WITHOUT committing anything to the live
+    /// ledger, and a doomed transfer reports `ok:false` instead of mutating.
+    #[test]
+    fn simulate_predicts_the_outcome_without_committing() {
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let mut l = new_test_ledger();
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let alice_before = l.get_balance(&alice.pubkey());
+
+        let mk = |amount: u64, payer: &Keypair| {
+            let transfer = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![payer.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount }).unwrap(),
+            };
+            Transaction::new_signed(payer, 0, [0u8; 32], 50_000_000, vec![transfer]).unwrap()
+        };
+
+        // A valid transfer: simulate says ok, charges a real fee, and predicts
+        // the payer's balance drops by amount+fee — but the LIVE ledger is
+        // untouched (alice still full, bob still zero).
+        let tx = mk(5 * qchain_core::UNITS_PER_QCH, &alice);
+        let sim = l.simulate(&tx, &proposer, 1);
+        assert!(sim.ok, "a fundable transfer must simulate ok, got {:?}", sim.error);
+        assert!(sim.fee > 0, "the simulated fee must be non-zero");
+        assert_eq!(sim.payer_before, alice_before);
+        assert_eq!(sim.payer_after, alice_before - 5 * qchain_core::UNITS_PER_QCH - sim.fee, "predicted payer balance = before - amount - fee");
+        assert!(sim.changes.iter().any(|(pk, _, after)| *pk == bob && *after == 5 * qchain_core::UNITS_PER_QCH), "bob's predicted balance is the amount");
+        // NOTHING committed.
+        assert_eq!(l.get_balance(&alice.pubkey()), alice_before, "simulate must NOT mutate the live ledger");
+        assert_eq!(l.get_balance(&bob), 0, "simulate must NOT credit the recipient");
+
+        // The real apply then matches the simulation.
+        l.apply_transaction(&tx, &proposer, 1).unwrap();
+        assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH);
+
+        // A doomed transfer (a broke payer) simulates ok:false, not a mutation.
+        let broke = Keypair::generate().unwrap();
+        let doomed = mk(5 * qchain_core::UNITS_PER_QCH, &broke);
+        let sim2 = l.simulate(&doomed, &proposer, 2);
+        assert!(!sim2.ok, "a transfer the payer can't afford must simulate as failing");
+        assert!(sim2.error.is_some(), "a failing simulation reports why");
     }
 
     /// A v7-economics ledger: shares+index staking (StakingV7Program) + quanto

@@ -198,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/stake/:address", get(stake_ep))
         .route("/api/stake_v7/:address", get(stake_v7_ep))
         .route("/api/relay-tx", post(relay_tx))
+        .route("/api/simulate", post(simulate_tx))
         .route("/api/config", get(config))
         .route("/api/node", get(node_status))
         // Info pública (no expone claves): el QR es solo la dirección
@@ -595,6 +596,31 @@ async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> R
     if !resp.status().is_success() {
         let msg = resp.text().await.unwrap_or_default();
         return Err(ApiError::bad(format!("el nodo rechazó la transacción: {msg}")));
+    }
+    let v: Value = resp.json().await.map_err(ApiError::internal)?;
+    Ok(Json(v))
+}
+
+/// DRY-RUN a browser-signed transaction against the node's `/simulate` (read-only)
+/// so the wallet can show the user the real predicted outcome (fee, resulting
+/// balance, success/failure) BEFORE they authorize broadcasting it — QCH-WALLET-001.
+/// Nothing is committed; the node runs it on a scratch ledger.
+async fn simulate_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+    const MAX_RELAY_BODY: usize = 256 * 1024;
+    if body.len() > MAX_RELAY_BODY {
+        return Err(ApiError::bad(format!("transacción demasiado grande ({} bytes, máximo {})", body.len(), MAX_RELAY_BODY)));
+    }
+    let resp = st
+        .http
+        .post(format!("{}/simulate", st.rpc))
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+    if !resp.status().is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(ApiError::bad(format!("el nodo no pudo simular la transacción: {msg}")));
     }
     let v: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(v))
