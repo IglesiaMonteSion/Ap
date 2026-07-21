@@ -1373,6 +1373,11 @@ pub struct ProgramEntry {
     pub entry_point: String,
     /// Size of the deployed bytecode in bytes.
     pub size_bytes: usize,
+    /// The address that DEPLOYED this contract (re-audit #4 provenance): recorded
+    /// on-chain by `DeployProgram` and bound to the program address by
+    /// construction (see `native::derive_program_address`). Lets a client tell
+    /// WHO deployed a contract, alongside verifying WHAT bytecode it is.
+    pub deployer: String,
     /// Liquid QCH held by the program account (usually 0 for a plain contract).
     #[serde(serialize_with = "ser_u64_str")]
     pub balance: u64,
@@ -2515,8 +2520,8 @@ impl Engine {
             // Decode the program data for its entry point + size. A loader-owned
             // account whose data doesn't decode is skipped (shouldn't happen for
             // a real DeployProgram, but never panic on snapshot data).
-            let (entry_point, size_bytes) = match borsh::from_slice::<WasmProgramData>(&sa.account.data) {
-                Ok(w) => (w.entry_point, w.module_bytes.len()),
+            let (entry_point, size_bytes, deployer) = match borsh::from_slice::<WasmProgramData>(&sa.account.data) {
+                Ok(w) => (w.entry_point, w.module_bytes.len(), w.deployer.to_string()),
                 Err(_) => continue,
             };
             programs.push(ProgramEntry {
@@ -2524,6 +2529,7 @@ impl Engine {
                 code_hash: hex::encode(sa.account.code_hash),
                 entry_point,
                 size_bytes,
+                deployer,
                 balance: sa.account.balance,
             });
         }
@@ -2533,6 +2539,33 @@ impl Engine {
         let count = programs.len();
         programs.truncate(limit);
         ProgramsResponse { count, round: cached.round, merkle_root: cached.merkle_root.clone(), programs }
+    }
+
+    /// A SINGLE deployed contract's metadata by address (`GET /program/:address`)
+    /// — re-audit #4: what `qchain verify-program` fetches to compare a deployed
+    /// contract's `code_hash` against a locally-compiled `.wasm` (reproducible-
+    /// build verification, the client-side "is this the bytecode I audited"). A
+    /// direct committed-store read (not the TTL snapshot), so the code_hash is
+    /// the live on-chain value. Returns `None` if no WASM program lives there.
+    pub async fn program(&self, address: &Pubkey) -> Option<ProgramEntry> {
+        use qchain_execution::ids::LOADER_PROGRAM_ID;
+        use qchain_execution::native::WasmProgramData;
+        let account = {
+            let state = self.state.lock().await;
+            state.ledger.store().get(address)?
+        };
+        if account.owner != LOADER_PROGRAM_ID {
+            return None;
+        }
+        let w = borsh::from_slice::<WasmProgramData>(&account.data).ok()?;
+        Some(ProgramEntry {
+            address: address.to_string(),
+            code_hash: hex::encode(account.code_hash),
+            entry_point: w.entry_point,
+            size_bytes: w.module_bytes.len(),
+            deployer: w.deployer.to_string(),
+            balance: account.balance,
+        })
     }
 
     /// This process's live RAM/CPU/disk/thread usage (see `ResourcesResponse`).

@@ -653,6 +653,26 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// Verify a DEPLOYED contract is byte-exactly a local `.wasm` (re-audit #4,
+    /// reproducible-build verification - the client-side "is this the bytecode I
+    /// audited"). Fetches the on-chain `code_hash` from `/program/<address>` and
+    /// compares it to SHA3-256 of your local file. MATCH proves the deployed
+    /// contract runs exactly that bytecode (the node enforces `code_hash` == the
+    /// executed module); it also prints WHO deployed it. Trust anchor: whatever
+    /// you build the `.wasm` from (audited source, reproducibly). NOTE: this is
+    /// the client-side equivalent of an explorer's "verified source" - a full
+    /// on-chain published-source registry remains future work.
+    VerifyProgram {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The deployed program's on-chain address.
+        #[arg(long)]
+        program: String,
+        /// Path to the local `.wasm` you expect it to be (e.g. what you compiled
+        /// from the audited source).
+        #[arg(long)]
+        wasm_file: PathBuf,
+    },
     /// Call a deployed contract. `--args` are packed as little-endian i64s
     /// back to back into the instruction data - the real on-chain calling
     /// convention `run_wasm_instruction` decodes (see its doc comment):
@@ -2498,6 +2518,37 @@ fn main() -> anyhow::Result<()> {
             let body = submit_instruction(&rpc, &payer, Pubkey::system_program_id(), vec![program_pk], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("program address: {program_pk}");
+        }
+        Command::VerifyProgram { rpc, program, wasm_file } => {
+            use sha3::{Digest, Sha3_256};
+            // Local bytecode -> its SHA3-256 fingerprint.
+            let local_bytes = std::fs::read(&wasm_file)?;
+            let local_hash = hex::encode::<[u8; 32]>(Sha3_256::digest(&local_bytes).into());
+            // Deployed program's advertised code_hash (the node enforces at
+            // dispatch that this equals SHA3 of the executed bytecode - re-audit
+            // #4, fail-loud - so a MATCH proves the deployed contract IS this file).
+            let url = format!("{rpc}/program/{program}");
+            let resp = reqwest::blocking::get(&url)?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                anyhow::bail!("no deployed program at {program}");
+            }
+            let info: serde_json::Value = resp.error_for_status()?.json()?;
+            let deployed_hash = info["code_hash"].as_str().unwrap_or("");
+            let deployer = info["deployer"].as_str().unwrap_or("?");
+            let entry = info["entry_point"].as_str().unwrap_or("?");
+            let size = info["size_bytes"].as_u64().unwrap_or(0);
+            println!("program:       {program}");
+            println!("deployer:      {deployer}");
+            println!("entry point:   {entry}");
+            println!("deployed size: {size} bytes   (local: {} bytes)", local_bytes.len());
+            println!("deployed hash: {deployed_hash}");
+            println!("local hash:    {local_hash}");
+            if deployed_hash.eq_ignore_ascii_case(&local_hash) {
+                println!("\n✅ MATCH — the deployed contract runs EXACTLY this bytecode.");
+            } else {
+                println!("\n❌ MISMATCH — the deployed contract is NOT this file. Do not trust it as this source.");
+                std::process::exit(1);
+            }
         }
         Command::CallProgram { rpc, keypair, program, accounts, args, nonce, fee_limit } => {
             let payer = qchain_crypto::read_keypair_file(&keypair)?;

@@ -12,6 +12,7 @@ use crate::receipt::{CompressedProofSet, StakingEvent, StakingEventKind, Transfe
 use crate::staking::StakeAccountData;
 use crate::wasm::WasmExecutor;
 use borsh::BorshDeserialize;
+use sha3::Digest as _;
 use qchain_core::{Account, Instruction, Round, Transaction};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
 use qchain_storage::compressed::{CompressedProof, IncrementalCompressedTree};
@@ -1594,6 +1595,20 @@ impl Ledger {
                         .ok_or(ExecError::UnknownProgram(ix.program_id))?;
                     let program_data = crate::native::WasmProgramData::try_from_slice(&program_account.data)
                         .map_err(|e| ExecError::ProgramError(format!("corrupt deployed program data: {e}")))?;
+                    // CODE-HASH INTEGRITY (re-audit #4, fail-loud): the account
+                    // advertises a `code_hash` (what QScan shows and what a client
+                    // pins via `verify-program`); prove it actually describes the
+                    // bytecode we're about to run before running it. At deploy both
+                    // come from the same `module_bytes` (native.rs), so they can
+                    // only diverge via disk corruption / a future bug — refuse to
+                    // execute bytecode whose advertised hash lies, rather than run
+                    // it, same fail-loud stance `SledStore` takes on corrupt data.
+                    let actual_code_hash: [u8; 32] = sha3::Sha3_256::digest(&program_data.module_bytes).into();
+                    if actual_code_hash != program_account.code_hash {
+                        return Err(ExecError::ProgramError(
+                            "deployed program bytecode does not match its advertised code_hash (corrupt program account)".into(),
+                        ));
+                    }
                     match self.run_wasm_instruction(
                         &program_data.module_bytes,
                         &program_data.entry_point,
@@ -4007,6 +4022,37 @@ mod tests {
         let result = ledger.apply_transaction(&call_tx, &validator, 0);
         assert!(result.is_err(), "the ledger must reject a debit of a non-signer even when the bytecode never checks host_is_signer");
         assert_eq!(ledger.get_balance(&victim.pubkey()), 2_000_000, "victim's balance untouched");
+    }
+
+    /// CODE-HASH INTEGRITY (re-audit #4, fail-loud): a deployed program whose
+    /// stored `code_hash` no longer matches its bytecode (disk corruption / a
+    /// future bug) is REFUSED at dispatch rather than executed — so the hash a
+    /// client verifies via `verify-program` provably describes the running code.
+    #[test]
+    fn a_program_whose_code_hash_does_not_match_its_bytecode_is_rejected() {
+        const NOOP_WAT: &str = r#"(module (func (export "go")))"#;
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = deploy_wat(&mut ledger, NOOP_WAT, "go", &deployer, &validator);
+
+        // Sanity: a call works while code_hash matches the bytecode.
+        let caller = Keypair::generate().unwrap();
+        ledger.credit(caller.pubkey(), 50_000_000);
+        let ok_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+        let ok_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![ok_ix]).unwrap();
+        assert!(ledger.apply_transaction(&ok_tx, &validator, 0).is_ok(), "a matching program must run");
+
+        // Corrupt the stored code_hash (leave the bytecode/data intact) and
+        // confirm the next call is REJECTED, not executed.
+        let mut prog = ledger.store().get(&program_pk).unwrap();
+        prog.code_hash[0] ^= 0xFF;
+        ledger.write_account(program_pk, prog);
+        let bad_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+        let bad_tx = Transaction::new_signed(&caller, 1, [0u8; 32], 50_000_000, vec![bad_ix]).unwrap();
+        let result = ledger.apply_transaction(&bad_tx, &validator, 0);
+        assert!(result.is_err(), "a program whose bytecode doesn't match its advertised code_hash must be refused");
     }
 
     /// A contract cannot conjure balance from nothing: even setting its own

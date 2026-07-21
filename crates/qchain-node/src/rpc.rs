@@ -109,6 +109,7 @@ fn base_router(engine: Arc<Engine>) -> Router {
         .route("/economics", get(economics))
         .route("/holders", get(holders))
         .route("/programs", get(programs))
+        .route("/program/:address", get(program))
         .route("/resources", get(resources))
         .route("/root", get(root))
         .route("/stark_proof", get(stark_proof))
@@ -388,6 +389,16 @@ struct ProgramsQuery {
 /// `ProgramsResponse`.
 async fn programs(State(engine): State<Arc<Engine>>, Query(query): Query<ProgramsQuery>) -> Json<crate::engine::ProgramsResponse> {
     Json(engine.programs(query.limit).await)
+}
+
+/// `/program/:address` - a SINGLE deployed contract's metadata (address,
+/// code_hash, entry point, size, deployer). Re-audit #4: what `qchain
+/// verify-program` fetches to compare a deployed contract's `code_hash` against a
+/// locally-compiled `.wasm` (reproducible-build verification). Metadata only,
+/// never the bytecode/keys. 404 if no WASM program lives at the address.
+async fn program(State(engine): State<Arc<Engine>>, Path(address): Path<String>) -> Result<Json<crate::engine::ProgramEntry>, (StatusCode, String)> {
+    let pk: Pubkey = address.parse().map_err(|e: anyhow::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    engine.program(&pk).await.map(Json).ok_or((StatusCode::NOT_FOUND, "no deployed program at this address".to_string()))
 }
 
 /// `/resources` - the node's own live RAM/CPU/disk/thread usage, so a load tool

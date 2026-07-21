@@ -88,6 +88,22 @@ qchain call-program --rpc <url> --keypair <tu>.json \
 interactuar → Conectar wallet**, subí el `.wasm`, entry point `run`; después
 llamá con las cuentas (CSV, la 1ª tu wallet) y los args i64 (CSV).
 
+**Verificar el bytecode desplegado (reproducible-build, re-auditoría #4):** antes
+de confiar en un contrato de otro, confirmá que corre EXACTAMENTE el `.wasm` que
+auditaste/compilaste:
+
+```bash
+qchain verify-program --rpc <url> --program <dir-contrato> --wasm-file esperado.wasm
+# ✅ MATCH  -> el contrato desplegado corre exactamente ese bytecode (+ imprime quién lo desplegó)
+# ❌ MISMATCH (exit 1) -> NO es ese archivo, no confíes
+```
+
+Compara el `code_hash` on-chain (que el nodo EXIGE que sea el SHA3 del bytecode
+ejecutado — fail-loud) contra el SHA3 de tu archivo local. Es el equivalente
+cliente-side del "verified source" de un explorer; un registro on-chain de código
+fuente publicado queda como trabajo futuro. El endpoint read-only
+`GET /program/<dir>` expone `code_hash`/`entry_point`/`size_bytes`/`deployer`.
+
 ## Reglas del modelo de ejecución (importante)
 
 - **Cuentas por índice.** La instrucción declara `accounts[]`. El contrato
