@@ -183,12 +183,17 @@
     await loadHomeData();
   }
 
+  // Pagination buttons carry their target hash in `data-go` and are driven by a
+  // DELEGATED click handler (below), NOT inline `onclick`. The indexer serves a
+  // strict CSP (`script-src 'self'`, no `'unsafe-inline'`), which BLOCKS inline
+  // event handlers — inline onclick here silently did nothing. `esc()` guards the
+  // interpolated base (defense-in-depth; it's a fixed router prefix).
   function pager(page, hasNext, base) {
     return `<div class="pager">
-      <button ${page <= 0 ? "disabled" : ""} onclick="QScan.go('${base}0')">« Primera</button>
-      <button ${page <= 0 ? "disabled" : ""} onclick="QScan.go('${base}${page - 1}')">‹</button>
+      <button ${page <= 0 ? "disabled" : ""} data-go="${esc(base + "0")}">« Primera</button>
+      <button ${page <= 0 ? "disabled" : ""} data-go="${esc(base + (page - 1))}">‹</button>
       <span class="dim">Página ${page + 1}</span>
-      <button ${!hasNext ? "disabled" : ""} onclick="QScan.go('${base}${page + 1}')">›</button></div>`;
+      <button ${!hasNext ? "disabled" : ""} data-go="${esc(base + (page + 1))}">›</button></div>`;
   }
 
   async function txsPage(page, kind) {
@@ -513,6 +518,13 @@
     c.textContent = "✓";
     c.classList.add("ok");
     setTimeout(() => { c.textContent = prev; c.classList.remove("ok"); delete c.dataset.busy; }, 1000);
+  });
+  // Delegated pagination (no inline JS, CSP-safe): a `[data-go]` button
+  // navigates to its target hash. A disabled button carries no click.
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest("[data-go]");
+    if (!b || b.disabled) return;
+    location.hash = b.getAttribute("data-go") || "";
   });
   window.addEventListener("hashchange", route);
   // Load the frontend config (wallet URL for the connect bridge) before the

@@ -26,3 +26,5 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
+sha3.workspace = true
+subtle = "2"

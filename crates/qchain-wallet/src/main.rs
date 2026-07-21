@@ -337,7 +337,15 @@ async fn require_auth(State(st): State<Arc<AppState>>, req: Request, next: Next)
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|creds| creds.split_once(':').map(|(_, pass)| pass.to_string()));
-    if provided.as_deref() == Some(expected.as_str()) {
+    // Constant-time password check (re-audit QCH-WALLET auth): comparing the
+    // password with `==` short-circuits on the first differing byte, a timing
+    // side-channel that (over a low-jitter path) could leak the password
+    // byte-by-byte. Hash both to a FIXED 32-byte digest first (so neither the
+    // length nor the bytes leak via timing) and compare with `subtle`'s
+    // constant-time equality. A missing/garbled Authorization header hashes the
+    // empty string, which never equals a real password.
+    let ok = provided.map(|p| ct_password_eq(&p, expected)).unwrap_or(false);
+    if ok {
         next.run(req).await
     } else {
         Response::builder()
@@ -346,6 +354,20 @@ async fn require_auth(State(st): State<Arc<AppState>>, req: Request, next: Next)
             .body(Body::from("autenticación requerida"))
             .expect("static 401 response always builds")
     }
+}
+
+/// Constant-time password equality (re-audit QCH-WALLET auth). Hashes both
+/// sides to a fixed 32-byte SHA3-256 digest — so the comparison is over a
+/// constant length regardless of how long either password is (no length leak) —
+/// then compares the digests with `subtle`'s data-independent `ct_eq`, which the
+/// compiler can't turn back into a short-circuiting branch. Result is identical
+/// to `a == b`; only the timing is now flat.
+fn ct_password_eq(a: &str, b: &str) -> bool {
+    use sha3::{Digest, Sha3_256};
+    use subtle::ConstantTimeEq;
+    let ha: [u8; 32] = Sha3_256::digest(a.as_bytes()).into();
+    let hb: [u8; 32] = Sha3_256::digest(b.as_bytes()).into();
+    ha.ct_eq(&hb).into()
 }
 
 async fn index() -> Html<&'static str> {
@@ -964,5 +986,24 @@ impl ApiError {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_password_eq;
+
+    #[test]
+    fn constant_time_password_check_matches_string_equality() {
+        // Same result as `==`, only the timing differs.
+        assert!(ct_password_eq("hunter2", "hunter2"));
+        assert!(!ct_password_eq("hunter2", "hunter3"));
+        assert!(!ct_password_eq("hunter2", "hunter2 "));
+        assert!(!ct_password_eq("", "hunter2"));
+        assert!(!ct_password_eq("hunter2", ""));
+        assert!(ct_password_eq("", ""));
+        // Length is not what's compared (hashes are fixed 32 bytes): a short and
+        // a long non-matching password both simply return false.
+        assert!(!ct_password_eq("a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     }
 }
