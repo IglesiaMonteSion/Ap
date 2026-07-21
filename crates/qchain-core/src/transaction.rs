@@ -327,3 +327,58 @@ mod tests {
         assert!(tx.byte_size() > 5_000, "byte_size = {}", tx.byte_size());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based tests (task #200): invariantes ejercitadas sobre MUCHOS
+    //! inputs generados, no unos pocos casos a mano. Complementa el fuzzing de
+    //! `fuzz/` (mismo objetivo — el borde de wire nunca panica) con propiedades
+    //! de correctitud sobre transacciones firmadas reales.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Deserializar bytes ARBITRARIOS como Transaction/Message NUNCA debe
+        // panicar ni colgarse — devuelve Err o un valor, jamás rompe (robustez
+        // del borde de wire, estilo fuzz, corrido en cada CI).
+        #[test]
+        fn arbitrary_bytes_deserialize_without_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = borsh::from_slice::<Transaction>(&bytes);
+            let _ = borsh::from_slice::<Message>(&bytes);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        // Para CUALQUIER combinación de campos escalares, una tx firmada (a)
+        // verifica, (b) round-trippea por Borsh preservando todos los campos, y
+        // (c) su txid es estable frente a una mutación de la firma (maleabilidad).
+        #[test]
+        fn signed_tx_roundtrips_and_txid_is_stable(
+            nonce in any::<u64>(), fee in any::<u64>(), tip in any::<u64>(),
+            valid in any::<u64>(), amount in any::<u64>(),
+        ) {
+            let payer = Keypair::generate().unwrap();
+            let to = Keypair::generate().unwrap().pubkey();
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![payer.pubkey(), to],
+                data: amount.to_le_bytes().to_vec(),
+            };
+            let tx = Transaction::new_signed_full(&payer, nonce, [7u8; 32], fee, tip, valid, vec![ix]).unwrap();
+            prop_assert!(tx.verify_signature());
+            let bytes = borsh::to_vec(&tx).unwrap();
+            let back: Transaction = borsh::from_slice(&bytes).unwrap();
+            prop_assert_eq!(back.message.nonce, nonce);
+            prop_assert_eq!(back.message.fee_limit, fee);
+            prop_assert_eq!(back.message.priority_fee, tip);
+            prop_assert_eq!(back.message.valid_until_round, valid);
+            prop_assert!(back.verify_signature());
+            // txid ignora la firma: mutar la firma no cambia el txid.
+            let txid = tx.txid();
+            let mut m = tx.clone();
+            m.signature.components[0].bytes[0] ^= 0xff;
+            prop_assert_eq!(m.txid(), txid);
+        }
+    }
+}

@@ -1,0 +1,41 @@
+# Fuzzing harness (task #200, QCH-S12). Un crate SEPARADO del workspace principal
+# (está en el `exclude` del Cargo.toml raíz) porque cargo-fuzz necesita nightly +
+# libFuzzer y su propio target. Correlo con:
+#
+#   cargo install cargo-fuzz            # una vez
+#   cargo +nightly fuzz run transaction_deserialize   # fuzz continuo del borde de wire
+#   cargo +nightly fuzz run message_deserialize
+#
+# El objetivo: ningún byte arbitrario del wire debe panicar/OOM el deserializador
+# ni el verify. El fuzzing continuo (correrlo por horas/CI-cron) es el complemento
+# de los property tests de proptest (que corren en cada CI sobre inputs generados).
+[package]
+name = "qchain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+borsh = { version = "1", features = ["derive"] }
+qchain-core = { path = "../crates/qchain-core" }
+
+[[bin]]
+name = "transaction_deserialize"
+path = "fuzz_targets/transaction_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_deserialize"
+path = "fuzz_targets/message_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz layout: este crate es su propio workspace de un solo miembro.
+[workspace]

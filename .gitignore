@@ -14,3 +14,9 @@ image-attestation.json
 # Supply-chain release artifacts (deploy/sign-release.sh, deploy/gen-sbom.sh)
 /release/
 sbom.cdx.json
+
+# cargo-fuzz artifacts (task #200)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/Cargo.lock

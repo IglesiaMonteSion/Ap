@@ -18,3 +18,16 @@ sha3.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# Property-based testing (task #200): exercise invariants over MANY generated
+# inputs instead of a few hand-picked cases.
+proptest = "1"
+# Statistical benchmarks (task #200): reproducible perf tracking of the hot path
+# (hybrid PQC verify + canonical txid) with confidence intervals, complementing
+# the live TPS/RAM measurements already documented.
+criterion = "0.5"
+
+[[bench]]
+name = "signing"
+harness = false
