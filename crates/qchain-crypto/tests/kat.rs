@@ -114,6 +114,22 @@ fn kat_pqc_acvp_official_sigver_vectors() {
         "ML-DSA-65 verify debe coincidir con el testPassed oficial de NIST ACVP (vector sigVer)"
     );
 
+    // Cobertura por-algoritmo (positivo Y negativo) para la firma PQC PRINCIPAL:
+    // el vector ML-DSA oficial es VÁLIDO (testPassed=true), así que además de
+    // confirmar que verifica true, derivamos un NEGATIVO de él —flipear un byte
+    // de la firma DEBE hacer que `verify` dé false— probando que el verificador
+    // RECHAZA una firma manipulada, no sólo que acepta una buena. (El vector
+    // SLH-DSA de la fixture es el INVÁLIDO oficial → su caso true está cubierto
+    // por el round-trip funcional en `slh_dsa` tests; aquí ML-DSA queda con el
+    // par completo positivo+negativo.)
+    assert!(pass_flag("mldsa65"), "el vector ML-DSA de la fixture debe ser el válido para poder derivar el negativo");
+    let mut tampered_sig = bytes("mldsa65_sig");
+    let last = tampered_sig.len() - 1;
+    tampered_sig[last] ^= 0x01; // un solo bit distinto
+    let mldsa_tampered_ok =
+        qchain_crypto::verify_ml_dsa_65_component(&bytes("mldsa65_pk"), &bytes("mldsa65_msg"), &tampered_sig);
+    assert!(!mldsa_tampered_ok, "ML-DSA-65 debe RECHAZAR una firma con un byte manipulado (negativo derivado del vector oficial)");
+
     // --- SLH-DSA-SHA2-256s (FIPS 205, sigVer external/pure, ctx vacío) ---
     let slh_ok = qchain_crypto::verify_slh_dsa_component(
         &bytes("slhdsa256s_pk"),
