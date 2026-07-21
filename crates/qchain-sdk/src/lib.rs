@@ -58,6 +58,10 @@ mod sys {
         pub fn host_set_balance(idx: i32, val: i64);
         pub fn host_is_signer(idx: i32) -> i32;
         pub fn host_log(ptr: i32, len: i32);
+        // SDK v0.2 — estado estructurado en account.data
+        pub fn host_data_len(idx: i32) -> i32;
+        pub fn host_get_data(idx: i32, ptr: i32, max_len: i32) -> i32;
+        pub fn host_set_data(idx: i32, ptr: i32, len: i32) -> i32;
     }
 
     // Stubs para compilar en el host (nunca se ejecutan en un contrato real).
@@ -73,6 +77,18 @@ mod sys {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn host_log(_ptr: i32, _len: i32) {}
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_data_len(_idx: i32) -> i32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_get_data(_idx: i32, _ptr: i32, _max_len: i32) -> i32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn host_set_data(_idx: i32, _ptr: i32, _len: i32) -> i32 {
+        0
+    }
 }
 
 /// Aborta la ejecución del contrato (trap). Todo lo que hizo la transacción se
@@ -179,6 +195,102 @@ pub fn transfer(from: u32, to: u32, amount: i64) {
     require_signer(from);
     debit(from, amount);
     credit(to, amount);
+}
+
+// ============================================================================
+// SDK v0.2 — ESTADO ESTRUCTURADO on-chain (bytes de `account.data`).
+//
+// Un contrato puede leer/escribir los bytes de `data` de una cuenta declarada.
+// La ESCRITURA la autoriza el LEDGER igual que un débito: solo se puede escribir
+// la `data` de una cuenta si el llamador está autorizado sobre ella — es el
+// FIRMANTE (`accounts[0]`), o el programa la posee. El patrón típico v0.2 es
+// guardar el estado del usuario en su PROPIA cuenta (`accounts[0]`, el firmante).
+// ============================================================================
+
+/// Largo actual (en bytes) de `accounts[idx].data`.
+#[inline]
+pub fn data_len(idx: u32) -> usize {
+    let n = unsafe { sys::host_data_len(idx as i32) };
+    if n < 0 {
+        0
+    } else {
+        n as usize
+    }
+}
+
+/// Copia hasta `out.len()` bytes de `accounts[idx].data` en `out`. Devuelve
+/// cuántos bytes se copiaron (0 si la cuenta no existe o no tiene data).
+#[inline]
+pub fn get_data(idx: u32, out: &mut [u8]) -> usize {
+    let n = unsafe { sys::host_get_data(idx as i32, out.as_mut_ptr() as i32, out.len() as i32) };
+    if n < 0 {
+        0
+    } else {
+        n as usize
+    }
+}
+
+/// Escribe `bytes` como la nueva `data` de `accounts[idx]`. Aborta si el ledger
+/// rechaza (no autorizado / supera el tope de 16 KB). Persiste on-chain.
+#[inline]
+pub fn set_data(idx: u32, bytes: &[u8]) {
+    let r = unsafe { sys::host_set_data(idx as i32, bytes.as_ptr() as i32, bytes.len() as i32) };
+    if r != 0 {
+        log("qchain-sdk: set_data rechazado");
+        abort();
+    }
+}
+
+// --- helpers de (des)serialización manual de enteros LE en un buffer ---
+// Sin `serde`/alloc: un contrato arma su layout con offsets fijos. Ej:
+//   [count: i64 @0][updates: u64 @8]  → 16 bytes.
+
+/// Lee un `u64` little-endian en `buf[off..off+8]`; `0` si no entra.
+#[inline]
+pub fn read_u64(buf: &[u8], off: usize) -> u64 {
+    match buf.get(off..off + 8) {
+        Some(s) => u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+        None => 0,
+    }
+}
+
+/// Lee un `i64` little-endian en `buf[off..off+8]`; `0` si no entra.
+#[inline]
+pub fn read_i64(buf: &[u8], off: usize) -> i64 {
+    read_u64(buf, off) as i64
+}
+
+/// Lee un `u32` little-endian en `buf[off..off+4]`; `0` si no entra.
+#[inline]
+pub fn read_u32(buf: &[u8], off: usize) -> u32 {
+    match buf.get(off..off + 4) {
+        Some(s) => u32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        None => 0,
+    }
+}
+
+/// Escribe un `u64` little-endian en `buf[off..off+8]`; aborta si no entra.
+#[inline]
+pub fn write_u64(buf: &mut [u8], off: usize, v: u64) {
+    match buf.get_mut(off..off + 8) {
+        Some(s) => s.copy_from_slice(&v.to_le_bytes()),
+        None => abort(),
+    }
+}
+
+/// Escribe un `i64` little-endian en `buf[off..off+8]`; aborta si no entra.
+#[inline]
+pub fn write_i64(buf: &mut [u8], off: usize, v: i64) {
+    write_u64(buf, off, v as u64)
+}
+
+/// Escribe un `u32` little-endian en `buf[off..off+4]`; aborta si no entra.
+#[inline]
+pub fn write_u32(buf: &mut [u8], off: usize, v: u32) {
+    match buf.get_mut(off..off + 4) {
+        Some(s) => s.copy_from_slice(&v.to_le_bytes()),
+        None => abort(),
+    }
 }
 
 /// Define el punto de entrada del contrato: exporta la función `run` con aridad

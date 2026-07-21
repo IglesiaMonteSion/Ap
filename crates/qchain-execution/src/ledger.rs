@@ -1680,6 +1680,9 @@ impl Ledger {
         // `accounts`/`is_signer` are moved into `call`.
         let before_balances: Vec<u64> = accounts.iter().map(|a| a.balance).collect();
         let before_owners: Vec<Pubkey> = accounts.iter().map(|a| a.owner).collect();
+        // SDK v0.2 — snapshot de la `data` de cada cuenta ANTES de ejecutar, para
+        // autorizar cualquier ESCRITURA de estado estructurado en el borde (abajo).
+        let before_data: Vec<Vec<u8>> = accounts.iter().map(|a| a.data.clone()).collect();
         let signer_flags = is_signer.clone();
 
         // Setup-level failures (bad module, missing entry point) never
@@ -1741,6 +1744,37 @@ impl Ledger {
                     return Err(ExecError::Unauthorized(format!(
                         "contract debited account {who} it is not authorized over (not the signer, not program-owned)"
                     )));
+                }
+            }
+
+            // SDK v0.2 — autorización del ESTADO ESTRUCTURADO (host_set_data).
+            // (a) El `owner` NUNCA puede cambiar por un contrato (el host no lo
+            //     expone, pero lo blindamos: un cambio de owner dejaría a un
+            //     contrato "adueñarse" de una cuenta). (b) La `data` de una
+            //     cuenta solo puede cambiar si el llamador está autorizado sobre
+            //     ella — es el firmante, o el programa la posee — MISMO modelo
+            //     que el débito de saldo. Sin esto, un contrato malicioso podría
+            //     sobrescribir la `data` de una víctima nombrada en `accounts`
+            //     (p.ej. corromper el estado de otra cuenta) sin su firma.
+            if before_owners.get(i).map(|o| *o != account_after.owner).unwrap_or(false) {
+                return Err(ExecError::ProgramError(
+                    "a contract may not change an account's owner".into(),
+                ));
+            }
+            let data_changed = before_data.get(i).map(|d| d != &account_after.data).unwrap_or(!account_after.data.is_empty());
+            if data_changed {
+                let authorized = signer_flags.get(i).copied().unwrap_or(false)
+                    || before_owners.get(i).map(|o| *o == program_id).unwrap_or(false);
+                if !authorized {
+                    let who = ix.accounts.get(i).copied().unwrap_or_else(Pubkey::system_program_id);
+                    return Err(ExecError::Unauthorized(format!(
+                        "contract wrote data to account {who} it is not authorized over (not the signer, not program-owned)"
+                    )));
+                }
+                if account_after.data.len() > crate::wasm::MAX_CONTRACT_ACCOUNT_DATA {
+                    return Err(ExecError::ProgramError(
+                        "contract wrote account data exceeding the maximum size".into(),
+                    ));
                 }
             }
         }
@@ -3623,6 +3657,63 @@ mod tests {
         let result = ledger.apply_transaction(&call_tx, &validator, 0);
         assert!(result.is_err(), "a WASM instruction naming the same account twice must be rejected (aliasing mint)");
         assert!(ledger.get_balance(&attacker.pubkey()) <= balance_before, "no minted balance may survive the rejected aliasing call");
+    }
+
+    /// SDK v0.2 — estado estructurado (`host_set_data`). Escribe 3 bytes en la
+    /// `data` de la cuenta cuyo índice se pasa como argumento.
+    const SETDATA_WAT: &str = r#"
+        (module
+            (import "env" "host_set_data" (func $set_data (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 16) "\aa\bb\cc")
+            (func (export "setd") (param $idx i64)
+                (drop (call $set_data (i32.wrap_i64 (local.get $idx)) (i32.const 16) (i32.const 3)))
+            )
+        )
+    "#;
+
+    /// El borde del ledger autoriza las escrituras de estado estructurado igual
+    /// que los débitos de saldo: un contrato puede escribir la `data` del
+    /// FIRMANTE (autorizado), pero NO la de una víctima no-firmante y no-poseída.
+    #[test]
+    fn a_contract_can_write_the_signers_data_but_not_a_non_signers() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = deploy_wat(&mut ledger, SETDATA_WAT, "setd", &deployer, &validator);
+
+        let user = Keypair::generate().unwrap();
+        let victim = Keypair::generate().unwrap();
+        ledger.credit(user.pubkey(), 50_000_000);
+        ledger.credit(victim.pubkey(), 2_000_000);
+
+        // Caso A — escribir la data del FIRMANTE (accounts[0] == payer): permitido.
+        let call_ok = Instruction {
+            program_id: program_pk,
+            accounts: vec![user.pubkey(), victim.pubkey()],
+            data: 0i64.to_le_bytes().to_vec(), // idx=0 (el firmante)
+        };
+        let tx_ok = Transaction::new_signed(&user, 0, [0u8; 32], 50_000_000, vec![call_ok]).unwrap();
+        assert!(ledger.apply_transaction(&tx_ok, &validator, 0).is_ok(), "escribir la data propia del firmante debe permitirse");
+        assert_eq!(
+            ledger.store().get(&user.pubkey()).map(|a| a.data),
+            Some(vec![0xaa, 0xbb, 0xcc]),
+            "la data estructurada del firmante quedó persistida"
+        );
+
+        // Caso B — escribir la data de una VÍCTIMA no-firmante (idx=1): rechazado.
+        let call_bad = Instruction {
+            program_id: program_pk,
+            accounts: vec![user.pubkey(), victim.pubkey()],
+            data: 1i64.to_le_bytes().to_vec(), // idx=1 (la víctima, no firma)
+        };
+        let tx_bad = Transaction::new_signed(&user, 1, [0u8; 32], 50_000_000, vec![call_bad]).unwrap();
+        assert!(ledger.apply_transaction(&tx_bad, &validator, 0).is_err(), "escribir la data de un no-firmante debe rechazarse");
+        assert!(
+            ledger.store().get(&victim.pubkey()).map(|a| a.data).unwrap_or_default().is_empty(),
+            "la data de la víctima quedó intacta"
+        );
     }
 
     #[test]

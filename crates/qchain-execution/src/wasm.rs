@@ -69,6 +69,20 @@ fn read_memory(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
     data.get(ptr..ptr.checked_add(len)?).map(|s| s.to_vec())
 }
 
+fn write_memory(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> bool {
+    let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        return false;
+    };
+    memory.write(caller, ptr as usize, bytes).is_ok()
+}
+
+/// Tope del tamaño de `data` que un contrato puede ESCRIBIR en una cuenta con
+/// `host_set_data` (el estado estructurado del SDK v0.2). Acota bloat/DoS; los
+/// singletons de protocolo (registro/params) no los escribe un contrato — su
+/// tamaño lo maneja el ledger, no este límite. 16 KB es holgado para el estado
+/// por-cuenta de un contrato (un token/perfil/contador entra en decenas de bytes).
+pub(crate) const MAX_CONTRACT_ACCOUNT_DATA: usize = 16 * 1024;
+
 /// See `host_verify_signature`'s doc comment for the `registry_account_idx`
 /// contract. Fails closed: a declared registry account that doesn't decode,
 /// or doesn't list `scheme_id`, rejects rather than falling back silently.
@@ -149,6 +163,52 @@ impl WasmExecutor {
                 caller.data_mut().log.push(msg);
             }
         })?;
+
+        // SDK v0.2 — estado estructurado on-chain. Un contrato lee/escribe los
+        // BYTES de `data` de una cuenta declarada, por índice (misma convención
+        // que balance). La AUTORIZACIÓN de escritura la refuerza el LEDGER (ver
+        // `run_wasm_instruction`): la `data` de una cuenta solo cambia si el
+        // llamador está autorizado sobre ella (es el firmante, o el programa la
+        // posee) — igual que el débito de saldo. Aquí solo se mueven bytes; el
+        // borde de seguridad valida el cambio antes de comprometerlo.
+        linker.func_wrap("env", "host_data_len", |caller: Caller<'_, HostState>, idx: i32| -> i32 {
+            caller.data().accounts.get(idx as usize).map(|a| a.data.len() as i32).unwrap_or(-1)
+        })?;
+        linker.func_wrap(
+            "env",
+            "host_get_data",
+            |mut caller: Caller<'_, HostState>, idx: i32, ptr: i32, max_len: i32| -> i32 {
+                // Clonar evita el conflicto de préstamo con `write_memory(&mut caller)`.
+                let Some(data) = caller.data().accounts.get(idx as usize).map(|a| a.data.clone()) else {
+                    return -1;
+                };
+                let n = core::cmp::min(data.len(), max_len.max(0) as usize);
+                if write_memory(&mut caller, ptr, &data[..n]) {
+                    n as i32
+                } else {
+                    -1
+                }
+            },
+        )?;
+        linker.func_wrap(
+            "env",
+            "host_set_data",
+            |mut caller: Caller<'_, HostState>, idx: i32, ptr: i32, len: i32| -> i32 {
+                if len < 0 || len as usize > MAX_CONTRACT_ACCOUNT_DATA {
+                    return -1;
+                }
+                let Some(bytes) = read_memory(&mut caller, ptr, len) else {
+                    return -1;
+                };
+                match caller.data_mut().accounts.get_mut(idx as usize) {
+                    Some(acc) => {
+                        acc.data = bytes;
+                        0
+                    }
+                    None => -1,
+                }
+            },
+        )?;
 
         // Exposes the crypto-agility layer to contracts (ARCHITECTURE.md
         // §4): a contract can verify a signature against any registered

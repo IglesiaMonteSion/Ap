@@ -121,6 +121,51 @@ igual paga el fee de su intento.
 | `log(msg)` | emite un evento de texto |
 | `abort()` / `require!(cond[, msg])` | trap si falla |
 | `entrypoint!(handler)` | exporta `run(4×i64)` → `handler([i64;4])` |
+| **`data_len(idx)`** | largo de `accounts[idx].data` (SDK v0.2) |
+| **`get_data(idx, &mut buf) -> usize`** | copia la `data` de `accounts[idx]` a `buf` |
+| **`set_data(idx, &bytes)`** | escribe la `data` de `accounts[idx]` (autorizada por el ledger) |
+| **`read_u64/read_i64/read_u32(buf, off)`** | lee un entero LE del buffer |
+| **`write_u64/write_i64/write_u32(buf, off, v)`** | escribe un entero LE en el buffer |
+
+## Estado estructurado on-chain (SDK v0.2)
+
+Además de saldos, un contrato puede guardar **estado estructurado** en los bytes
+de `data` de una cuenta. El patrón v0.2: **cada usuario guarda su propio estado
+en su cuenta** (`accounts[0]`, el firmante). El contrato arma un layout de
+offsets fijos (sin `serde`, `no_std`):
+
+```rust
+// Estado en accounts[0].data (16 bytes): [count: i64 @0][updates: u64 @8]
+fn dispatch([sel, x, _y, _z]: [i64; 4]) {
+    require!(is_signer(0));                 // solo el dueño toca su estado
+    let mut buf = [0u8; 16];
+    let n = get_data(0, &mut buf);
+    let mut count = if n >= 8 { read_i64(&buf, 0) } else { 0 };
+    match sel {
+        1 => count = x,                     // init
+        2 => count = count.saturating_add(x), // add
+        _ => abort(),
+    }
+    write_i64(&mut buf, 0, count);
+    set_data(0, &buf);                      // persiste on-chain
+}
+```
+
+Ejemplo completo: `crates/qchain-sdk/templates/counter/`. **Se lee de vuelta por
+RPC**: `GET /account/<dir>` devuelve el campo `data` (los bytes del estado), que
+el cliente decodifica con el mismo layout.
+
+**Autorización (la refuerza el LEDGER):** la `data` de una cuenta solo puede
+cambiar si el llamador está autorizado sobre ella — es el **firmante**, o el
+**programa la posee** — el MISMO modelo que el débito de saldo. Un contrato NO
+puede sobrescribir la `data` de una víctima que no firmó. Tope de escritura:
+**16 KB** por cuenta. Un `owner` de cuenta **nunca** cambia por un contrato.
+
+> **Límite v0.2:** el estado se guarda en la cuenta del **firmante**. Cuentas de
+> estado **propias del programa** (estilo PDA de Solana, `owner == program_id`,
+> para estado compartido que ningún usuario firma) necesitan asignación de owner
+> — es el próximo incremento del SDK. El borde de autorización ya lo contempla
+> (la rama "programa la posee"), así que landeará sin cambio de seguridad.
 
 Los syscalls crudos del host (`host_get_balance`, `host_set_balance`,
 `host_is_signer`, `host_log`, `host_verify_signature`) siguen disponibles para
