@@ -122,6 +122,18 @@ pub struct SimOutcome {
     pub payer_before: u64,
     pub payer_after: u64,
     pub changes: Vec<(Pubkey, u64, u64)>,
+    /// The committed round the dry-run was evaluated against (re-audit
+    /// QCH-SIMULATE economics): lets the caller show/verify which height the
+    /// preview reflects, since fee/economics depend on the round.
+    pub round: u64,
+}
+
+impl SimOutcome {
+    /// A rejection produced by the `/simulate` pre-checks (chain_id / size /
+    /// signature) BEFORE any dry-run runs — see `Engine::simulate_transaction`.
+    pub fn rejected(error: impl Into<String>) -> Self {
+        SimOutcome { ok: false, error: Some(error.into()), fee: 0, payer_before: 0, payer_after: 0, changes: vec![], round: 0 }
+    }
 }
 
 /// Persistable snapshot of a `Ledger`'s running economic counters. Written to
@@ -338,6 +350,14 @@ impl Ledger {
     /// a correctness/safety issue. Signature verification is skipped
     /// (`apply_transaction_presigned`): it's a preview, and the real admission +
     /// commit paths still verify for real.
+    ///
+    /// ECONOMIC ACCURACY (re-audit QCH-SIMULATE, MED): `fee_collector` MUST be a
+    /// distinct dummy, NOT the payer. If the payer is also the fee collector, the
+    /// ledger credits the validator commission back to the payer, so the preview
+    /// would understate what the payer really loses. The caller
+    /// (`Engine::simulate_transaction`) passes a fixed non-payer placeholder, and
+    /// the fee collector is excluded from `changes` (it's the validator's
+    /// commission credit, noise for the user).
     pub fn simulate(&self, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
         use qchain_storage::InMemoryStore;
         // Seed the scratch store with everything `apply` can read for a wallet's
@@ -387,6 +407,7 @@ impl Ledger {
                     payer_before,
                     payer_after: payer_before,
                     changes: vec![],
+                    round,
                 }
             }
         };
@@ -396,6 +417,9 @@ impl Ledger {
         let payer_after = sim.get_balance(&tx.message.payer);
         let mut changes: Vec<(Pubkey, u64, u64)> = before
             .iter()
+            // Exclude the fee collector: its balance change is the validator's
+            // commission credit, which is noise for the user's preview.
+            .filter(|(pk, _)| *pk != fee_collector)
             .filter_map(|(pk, b)| {
                 let after = sim.get_balance(pk);
                 (after != *b).then_some((*pk, *b, after))
@@ -403,8 +427,8 @@ impl Ledger {
             .collect();
         changes.sort_by(|a, b| a.0.cmp(&b.0));
         match result {
-            Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes },
-            Err(e) => SimOutcome { ok: false, error: Some(e.to_string()), fee: 0, payer_before, payer_after: payer_before, changes: vec![] },
+            Ok(fee) => SimOutcome { ok: true, error: None, fee, payer_before, payer_after, changes, round },
+            Err(e) => SimOutcome { ok: false, error: Some(e.to_string()), fee: 0, payer_before, payer_after: payer_before, changes: vec![], round },
         }
     }
 
@@ -1934,19 +1958,21 @@ impl Ledger {
             //     que el débito de saldo. Sin esto, un contrato malicioso podría
             //     sobrescribir la `data` de una víctima nombrada en `accounts`
             //     (p.ej. corromper el estado de otra cuenta) sin su firma.
-            // Cambio de owner: el ÚNICO permitido es RECLAMAR una cuenta FRESCA
-            // como PDA de ESTE programa (system → program_id sobre una cuenta con
-            // saldo 0 y data vacía). `host_use_pda` ya verificó que la dirección
-            // == derive_pda(program_id, seed), así que solo una PDA genuina de
-            // este programa llega acá; el borde vuelve a exigir que sea fresca.
+            // Cambio de owner: el ÚNICO permitido es RECLAMAR la PDA de ESTE
+            // programa. `host_use_pda` verificó criptográficamente que la
+            // dirección == derive_pda(program_id, seed), puso owner = program_id,
+            // y registró el índice `i` en `result.pda_claims`. El borde autoriza
+            // el cambio SOLO para esos índices y exige que el owner nuevo sea
+            // exactamente `program_id`. Confía en código-host (el syscall propio
+            // del ledger), NO en el bytecode: un contrato no puede fabricar un
+            // claim, y el owner nuevo jamás puede ser otro que `program_id`. Esto
+            // cubre el reclamo forzoso de una PDA squatteada (re-audit QCH-WASM
+            // PDA-squatting) sin abrir un cambio de owner arbitrario.
             if before_owners.get(i).map(|o| *o != account_after.owner).unwrap_or(false) {
-                let is_pda_claim = before_owners.get(i).map(|o| *o == Pubkey::system_program_id()).unwrap_or(false)
-                    && account_after.owner == program_id
-                    && before_balances.get(i).copied().unwrap_or(0) == 0
-                    && before_data.get(i).map(|d| d.is_empty()).unwrap_or(true);
+                let is_pda_claim = account_after.owner == program_id && result.pda_claims.contains(&i);
                 if !is_pda_claim {
                     return Err(ExecError::ProgramError(
-                        "a contract may not change an account's owner (only a fresh PDA claim is allowed)".into(),
+                        "a contract may not change an account's owner (only a verified PDA claim is allowed)".into(),
                     ));
                 }
             }
@@ -4101,6 +4127,42 @@ mod tests {
         let tx3 = Transaction::new_signed(&user, 2, [0u8; 32], 50_000_000, vec![ix3]).unwrap();
         assert!(ledger.apply_transaction(&tx3, &validator, 0).is_err(), "B no puede tocar la PDA de A (front-running imposible)");
         assert_eq!(ledger.store().get(&pda_a).map(|a| a.owner), Some(prog_a), "la PDA de A sigue siendo de A");
+    }
+
+    /// SECURITY (re-audit QCH-WASM PDA-squatting DoS, HIGH): a third party who
+    /// occupies a program's PDA address ahead of time (it is publicly derivable)
+    /// with a foreign owner and data must NOT lock the program out. The program
+    /// force-reclaims it: owner becomes program_id, the squatter's illegitimate
+    /// data is discarded, and any balance at the address (the program's
+    /// treasury) is preserved. Safe because the PDA address is SHA3-bound to
+    /// program_id — no legitimate foreign account can live there.
+    #[test]
+    fn a_program_reclaims_its_pda_even_when_a_squatter_occupied_it_first() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 100_000_000);
+        let prog = deploy_wat(&mut ledger, USE_PDA_WAT, "go", &deployer, &validator);
+        let pda = crate::wasm::derive_pda(&prog, b"state");
+
+        // A SQUATTER occupies the PDA address first: foreign owner, its own data,
+        // and a balance already sent there (treasury the program owns).
+        let squatter_owner = Pubkey::new([0x55u8; 32]);
+        ledger.write_account(
+            pda,
+            Account { balance: 777, nonce: 0, algorithm_id: qchain_crypto::AlgorithmId(0), owner: squatter_owner, code_hash: [0u8; 32], data: vec![0xde, 0xad, 0xbe, 0xef] },
+        );
+
+        let user = Keypair::generate().unwrap();
+        ledger.credit(user.pubkey(), 100_000_000);
+        let ix = Instruction { program_id: prog, accounts: vec![user.pubkey(), pda], data: 1i64.to_le_bytes().to_vec() };
+        let tx = Transaction::new_signed(&user, 0, [0u8; 32], 50_000_000, vec![ix]).unwrap();
+        assert!(ledger.apply_transaction(&tx, &validator, 0).is_ok(), "the program must reclaim its squatted PDA, not be locked out");
+
+        let reclaimed = ledger.store().get(&pda).expect("the PDA still exists");
+        assert_eq!(reclaimed.owner, prog, "ownership was force-reclaimed by the program");
+        assert_eq!(reclaimed.balance, 777, "any balance at the PDA (program treasury) is preserved across the reclaim");
+        assert_eq!(reclaimed.data, vec![0x11, 0x22, 0x33, 0x44], "the squatter's data was discarded and replaced by the program's own state");
     }
 
     #[test]

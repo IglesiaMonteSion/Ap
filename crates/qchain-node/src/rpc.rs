@@ -237,6 +237,7 @@ async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transacti
         "payer_before": sim.payer_before.to_string(),
         "payer_after": sim.payer_after.to_string(),
         "changes": changes,
+        "round": sim.round,
     }))
 }
 

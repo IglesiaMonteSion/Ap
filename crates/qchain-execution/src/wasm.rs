@@ -125,6 +125,11 @@ pub struct WasmCallResult {
     /// and then traps must still be billed for it, not treated as if no
     /// computation happened at all.
     pub trap: Option<String>,
+    /// Indices into the instruction's declared accounts that `host_use_pda`
+    /// verified are genuine PDAs of `program_id` and claimed (owner set to
+    /// `program_id`). The ledger boundary authorizes an owner change to
+    /// `program_id` ONLY for these indices.
+    pub pda_claims: Vec<usize>,
 }
 
 struct HostState {
@@ -153,6 +158,14 @@ struct HostState {
     /// (activation height / retirement) against real committed height, exactly
     /// like `Ledger::check_registry_status` (QCH-WASM-003).
     current_round: u64,
+    /// Indices into `accounts` that `host_use_pda` cryptographically verified are
+    /// this program's genuine PDA (`address == derive_pda(program_id, seed)`) AND
+    /// claimed/reclaimed (set `owner = program_id`). The ledger authorization
+    /// boundary (`run_wasm_instruction`) trusts ONLY these indices for an owner
+    /// change to `program_id` — see `host_use_pda`'s doc for the PDA-squatting
+    /// DoS the reclaim closes. Set by host code (the ledger's own trusted
+    /// syscall), never by contract bytecode, so the boundary can rely on it.
+    pda_claims: Vec<usize>,
     /// Enforces `MAX_CONTRACT_MEMORY_BYTES` - see that constant's doc
     /// comment for the real memory-bomb DoS this closes.
     limits: StoreLimits,
@@ -198,11 +211,29 @@ pub(crate) const MAX_CONTRACT_ACCOUNT_DATA: usize = 16 * 1024;
 ///
 /// Deterministic: a pure function of the committed `current_round` + committed
 /// registry account → every validator agrees, no fork.
-fn scheme_acceptable(accounts: &[Account], registry_account_idx: i32, scheme_id: u16, current_round: u64) -> bool {
+///
+/// SECURITY (re-audit QCH-WASM registry forgery, HIGH): the declared account at
+/// `registry_account_idx` MUST be the canonical on-chain registry singleton
+/// (`REGISTRY_ACCOUNT_ID` = `[4;32]`). Without this address pin a contract could
+/// pass ANY account it declared carrying attacker-authored Borsh — e.g. a table
+/// marking a scheme governance already RETIRED (because it was found
+/// cryptographically broken) as Active — and have this syscall accept
+/// signatures the network as a whole rejects, potentially draining a contract
+/// that trusts the crypto-agility layer. Pinning the address closes it: the
+/// only account whose data is consulted is the genuine registry singleton,
+/// which an attacker cannot occupy (it is seeded at genesis and
+/// `CreateAccount`/`DeployProgram` refuse to overwrite an existing account, so
+/// `[4;32]` always holds the real, governance-controlled registry). `keys` are
+/// the declared account addresses (same order as `accounts`).
+fn scheme_acceptable(keys: &[Pubkey], accounts: &[Account], registry_account_idx: i32, scheme_id: u16, current_round: u64) -> bool {
     if registry_account_idx < 0 {
         return false;
     }
-    let Some(account) = accounts.get(registry_account_idx as usize) else {
+    let idx = registry_account_idx as usize;
+    if keys.get(idx) != Some(&crate::ids::REGISTRY_ACCOUNT_ID) {
+        return false; // NOT the canonical registry singleton — a substitute is never trusted
+    }
+    let Some(account) = accounts.get(idx) else {
         return false;
     };
     let Ok(registry) = Vec::<RegistryEntry>::try_from_slice(&account.data) else {
@@ -218,11 +249,33 @@ fn scheme_acceptable(accounts: &[Account], registry_account_idx: i32, scheme_id:
 }
 
 /// Bound on the compiled-module cache (QCH-WASM-002). Each entry is a compiled
-/// `Arc<Module>`; when full we clear wholesale (a crude bound, not an LRU — the
-/// cache is a pure perf optimization with zero consensus effect, so correctness
-/// is independent of eviction policy). 256 distinct deployed contracts warm at
-/// once is generous for this project's scale.
+/// `Arc<Module>`. Eviction is a real LRU (re-audit QCH-WASM cache thrashing,
+/// MED): when full we drop only the SINGLE least-recently-used entry, never the
+/// whole cache — clearing all 256 let an attacker rotating 257 tiny modules nuke
+/// every OTHER warm contract on each overflow, forcing constant recompiles for
+/// honest traffic. The cache is a pure perf optimization with zero consensus
+/// effect, so correctness is independent of eviction policy. 256 distinct
+/// deployed contracts warm at once is generous for this project's scale.
 const MAX_CACHED_MODULES: usize = 256;
+
+/// Compiled-module cache with real LRU eviction. `map` holds the modules; `order`
+/// records access order, most-recently-used at the back. Kept together under one
+/// `Mutex` so the two never drift.
+#[derive(Default)]
+struct ModuleCache {
+    map: HashMap<[u8; 32], Arc<Module>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl ModuleCache {
+    /// Mark `code_hash` as most-recently-used (move to the back of `order`).
+    fn touch(&mut self, code_hash: &[u8; 32]) {
+        if let Some(pos) = self.order.iter().position(|k| k == code_hash) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(*code_hash);
+    }
+}
 
 pub struct WasmExecutor {
     engine: Engine,
@@ -236,7 +289,7 @@ pub struct WasmExecutor {
     /// cache states produce identical output. `Mutex` gives interior
     /// mutability under `&self` (`call` takes `&self`); a single `Ledger`'s
     /// executor is never touched concurrently (`apply_transaction` is `&mut`).
-    module_cache: Mutex<HashMap<[u8; 32], Arc<Module>>>,
+    module_cache: Mutex<ModuleCache>,
 }
 
 impl Default for WasmExecutor {
@@ -267,24 +320,38 @@ impl WasmExecutor {
         config.wasm_relaxed_simd(false);
         config.max_wasm_stack(512 * 1024);
         let engine = Engine::new(&config)?;
-        Ok(WasmExecutor { engine, module_cache: Mutex::new(HashMap::new()) })
+        Ok(WasmExecutor { engine, module_cache: Mutex::new(ModuleCache::default()) })
     }
 
     /// Get the compiled `Module` for `wasm_bytes`, compiling+caching on a miss
     /// (keyed by `code_hash`). See `module_cache`'s doc for the determinism
     /// argument — the cache never changes execution results.
     fn get_or_compile(&self, code_hash: [u8; 32], wasm_bytes: &[u8]) -> anyhow::Result<Arc<Module>> {
-        if let Ok(cache) = self.module_cache.lock() {
-            if let Some(m) = cache.get(&code_hash) {
-                return Ok(m.clone());
+        if let Ok(mut cache) = self.module_cache.lock() {
+            if let Some(m) = cache.map.get(&code_hash).cloned() {
+                cache.touch(&code_hash);
+                return Ok(m);
             }
         }
         let module = Arc::new(Module::new(&self.engine, wasm_bytes)?);
         if let Ok(mut cache) = self.module_cache.lock() {
-            if cache.len() >= MAX_CACHED_MODULES {
-                cache.clear();
+            // Another caller may have inserted while we compiled; keep the cached one.
+            if let Some(m) = cache.map.get(&code_hash).cloned() {
+                cache.touch(&code_hash);
+                return Ok(m);
             }
-            cache.insert(code_hash, module.clone());
+            // Evict the SINGLE least-recently-used entry when full — never the
+            // whole cache (see `MAX_CACHED_MODULES` doc for the thrashing DoS).
+            while cache.order.len() >= MAX_CACHED_MODULES {
+                match cache.order.pop_front() {
+                    Some(lru) => {
+                        cache.map.remove(&lru);
+                    }
+                    None => break,
+                }
+            }
+            cache.map.insert(code_hash, module.clone());
+            cache.order.push_back(code_hash);
         }
         Ok(module)
     }
@@ -394,17 +461,29 @@ impl WasmExecutor {
             "env",
             "host_get_data",
             |mut caller: Caller<'_, HostState>, idx: i32, ptr: i32, max_len: i32| -> i32 {
-                // Clonar evita el conflicto de préstamo con `write_memory(&mut caller)`.
-                let Some(data) = caller.data().accounts.get(idx as usize).map(|a| a.data.clone()) else {
+                // SECURITY (re-audit QCH-WASM host_get_data unmetered copy, MED/
+                // HIGH): compute `n` and clone ONLY the requested `data[..n]`
+                // prefix — never the whole account. A program account's `data`
+                // can hold up to 256 KiB of bytecode; cloning it in full before
+                // the fuel charge (which is proportional to `n`) let a contract
+                // force gigabytes of unmetered copies by looping
+                // `host_get_data(idx, _, 0)` (n=0 → charged nothing, yet the old
+                // code cloned all 256 KiB each call). The small `data[..n]` clone
+                // is unavoidable to release the immutable borrow before
+                // `write_memory(&mut caller)`.
+                let slice: Option<Vec<u8>> = caller.data().accounts.get(idx as usize).map(|a| {
+                    let n = core::cmp::min(a.data.len(), max_len.max(0) as usize);
+                    a.data[..n].to_vec()
+                });
+                let Some(bytes) = slice else {
                     return -1;
                 };
-                let n = core::cmp::min(data.len(), max_len.max(0) as usize);
-                // Charge for the bytes copied out (QCH-WASM-001).
-                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(n as u64))) {
+                // Charge for the bytes actually copied out (QCH-WASM-001).
+                if !charge(&mut caller, FUEL_PER_HOST_CALL.saturating_add(FUEL_PER_BYTE.saturating_mul(bytes.len() as u64))) {
                     return -1;
                 }
-                if write_memory(&mut caller, ptr, &data[..n]) {
-                    n as i32
+                if write_memory(&mut caller, ptr, &bytes) {
+                    bytes.len() as i32
                 } else {
                     -1
                 }
@@ -436,13 +515,26 @@ impl WasmExecutor {
 
         // SDK v0.3 — cuentas de estado PROPIAS DEL PROGRAMA (PDAs). Verifica que
         // `accounts[idx]` sea genuinamente la PDA de ESTE programa para `seed`
-        // (`address == derive_pda(program_id, seed)`), y si es una cuenta FRESCA
-        // (system-owned, saldo 0, data vacía) la RECLAMA poniendo su owner =
-        // program_id. Devuelve 0 si la cuenta ya es utilizable por el programa
-        // (recién reclamada o ya suya), -1 si no es la PDA o está ocupada por
-        // otro. Como `program_id` entra en la derivación, un programa jamás
-        // puede reclamar la PDA de otro (sin front-running). El borde del ledger
-        // vuelve a autorizar el cambio de owner (solo fresh system→program_id).
+        // (`address == derive_pda(program_id, seed)`), y si no es ya del programa
+        // la RECLAMA poniendo su owner = program_id. Devuelve 0 si la cuenta
+        // quedó utilizable por el programa, -1 si la dirección declarada NO es la
+        // PDA de este programa. Como `program_id` entra en la derivación, un
+        // programa jamás puede reclamar la PDA de otro (sin front-running).
+        //
+        // SECURITY (re-audit QCH-WASM PDA-squatting DoS, HIGH): antes el reclamo
+        // exigía que la cuenta estuviera FRESCA (system-owned, saldo 0, data
+        // vacía). Un tercero podía OCUPAR la PDA por adelantado (una dirección de
+        // bóveda/token derivada es pública) creando allí una cuenta con otro
+        // owner o data, y `host_use_pda` quedaba bloqueado para siempre → DoS. El
+        // reclamo FORZOSO lo cierra: como la dirección está criptográficamente
+        // ligada a `program_id` (SHA3 preimagen-resistente → ninguna cuenta ajena
+        // legítima puede vivir ahí), este programa es el ÚNICO con derecho sobre
+        // esa dirección. Reclama poniendo owner = program_id, PRESERVANDO el
+        // saldo (los fondos en la dirección de la PDA son la tesorería del
+        // programa) y DESCARTANDO cualquier `data` que un ocupante ilegítimo haya
+        // puesto. El índice se registra en `pda_claims` para que el borde del
+        // ledger autorice el cambio de owner (confía en código-host, no en el
+        // bytecode → el borde sigue sólido).
         linker.func_wrap(
             "env",
             "host_use_pda",
@@ -466,17 +558,19 @@ impl WasmExecutor {
                 if key != expected {
                     return -1; // la cuenta declarada NO es la PDA de este programa
                 }
-                let Some(acc) = caller.data_mut().accounts.get_mut(idx) else {
-                    return -1;
-                };
-                if acc.owner == program_id {
-                    return 0; // ya es nuestra, lista para usar
+                {
+                    let Some(acc) = caller.data_mut().accounts.get_mut(idx) else {
+                        return -1;
+                    };
+                    if acc.owner == program_id {
+                        return 0; // ya es nuestra, lista para usar (sin cambio de owner)
+                    }
+                    // Reclamo forzoso: la dirección es criptográficamente nuestra.
+                    acc.owner = program_id;
+                    acc.data.clear(); // descarta estado de un ocupante ilegítimo; el saldo se preserva
                 }
-                if acc.owner == Pubkey::system_program_id() && acc.balance == 0 && acc.data.is_empty() {
-                    acc.owner = program_id; // reclamar la cuenta fresca como PDA del programa
-                    return 0;
-                }
-                -1 // existe y no es nuestra (ocupada) — no reclamable
+                caller.data_mut().pda_claims.push(idx);
+                0
             },
         )?;
 
@@ -563,8 +657,11 @@ impl WasmExecutor {
                 let Some(sig) = read_memory(&mut caller, sig_ptr, sig_len) else {
                     return 0;
                 };
-                let current_round = caller.data().current_round;
-                if !scheme_acceptable(&caller.data().accounts, registry_account_idx, scheme_id as u16, current_round) {
+                let acceptable = {
+                    let hs = caller.data();
+                    scheme_acceptable(&hs.keys, &hs.accounts, registry_account_idx, scheme_id as u16, hs.current_round)
+                };
+                if !acceptable {
                     return 0;
                 }
                 let ok = if scheme_id as u16 == ALGORITHM_ED25519.0 {
@@ -613,7 +710,7 @@ impl WasmExecutor {
         let linker = self.build_linker()?;
 
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), log_bytes: 0, current_round, limits };
+        let host_state = HostState { program_id, keys, accounts, is_signer, log: Vec::new(), log_bytes: 0, current_round, pda_claims: Vec::new(), limits };
         let mut store = Store::new(&self.engine, host_state);
         store.set_fuel(fuel_limit)?;
         store.limiter(|state| &mut state.limits);
@@ -640,7 +737,7 @@ impl WasmExecutor {
         let trap = call_result.err().map(|e| e.to_string());
         let host_state = store.into_data();
 
-        Ok(WasmCallResult { accounts: host_state.accounts, log: host_state.log, fuel_consumed, trap })
+        Ok(WasmCallResult { accounts: host_state.accounts, log: host_state.log, fuel_consumed, trap, pda_claims: host_state.pda_claims })
     }
 }
 
@@ -796,7 +893,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts: vec![], is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -827,7 +924,7 @@ mod tests {
         let linker = executor.build_linker().unwrap();
         let accounts = vec![wallet(0), wallet(0)];
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let func = instance.get_func(&mut store, "check").unwrap();
@@ -868,7 +965,7 @@ mod tests {
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
         let mut store = wasmtime::Store::new(
             &executor.engine,
-            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, limits },
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![a0, a1], accounts, is_signer: vec![true, false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
         );
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -914,8 +1011,35 @@ mod tests {
     /// Lays out `pubkey`/`msg`/`sig` back-to-back in `store`'s linear memory
     /// and calls the WAT module's `check` export - shared by every
     /// `host_verify_signature` test below.
+    /// Auto-pins the declared registry account at `registry_account_idx` to the
+    /// canonical `REGISTRY_ACCOUNT_ID` (so the honest-path tests exercise a
+    /// genuine registry). For the address-forgery test, use
+    /// `call_verify_syscall_keys` to pass a non-canonical key explicitly.
     fn call_verify_syscall(
         executor: &WasmExecutor,
+        accounts: Vec<Account>,
+        scheme_id: u16,
+        pubkey: &[u8],
+        msg: &[u8],
+        sig: &[u8],
+        registry_account_idx: i32,
+    ) -> i32 {
+        let keys: Vec<Pubkey> = (0..accounts.len())
+            .map(|i| {
+                if registry_account_idx >= 0 && i == registry_account_idx as usize {
+                    crate::ids::REGISTRY_ACCOUNT_ID
+                } else {
+                    Pubkey::new([0xAAu8; 32]) // filler, distinct from the registry singleton
+                }
+            })
+            .collect();
+        call_verify_syscall_keys(executor, keys, accounts, scheme_id, pubkey, msg, sig, registry_account_idx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_verify_syscall_keys(
+        executor: &WasmExecutor,
+        keys: Vec<Pubkey>,
         accounts: Vec<Account>,
         scheme_id: u16,
         pubkey: &[u8],
@@ -927,7 +1051,7 @@ mod tests {
         let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
         let linker = executor.build_linker().unwrap();
         let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
-        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys: vec![], accounts, is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, limits });
+        let mut store = wasmtime::Store::new(&executor.engine, HostState { program_id: Pubkey::system_program_id(), keys, accounts, is_signer: vec![], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits });
         store.set_fuel(1_000_000).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
@@ -1058,6 +1182,102 @@ mod tests {
         let result =
             call_verify_syscall(&executor, vec![registry_account], ALGORITHM_ED25519.0, &bundle.components[0].bytes, msg, &sig.components[0].bytes, 0);
         assert_eq!(result, 0, "a Retired scheme must be rejected by the syscall even though the raw signature is genuinely valid");
+    }
+
+    /// SECURITY (re-audit QCH-WASM registry forgery, HIGH): a FORGED registry
+    /// carrying perfectly valid Borsh (here marking a Retired scheme as Active)
+    /// is REJECTED when it is passed at a NON-canonical address, because
+    /// `scheme_acceptable` pins the declared account to `REGISTRY_ACCOUNT_ID`.
+    /// This is the exact attack: an attacker crafts an account with a fake
+    /// algorithm table, marks a retired (broken) scheme Active, and points
+    /// `registry_account_idx` at it. Without the address pin the syscall would
+    /// accept signatures governance already retired.
+    #[test]
+    fn syscall_rejects_a_forged_registry_at_a_noncanonical_address() {
+        let executor = WasmExecutor::new().unwrap();
+        let kp = qchain_crypto::Keypair::generate().unwrap();
+        let msg = b"contract-checked message";
+        let sig = kp.sign(msg).unwrap();
+        let bundle = kp.public_key_bundle();
+
+        // A forged registry: the real genesis entry, but flipped to say a
+        // Retired scheme is Active. Perfectly valid Borsh — the only thing wrong
+        // is that this account is NOT at REGISTRY_ACCOUNT_ID.
+        let mut forged = qchain_crypto::registry::genesis_registry()[0].clone();
+        forged.status = qchain_crypto::AlgorithmStatus::Active;
+        let forged_account = Account { data: borsh::to_vec(&vec![forged]).unwrap(), ..wallet(0) };
+
+        let attacker_addr = Pubkey::new([7u8; 32]);
+        assert_ne!(attacker_addr, crate::ids::REGISTRY_ACCOUNT_ID);
+
+        let result = call_verify_syscall_keys(
+            &executor,
+            vec![attacker_addr], // keys[0] is NOT the canonical registry
+            vec![forged_account],
+            ALGORITHM_ED25519.0,
+            &bundle.components[0].bytes,
+            msg,
+            &sig.components[0].bytes,
+            0,
+        );
+        assert_eq!(result, 0, "a forged registry at a non-canonical address must be rejected regardless of its (valid) contents");
+
+        // Control: the SAME forged data, but with the account pinned at the
+        // canonical address (which in reality only the genuine registry can be),
+        // would be consulted — proving the ONLY thing the pin changed is the
+        // address check, not the content parsing.
+        let mut forged2 = qchain_crypto::registry::genesis_registry()[0].clone();
+        forged2.status = qchain_crypto::AlgorithmStatus::Active;
+        let ok = call_verify_syscall_keys(
+            &executor,
+            vec![crate::ids::REGISTRY_ACCOUNT_ID],
+            vec![Account { data: borsh::to_vec(&vec![forged2]).unwrap(), ..wallet(0) }],
+            ALGORITHM_ED25519.0,
+            &bundle.components[0].bytes,
+            msg,
+            &sig.components[0].bytes,
+            0,
+        );
+        assert_eq!(ok, 1, "at the canonical address the registry IS consulted (Ed25519 Active → verifies)");
+    }
+
+    /// SECURITY (re-audit QCH-WASM host_get_data unmetered copy, MED/HIGH): a
+    /// `host_get_data(idx, ptr, 0)` on a large (256 KiB) program account must
+    /// copy ZERO bytes and never clone the whole account. Before the fix the host
+    /// cloned the entire `data` on every call regardless of `max_len`, so a loop
+    /// of zero-length reads could force gigabytes of copies for a handful of
+    /// fuel. This proves the requested length bounds the work.
+    #[test]
+    fn host_get_data_copies_only_the_requested_length_not_the_whole_account() {
+        const GET_DATA_WAT: &str = r#"
+            (module
+                (import "env" "host_get_data" (func $get_data (param i32 i32 i32) (result i32)))
+                (memory (export "memory") 8)
+                (func (export "read") (param $idx i32) (param $max i32) (result i32)
+                    (call $get_data (local.get $idx) (i32.const 0) (local.get $max)))
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(GET_DATA_WAT).unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        let module = wasmtime::Module::new(&executor.engine, &wasm_bytes).unwrap();
+        let linker = executor.build_linker().unwrap();
+        let big = Account { data: vec![0xabu8; 256 * 1024], ..wallet(0) };
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_CONTRACT_MEMORY_BYTES).trap_on_grow_failure(true).build();
+        let mut store = wasmtime::Store::new(
+            &executor.engine,
+            HostState { program_id: Pubkey::system_program_id(), keys: vec![Pubkey::new([1u8; 32])], accounts: vec![big], is_signer: vec![false], log: vec![], log_bytes: 0, current_round: 0, pda_claims: vec![], limits },
+        );
+        store.set_fuel(1_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let func = instance.get_func(&mut store, "read").unwrap();
+        let call = |store: &mut wasmtime::Store<HostState>, max: i32| -> i32 {
+            let mut results = vec![Val::I32(0)];
+            func.call(&mut *store, &[Val::I32(0), Val::I32(max)], &mut results).unwrap();
+            results[0].i32().unwrap()
+        };
+        assert_eq!(call(&mut store, 0), 0, "max_len=0 must copy zero bytes");
+        assert_eq!(call(&mut store, 8), 8, "max_len=8 must copy exactly 8 bytes");
+        assert_eq!(call(&mut store, 512 * 1024), 256 * 1024, "asking for more than present returns the full data length");
     }
 
     /// QCH-WASM-001: host calls are fuel-metered. A contract that loops a host

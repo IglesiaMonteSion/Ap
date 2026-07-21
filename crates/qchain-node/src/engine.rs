@@ -366,6 +366,17 @@ static STARK_PROOF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::con
 const MAX_CONCURRENT_SNAPSHOTS: usize = 2;
 static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SNAPSHOTS);
 
+/// Caps concurrent `/simulate` dry-runs (re-audit QCH-SIMULATE DoS). A dry-run
+/// can compile+run WASM and holds the state lock while seeding the scratch
+/// store, so an unbounded fan-out of concurrent simulations could pin cores and
+/// starve consensus of the lock. Excess callers queue for a permit, same pattern
+/// as `MAX_CONCURRENT_STARK_PROOFS`. Combined with the mandatory
+/// chain_id/size/signature gate applied BEFORE this permit, only a
+/// genuinely-signed, chain-bound tx ever reaches the expensive dry-run, and at
+/// most this many at once.
+const MAX_CONCURRENT_SIMULATIONS: usize = 4;
+static SIMULATE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SIMULATIONS);
+
 /// How long a captured point-in-time snapshot stays servable before the node
 /// re-captures a fresh one (see `CachedSnapshot`). Long enough that a client
 /// can page through a large state within one snapshot without it rotating,
@@ -1979,12 +1990,39 @@ impl Engine {
     /// (QCH-WALLET-001) — the `/simulate` endpoint. Runs on a throwaway scratch
     /// ledger, so it can never touch consensus/state; used by a wallet to show
     /// the real predicted outcome (fee, resulting balances, success/failure)
-    /// before the user authorizes broadcasting. The fee collector doesn't affect
-    /// the payer's outcome, so we use the payer as a harmless placeholder.
+    /// before the user authorizes broadcasting.
+    ///
+    /// ECONOMIC ACCURACY (re-audit QCH-SIMULATE, MED): the fee collector is a
+    /// fixed DUMMY distinct from the payer — never the payer. Using the payer
+    /// would credit the validator commission back to them, understating the true
+    /// cost shown in the preview.
     pub async fn simulate_transaction(&self, tx: &qchain_core::Transaction) -> qchain_execution::SimOutcome {
+        // A placeholder validator address that is never a real payer (no keypair
+        // derives it) and is not a protocol singleton, so it can safely absorb
+        // the simulated commission without touching the payer's outcome.
+        const SIM_FEE_COLLECTOR: qchain_crypto::Pubkey = qchain_crypto::Pubkey::new([0xFDu8; 32]);
+        // DoS GATE (re-audit QCH-SIMULATE, HIGH): cheap checks BEFORE any lock or
+        // expensive work — reject a tx for another chain, an oversized tx, or one
+        // whose signature doesn't verify (the same gate admission applies). So
+        // the scratch-ledger dry-run (which can compile+run WASM) only ever runs
+        // for a genuinely-signed, chain-bound, size-bounded transaction, closing
+        // the "unauthenticated free arbitrary WASM under the state lock" hole.
+        if tx.message.chain_id != self.chain_id {
+            return qchain_execution::SimOutcome::rejected("transaction's chain_id does not match this network");
+        }
+        if tx.byte_size() > MAX_TRANSACTION_BYTES {
+            return qchain_execution::SimOutcome::rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size()));
+        }
+        if !tx.verify_signature() {
+            return qchain_execution::SimOutcome::rejected("invalid transaction signature");
+        }
+        // Bound concurrent dry-runs so a flood of validly-signed simulations
+        // can't pin every core or monopolize the state lock (excess callers queue
+        // for a permit). The permit is held only for the brief dry-run.
+        let _permit = SIMULATE_PERMITS.acquire().await;
         let state = self.state.lock().await;
         let round = state.next_round;
-        state.ledger.simulate(tx, &tx.message.payer, round)
+        state.ledger.simulate(tx, &SIM_FEE_COLLECTOR, round)
     }
 
     /// v7 reward/unbonding timing for the wallet's staking progress bars:
