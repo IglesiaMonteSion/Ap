@@ -423,6 +423,11 @@ const PARTICIPATION_LAG_QUANTOS: u64 = 1;
 /// ever reads `cur - 1`; a small window covers a multi-quanto catch-up).
 const PARTICIPATION_RETENTION_QUANTOS: u64 = 64;
 
+/// Fed-but-unconsumed participation tallies, one per quanto:
+/// `(quanto, [(validator, credits, opportunities)])`. Exported/imported so the
+/// node can persist them atomically with the round state (#209).
+pub type ParticipationTallies = Vec<(u64, Vec<(Pubkey, u64, u64)>)>;
+
 /// Defensive per-transaction cap on how many elapsed quantos one apply closes in
 /// a single pass (a long idle gap then a burst). Emission is never lost — the
 /// next transaction continues the catch-up; this only bounds per-tx work.
@@ -826,6 +831,14 @@ impl Ledger {
                 }
             }
         }
+        // Jail any validator that was TOTALLY inactive over the scored quanto (had
+        // opportunities, produced no committed certificate) — the on-chain part of
+        // "exclude inactive/disconnected validators": Jailed drops out of both the
+        // active committee (`active_committee`) AND the fee split (`is_eligible`).
+        // Recoverable via an operator `Unjail`. Deterministic (reads the committed
+        // counters just written). Runs on the same registry object so a single
+        // write persists both the participation update and the jail transition.
+        changed |= crate::validator_v7::jail_inactive(&mut registry);
         if !changed {
             return;
         }
@@ -1095,6 +1108,31 @@ impl Ledger {
         self.pool_earned = snap.pool_earned;
         self.total_emitted = snap.total_emitted;
         self.validator_commissions = snap.validator_commissions.into_iter().collect();
+    }
+
+    /// Export the fed-but-unconsumed participation tallies (the in-memory
+    /// `participation_by_quanto` map) so the node can persist them ATOMICALLY with
+    /// the round state. A tally is fed by the node's participation feed and read
+    /// by a later quanto close (`apply_participation_for_quanto`, lagged 1 quanto);
+    /// a tally fed but not yet consumed lives ONLY in this in-memory map, so a
+    /// restart WITHOUT this would lose it and the close would find no tally →
+    /// leave `participation_bps` at 10000 while a non-restarted node gated →
+    /// FORK. Persisting + restoring it is exactly what makes re-enabling the
+    /// participation gating fork-safe. Deterministic order (by quanto) so the
+    /// serialized blob is byte-identical on every node.
+    pub fn export_participation(&self) -> ParticipationTallies {
+        let mut out: ParticipationTallies = self.participation_by_quanto.iter().map(|(q, t)| (*q, t.clone())).collect();
+        out.sort_by_key(|(q, _)| *q);
+        out
+    }
+
+    /// Restore the participation tallies persisted by `export_participation` on a
+    /// restart, BEFORE any transaction replay, so a quanto close after the restart
+    /// reads the identical tally a non-restarted node has.
+    pub fn import_participation(&mut self, tallies: ParticipationTallies) {
+        for (q, t) in tallies {
+            self.participation_by_quanto.insert(q, t);
+        }
     }
 
     /// Writes an account directly into the store - genesis-time seeding

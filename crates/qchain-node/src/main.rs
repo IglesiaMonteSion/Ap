@@ -808,6 +808,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // v7 participation pipeline (#209): restore the accumulator + next-quanto +
+    // fed-but-unconsumed tallies committed atomically with the round state, so
+    // the participation gating resumes fork-safely instead of re-deriving from a
+    // pruned DAG. Only present on a v7 network with the atomic store; absent (a
+    // v6 network / fresh genesis) → start empty, identical to before.
+    let mut participation_credits: std::collections::BTreeMap<u64, HashMap<qchain_core::ValidatorId, u64>> = std::collections::BTreeMap::new();
+    let mut participation_next_quanto: u64 = 0;
+    if let Some(bytes) = ledger.get_meta("v7_participation") {
+        match <qchain_node::engine::PersistedParticipation as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+            Ok(blob) => {
+                participation_next_quanto = blob.next_quanto;
+                for (q, m) in blob.credits {
+                    participation_credits.insert(q, m.into_iter().collect());
+                }
+                ledger.import_participation(blob.tallies);
+                tracing::info!("restored v7 participation pipeline (next_quanto={participation_next_quanto}, {} accrued quanto(s))", participation_credits.len());
+            }
+            Err(e) => tracing::warn!("ignoring a corrupt v7 participation blob ({e}); participation resumes empty"),
+        }
+    }
+
     // The committee schedule was built (and, for a rotation node, reloaded from
     // disk) above, before the consensus-resume decision. `current_committee` is
     // the set in effect for the resume round; the schedule carries the full
@@ -860,8 +881,8 @@ async fn main() -> anyhow::Result<()> {
             update_available: None,
             pending_execution: std::collections::VecDeque::new(),
             pending_availability_votes: HashMap::new(),
-            participation_credits: std::collections::BTreeMap::new(),
-            participation_next_quanto: 0,
+            participation_credits,
+            participation_next_quanto,
         }),
     });
 

@@ -102,6 +102,50 @@ pub fn active_committee_from_registry(
     Some(ValidatorSet::new(infos))
 }
 
+/// Derive the active consensus committee from the **v7 validator registry** (the
+/// unified canonical registry, #209). Unlike `active_committee_from_registry`
+/// (the phase-3 stake-ranked format), this reads the rich `ValidatorV7Registry`
+/// that already drives bonds, lifecycle, participation, jailing, and fees — so a
+/// v7 network has ONE registry deciding who is in the committee, who may
+/// produce/vote, who is bonded/active/exiting/jailed/slashed, who receives fees,
+/// and what consensus key + P2P address each uses. A member is `Active`, past its
+/// `activation_quanto` (activation synced to the epoch), and holds the full bond;
+/// each carries EQUAL weight (one bond = one unit). Deterministic (ordered by
+/// consensus address, capped) → every honest node derives the byte-identical
+/// committee from the identical committed registry → fork-free. Returns `None`
+/// when no viable active set exists (so the ratchet keeps the inherited genesis
+/// committee until real activations exist), and the members for peer discovery.
+pub fn active_committee_from_v7_registry(
+    registry: &qchain_execution::validator_v7::ValidatorV7Registry,
+    current_quanto: u64,
+) -> Option<(ValidatorSet, Vec<qchain_execution::validator_v7::ActiveV7Member>)> {
+    let members = qchain_execution::validator_v7::active_committee(registry, current_quanto);
+    if members.is_empty() {
+        return None;
+    }
+    let infos: Vec<ValidatorInfo> = members.iter().map(|m| ValidatorInfo { id: m.address, pubkey_bundle: m.pubkey_bundle.clone(), stake: m.bond }).collect();
+    Some((ValidatorSet::new(infos), members))
+}
+
+/// Stage-3 peer discovery for the v7 unified registry: the config mesh unioned
+/// with the active committee's registered `p2p_address`es (excluding self, deduped
+/// by id, skipping any unparseable address). Same union rationale as `merge_peers`
+/// — a good config peer is never dropped for a bad registry address, and a
+/// genuinely new bonded validator (not in anyone's config) is dialed automatically.
+pub fn merge_peers_v7(config_peers: &[PeerInfo], members: &[qchain_execution::validator_v7::ActiveV7Member], self_id: &qchain_core::ValidatorId) -> Vec<PeerInfo> {
+    let mut peers = config_peers.to_vec();
+    for m in members {
+        if &m.address == self_id || peers.iter().any(|p| p.id == m.address) {
+            continue;
+        }
+        match m.p2p_address.parse::<std::net::SocketAddr>() {
+            Ok(addr) => peers.push(PeerInfo { id: m.address, addr }),
+            Err(e) => tracing::warn!("skipping unparseable v7 registry address '{}' for validator {}: {e}", m.p2p_address, m.address),
+        }
+    }
+    peers
+}
+
 /// SUPERSEDED (v4.1.0): the epoch ratchet no longer calls this — it now adopts
 /// the derived set wholesale (real shrink: `Some(d) => (*d).clone()`), which is
 /// safe because the consensus ordering fixes landed first (v4.0.3 `direct_status`
@@ -511,32 +555,57 @@ const MAX_ROUND_LOOKAHEAD: Round = 1_024;
 /// draws).
 const DAG_RETENTION_ROUNDS: Round = 1_024;
 
-/// v7 participation gating (§21.2) master switch — DISABLED.
+/// v7 participation gating (§21.2) master switch — ENABLED, fork-safe via atomic
+/// persistence (#209).
 ///
 /// The async participation feed (accumulate per-quanto committed-cert credits
 /// from the DAG on this node, feed the ledger a tally the following quanto's
-/// close reads to gate a down validator out of the 1/N fee split) is
-/// STRUCTURALLY INCOMPATIBLE WITH DAG PRUNING across a restart. A quanto is only
-/// safe to feed once it is `gc_floor`-final (below the watermark under which
-/// certs can never be revised) — but those very certs are then PRUNED, so a
-/// RESTARTED node has no DAG history to rebuild that quanto's credits from and
-/// re-derives a DIFFERENT tally than a node that never restarted → FORK. Both a
-/// `finalized_floor` and a `gc_floor` threshold were confirmed live to fork a
-/// restarted node (wrong bps on validators that were never down). Making the
-/// gating fork-safe requires PERSISTING the fed tallies + `participation_next_quanto`
-/// to disk (a new sled layer) so a restart resumes from persisted state instead
-/// of re-deriving from a pruned DAG — deferred as its own increment.
+/// close reads to gate/jail a down validator out of the 1/N fee split and the
+/// committee) was STRUCTURALLY INCOMPATIBLE WITH DAG PRUNING across a restart. A
+/// quanto is only safe to feed once it is `gc_floor`-final (below the watermark
+/// under which certs can never be revised) — but those very certs are then
+/// PRUNED, so a RESTARTED node had no DAG history to rebuild the STRADDLING
+/// quanto's partial credits from and re-derived a DIFFERENT tally than a node
+/// that never restarted → FORK (confirmed live at both `finalized_floor` and
+/// `gc_floor` thresholds).
 ///
-/// With the switch OFF: no credits accumulate, no tally is ever fed, the
-/// ledger's `apply_participation_for_quanto` always finds no tally and leaves
-/// `participation_bps` at the genesis-seeded 10000, so every Active founder is
-/// eligible → deterministic 1/N split identical on every node → NO FORK. The
-/// accepted imperfection is that a DOWN validator keeps earning its 1/N share
-/// (a fee overpayment, never a safety/consensus issue; its bond/stake is still
-/// intact and equivocation is still slashed). The ledger unit test that feeds a
-/// tally directly (`set_quanto_participation`) still exercises the gating logic
-/// in isolation — only the node's async feed is inert.
-const V7_PARTICIPATION_GATING: bool = false;
+/// **The fix (#209): persist the pipeline ATOMICALLY.** Each committed round
+/// folds a `PersistedParticipation` blob — the engine's `participation_credits`
+/// accumulator + `participation_next_quanto` + the ledger's fed-but-unconsumed
+/// tallies — into the SAME atomic redb commit as the state+round (see
+/// `persist_round_atomic`). On restart the node restores all three from that
+/// blob (`main.rs`) instead of re-deriving from a pruned DAG, so a restarted node
+/// resumes with the byte-identical accumulator/next-quanto/tallies a
+/// non-restarted node has → identical feeds → identical gating → NO FORK.
+///
+/// Because fork-safety REQUIRES that atomic persistence, `participation_on` also
+/// requires `store_supports_atomic_meta()` (true only for `RedbStore`, the
+/// production/mainnet store). On the in-memory store (DST / unit tests) atomic
+/// meta is unavailable → gating stays off → the DST is unaffected and a v7
+/// network runs the deterministic 10000-bps split there. Gated on economics_v7
+/// throughout, so a v6 network is byte-identical.
+const V7_PARTICIPATION_GATING: bool = true;
+
+/// Engine per-quanto participation credit accumulator, serialized:
+/// `(quanto, [(validator, credits)])`.
+pub type PersistedCredits = Vec<(u64, Vec<(qchain_crypto::Pubkey, u64)>)>;
+
+/// The atomically-persisted v7 participation pipeline (#209) — folded into the
+/// per-round redb commit and restored on restart so re-enabling the gating is
+/// fork-safe under DAG pruning. Three parts, all needed. `next_quanto` is the
+/// engine's `participation_next_quanto` (how far the feed advanced) so a restart
+/// never re-feeds an already-fed quanto; `credits` is the engine's
+/// `participation_credits` accumulator for quantos not yet fed (a quanto
+/// straddling the pruned floor can't be rebuilt from the reloaded above-floor DAG
+/// alone, so its partial pre-restart credits must survive verbatim); `tallies` is
+/// the ledger's fed-but-unconsumed `participation_by_quanto` (a tally fed but not
+/// yet read by a quanto close lives only in RAM otherwise).
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Default)]
+pub struct PersistedParticipation {
+    pub next_quanto: u64,
+    pub credits: PersistedCredits,
+    pub tallies: qchain_execution::ledger::ParticipationTallies,
+}
 
 /// How many of `available` receipts a single `/stark_proof` call actually
 /// proves, given what the caller requested (`None` meaning "all of them").
@@ -595,6 +664,25 @@ fn persist_round_atomic(state: &mut EngineState) {
         match borsh::to_vec(&state.ledger.export_economics()) {
             Ok(bytes) => state.ledger.put_meta("economics", bytes),
             Err(e) => tracing::warn!("could not encode economics for the atomic commit: {e}"),
+        }
+        // v7 participation pipeline (#209): fold the accumulator + next-quanto +
+        // fed-but-unconsumed tallies into the SAME atomic commit, so a restart
+        // restores them fork-safely (the const's doc explains why all three are
+        // needed). Only for a v7 network; a v6 network never writes this key.
+        if state.ledger.is_economics_v7() {
+            let blob = PersistedParticipation {
+                next_quanto: state.participation_next_quanto,
+                credits: state
+                    .participation_credits
+                    .iter()
+                    .map(|(q, m)| (*q, m.iter().map(|(v, c)| (*v, *c)).collect()))
+                    .collect(),
+                tallies: state.ledger.export_participation(),
+            };
+            match borsh::to_vec(&blob) {
+                Ok(bytes) => state.ledger.put_meta("v7_participation", bytes),
+                Err(e) => tracing::warn!("could not encode v7 participation for the atomic commit: {e}"),
+            }
         }
         if let Err(e) = state.ledger.flush() {
             fatal_persist_failure("atomic round+state commit", &e);
@@ -3881,7 +3969,10 @@ impl Engine {
         // const's doc comment. With it off `participation_on` is false, both the
         // credit accumulator and the feed loop below are skipped, and the ledger
         // keeps every founder at 10000 bps → deterministic 1/N split, no fork.
-        let participation_on = state.ledger.is_economics_v7() && V7_PARTICIPATION_GATING;
+        // Requires atomic-meta persistence (`RedbStore`) so the accumulator +
+        // next-quanto + tallies survive a restart fork-safely (see the const's
+        // doc). Off on the in-memory store → DST unaffected.
+        let participation_on = state.ledger.is_economics_v7() && V7_PARTICIPATION_GATING && state.ledger.store_supports_atomic_meta();
         let rpq = state.ledger.rounds_per_quanto();
         for digest in newly_ordered {
             let Some(cert) = state.dag.get(&digest).cloned() else { continue };
@@ -4144,37 +4235,73 @@ impl Engine {
                     .all(|c| c.vertex.round >= boundary);
                 if finalized_floor >= boundary && execution_crossed {
                     let next_epoch = frontier + 1;
-                    let registry = state
-                        .ledger
-                        .store()
-                        .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
-                        .and_then(|a| qchain_execution::validator_registry::ValidatorRegistryData::try_read(&a.data).ok())
-                        .unwrap_or_default();
-                    // Re-read each self-registered validator's LIVE self-stake
-                    // from committed state (v4.1.4 audit MEDIUM fix): a validator
-                    // that undelegated its bond is dropped from the derived set
-                    // instead of coasting on its registration-time snapshot.
-                    // Genesis-seeded entries (`self_stake_account == None`) keep
-                    // their snapshot. Reads committed state, so every honest node
-                    // computes the identical committee — fork-free.
-                    let store = state.ledger.store();
-                    let live_stake_of = |rv: &qchain_execution::validator_registry::RegisteredValidator| -> u64 {
-                        match rv.self_stake_account {
-                            None => rv.stake, // genesis bootstrap: trust snapshot
-                            Some(addr) => store
-                                .get(&addr)
-                                .and_then(|a| <qchain_execution::staking::StakeAccountData as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
-                                // A genuine self-stake: owner == validator == the entry's validator.
-                                .filter(|d| d.owner == rv.validator && d.validator == rv.validator)
-                                .map(|d| d.amount)
-                                .unwrap_or(0), // withdrawn / missing / not a self-stake -> dropped by the min filter
+                    // UNIFIED REGISTRY (#209): on a v7 network, derive the committee
+                    // from the SINGLE canonical `ValidatorV7Registry` — the same
+                    // registry that drives bonds/lifecycle/participation/jailing/
+                    // fees — so "who is in the committee / may produce/vote / is
+                    // bonded/active/exiting/jailed/slashed / receives fees / uses
+                    // which consensus key + P2P address" is ONE decision from ONE
+                    // registry. A v6 network keeps the phase-3 stake-ranked path.
+                    // `v7_members` carries the p2p addresses for v7 peer discovery.
+                    // `derived` is the committee (None → fall back to inherited);
+                    // exactly one of `v7_members` / `phase3_registry` is populated
+                    // for the corresponding peer-discovery path below.
+                    let mut derived: Option<ValidatorSet> = None;
+                    let mut v7_members: Option<Vec<qchain_execution::validator_v7::ActiveV7Member>> = None;
+                    let mut phase3_registry: Option<qchain_execution::validator_registry::ValidatorRegistryData> = None;
+                    if state.ledger.is_economics_v7() {
+                        let registry = state
+                            .ledger
+                            .store()
+                            .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+                            .and_then(|a| <qchain_execution::validator_v7::ValidatorV7Registry as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
+                            .unwrap_or_default();
+                        // Activation is synced to the epoch via the quanto clock:
+                        // `active_committee` only seats a validator whose
+                        // `activation_quanto <= current_quanto`, and `jail_inactive`
+                        // + `WithdrawBond` remove exiting/down ones. Read the quanto
+                        // from committed STAKING_GLOBAL so every node agrees.
+                        let current_quanto = state
+                            .ledger
+                            .store()
+                            .get(&qchain_execution::ids::STAKING_GLOBAL_ID)
+                            .and_then(|a| <qchain_execution::staking_v7::GlobalStakingState as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
+                            .map(|g| g.current_quanto)
+                            .unwrap_or(0);
+                        if let Some((set, members)) = active_committee_from_v7_registry(&registry, current_quanto) {
+                            derived = Some(set);
+                            v7_members = Some(members);
                         }
-                    };
-                    // Fall back to the committee this epoch would otherwise
-                    // inherit (the frontier epoch's) when the registry has no
-                    // viable active set — so a rotation network keeps running on
-                    // its genesis validators until real registrations exist.
-                    let derived = active_committee_from_registry(&registry, live_stake_of);
+                    } else {
+                        let registry = state
+                            .ledger
+                            .store()
+                            .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
+                            .and_then(|a| qchain_execution::validator_registry::ValidatorRegistryData::try_read(&a.data).ok())
+                            .unwrap_or_default();
+                        // Re-read each self-registered validator's LIVE self-stake
+                        // from committed state (v4.1.4 audit MEDIUM fix): a validator
+                        // that undelegated its bond is dropped from the derived set
+                        // instead of coasting on its registration-time snapshot.
+                        // Genesis-seeded entries (`self_stake_account == None`) keep
+                        // their snapshot. Reads committed state, so every honest node
+                        // computes the identical committee — fork-free.
+                        let store = state.ledger.store();
+                        let live_stake_of = |rv: &qchain_execution::validator_registry::RegisteredValidator| -> u64 {
+                            match rv.self_stake_account {
+                                None => rv.stake, // genesis bootstrap: trust snapshot
+                                Some(addr) => store
+                                    .get(&addr)
+                                    .and_then(|a| <qchain_execution::staking::StakeAccountData as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
+                                    // A genuine self-stake: owner == validator == the entry's validator.
+                                    .filter(|d| d.owner == rv.validator && d.validator == rv.validator)
+                                    .map(|d| d.amount)
+                                    .unwrap_or(0), // withdrawn / missing / not a self-stake -> dropped by the min filter
+                            }
+                        };
+                        derived = active_committee_from_registry(&registry, live_stake_of);
+                        phase3_registry = Some(registry);
+                    }
                     // The committee this epoch inherits (the frontier epoch's) —
                     // used only as the fallback when the registry yields no set.
                     let inherited = sched.for_round(frontier.saturating_mul(epoch_rounds));
@@ -4235,8 +4362,15 @@ impl Engine {
                     // registry address, and a genuinely new validator (not in
                     // the config) is now reached automatically.
                     if derived.is_some() {
-                        let active = qchain_execution::validator_registry::select_active_set(&registry, qchain_execution::validator_registry::MAX_ACTIVE_VALIDATORS);
-                        let merged = merge_peers(&self.config_peers, &active, &self.self_id);
+                        // Peer discovery from whichever registry drove the derived
+                        // committee: v7 members' p2p addresses, or the phase-3
+                        // active set's — unioned with the config mesh.
+                        let merged = if let Some(members) = &v7_members {
+                            merge_peers_v7(&self.config_peers, members, &self.self_id)
+                        } else {
+                            let active = qchain_execution::validator_registry::select_active_set(phase3_registry.as_ref().expect("phase3 registry present when not v7"), qchain_execution::validator_registry::MAX_ACTIVE_VALIDATORS);
+                            merge_peers(&self.config_peers, &active, &self.self_id)
+                        };
                         // Keep the authenticated-transport accept set in lock-step
                         // with the dial set (task #176), so a genuinely new
                         // registered validator can both be dialed AND complete the
@@ -4647,6 +4781,50 @@ mod tests {
         assert!(derived.get(&kps[0].pubkey()).is_none(), "withdrawn self-stake -> not in the active committee");
         assert!(derived.get(&kps[1].pubkey()).is_some(), "healthy live self-stake stays");
         assert!(derived.get(&kps[2].pubkey()).is_some(), "genesis-seeded entry keeps its snapshot");
+    }
+
+    /// #209: the epoch ratchet, on a v7 network, derives the committee from the
+    /// unified `ValidatorV7Registry` — Active+activated+bonded members with equal
+    /// weight, and the v7 members carry the p2p addresses for peer discovery.
+    #[test]
+    fn v7_registry_drives_the_consensus_committee_and_peer_discovery() {
+        use qchain_execution::economics_v7::VALIDATOR_BOND_ATOMS;
+        use qchain_execution::validator_v7::{ValidatorV7Entry, ValidatorV7Registry, ValidatorV7State};
+        let kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let entry = |kp: &Keypair, state: ValidatorV7State, port: u16| ValidatorV7Entry {
+            address: kp.pubkey(),
+            operator_address: kp.pubkey(),
+            withdrawal_address: kp.pubkey(),
+            moniker: format!("v{port}"),
+            pubkey_bundle: kp.public_key_bundle(),
+            p2p_address: format!("127.0.0.1:{port}"),
+            bond: VALIDATOR_BOND_ATOMS,
+            state,
+            registered_quanto: 0,
+            activation_quanto: 0,
+            exit_requested_quanto: 0,
+            bond_release_quanto: 0,
+            participation_credits: 0,
+            participation_opportunities: 0,
+        };
+        // Two Active + one Jailed → the committee is the two Active ones.
+        let reg = ValidatorV7Registry {
+            validators: vec![
+                entry(&kps[0], ValidatorV7State::Active, 9001),
+                entry(&kps[1], ValidatorV7State::Active, 9002),
+                entry(&kps[2], ValidatorV7State::Jailed, 9003),
+            ],
+        };
+        let (committee, members) = active_committee_from_v7_registry(&reg, 0).expect("two active validators form a committee");
+        assert_eq!(committee.len(), 2, "the jailed validator is excluded from the committee");
+        assert!(committee.get(&kps[2].pubkey()).is_none(), "jailed → not in committee");
+        assert!(committee.infos().iter().all(|i| i.stake == VALIDATOR_BOND_ATOMS), "equal weight per bond");
+        // Peer discovery: the two active members' registered p2p addresses are
+        // unioned with the config mesh (self excluded).
+        let peers = merge_peers_v7(&[], &members, &kps[0].pubkey());
+        assert_eq!(peers.len(), 1, "only the other active member is dialed (self excluded)");
+        assert_eq!(peers[0].id, kps[1].pubkey());
+        assert_eq!(peers[0].addr.port(), 9002);
     }
 
     fn new_state() -> EngineState {

@@ -271,6 +271,22 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// v7: un-jail a validator that was jailed for downtime, re-entering the
+    /// active committee at the next epoch. `--keypair` is the OPERATOR (cold) key;
+    /// `--consensus-address` names the validator (defaults to the operator's own).
+    V7Unjail {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The consensus address of the jailed validator (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
     /// v7 treasury: release (unlock+send) locked treasury funds to an address.
     /// The keypair MUST be the treasury authority set at genesis.
     TreasuryRelease {
@@ -1402,6 +1418,25 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("submitted: {body}");
             println!("withdrew the 500 QCH bond for v7 validator {target} to {wd} (removed from the registry)");
+        }
+        Command::V7Unjail { rpc, keypair, consensus_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::Unjail { consensus_address: target })?;
+            let body = submit_instruction(
+                &rpc,
+                &operator,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("un-jailed v7 validator {target} - rejoins the active committee at the next epoch");
         }
         Command::TreasuryRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
             let authority = qchain_crypto::read_keypair_file(&keypair)?;
