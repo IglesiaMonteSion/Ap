@@ -25,7 +25,7 @@
 //! never reaches it.
 
 use qchain_node::config::NodeConfig;
-use qchain_node::engine::{SnapshotMeta, SnapshotPage, StateSnapshot, SNAPSHOT_PAGE_SIZE};
+use qchain_node::engine::{committee_fingerprint, SnapshotMeta, SnapshotPage, StateSnapshot, SNAPSHOT_PAGE_SIZE};
 use qchain_storage::compressed::IncrementalCompressedTree;
 use qchain_storage::IncrementalStateTree;
 use std::time::Duration;
@@ -65,13 +65,29 @@ pub(crate) fn check_trust_anchor_requirement(require: bool, trusted_root: &Optio
 /// caller installs it. Returns an error (aborting node startup) rather than
 /// ever installing unverified or forked state.
 pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<StateSnapshot> {
-    // Fail fast, before any network I/O, if the operator requires an anchor but
-    // none is configured (#194).
+    let is_mainnet = config.is_mainnet_profile();
+    // Authentication is MANDATORY when the operator requires an anchor OR under
+    // the mainnet profile (task #212 / #194). In those modes a snapshot is only
+    // accepted when its (round, root) is authenticated by a quorum-signed
+    // checkpoint OR the out-of-band trust anchor.
+    let auth_required = config.require_state_sync_trust_anchor || is_mainnet;
+
+    // Fail fast, before any network I/O, if the anchor is required but missing.
+    // Mainnet forces the anchor requirement even if the flag were unset.
     check_trust_anchor_requirement(
-        config.require_state_sync_trust_anchor,
+        auth_required && is_mainnet, // mainnet: the anchor itself is mandatory
         &config.state_sync_trusted_root,
         &config.state_sync_trusted_round,
     )?;
+
+    // The committee + network identity THIS node treats as authoritative, from
+    // its own config (never from a peer). For a fixed-membership network these
+    // are what every honest peer also computes; the syncing node verifies the
+    // quorum-signed checkpoint against THIS committee.
+    let committee = committee_from_config(config);
+    let own_chain_id = hex::encode(config.chain_id());
+    let own_fingerprint = hex::encode(committee_fingerprint(&committee));
+    let min_confirmations = config.state_sync_min_confirmations() as usize;
 
     // Bounded HTTP client: without an overall + connect timeout, a configured
     // peer that accepts the connection and never finishes hangs node startup
@@ -82,20 +98,41 @@ pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<Stat
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    // 1. Gather each peer's snapshot header for a cheap fork check.
+    // 1. Gather each peer's snapshot header.
     let mut metas: Vec<(String, SnapshotMeta)> = Vec::new();
     for peer in &config.state_sync_peers {
         let url = format!("{}/snapshot/meta", peer.trim_end_matches('/'));
         match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
             Ok(resp) => match resp.json::<SnapshotMeta>().await {
-                Ok(meta) => metas.push((peer.clone(), meta)),
+                // JOINT chain_id / committee check (#212): reject a peer that
+                // declares a DIFFERENT chain_id or committee fingerprint than
+                // ours outright — it is not serving our network. A pre-#212 peer
+                // declares "" for both; in mainnet an empty declaration is
+                // rejected (we require the authenticated fields), on a testnet we
+                // tolerate it for backward-compat (the legacy weak-subjectivity
+                // path still applies below).
+                Ok(meta) => {
+                    if !meta.chain_id.is_empty() && meta.chain_id != own_chain_id {
+                        tracing::warn!("state-sync: peer {peer} declares chain_id {} != ours {own_chain_id} — skipping", meta.chain_id);
+                        continue;
+                    }
+                    if !meta.validator_set_fingerprint.is_empty() && meta.validator_set_fingerprint != own_fingerprint {
+                        tracing::warn!("state-sync: peer {peer} declares a different committee fingerprint — skipping");
+                        continue;
+                    }
+                    if is_mainnet && (meta.chain_id.is_empty() || meta.validator_set_fingerprint.is_empty()) {
+                        tracing::warn!("state-sync: mainnet requires an authenticated meta (chain_id + committee); peer {peer} sent none — skipping");
+                        continue;
+                    }
+                    metas.push((peer.clone(), meta));
+                }
                 Err(e) => tracing::warn!("state-sync: bad snapshot meta from {peer}: {e}"),
             },
             Err(e) => tracing::warn!("state-sync: could not reach {peer} for snapshot meta: {e}"),
         }
     }
     if metas.is_empty() {
-        anyhow::bail!("state-sync: no configured peer returned a snapshot meta");
+        anyhow::bail!("state-sync: no configured peer returned an acceptable snapshot meta");
     }
 
     // Two peers reporting the same round but different roots is a real fork
@@ -113,42 +150,150 @@ pub async fn fetch_verified_snapshot(config: &NodeConfig) -> anyhow::Result<Stat
         }
     }
 
-    // 2. Pull the snapshot from the first peer that answered, page by page
-    //    (bounded response size regardless of state size).
-    let source = metas[0].0.trim_end_matches('/');
-    let snapshot = fetch_snapshot_paginated(&client, source).await?;
-
-    // 3. Internal consistency: rebuild the real state tree from the accounts
-    //    and require it to hash to the claimed root - catches any account
-    //    tampering relative to that root. Must use the SAME tree this network
-    //    runs (legacy vs compressed is a genesis-level, network-wide choice
-    //    folded into `chain_id`); rebuilding with the wrong tree would never
-    //    match a peer's claimed root, silently breaking state-sync for a
-    //    compressed-tree deployment. A node only ever syncs into its own
-    //    network, whose mode it knows from its config.
-    verify_internal_consistency(&snapshot, config.compressed_state_tree)?;
-
-    // 4. Optional operator trust anchor: exact match turns "trust the source
-    //    peer" into a fully verified catch-up. Most useful for a controlled
-    //    recovery where the operator pinned a known `(round, root)` out of
-    //    band; against a live, advancing peer leave it unset and rely on the
-    //    internal check plus the cross-check above.
-    if let Some(trusted_root) = &config.state_sync_trusted_root {
-        if &snapshot.merkle_root != trusted_root {
-            anyhow::bail!(
-                "state-sync: snapshot root {} does not match the configured trusted root {trusted_root}",
-                snapshot.merkle_root
-            );
-        }
-        if let Some(trusted_round) = config.state_sync_trusted_round {
-            if snapshot.round != trusted_round {
-                anyhow::bail!("state-sync: snapshot round {} does not match the configured trusted round {trusted_round}", snapshot.round);
-            }
-        }
-        tracing::info!("state-sync: snapshot matches the configured trust anchor");
+    // 2. MULTI-PEER CONFIRMATION (#212): group peers by their (round, root) and
+    //    pick the target confirmed by the most peers. If a trust anchor is set,
+    //    the target MUST be the anchored (round, root). Require at least
+    //    `min_confirmations` distinct peers agree on the chosen target.
+    let target = choose_target(&metas, &config.state_sync_trusted_root, config.state_sync_trusted_round)?;
+    let confirming: Vec<&(String, SnapshotMeta)> =
+        metas.iter().filter(|(_, m)| m.round == target.0 && m.merkle_root == target.1).collect();
+    if confirming.len() < min_confirmations {
+        anyhow::bail!(
+            "state-sync: only {} peer(s) confirmed (round {}, root {}), need {min_confirmations} — refusing (task #212 multi-peer confirmation)",
+            confirming.len(),
+            target.0,
+            target.1
+        );
     }
 
+    // 3. QUORUM-SIGNED CHECKPOINT (#212): union every confirming peer's
+    //    self-signed checkpoint over the target (chain_id, round, root),
+    //    dedup by validator, verify each signature against THAT member's bundle
+    //    in OUR committee, and sum distinct verified stake. A quorum authenticates
+    //    the (round, root) without trusting any peer's claimed root.
+    let quorum_ok = verify_quorum_checkpoint(&confirming, &committee, &config.chain_id(), &target)?;
+
+    // 4. TRUST ANCHOR (#194): exact match against the operator's pinned value.
+    let anchor_ok = match (&config.state_sync_trusted_root, config.state_sync_trusted_round) {
+        (Some(r), Some(rd)) => *r == target.1 && rd == target.0,
+        _ => false,
+    };
+
+    // AUTHENTICATION DECISION. Mainnet: the anchor is MANDATORY (reject a
+    // snapshot without it), and the quorum checkpoint is additional defense in
+    // depth. Non-mainnet with the require flag: quorum OR anchor. Otherwise
+    // (legacy testnet, no anchor, no checkpoints): keep the weak-subjectivity
+    // path (internal consistency + cross-check), byte-identical to before — but
+    // still surface the quorum result if a checkpoint was present.
+    if is_mainnet {
+        if !anchor_ok {
+            anyhow::bail!("state-sync: mainnet REQUIRES the snapshot to match the pinned trust anchor (round, root) — refusing (task #212)");
+        }
+        tracing::info!("state-sync[mainnet]: (round {}, root {}) authenticated by trust anchor{}", target.0, target.1, if quorum_ok { " + quorum checkpoint" } else { "" });
+    } else if auth_required {
+        if !(anchor_ok || quorum_ok) {
+            anyhow::bail!("state-sync: (round {}, root {}) is authenticated by NEITHER a quorum-signed checkpoint NOR the trust anchor — refusing (task #212)", target.0, target.1);
+        }
+        tracing::info!("state-sync: (round {}, root {}) authenticated ({}{}{})", target.0, target.1, if quorum_ok { "quorum" } else { "" }, if quorum_ok && anchor_ok { "+" } else { "" }, if anchor_ok { "anchor" } else { "" });
+    } else if quorum_ok {
+        tracing::info!("state-sync: (round {}, root {}) additionally confirmed by a quorum-signed checkpoint", target.0, target.1);
+    } else {
+        tracing::warn!("state-sync: proceeding on the weak-subjectivity path (no anchor, no quorum checkpoint) — set require_state_sync_trust_anchor or state_checkpoints to harden");
+    }
+
+    // 5. Download from a confirming peer, then verify internal consistency
+    //    against the SAME tree this network runs (root must match target).
+    let source = confirming[0].0.trim_end_matches('/');
+    let snapshot = fetch_snapshot_paginated(&client, source).await?;
+    if snapshot.round != target.0 || snapshot.merkle_root != target.1 {
+        anyhow::bail!("state-sync: downloaded snapshot (round {}, root {}) does not match the confirmed target (round {}, root {})", snapshot.round, snapshot.merkle_root, target.0, target.1);
+    }
+    verify_internal_consistency(&snapshot, config.compressed_state_tree)?;
+
     Ok(snapshot)
+}
+
+/// Build the authoritative committee from THIS node's config validators (fixed
+/// membership). The syncing node verifies a quorum checkpoint against this — it
+/// never trusts a committee a peer declares. For a rotation network the live
+/// committee differs from genesis, so the quorum arm won't verify and the node
+/// relies on the mandatory trust anchor instead (documented, #212).
+fn committee_from_config(config: &NodeConfig) -> qchain_consensus::ValidatorSet {
+    let infos = config
+        .validators
+        .iter()
+        .map(|v| qchain_consensus::ValidatorInfo {
+            id: v.pubkey_bundle.to_address(),
+            pubkey_bundle: v.pubkey_bundle.clone(),
+            stake: v.stake,
+        })
+        .collect();
+    qchain_consensus::ValidatorSet::new(infos)
+}
+
+/// Choose the (round, root) target: if a trust anchor is pinned, it MUST be the
+/// anchored one (and a peer must report it); otherwise the (round, root)
+/// confirmed by the most peers (ties broken by highest round then root string).
+fn choose_target(
+    metas: &[(String, SnapshotMeta)],
+    trusted_root: &Option<String>,
+    trusted_round: Option<u64>,
+) -> anyhow::Result<(u64, String)> {
+    if let (Some(root), Some(round)) = (trusted_root, trusted_round) {
+        let matches = metas.iter().any(|(_, m)| m.round == round && &m.merkle_root == root);
+        if !matches {
+            anyhow::bail!("state-sync: no peer reported the pinned trust anchor (round {round}, root {root}) — refusing");
+        }
+        return Ok((round, root.clone()));
+    }
+    let mut counts: std::collections::HashMap<(u64, String), usize> = std::collections::HashMap::new();
+    for (_, m) in metas {
+        *counts.entry((m.round, m.merkle_root.clone())).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.0 .0.cmp(&b.0 .0)).then(a.0 .1.cmp(&b.0 .1)))
+        .map(|(k, _)| k)
+        .ok_or_else(|| anyhow::anyhow!("state-sync: no snapshot target"))
+}
+
+/// Union the confirming peers' self-signed checkpoints over the target
+/// `(chain_id, round, root)`, dedup by validator, verify each against that
+/// member's bundle in OUR committee, and return whether the distinct verified
+/// stake reaches the committee's quorum threshold (task #212).
+fn verify_quorum_checkpoint(
+    confirming: &[&(String, SnapshotMeta)],
+    committee: &qchain_consensus::ValidatorSet,
+    chain_id: &[u8; 32],
+    target: &(u64, String),
+) -> anyhow::Result<bool> {
+    let target_root = decode_root(&target.1)?;
+    let mut verified: std::collections::HashMap<qchain_core::ValidatorId, u64> = std::collections::HashMap::new();
+    for (_, meta) in confirming {
+        let Some(cp) = &meta.checkpoint else { continue };
+        // The checkpoint must be over the SAME (chain_id, round, root) we chose.
+        if cp.round != target.0 || cp.merkle_root != target.1 || cp.chain_id != hex::encode(chain_id) {
+            continue;
+        }
+        for sig in &cp.signatures {
+            let Ok(id) = sig.validator.parse::<qchain_core::ValidatorId>() else { continue };
+            // Look up the member's bundle in OUR committee — never trust a bundle
+            // the message might carry.
+            let Some(info) = committee.get(&id) else { continue };
+            if qchain_crypto::verify_state_checkpoint(&info.pubkey_bundle, chain_id, target.0, &target_root, &sig.signature) {
+                verified.insert(id, info.stake);
+            }
+        }
+    }
+    let stake: u64 = verified.values().fold(0u64, |a, s| a.saturating_add(*s));
+    Ok(stake >= committee.quorum_threshold())
+}
+
+/// Decode a hex 32-byte Merkle root string into bytes.
+fn decode_root(root_hex: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(root_hex).map_err(|e| anyhow::anyhow!("bad root hex: {e}"))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("root is not 32 bytes"))?;
+    Ok(arr)
 }
 
 /// Download a full snapshot from `source` by keyset pagination against its
@@ -343,5 +488,102 @@ mod tests {
         assert!(check_trust_anchor_requirement(true, &root(), &Some(42)).is_ok(), "a full pinned anchor satisfies the requirement");
         // Off but a full anchor present => ok (optional hardening path).
         assert!(check_trust_anchor_requirement(false, &root(), &Some(42)).is_ok(), "off with an anchor set is still fine");
+    }
+
+    use qchain_consensus::{ValidatorInfo, ValidatorSet};
+    use qchain_crypto::Keypair;
+    use qchain_node::engine::{CheckpointSig, SignedCheckpoint};
+
+    fn committee_of(keys: &[(&Keypair, u64)]) -> ValidatorSet {
+        ValidatorSet::new(keys.iter().map(|(kp, stake)| ValidatorInfo {
+            id: kp.pubkey(),
+            pubkey_bundle: kp.public_key_bundle(),
+            stake: *stake,
+        }).collect())
+    }
+
+    /// Build a `SnapshotMeta` with a checkpoint self-signed by `signer` over
+    /// (chain_id, round, root). `peer` is a dummy URL.
+    fn meta_with_checkpoint(chain_id: &[u8; 32], round: u64, root: &[u8; 32], signer: &Keypair) -> (String, SnapshotMeta) {
+        let sig = qchain_crypto::sign_state_checkpoint(signer, chain_id, round, root).unwrap();
+        let cp = SignedCheckpoint {
+            chain_id: hex::encode(chain_id),
+            round,
+            merkle_root: hex::encode(root),
+            signatures: vec![CheckpointSig { validator: signer.pubkey().to_string(), signature: sig }],
+        };
+        let meta = SnapshotMeta {
+            round,
+            merkle_root: hex::encode(root),
+            account_count: 0,
+            chain_id: hex::encode(chain_id),
+            validator_set_fingerprint: String::new(),
+            checkpoint: Some(cp),
+        };
+        ("http://peer".into(), meta)
+    }
+
+    /// Task #212: the union of confirming peers' self-signed checkpoints reaches
+    /// quorum only when enough distinct validator stake has signed the SAME
+    /// (chain_id, round, root); a wrong root, a non-member signer, or too few
+    /// signers do NOT reach quorum.
+    #[test]
+    fn quorum_checkpoint_authenticates_only_with_enough_distinct_verified_stake() {
+        let chain_id = [7u8; 32];
+        let round = 100u64;
+        let root = [9u8; 32];
+        let a = Keypair::generate().unwrap();
+        let b = Keypair::generate().unwrap();
+        let c = Keypair::generate().unwrap();
+        let outsider = Keypair::generate().unwrap();
+        // 3 validators of equal stake → quorum = 3 (strictly > 2/3 of 3 = 2).
+        let committee = committee_of(&[(&a, 1), (&b, 1), (&c, 1)]);
+
+        // Only ONE peer/signature → below quorum.
+        let m_a = meta_with_checkpoint(&chain_id, round, &root, &a);
+        let target = (round, hex::encode(root));
+        let confirming1: Vec<&(String, SnapshotMeta)> = vec![&m_a];
+        assert!(!verify_quorum_checkpoint(&confirming1, &committee, &chain_id, &target).unwrap(), "one signer of three is below quorum");
+
+        // All THREE distinct members → quorum reached.
+        let m_b = meta_with_checkpoint(&chain_id, round, &root, &b);
+        let m_c = meta_with_checkpoint(&chain_id, round, &root, &c);
+        let confirming3: Vec<&(String, SnapshotMeta)> = vec![&m_a, &m_b, &m_c];
+        assert!(verify_quorum_checkpoint(&confirming3, &committee, &chain_id, &target).unwrap(), "three distinct members reach quorum");
+
+        // A NON-member's signature does not count, even with a valid signature.
+        let m_out = meta_with_checkpoint(&chain_id, round, &root, &outsider);
+        let confirming_out: Vec<&(String, SnapshotMeta)> = vec![&m_a, &m_b, &m_out];
+        assert!(!verify_quorum_checkpoint(&confirming_out, &committee, &chain_id, &target).unwrap(), "an outsider's signature must not count toward quorum");
+
+        // A signature over a DIFFERENT root is rejected (does not authenticate the target).
+        let other_root = [8u8; 32];
+        let m_a_wrong = meta_with_checkpoint(&chain_id, round, &other_root, &a);
+        let m_b_wrong = meta_with_checkpoint(&chain_id, round, &other_root, &b);
+        let m_c_wrong = meta_with_checkpoint(&chain_id, round, &other_root, &c);
+        let confirming_wrong: Vec<&(String, SnapshotMeta)> = vec![&m_a_wrong, &m_b_wrong, &m_c_wrong];
+        assert!(!verify_quorum_checkpoint(&confirming_wrong, &committee, &chain_id, &target).unwrap(), "checkpoints over a different root must not authenticate the target");
+
+        // A signature over a different CHAIN_ID is rejected.
+        let other_chain = [1u8; 32];
+        let m_a_oc = meta_with_checkpoint(&other_chain, round, &root, &a);
+        let m_b_oc = meta_with_checkpoint(&other_chain, round, &root, &b);
+        let m_c_oc = meta_with_checkpoint(&other_chain, round, &root, &c);
+        let confirming_oc: Vec<&(String, SnapshotMeta)> = vec![&m_a_oc, &m_b_oc, &m_c_oc];
+        assert!(!verify_quorum_checkpoint(&confirming_oc, &committee, &chain_id, &target).unwrap(), "checkpoints over a different chain_id must not authenticate");
+    }
+
+    /// `choose_target` prefers the (round, root) most peers confirm, and is FORCED
+    /// to the pinned anchor when one is set (and refuses if no peer reports it).
+    #[test]
+    fn choose_target_prefers_majority_and_honors_the_anchor() {
+        let mk = |round: u64, root: &str| ("p".to_string(), SnapshotMeta { round, merkle_root: root.to_string(), account_count: 0, chain_id: String::new(), validator_set_fingerprint: String::new(), checkpoint: None });
+        let metas = vec![mk(10, "aa"), mk(10, "aa"), mk(11, "bb")];
+        // Majority (round 10, aa).
+        assert_eq!(choose_target(&metas, &None, None).unwrap(), (10, "aa".to_string()));
+        // Anchor forces (11, bb) since a peer reports it.
+        assert_eq!(choose_target(&metas, &Some("bb".to_string()), Some(11)).unwrap(), (11, "bb".to_string()));
+        // Anchor that NO peer reports → refuse.
+        assert!(choose_target(&metas, &Some("cc".to_string()), Some(99)).is_err(), "an anchor no peer reports must refuse");
     }
 }

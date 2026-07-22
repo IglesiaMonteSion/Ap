@@ -861,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
         cert_log,
         batch_log,
         committee_log,
+        state_checkpoints: config.state_checkpoints(),
         config_peers,
         receipt_log,
         receipt_full_log,

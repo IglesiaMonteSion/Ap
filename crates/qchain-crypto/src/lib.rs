@@ -416,6 +416,15 @@ pub trait Signer: Send + Sync {
     /// el transcript del handshake autenticado, que ya lleva su propio dominio).
     /// Sin guardia (no es un voto de consenso).
     fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature>;
+    /// Firma un **checkpoint de estado** (`STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖
+    /// root`, tarea #212) para atestar el state root de esta red en una ronda. No
+    /// es un voto de consenso (dominio distinto) → sin guardia anti-doble-firma; un
+    /// validador honesto sólo firma su root REAL (determinista) por ronda. Default:
+    /// firma con la clave local vía `sign_state_checkpoint`.
+    fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        let _ = (chain_id, round, merkle_root);
+        anyhow::bail!("this signer does not support checkpoint signing")
+    }
 }
 
 /// El `Keypair` en-proceso ES un `Signer` (el default, byte-idéntico a antes de
@@ -434,6 +443,30 @@ impl Signer for Keypair {
     fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
         self.sign(msg)
     }
+    fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        sign_state_checkpoint(self, chain_id, round, merkle_root)
+    }
+}
+
+/// Preimagen canónica de un checkpoint de estado: `chain_id ‖ round(le) ‖ root`
+/// (bajo el dominio [`domains::STATE_CHECKPOINT_V1`], tarea #212). Largos fijos
+/// (32 + 8 + 32) → sin ambigüedad de framing.
+pub fn state_checkpoint_message(chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(72);
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(&round.to_le_bytes());
+    m.extend_from_slice(merkle_root);
+    m
+}
+
+/// Firma un checkpoint de estado (`STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖ root`).
+pub fn sign_state_checkpoint(kp: &Keypair, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+    sign_domain(kp, domains::STATE_CHECKPOINT_V1, &state_checkpoint_message(chain_id, round, merkle_root))
+}
+
+/// Verifica una firma de checkpoint de estado (contraparte de [`sign_state_checkpoint`]).
+pub fn verify_state_checkpoint(bundle: &PublicKeyBundle, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32], signature: &MultiSignature) -> bool {
+    verify_domain(bundle, domains::STATE_CHECKPOINT_V1, &state_checkpoint_message(chain_id, round, merkle_root), signature)
 }
 
 /// Firma la **atestación de un voto/vértice** sobre el digest de un vértice

@@ -228,9 +228,43 @@ mainnet (además de `validators`/`genesis`/`keypair_path`/`listen_addr`):
   "tx_rate_limit_per_10s": 16,
   "economics_v7": true,
   "quanto_rate_fp": 310537755655371,
-  "rounds_per_quanto": 86400
+  "rounds_per_quanto": 86400,
+  "state_checkpoints": true,
+  "state_sync_min_confirmations": 2,
+  "state_sync_trusted_root": "<hex root pinned out of band>",
+  "state_sync_trusted_round": 123456
 }
 ```
+
+### State-sync seguro: checkpoint firmado por quórum + verificación conjunta (tarea #212)
+
+Un snapshot ya no se acepta sólo porque coincide con la raíz que el propio par
+declara (weak-subjectivity). El nodo que se sincroniza AUTENTICA la
+`(ronda, raíz)` de dos formas, y en **mainnet exige el ancla**:
+
+- **Checkpoint firmado por quórum** — con `state_checkpoints: true`, cada
+  validador self-firma su `(chain_id, ronda, raíz)` en `/snapshot/meta`. El nodo
+  que se sincroniza **UNE** las firmas de todos los peers que confirman el MISMO
+  `(chain_id, ronda, raíz)` y sólo acepta si los firmantes distintos alcanzan el
+  **quórum de stake** del comité (verificado contra el comité de SU config, nunca
+  el que declara un par). Así la confirmación multi-peer ES la agregación del
+  quórum, sin subsistema de gossip.
+- **Trust anchor** — `state_sync_trusted_root` + `state_sync_trusted_round`
+  pinneados por un canal independiente. En **mainnet es OBLIGATORIO**: un snapshot
+  sin ancla se rechaza.
+
+Se verifican **CONJUNTAMENTE**: `chain_id` (un par de otra red se descarta),
+`validator_set_fingerprint` (comité), ronda y raíz. Y se exige la confirmación de
+**varios peers** (`state_sync_min_confirmations`, mínimo **2** en mainnet).
+
+**Requisitos del operador:** poné `state_checkpoints: true` en TODOS los
+validadores; el nodo que se recupera lista suficientes **RPC de validadores** en
+`state_sync_peers` para que sus checkpoints self-firmados unan a un quórum
+(típicamente hace falta que los validadores ARRIBA alcancen el quórum por sí
+solos → `n ≥ 4` con stake parejo; con menos, o con demasiados nodos caídos, el
+**trust anchor** es el autenticador — por eso es obligatorio en mainnet). Un
+relay/réplica read-only (sin clave de validador) no aporta firma; sí aportan los
+validadores.
 
 **Fingerprint de red (config idéntica).** Al arrancar en perfil mainnet el nodo
 loguea `network fingerprint: <hex>`. Es el hash de los campos que TODOS los nodos

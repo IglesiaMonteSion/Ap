@@ -61,3 +61,17 @@ pub const P2P_AUTH_V1: &[u8] = b"qchain-p2p-auth-v1";
 /// puede firmar bloques (slasheable) pero jamás controla el bono ni las ganancias,
 /// que quedan bajo la clave fría de retiro.
 pub const VALIDATOR_POP_V1: &[u8] = b"qchain-v7-validator-pop-v1";
+
+/// **Checkpoint de estado firmado por quórum** para AUTENTICAR un snapshot de
+/// state-sync (tarea #212). Un validador firma
+/// `STATE_CHECKPOINT_V1 ‖ chain_id ‖ round(le) ‖ merkle_root` para atestar que,
+/// en `round`, el state root de ESTA red (`chain_id`) es `merkle_root`. Un nodo
+/// que se sincroniza une las firmas de un QUÓRUM del comité sobre EXACTAMENTE
+/// ese `(chain_id, round, root)` → sólo entonces acepta el snapshot, en vez de
+/// confiar en la raíz que el propio par declara (weak-subjectivity). El dominio
+/// separa esta atestación de un voto de vértice o una firma de tx: una firma de
+/// checkpoint NUNCA vale como voto ni al revés (la ronda va incluida, pero un
+/// `Vertex` firma `VERTEX_VOTE_V1 ‖ digest` y una tx `TX_SIG_V1 ‖ borsh`, ambos
+/// preimágenes distintas). No cambia consenso/estado/wire de tx — es una capa de
+/// AUTENTICACIÓN del state-sync (endurece la weak-subjectivity de #109/#194).
+pub const STATE_CHECKPOINT_V1: &[u8] = b"qchain-state-checkpoint-v1";

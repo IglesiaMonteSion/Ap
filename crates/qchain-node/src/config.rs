@@ -360,6 +360,40 @@ pub struct NodeConfig {
     /// TODOS los faltantes en un solo error para arreglarlos en una pasada.
     #[serde(default)]
     pub network_profile: Option<String>,
+
+    /// **Servir un checkpoint de estado firmado por quórum en `/snapshot/meta`**
+    /// (tarea #212). `false` (default) = byte-idéntico: el meta no lleva
+    /// checkpoint y el state-sync usa el camino previo (consistencia interna +
+    /// cross-check + trust anchor opcional). `true` = el nodo self-firma su
+    /// `(chain_id, round, root)` para que un nodo que se sincroniza UNA las
+    /// firmas de un quórum de peers confirmantes y AUTENTIQUE la raíz sin confiar
+    /// en el par. Se fuerza en el perfil mainnet. Node-LOCAL (no toca
+    /// consenso/estado/wire de tx).
+    #[serde(default)]
+    pub state_checkpoints: bool,
+
+    /// **Mínimo de peers que deben confirmar el MISMO `(round, root, chain_id,
+    /// comité)` antes de aceptar un snapshot** (tarea #212). `None`/`0`/`1`
+    /// (default) = 1 (comportamiento previo: basta un par, con el cross-check
+    /// anti-fork). El perfil mainnet FUERZA `>= 2`. Sube la barra: un solo par
+    /// malicioso no basta; varios independientes deben coincidir.
+    #[serde(default)]
+    pub state_sync_min_confirmations: Option<u32>,
+}
+
+impl NodeConfig {
+    /// Whether to serve/produce quorum-signable state checkpoints (#212): the
+    /// explicit flag, OR forced on by the mainnet profile.
+    pub fn state_checkpoints(&self) -> bool {
+        self.state_checkpoints || self.is_mainnet_profile()
+    }
+
+    /// Minimum distinct peers that must confirm the same checkpoint before a
+    /// snapshot is accepted (#212). Floor of 1; mainnet raises the floor to 2.
+    pub fn state_sync_min_confirmations(&self) -> u32 {
+        let base = self.state_sync_min_confirmations.unwrap_or(1).max(1);
+        if self.is_mainnet_profile() { base.max(2) } else { base }
+    }
 }
 
 fn default_storage_engine() -> String {
@@ -676,6 +710,8 @@ mod tests {
             remote_signer: None,
             mainnet: false,
             network_profile: None,
+            state_checkpoints: false,
+            state_sync_min_confirmations: None,
         }
     }
 

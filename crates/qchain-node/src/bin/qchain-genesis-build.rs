@@ -302,6 +302,8 @@ fn main() -> anyhow::Result<()> {
             remote_signer: None,
             mainnet: false,
             network_profile: cli.network_profile.clone(),
+            state_checkpoints: cli.network_profile.as_deref()==Some("mainnet"),
+            state_sync_min_confirmations: None,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's

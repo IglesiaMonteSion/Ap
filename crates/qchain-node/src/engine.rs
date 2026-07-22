@@ -1245,6 +1245,12 @@ pub struct Engine {
     /// registry as of a *past* epoch boundary, state the current ledger no
     /// longer reflects, so it cannot be re-derived after a restart.
     pub committee_log: Option<sled::Db>,
+    /// Serve a quorum-signable state checkpoint in `/snapshot/meta` (task #212):
+    /// when `true`, the node self-signs its `(chain_id, round, root)` so a
+    /// syncing peer can union signatures across confirming validators into a
+    /// quorum proof. `false` (default) = byte-identical old behavior (meta carries
+    /// no checkpoint). On for mainnet.
+    pub state_checkpoints: bool,
     /// A cached consistent point-in-time snapshot for paginated serving, so a
     /// far-behind peer can download the state in bounded pages that all hash
     /// to one root (see `CachedSnapshot`/`snapshot_page`). Lazily captured on
@@ -1871,6 +1877,73 @@ pub struct SnapshotMeta {
     pub round: Round,
     pub merkle_root: String,
     pub account_count: usize,
+    /// This network's `chain_id` (hex). A syncing node REJECTS a snapshot whose
+    /// `chain_id` differs from its own — the "chain ID verified jointly" leg of
+    /// task #212. `#[serde(default)]` so a pre-#212 server (no field) reads as ""
+    /// and the syncing node treats it as "unauthenticated by chain_id".
+    #[serde(default)]
+    pub chain_id: String,
+    /// Fingerprint (hex) of the committee this server believes authoritative —
+    /// hash of `(validator_id, stake, pubkey_bundle)` over the validator set. The
+    /// syncing node compares it to the committee IT knows (config validators);
+    /// the "committee verified jointly" leg of #212. For a fixed-membership
+    /// network both compute the same value; a rotation network's live committee
+    /// differs from genesis, so the quorum-checkpoint arm can't be used and the
+    /// node relies on the mandatory trust anchor. `#[serde(default)]`.
+    #[serde(default)]
+    pub validator_set_fingerprint: String,
+    /// This server's SELF-SIGNED checkpoint over `(chain_id, round, merkle_root)`
+    /// (task #212), when `state_checkpoints` is on. Carries exactly ONE signature
+    /// (this server's). A syncing node UNIONS the signatures from every peer that
+    /// agrees on the same `(chain_id, round, root)` into a single quorum-signed
+    /// checkpoint and verifies it reaches the committee's quorum — so the
+    /// multi-peer confirmation IS the quorum aggregation, with no gossip
+    /// subsystem. `None` on a read-only replica (no validator key) or when
+    /// checkpoints are off.
+    #[serde(default)]
+    pub checkpoint: Option<SignedCheckpoint>,
+}
+
+/// One validator's signature over a state checkpoint (task #212). `validator` is
+/// the signer's `ValidatorId` (string); the verifier looks up that member's
+/// pubkey bundle in the committee IT knows (never trusts a bundle carried in the
+/// message) and verifies `verify_state_checkpoint(bundle, chain_id, round, root)`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CheckpointSig {
+    pub validator: String,
+    pub signature: MultiSignature,
+}
+
+/// A state checkpoint authenticated by validator signatures over
+/// `STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖ merkle_root` (task #212). One server
+/// serves its own single signature; a syncing node unions signatures across
+/// confirming peers and accepts the `(round, root)` ONLY when the distinct
+/// verified signers reach the committee's quorum of stake — replacing "trust the
+/// source peer's claimed root" (weak subjectivity) with a real quorum proof.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SignedCheckpoint {
+    pub chain_id: String,
+    pub round: Round,
+    pub merkle_root: String,
+    pub signatures: Vec<CheckpointSig>,
+}
+
+/// SHA3-256 over the committee `(validator_id, stake, pubkey_bundle)` in
+/// deterministic id order — the "committee verified jointly" fingerprint (#212).
+/// The serving node and a syncing node compute it from their respective views
+/// (the peer's live committee vs the syncing node's config validators); a
+/// fixed-membership network yields the same value on both sides.
+pub fn committee_fingerprint(set: &qchain_consensus::ValidatorSet) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"qchain-committee-fingerprint-v1");
+    for info in set.infos() {
+        h.update(info.id.to_bytes());
+        h.update(info.stake.to_le_bytes());
+        // Borsh of the bundle is canonical and length-framed.
+        h.update(borsh::to_vec(&info.pubkey_bundle).expect("bundle always serializes"));
+    }
+    h.finalize().into()
 }
 
 /// One account in a state snapshot, keyed by its address.
@@ -1921,6 +1994,11 @@ pub struct CachedSnapshot {
     merkle_root: String,
     accounts: std::sync::Arc<Vec<SnapshotAccount>>,
     captured: tokio::time::Instant,
+    /// This node's self-signed checkpoint over `(chain_id, round, merkle_root)`
+    /// for THIS snapshot (task #212), computed once at capture so serving
+    /// `/snapshot/meta` doesn't re-sign per request. `None` when
+    /// `state_checkpoints` is off or signing failed.
+    checkpoint: Option<SignedCheckpoint>,
 }
 
 /// What `GET /stark_proof` hands back to a light client - a real
@@ -2637,14 +2715,43 @@ impl Engine {
             (state.next_round, state.ledger.merkle_root(), accounts)
         };
         accounts.sort_by(|a, b| a.address.to_bytes().cmp(&b.address.to_bytes()));
+        // Self-sign this snapshot's (chain_id, round, root) once at capture, so a
+        // syncing peer can union it with other validators' signatures into a
+        // quorum-signed checkpoint (#212). Only when checkpoints are enabled.
+        let checkpoint = if self.state_checkpoints {
+            match self.signer.sign_checkpoint(&self.chain_id, round, &root) {
+                Ok(sig) => Some(SignedCheckpoint {
+                    chain_id: hex::encode(self.chain_id),
+                    round,
+                    merkle_root: hex::encode(root),
+                    signatures: vec![CheckpointSig { validator: self.self_id.to_string(), signature: sig }],
+                }),
+                Err(e) => {
+                    tracing::warn!("state-checkpoint: could not self-sign snapshot at round {round}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let captured = std::sync::Arc::new(CachedSnapshot {
             round,
             merkle_root: hex::encode(root),
             accounts: std::sync::Arc::new(accounts),
             captured: tokio::time::Instant::now(),
+            checkpoint,
         });
         *guard = Some(captured.clone());
         captured
+    }
+
+    /// Fingerprint (hex) of the committee this node treats as authoritative — a
+    /// SHA3-256 over `(validator_id, stake, pubkey_bundle)` for every member, in
+    /// deterministic id order. A syncing node compares the peer's declared
+    /// fingerprint to the one it computes from its OWN config validators, so the
+    /// committee is verified jointly with round/root/chain_id (#212).
+    pub fn validator_set_fingerprint(&self) -> String {
+        hex::encode(committee_fingerprint(&self.committee()))
     }
 
     /// Header of the current consistent snapshot - round, Merkle root, and
@@ -2652,7 +2759,14 @@ impl Engine {
     /// `snapshot_page` against the same cached snapshot (matched by root).
     pub async fn snapshot_meta(&self) -> SnapshotMeta {
         let cached = self.cached_snapshot().await;
-        SnapshotMeta { round: cached.round, merkle_root: cached.merkle_root.clone(), account_count: cached.accounts.len() }
+        SnapshotMeta {
+            round: cached.round,
+            merkle_root: cached.merkle_root.clone(),
+            account_count: cached.accounts.len(),
+            chain_id: hex::encode(self.chain_id),
+            validator_set_fingerprint: self.validator_set_fingerprint(),
+            checkpoint: cached.checkpoint.clone(),
+        }
     }
 
     /// One keyset page of the cached snapshot: up to `SNAPSHOT_PAGE_SIZE`

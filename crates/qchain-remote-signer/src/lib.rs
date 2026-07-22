@@ -60,6 +60,12 @@ pub enum SignerRequest {
     /// Firmar exactamente estos bytes (transcript del handshake P2P, ya domainado
     /// por el llamador) — sin guardia.
     SignRaw { msg: Vec<u8> },
+    /// Firmar un checkpoint de estado (`STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖
+    /// root`, tarea #212) — una atestación de state-sync, no un voto. Sin guardia:
+    /// un validador honesto sólo firma su root REAL determinista por ronda, y el
+    /// dominio la separa de un voto/tx. Estructurada (no `SignRaw`), así el
+    /// allowlist estricto de `SignRaw` (sólo `P2P_AUTH_V1`) queda intacto.
+    SignCheckpoint { chain_id: [u8; 32], round: u64, merkle_root: [u8; 32] },
 }
 
 /// Respuesta del firmante.
@@ -186,6 +192,9 @@ impl qchain_crypto::Signer for RemoteSigner {
     }
     fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignRaw { msg: msg.to_vec() })?)
+    }
+    fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignCheckpoint { chain_id: *chain_id, round, merkle_root: *merkle_root })?)
     }
 }
 
@@ -377,6 +386,16 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 return SignerResponse::Refused(reason);
             }
             match keypair.sign(msg) {
+                Ok(sig) => SignerResponse::Signature(sig),
+                Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+            }
+        }
+        SignerRequest::SignCheckpoint { chain_id, round, merkle_root } => {
+            // #212 — atestación de state-sync bajo el dominio STATE_CHECKPOINT_V1,
+            // NO un voto ni valor. Es una firma sobre un (chain_id, round, root)
+            // público y determinista, sin poder de gasto — segura de servir. No
+            // toca el allowlist de `sign_raw` (es una request estructurada aparte).
+            match qchain_crypto::sign_state_checkpoint(keypair, chain_id, *round, merkle_root) {
                 Ok(sig) => SignerResponse::Signature(sig),
                 Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
             }
