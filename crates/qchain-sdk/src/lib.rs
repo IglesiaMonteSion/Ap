@@ -490,6 +490,61 @@ pub fn sub_u64(a: u64, b: u64) -> u64 {
     }
 }
 
+/// Multiplicación checkeada de `u64`: aborta (no envuelve) en overflow. Necesaria
+/// para la aritmética de precios/tasas de un contrato financiero (p.ej.
+/// `amount * rate`), donde un `*` que envuelve daría un resultado disparatado.
+#[inline]
+pub fn mul_u64(a: u64, b: u64) -> u64 {
+    match a.checked_mul(b) {
+        Some(v) => v,
+        None => {
+            log("qchain-sdk: overflow u64 (mul)");
+            abort()
+        }
+    }
+}
+
+/// División entera checkeada de `u64`: aborta si el divisor es 0 (nunca un
+/// resultado silencioso o un trap sin mensaje). Usala para calcular un precio
+/// efectivo (`amount_in / amount_out`) sin arriesgar una división por cero cuando
+/// el otro lado del par es 0.
+#[inline]
+pub fn div_u64(a: u64, b: u64) -> u64 {
+    match a.checked_div(b) {
+        Some(v) => v,
+        None => {
+            log("qchain-sdk: division por cero");
+            abort()
+        }
+    }
+}
+
+/// GUARDA FINANCIERA (anti-slippage): exige `actual >= minimo`, aborta si no. El
+/// patrón `amountOutMin` de un swap — el usuario firma el mínimo que acepta
+/// recibir y el contrato lo hace cumplir ANTES de comprometer la operación, así el
+/// precio no puede moverse en su contra entre firmar y ejecutar. Ver
+/// `docs/CONTRACT-SECURITY.md` §7. El `minimo` DEBE venir como arg firmado por el
+/// usuario, nunca calculado por el contrato.
+#[inline]
+pub fn require_at_least(actual: u64, minimo: u64) {
+    if actual < minimo {
+        log("qchain-sdk: por debajo del minimo aceptado (slippage)");
+        abort();
+    }
+}
+
+/// GUARDA FINANCIERA (precio/monto máximo): exige `actual <= maximo`, aborta si no.
+/// El usuario firma el máximo que acepta pagar (o el precio tope) y el contrato lo
+/// hace cumplir. Igual que [`require_at_least`], el `maximo` DEBE ser un arg
+/// firmado por el usuario.
+#[inline]
+pub fn require_at_most(actual: u64, maximo: u64) {
+    if actual > maximo {
+        log("qchain-sdk: por encima del maximo aceptado");
+        abort();
+    }
+}
+
 /// Lee una dirección (32 bytes) de `buf[off..off+32]`; aborta si no entra.
 #[inline]
 pub fn read_pubkey(buf: &[u8], off: usize) -> [u8; 32] {
@@ -562,4 +617,113 @@ macro_rules! entrypoint {
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
+}
+
+// ============================================================================
+// Tests de HOST de las funciones PURAS del SDK (LE read/write, aritmética
+// overflow-safe, guardas financieras, holder_seed, pubkey read/write). No tocan
+// los syscalls del host, así que corren en `cargo test` nativo. En el host,
+// `abort()` hace `panic!`, así que una guarda que falla se captura con
+// `#[should_panic]`. El SDK antes NO tenía tests; esto es su primera cobertura.
+// ============================================================================
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn le_read_write_roundtrip() {
+        let mut buf = [0u8; 20];
+        write_u64(&mut buf, 0, 0x0102_0304_0506_0708);
+        write_i64(&mut buf, 8, -5);
+        write_u32(&mut buf, 16, 0xAABB_CCDD);
+        assert_eq!(read_u64(&buf, 0), 0x0102_0304_0506_0708);
+        assert_eq!(read_i64(&buf, 8), -5);
+        assert_eq!(read_u32(&buf, 16), 0xAABB_CCDD);
+        // little-endian on the wire
+        assert_eq!(&buf[0..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn pubkey_read_write_roundtrip() {
+        let pk = [7u8; 32];
+        let mut buf = [0u8; 40];
+        write_pubkey(&mut buf, 8, &pk);
+        assert_eq!(read_pubkey(&buf, 8), pk);
+        // untouched bytes stay zero
+        assert_eq!(&buf[0..8], &[0u8; 8]);
+    }
+
+    #[test]
+    fn checked_arithmetic_ok_paths() {
+        assert_eq!(add_u64(2, 3), 5);
+        assert_eq!(sub_u64(10, 4), 6);
+        assert_eq!(mul_u64(6, 7), 42);
+        assert_eq!(div_u64(20, 4), 5);
+        assert_eq!(div_u64(7, 2), 3); // integer division floors
+    }
+
+    #[test]
+    #[should_panic]
+    fn add_overflow_aborts() {
+        let _ = add_u64(u64::MAX, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn sub_underflow_aborts() {
+        let _ = sub_u64(1, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn mul_overflow_aborts() {
+        let _ = mul_u64(u64::MAX, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn div_by_zero_aborts() {
+        let _ = div_u64(1, 0);
+    }
+
+    #[test]
+    fn financial_guards_ok_paths() {
+        // amount_out (100) >= min_out (95): ok, no panic.
+        require_at_least(100, 95);
+        require_at_least(95, 95); // boundary is inclusive
+        // price (10) <= max_price (12): ok.
+        require_at_most(10, 12);
+        require_at_most(12, 12); // boundary inclusive
+    }
+
+    #[test]
+    #[should_panic]
+    fn require_at_least_rejects_slippage() {
+        // Received less than the signed minimum → abort.
+        require_at_least(94, 95);
+    }
+
+    #[test]
+    #[should_panic]
+    fn require_at_most_rejects_over_max() {
+        // Price above the signed maximum → abort.
+        require_at_most(13, 12);
+    }
+
+    #[test]
+    fn holder_seed_is_tagged_and_deterministic() {
+        let holder = [0xABu8; 32];
+        let s1 = holder_seed(0x01, &holder);
+        let s2 = holder_seed(0x01, &holder);
+        assert_eq!(s1, s2, "same tag+holder derive the same seed");
+        assert_eq!(s1[0], 0x01, "byte 0 is the tag");
+        assert_eq!(&s1[1..], &holder, "bytes 1..33 are the holder");
+        // A different tag (balance space vs another) gives a different seed.
+        assert_ne!(holder_seed(0x02, &holder), s1);
+        // A different holder gives a different seed → PDA de otro no colisiona.
+        assert_ne!(holder_seed(0x01, &[0xCDu8; 32]), s1);
+    }
 }

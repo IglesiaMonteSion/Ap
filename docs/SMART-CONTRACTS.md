@@ -147,7 +147,9 @@ igual paga el fee de su intento.
 | **`pubkey_eq(idx, &expected) -> bool`** | ¿la dirección de `accounts[idx]` es `expected`? |
 | **`pda_transfer(from, to, amount)`** | PAGA desde una PDA del programa (sin firma sobre el origen; SDK v0.4) |
 | **`deposit(from, to, amount)`** | DEPÓSITO en una tesorería (= `transfer`, con nombre de intención) |
-| **`add_u64(a,b)` / `sub_u64(a,b)`** | aritmética checkeada (abortan en over/underflow; SDK v0.5) |
+| **`add_u64(a,b)` / `sub_u64(a,b)` / `mul_u64(a,b)` / `div_u64(a,b)`** | aritmética checkeada (abortan en over/underflow y división por cero; SDK v0.5/v0.6) |
+| **`require_at_least(actual, minimo)`** | guarda financiera anti-slippage (`amountOutMin`): aborta si `actual < minimo` (SDK v0.6) |
+| **`require_at_most(actual, maximo)`** | guarda financiera de precio/monto máximo: aborta si `actual > maximo` (SDK v0.6) |
 | **`read_pubkey/write_pubkey(buf, off[, pk])`** | lee/escribe una dirección (32B) en un buffer |
 | **`require_owner(&buf, off)`** | exige que el firmante sea el dueño guardado en `buf[off..off+32]` |
 | **`holder_seed(tag, &holder) -> [u8;33]`** | seed de PDA por-titular (`tag ‖ holder`) — "debitar sólo lo tuyo" por construcción |
@@ -157,6 +159,14 @@ igual paga el fee de su intento.
 > autores (qué garantiza el ledger vs qué tenés que hacer vos), y usá
 > `templates/token/` (token fungible endurecido, verificado en vivo contra ataques)
 > como punto de partida.
+
+> **¿Contrato FINANCIERO (swap, subasta, compra a precio límite)?** Además de la
+> §7 de `CONTRACT-SECURITY.md`, mirá `templates/escrow/` — una **compra a precio
+> límite** que aplica las guardas (`require_at_most` + `mul_u64` + `require_deployer`
+> + `pubkey_eq`), **verificada EN VIVO con ataque**: una compra que excede el
+> `max_total` firmado por el comprador es RECHAZADA (el vendedor queda intacto, el
+> comprador sólo paga el fee del intento). El `deadline` lo da la propia tx con
+> `valid_until_round` (la wallet lo pone obligatorio y corto).
 
 ## Estado estructurado on-chain (SDK v0.2)
 

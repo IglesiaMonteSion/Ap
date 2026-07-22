@@ -144,6 +144,12 @@ máximo/mínimo X" debe ser un ARG firmado, no algo que el contrato calcule solo
 si el contrato decide el límite por su cuenta, no hay protección real para el
 usuario. El `deadline` corto ya lo garantiza la wallet vía `valid_until_round`.
 
+El SDK trae las guardas listas: **`require_at_least(actual, minimo)`** (anti-slippage,
+`amountOutMin`), **`require_at_most(actual, maximo)`** (precio/monto máximo), y la
+aritmética overflow-safe **`mul_u64`/`div_u64`** para precios. Plantilla completa y
+**verificada EN VIVO con ataque**: `crates/qchain-sdk/templates/escrow/` — una compra
+a precio límite donde una compra que excede el `max_total` firmado es RECHAZADA.
+
 ---
 
 ## Ejemplo de referencia auditado

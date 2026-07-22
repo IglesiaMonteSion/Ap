@@ -93,22 +93,28 @@ jobs:
             crates/qchain-sdk/templates/payments
             crates/qchain-sdk/templates/counter
             crates/qchain-sdk/templates/shared_counter
+            crates/qchain-sdk/templates/escrow
       # El SDK es no_std + sin dependencias (sólo `core` + los syscalls del host):
       # compila a wasm32 Y en host (stubs inertes para que clippy corra).
       - name: Clippy qchain-sdk (host, -D warnings)
         run: cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --all-targets -- -D warnings
       - name: Clippy qchain-sdk (wasm32, -D warnings)
         run: cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      # Tests de HOST de las funciones puras del SDK (LE read/write, aritmética
+      # overflow-safe add/sub/mul/div, guardas financieras require_at_least/at_most,
+      # holder_seed). Corren en host (no wasm32) porque necesitan el test harness.
+      - name: Tests del SDK (host)
+        run: cargo test --manifest-path crates/qchain-sdk/Cargo.toml
       - name: Build del SDK a wasm32
         run: cargo build --manifest-path crates/qchain-sdk/Cargo.toml --release --target wasm32-unknown-unknown
-      # Cada plantilla de ejemplo (token/vault/payments/counter/shared_counter)
-      # DEBE compilar a wasm32 — así el fix anti init-takeover de la bóveda
-      # (require_deployer en init) y toda la capa de seguridad del SDK quedan
-      # bajo CI.
+      # Cada plantilla de ejemplo DEBE compilar a wasm32 — así el fix anti
+      # init-takeover de la bóveda (require_deployer en init), la plantilla
+      # financiera `escrow` (guardas require_at_most + mul_u64) y toda la capa de
+      # seguridad del SDK quedan bajo CI.
       - name: Build de cada plantilla de contrato a wasm32
         run: |
           set -e
-          for t in token vault payments counter shared_counter; do
+          for t in token vault payments counter shared_counter escrow; do
             echo "==> compilando plantilla $t"
             cargo build --manifest-path "crates/qchain-sdk/templates/$t/Cargo.toml" \
               --release --target wasm32-unknown-unknown

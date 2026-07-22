@@ -20,7 +20,13 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
 - **Anti init-takeover (v0.6):** `deployer()` / `require_deployer()` — la `init`
   de un contrato exige que el firmante sea la dirección que lo DESPLEGÓ, cerrando
   el front-run donde un tercero llama `init` primero y se registra como admin.
+- **Guardas financieras (v0.6):** `require_at_least` (anti-slippage, `amountOutMin`)
+  y `require_at_most` (precio/monto máximo), + aritmética overflow-safe completa
+  `mul_u64`/`div_u64`. El `deadline` va a nivel de tx (`valid_until_round`). Ver
+  la §7 de [`docs/CONTRACT-SECURITY.md`](../../docs/CONTRACT-SECURITY.md).
 - Macro `entrypoint!` que exporta el punto de entrada `run` (4 args `i64`).
+- **Tests de host:** las funciones puras del SDK (LE read/write, add/sub/mul/div,
+  guardas, `holder_seed`) tienen cobertura — `cargo test` en `crates/qchain-sdk/`.
 
 **Ejemplos listos para compilar:**
 - `templates/payments/` — tesorería/pagos con 6 funciones (saldos).
@@ -33,6 +39,10 @@ vez de WebAssembly a mano). Compila a `wasm32-unknown-unknown` y produce un
 - `templates/token/` — **token fungible ENDURECIDO**: mint autorizado + cap,
   saldos en PDAs por-titular, transfer que debita al firmante por construcción
   (v0.5, verificado en vivo contra ataques).
+- `templates/escrow/` — **compra a precio límite** (contrato FINANCIERO): aplica
+  las guardas `require_at_most` + `mul_u64` + `require_deployer` + `pubkey_eq`
+  (v0.6, **verificado en vivo con ataque**: una compra que excede el `max_total`
+  firmado es RECHAZADA).
 
 Compilalos con:
 
