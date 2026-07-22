@@ -3118,23 +3118,50 @@ function bridgeApprove(title, lines, opts){
   return new Promise((resolve)=>{
     const ov=document.createElement("div");
     ov.style.cssText="position:fixed;inset:0;z-index:9999;background:rgba(4,6,20,.72);display:flex;align-items:center;justify-content:center;padding:18px";
-    const rows=lines.map(l=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.08)"><span style="opacity:.7">${esc(l[0])}</span><span style="font-weight:600;word-break:break-all;text-align:right">${esc(l[1])}</span></div>`).join("");
+    // Cada fila es [etiqueta, valor, tipo?] — tipo "danger" la pinta en ROJO (un
+    // cambio sensible de estado: dueño/datos/código/eliminación) y "signer" la
+    // resalta en cian (una cuenta del FIRMANTE). Todo se escapa con esc().
+    const rows=lines.map(l=>{
+      const kind=l[2]||"";
+      const danger=kind==="danger", signer=kind==="signer";
+      const bd = danger ? "rgba(255,90,90,.35)" : "rgba(255,255,255,.08)";
+      const bg = danger ? "background:rgba(255,90,90,.07);" : "";
+      const lc = danger ? "color:#ff9a9a;opacity:1" : (signer ? "color:#7fe3ff;opacity:1" : "opacity:.7");
+      const vc = danger ? "color:#ffb0b0;" : (signer ? "color:#7fe3ff;" : "");
+      return `<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 8px;border-bottom:1px solid ${bd};${bg}border-radius:6px"><span style="${lc}">${esc(l[0])}</span><span style="font-weight:600;word-break:break-all;text-align:right;${vc}">${esc(l[1])}</span></div>`;
+    }).join("");
     const noteHtml=opts.note?`<div style="margin:12px 0;padding:9px 11px;border-radius:9px;background:rgba(255,90,90,.12);border:1px solid rgba(255,90,90,.4);color:#ffb0b0;font-size:12.5px">${esc(opts.note)}</div>`:"";
-    const yesAttr=opts.blocked?"disabled style=\"flex:1;opacity:.45;cursor:not-allowed\"":"style=\"flex:1\"";
+    // SEGUNDA CONFIRMACIÓN para cambios sensibles (re-audit QCH-SIMULATE): un
+    // cambio de dueño/permisos/datos/código o la eliminación de una cuenta exige
+    // marcar explícitamente esta casilla ANTES de habilitar "Aprobar" — no basta
+    // con un clic distraído.
+    const ackHtml=opts.sensitive?`<label style="display:flex;gap:9px;align-items:flex-start;margin:12px 0;padding:10px 11px;border-radius:9px;background:rgba(255,90,90,.10);border:1px solid rgba(255,90,90,.45);cursor:pointer;font-size:12.5px;color:#ffd0d0"><input type="checkbox" id="bg-ack" style="margin-top:2px;flex:0 0 auto"><span>Confirmo que entiendo que esta transacción realiza <b>cambios sensibles de estado</b> (dueño / permisos / datos / código, o elimina una cuenta) y quiero continuar.</span></label>`:"";
     ov.innerHTML=`<div style="max-width:440px;width:100%;background:var(--card,#0f1330);border:1px solid rgba(140,120,255,.25);border-radius:16px;padding:20px;max-height:88vh;overflow:auto">
       <div style="font-weight:800;font-size:17px;margin-bottom:4px">${esc(title)}</div>
       <div style="opacity:.65;font-size:13px;margin-bottom:12px">Pedido desde <span class="mono">${esc(CONNECT_ORIGIN||"")}</span></div>
       ${rows}
       ${noteHtml}
+      ${ackHtml}
       <div style="opacity:.6;font-size:12px;margin:12px 0">Tu clave NUNCA sale de esta wallet. Se firma acá, se SIMULA contra el nodo, y recién si aprobás se envía la MISMA transacción ya firmada.</div>
       <div style="display:flex;gap:10px;margin-top:6px">
         <button id="bg-no" class="btn-sec" style="flex:1">Rechazar</button>
-        <button id="bg-yes" class="btn-glow" ${yesAttr}>Aprobar y enviar</button>
+        <button id="bg-yes" class="btn-glow" style="flex:1">Aprobar y enviar</button>
       </div></div>`;
     document.body.appendChild(ov);
     ov.querySelector("#bg-no").onclick=()=>{ ov.remove(); resolve(false); };
     const yes=ov.querySelector("#bg-yes");
-    if(!opts.blocked) yes.onclick=()=>{ ov.remove(); resolve(true); };
+    const ack=ov.querySelector("#bg-ack");
+    // El botón "Aprobar" se habilita SÓLO si la simulación no está bloqueada Y, si
+    // hay cambios sensibles, la casilla de segunda confirmación está marcada.
+    function refresh(){
+      const ok = !opts.blocked && (!opts.sensitive || (ack && ack.checked));
+      yes.disabled=!ok;
+      yes.style.opacity=ok?"":"0.45";
+      yes.style.cursor=ok?"":"not-allowed";
+    }
+    if(ack) ack.onchange=refresh;
+    refresh();
+    yes.onclick=()=>{ if(yes.disabled) return; ov.remove(); resolve(true); };
   });
 }
 
@@ -3169,18 +3196,129 @@ function bridgeSimNote(sim){
   }
   return "No se pudo simular. No se firmará a ciegas.";
 }
-// Filas de detalle a partir de una simulación: fee REAL + cada cambio de saldo
-// (dirección → antes/después), para que el usuario vea EXACTAMENTE qué mueve la tx.
+// Filas de detalle COMPLETAS a partir de una simulación (re-audit QCH-SIMULATE #2:
+// "mostrar cambios completos de estado"): fee REAL + por CADA cuenta que la tx
+// cambiaría, TODO su estado antes/después — saldo, existencia (creada/eliminada),
+// owner, nonce, data_hash y code_hash — no sólo el saldo. Un cambio de owner/data/
+// code NO mueve saldo pero es lo MÁS sensible: puede transferir el control de una
+// cuenta/contrato (admin, permisos, allowance, dirección de retiro). Cada fila
+// sensible lleva un tercer elemento "danger" para pintarla en ROJO en el modal; la
+// cuenta del FIRMANTE se marca "signer". Un cambio de owner/data/code sobre una
+// cuenta RECIÉN CREADA es la inicialización normal (no un takeover), así que se
+// muestra informativo, no en rojo; el rojo se reserva para cambios sobre cuentas
+// PREEXISTENTES (donde el control realmente se transfiere) y para eliminaciones.
+// ¿Este cambio de cuenta es SENSIBLE (rojo + exige 2ª confirmación)? El veredicto
+// AUTORITATIVO lo da el NODO (`c.sensitive`): sabe qué direcciones son singletons
+// de PROTOCOLO (su `data` la reescribe el ledger en cada tx = ruido, no un
+// takeover) y distingue una cuenta NUEVA benigna (wallet vacía) de un registro de
+// AUTORIDAD recién creado (una PDA program-owned con datos = un allowance/operator/
+// admin lazily-creado — el vector de approve-phishing). Si el nodo es VIEJO y no
+// manda `c.sensitive`, fallamos CERRADO: tratamos como sensible cualquier cambio
+// de owner/data/code sobre una cuenta preexistente, una eliminación, o una cuenta
+// nueva con datos (posible grant) — más avisos, nunca menos.
+function simChangeSensitive(c){
+  if(typeof c.sensitive==="boolean") return c.sensitive;
+  const created = c.existed_before===false && c.exists_after===true;
+  const deleted = c.existed_before===true && c.exists_after===false;
+  const grantLike = created && c.data_changed===true; // cuenta nueva con datos
+  return deleted || grantLike || (c.existed_before===true && (c.owner_changed===true||c.data_changed===true||c.code_changed===true));
+}
+
+// Filas de detalle COMPLETAS a partir de una simulación (re-audit QCH-SIMULATE #2:
+// "mostrar cambios completos de estado"): fee REAL + por CADA cuenta que la tx
+// cambiaría, TODO su estado antes/después — saldo, existencia (creada/eliminada),
+// owner, nonce, data_hash y code_hash — no sólo el saldo. Un cambio de owner/data/
+// code NO mueve saldo pero es lo MÁS sensible: puede transferir el control de una
+// cuenta/contrato (admin, permisos, allowance, dirección de retiro). Cada fila
+// sensible (veredicto del nodo) lleva un tercer elemento "danger" para pintarla en
+// ROJO; la cuenta del FIRMANTE se marca "signer"; una cuenta de PROTOCOLO se
+// etiqueta como tal (su churn es mecánica del ledger, no un ataque).
 function bridgeSimLines(sim){
   const out=[];
-  // Only a real, successful simulation produces balance-change detail. A marker
+  // Only a real, successful simulation produces change detail. A marker
   // ({unavailable:true}) or a failed sim must NOT render a fake "0" fee.
   if(!sim || sim.ok!==true) return out;
   try{ out.push(["Fee real", qchDisp(BigInt(sim.fee||"0"))]); }catch(e){}
+  const me = myAddress();
+  const bof=(c)=>{ try{ return BigInt(c.balance_before!=null?c.balance_before:(c.before||"0")); }catch(e){ return 0n; } };
+  const aof=(c)=>{ try{ return BigInt(c.balance_after!=null?c.balance_after:(c.after||"0")); }catch(e){ return 0n; } };
   (sim.changes||[]).forEach(c=>{
-    try{ out.push(["Δ "+short(c.address), qchDisp(BigInt(c.before))+" → "+qchDisp(BigInt(c.after))]); }catch(e){}
+    const isSigner = !!me && c.address===me;
+    const proto = c.protocol===true;
+    const created = c.existed_before===false && c.exists_after===true;
+    const deleted = c.existed_before===true && c.exists_after===false;
+    const ownerChg = c.owner_changed===true;
+    const dataChg  = c.data_changed===true;
+    const codeChg  = c.code_changed===true;
+    const balChg   = bof(c)!==aof(c);
+    const nonceChg = (c.nonce_before!=null || c.nonce_after!=null) && String(c.nonce_before)!==String(c.nonce_after);
+    const sens = simChangeSensitive(c);
+    // Encabezado de la cuenta con etiquetas de lo que cambia.
+    const tags=[];
+    if(isSigner) tags.push("TU CUENTA (firmante)");
+    if(proto)    tags.push("cuenta de protocolo");
+    if(created && sens) tags.push("⚠ NUEVA cuenta con DATOS/AUTORIDAD");
+    else if(created)    tags.push("creada");
+    if(deleted)  tags.push("⚠ ELIMINADA");
+    if(ownerChg && sens && !created) tags.push("⚠ cambia DUEÑO");
+    if(codeChg && sens && !created)  tags.push("⚠ cambia CÓDIGO");
+    if(dataChg && sens && !created)  tags.push("⚠ cambia DATOS");
+    const kind = sens ? "danger" : (isSigner ? "signer" : null);
+    out.push(["Cuenta "+short(c.address), tags.length?tags.join(" · "):"(cambia)", kind]);
+    if(balChg) out.push(["↳ saldo", qchDisp(bof(c))+" → "+qchDisp(aof(c)), isSigner?"signer":null]);
+    if(created) out.push(["↳ existencia", "cuenta NUEVA (no existía antes)", sens?"danger":null]);
+    if(deleted) out.push(["↳ existencia", "cuenta ELIMINADA (existía antes)", "danger"]);
+    if(ownerChg) out.push(["↳ dueño (owner)", short(c.owner_before)+" → "+short(c.owner_after), sens?"danger":null]);
+    if(nonceChg) out.push(["↳ nonce", String(c.nonce_before)+" → "+String(c.nonce_after), isSigner?"signer":null]);
+    if(dataChg) out.push(["↳ data_hash", short(c.data_hash_before)+" → "+short(c.data_hash_after), sens?"danger":null]);
+    if(codeChg) out.push(["↳ code_hash", short(c.code_hash_before)+" → "+short(c.code_hash_after), sens?"danger":null]);
   });
   return out;
+}
+
+// Detecta CAMBIOS SENSIBLES en la simulación (veredicto del nodo `c.sensitive`,
+// con fallback fail-closed) para: (a) armar el aviso rojo y (b) EXIGIR una segunda
+// confirmación explícita antes de aprobar. Distingue un GRANT (cuenta de autoridad
+// recién creada = approve-phishing) de un takeover de cuenta existente y de una
+// eliminación. Para un contrato SIN ABI verificada, explica que un cambio de datos
+// puede representar un cambio de ADMINISTRADOR, PERMISOS, ALLOWANCE o DIRECCIÓN DE
+// RETIRO — el usuario no puede saber QUÉ campo cambió sin la fuente. Devuelve
+// {sensitive, note}.
+function bridgeSimAlert(sim, opts){
+  opts=opts||{};
+  const res={ sensitive:false, note:"" };
+  if(!sim || sim.ok!==true) return res;
+  const me=myAddress();
+  let grant=0, owner=0, data=0, code=0, del=0, signerSensitive=false;
+  (sim.changes||[]).forEach(c=>{
+    if(!simChangeSensitive(c)) return;
+    const created = c.existed_before===false && c.exists_after===true;
+    const deleted = c.existed_before===true && c.exists_after===false;
+    if(deleted) del++;
+    else if(created) grant++;               // registro de autoridad recién creado
+    else {
+      if(c.owner_changed===true) owner++;
+      if(c.code_changed===true) code++;
+      if(c.data_changed===true) data++;
+    }
+    if(!!me && c.address===me) signerSensitive=true;
+  });
+  if(grant+owner+data+code+del===0) return res;
+  res.sensitive=true;
+  const parts=[];
+  if(grant) parts.push(grant+" cuenta(s) de AUTORIDAD/DATOS recién creada(s) (posible permiso/allowance/admin)");
+  if(owner) parts.push(owner+" cambio(s) de DUEÑO (owner)");
+  if(code)  parts.push(code+" cambio(s) de CÓDIGO (bytecode)");
+  if(data)  parts.push(data+" cambio(s) de DATOS (data_hash)");
+  if(del)   parts.push(del+" cuenta(s) ELIMINADA(s)");
+  let m="⚠ CAMBIO SENSIBLE DE ESTADO — esta transacción hace: "+parts.join(", ")+". Un cambio de dueño/datos/código (o crear un registro de autoridad) NO mueve saldo pero puede TRANSFERIR EL CONTROL de una cuenta o darle a un tercero permiso para GASTAR tus fondos MÁS TARDE.";
+  if(signerSensitive) m+=" Además MODIFICA una de TUS cuentas (la del firmante).";
+  if((data||grant) && opts.unverified){
+    m+=" Este contrato NO tiene ABI/código verificado: ese cambio de datos puede representar un cambio de ADMINISTRADOR, PERMISOS, ALLOWANCE o DIRECCIÓN DE RETIRO — no hay forma de saber cuál sin la fuente. Aprobá SÓLO si confiás plenamente en quién lo desplegó.";
+  }
+  m+=" Revisá cada fila ROJA antes de continuar.";
+  res.note=m;
+  return res;
 }
 
 // La primera dirección de programa (derivada de la semilla) que todavía NO tiene
@@ -3241,7 +3379,13 @@ async function bridgeSignAndSubmit(tx){
     // FAIL-CLOSED (re-audit QCH-WALLET, HIGH): sólo una simulación ok===true
     // habilita aprobar. No disponible / 429 / fallida ⇒ bloqueado.
     const blocked = bridgeSimBlocked(sim);
-    const note = bridgeSimNote(sim);
+    let note = bridgeSimNote(sim);
+    // Un deploy CREA una cuenta de programa nueva (owner/código iniciales), lo que
+    // NO es un cambio sensible sobre una cuenta preexistente. Igual detectamos por
+    // si tocara una cuenta ya existente (defensa en profundidad) y exigimos la 2ª
+    // confirmación si así fuera.
+    const alert = bridgeSimAlert(sim, {unverified:false});
+    if(alert.note) note = note ? (note+"  "+alert.note) : alert.note;
     const lines=[
       ["Acción","Desplegar un contrato WASM"],
       ["Tamaño", kb+" KB"],
@@ -3250,7 +3394,7 @@ async function bridgeSignAndSubmit(tx){
       ["Firmando como", short(me)],
       ["Expira", validUntil>0n ? ("ronda "+validUntil.toString()+" (~"+CONTRACT_TX_TTL_ROUNDS+" rondas)") : "sin expiración"],
     ].concat(bridgeSimLines(sim));
-    const ok=await bridgeApprove("Desplegar contrato", lines, {blocked, note});
+    const ok=await bridgeApprove("Desplegar contrato", lines, {blocked, note, sensitive:alert.sensitive});
     if(!ok) return { rejected:true };
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
     const body=await r.json().catch(()=>({}));
@@ -3296,6 +3440,12 @@ async function bridgeSignAndSubmit(tx){
     ] : [["Contrato","⚠ NO existe un contrato desplegado en esta dirección"]];
     if(!prog && !note) note="No hay un contrato desplegado en esa dirección — la llamada fallaría. Verificá la dirección.";
     else if(prog && !known && !blocked && !note) note="El código de este contrato NO coincide con ninguna compilación conocida y NO tiene ABI verificada. Las cuentas y los argumentos i64 de abajo NO tienen una interpretación humana confiable: no podés saber con certeza qué hará este contrato con ellos. Confirmá que confiás en quién lo desplegó antes de aprobar.";
+    // CAMBIOS SENSIBLES (re-audit QCH-SIMULATE): si la simulación muestra un cambio
+    // de dueño/datos/código sobre una cuenta preexistente (o elimina una), se pinta
+    // en rojo, se explica (para un contrato SIN ABI, qué puede representar un cambio
+    // de data_hash), y se exige la 2ª confirmación. Se combina con el aviso previo.
+    const alert = bridgeSimAlert(sim, {unverified: !known});
+    if(alert.note) note = note ? (note+"  "+alert.note) : alert.note;
     const lines=[
       ["Acción","Llamar un contrato"],
       ["Contrato", pid],
@@ -3305,7 +3455,7 @@ async function bridgeSignAndSubmit(tx){
       ["Firmando como", short(me)],
       ["Expira", validUntil>0n ? ("ronda "+validUntil.toString()+" (~"+CONTRACT_TX_TTL_ROUNDS+" rondas)") : "sin expiración"],
     ]).concat(bridgeSimLines(sim));
-    const ok=await bridgeApprove("Interactuar con contrato", lines, {blocked, note});
+    const ok=await bridgeApprove("Interactuar con contrato", lines, {blocked, note, sensitive:alert.sensitive});
     if(!ok) return { rejected:true };
     const r=await fetch("/api/relay-tx",{method:"POST",headers:{"content-type":"application/json"},body:txJson});
     const body=await r.json().catch(()=>({}));

@@ -219,6 +219,51 @@ async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction
     Ok(Json(json!({ "hash": hex::encode(hash) })))
 }
 
+/// The protocol singletons + admin wallet whose `data`/state the LEDGER ITSELF
+/// rewrites as part of normal execution (dynamic-fee epoch tick, quanto close,
+/// reward accrual). A WASM contract cannot take one over (the boundary forbids
+/// writing an account it neither signs for nor owns), so their churn appearing in
+/// a sim diff is mechanics, not an attack — the wallet must NOT red-flag them.
+fn is_protocol_singleton(pk: &Pubkey) -> bool {
+    use qchain_execution::ids::*;
+    const PROTOCOL: [Pubkey; 19] = [
+        STAKING_PROGRAM_ID, STAKING_STATS_ID, GOVERNANCE_PROGRAM_ID, REGISTRY_ACCOUNT_ID,
+        PARAMS_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, LOADER_PROGRAM_ID, FEE_STATE_ACCOUNT_ID,
+        VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, STAKING_RESERVE_ID,
+        VALIDATOR_FEE_POOL_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID,
+        STAKING_GLOBAL_ID, VALIDATOR_V7_PROGRAM_ID, ADMIN_FEE_WALLET, TREASURY_V7_PROGRAM_ID,
+        TREASURY_ACCOUNT_ID,
+    ];
+    PROTOCOL.contains(pk)
+}
+
+/// Classify one simulated account change → `(sensitive, is_protocol)`. The wallet
+/// renders `sensitive` in red and demands a second confirmation. Computed on the
+/// NODE (not the wallet) because it needs the singleton IDs + account semantics the
+/// wallet can't see. A change is SENSITIVE when it is NOT a protocol singleton AND
+/// one of: the account is DELETED; a PRE-EXISTING account's owner/data/code moved
+/// (a takeover); or a freshly-CREATED, program-owned account gains non-empty data
+/// (a lazily-created allowance/operator/admin record — the approve-phishing vector).
+/// A plain new wallet (system-owned, no data) and protocol-singleton churn are NOT
+/// sensitive, which avoids alert fatigue on ordinary transfers/contract calls.
+fn classify_sim_change(c: &qchain_execution::SimAccountChange) -> (bool, bool) {
+    let sys = Pubkey::system_program_id();
+    let empty_hash: [u8; 32] = <sha3::Sha3_256 as sha3::Digest>::digest([]).into();
+    let owner_changed = c.owner_before != c.owner_after;
+    let data_changed = c.data_hash_before != c.data_hash_after;
+    let code_changed = c.code_hash_before != c.code_hash_after;
+    let created = !c.existed_before && c.exists_after;
+    let deleted = c.existed_before && !c.exists_after;
+    let is_protocol = is_protocol_singleton(&c.address);
+    let program_owned_after = c.owner_after != sys;
+    let data_nonempty_after = c.data_hash_after != empty_hash;
+    let sensitive = !is_protocol
+        && (deleted
+            || (c.existed_before && (owner_changed || data_changed || code_changed))
+            || (created && program_owned_after && data_nonempty_after));
+    (sensitive, is_protocol)
+}
+
 /// DRY-RUN a transaction and report its predicted outcome WITHOUT committing
 /// (QCH-WALLET-001): a wallet POSTs the (signed) tx here before broadcasting so
 /// it can show the user the real fee + resulting balances + whether it would
@@ -236,11 +281,31 @@ async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transacti
     // `owner_changed`/etc. booleans so the wallet can warn "this changes the
     // contract's data/admin" even when no balance moves. `before`/`after` (the
     // balance) are kept for backward compatibility with older wallet builds.
+    //
+    // The node ALSO computes, authoritatively, `sensitive` (should the wallet
+    // red-flag + demand a second confirmation) and `protocol` (is this a
+    // protocol singleton whose data churn is ledger mechanics, not a takeover).
+    // Doing it here — not in the wallet — is the fix for a real review finding:
+    // (1) an authority GRANT that lazily CREATES its record (approve/setOperator/
+    // admin-PDA writing `{spender, amount}` into a fresh program-owned account)
+    // must count as sensitive even though the account is "new" — the wallet alone
+    // can't tell a benign new wallet from a new authority record, but the node
+    // knows the resulting owner + whether `data` is non-empty; (2) the sim diff
+    // window includes protocol singletons ([1..=18] + ADMIN_FEE_WALLET) whose
+    // `data` the LEDGER itself rewrites every call (dynamic-fee epoch tick) or
+    // quanto close — flagging those as "sensitive" would train users to reflexively
+    // tick the confirmation on ordinary calls, dulling the real alert. A contract
+    // cannot take over a protocol singleton (the WASM boundary forbids writing an
+    // account it neither signs for nor owns), so their churn is never sensitive.
     let hx = |b: &[u8; 32]| hex::encode(b);
     let changes: Vec<serde_json::Value> = sim
         .changes
         .iter()
         .map(|c| {
+            let owner_changed = c.owner_before != c.owner_after;
+            let data_changed = c.data_hash_before != c.data_hash_after;
+            let code_changed = c.code_hash_before != c.code_hash_after;
+            let (sensitive, is_protocol) = classify_sim_change(c);
             json!({
                 "address": c.address.to_string(),
                 "existed_before": c.existed_before,
@@ -251,15 +316,18 @@ async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transacti
                 "balance_after": c.balance_after.to_string(),
                 "owner_before": c.owner_before.to_string(),
                 "owner_after": c.owner_after.to_string(),
-                "owner_changed": c.owner_before != c.owner_after,
+                "owner_changed": owner_changed,
                 "nonce_before": c.nonce_before,
                 "nonce_after": c.nonce_after,
                 "data_hash_before": hx(&c.data_hash_before),
                 "data_hash_after": hx(&c.data_hash_after),
-                "data_changed": c.data_hash_before != c.data_hash_after,
+                "data_changed": data_changed,
                 "code_hash_before": hx(&c.code_hash_before),
                 "code_hash_after": hx(&c.code_hash_after),
-                "code_changed": c.code_hash_before != c.code_hash_after,
+                "code_changed": code_changed,
+                // Authoritative node verdict (see the block comment above).
+                "sensitive": sensitive,
+                "protocol": is_protocol,
             })
         })
         .collect();
@@ -731,7 +799,98 @@ async fn equivocation_evidence(State(engine): State<Arc<Engine>>) -> Json<Vec<qc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qchain_execution::SimAccountChange;
+    use sha3::{Digest, Sha3_256};
     use std::net::{IpAddr, Ipv4Addr};
+
+    fn mk_change(addr: Pubkey) -> SimAccountChange {
+        // A no-op change: existed before and after, nothing moved. Callers mutate
+        // the fields for the case under test.
+        let empty: [u8; 32] = Sha3_256::digest([]).into();
+        SimAccountChange {
+            address: addr,
+            existed_before: true,
+            exists_after: true,
+            balance_before: 100,
+            balance_after: 100,
+            owner_before: Pubkey::system_program_id(),
+            owner_after: Pubkey::system_program_id(),
+            nonce_before: 0,
+            nonce_after: 0,
+            data_hash_before: empty,
+            data_hash_after: empty,
+            code_hash_before: [0u8; 32],
+            code_hash_after: [0u8; 32],
+        }
+    }
+
+    /// "Mostrar cambios completos de estado" — the NODE authoritatively classifies
+    /// each simulated change so the wallet knows what to red-flag + gate behind a
+    /// second confirmation. Covers the two real review findings: an authority GRANT
+    /// (fresh program-owned account with data = approve-phishing) MUST be sensitive
+    /// even though it's "new", and protocol-singleton data churn (the ledger's own
+    /// fee/quanto mechanics) must NOT be, to avoid alert fatigue.
+    #[test]
+    fn sim_change_sensitivity_classification() {
+        use qchain_execution::ids::{FEE_STATE_ACCOUNT_ID, LOADER_PROGRAM_ID, STAKING_GLOBAL_ID};
+        let nonempty: [u8; 32] = Sha3_256::digest(b"grant").into();
+        let user = Pubkey::new([99u8; 32]); // a non-protocol address (1..=18 are singletons)
+        let contract = Pubkey::new([200u8; 32]); // a program (non-system) owner
+
+        // Plain transfer: the recipient is a NEW system-owned wallet with NO data.
+        // Not sensitive (the created-account carve-out is safe HERE, unlike a grant).
+        let mut newpay = mk_change(user);
+        newpay.existed_before = false;
+        newpay.owner_after = Pubkey::system_program_id();
+        newpay.balance_before = 0;
+        newpay.balance_after = 5;
+        assert_eq!(classify_sim_change(&newpay), (false, false), "new plain wallet is not sensitive");
+
+        // GRANT (Finding 1): a freshly CREATED, program-owned account gains data =
+        // a lazily-created allowance/operator/admin record. MUST be sensitive.
+        let mut grant = mk_change(user);
+        grant.existed_before = false;
+        grant.owner_after = contract;
+        grant.data_hash_after = nonempty;
+        assert_eq!(classify_sim_change(&grant), (true, false), "a new program-owned account with data (a grant) IS sensitive");
+
+        // A new program-owned account with EMPTY data (e.g. a claimed-but-unwritten
+        // PDA) is not a grant yet → not sensitive.
+        let mut empty_pda = mk_change(user);
+        empty_pda.existed_before = false;
+        empty_pda.owner_after = contract;
+        assert_eq!(classify_sim_change(&empty_pda), (false, false), "a new program-owned account with no data is not sensitive");
+
+        // TAKEOVER: a PRE-EXISTING account's data moves (admin/allowance change).
+        let mut takeover = mk_change(user);
+        takeover.data_hash_after = nonempty;
+        assert_eq!(classify_sim_change(&takeover), (true, false), "data change on a pre-existing account is sensitive");
+
+        // OWNER takeover of a pre-existing account.
+        let mut owner_to = mk_change(user);
+        owner_to.owner_after = contract;
+        assert_eq!(classify_sim_change(&owner_to), (true, false), "owner change on a pre-existing account is sensitive");
+
+        // DELETION of a pre-existing account.
+        let mut del = mk_change(user);
+        del.exists_after = false;
+        assert_eq!(classify_sim_change(&del), (true, false), "deletion is sensitive");
+
+        // PROTOCOL singleton churn (Finding 2): FEE_STATE / STAKING_GLOBAL data is
+        // rewritten by the ledger every call/quanto — flagged `protocol`, NEVER
+        // sensitive (a contract cannot take a singleton over).
+        for id in [FEE_STATE_ACCOUNT_ID, STAKING_GLOBAL_ID, LOADER_PROGRAM_ID] {
+            let mut proto = mk_change(id);
+            proto.data_hash_after = nonempty; // its data churned
+            assert_eq!(classify_sim_change(&proto), (false, true), "protocol singleton churn is not sensitive, but is flagged protocol");
+        }
+
+        // A pure balance change on a normal account (a received transfer) is not
+        // sensitive.
+        let mut balonly = mk_change(user);
+        balonly.balance_after = 999;
+        assert_eq!(classify_sim_change(&balonly), (false, false), "a pure balance change is not sensitive");
+    }
 
     /// #196: the per-IP limiter allows up to `limit` requests, then bans the IP
     /// (subsequent requests are throttled), and a DIFFERENT IP is unaffected.
