@@ -24,7 +24,7 @@ members = [
 exclude = ["crates/qchain-wasm", "crates/qchain-sdk", "fuzz"]
 
 [workspace.package]
-version = "6.26.6"
+version = "6.26.7"
 edition = "2021"
 
 # Defense-in-depth for a ledger: catch integer overflow/underflow as a loud

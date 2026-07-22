@@ -384,34 +384,37 @@ static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_
 const MAX_CONCURRENT_SIMULATIONS: usize = 4;
 static SIMULATE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SIMULATIONS);
 
-/// Round-scoped `/simulate` result cache (re-audit QCH-SIMULATE #3): maps a
-/// canonical txid to its `(round, outcome)`. A dry-run is a pure function of the
-/// message plus the committed round, so an identical tx replayed in the SAME
-/// round is served from here instead of re-running the WASM, closing the "replay
-/// one signed tx to force endless dry-runs" DoS. Bounded FIFO (evict oldest) so
-/// it cannot grow without limit; an entry from an older round is ignored
-/// (freshness is a round match), so nothing stale is ever returned.
+/// The identity of a `/simulate` dry-run: `(canonical txid, committed round,
+/// committed state root)`. A dry-run is a pure function of the MESSAGE, the round
+/// (expiration + the effective fee's idle decay depend on it), AND the committed
+/// state it runs against — so the STATE ROOT must be part of the key (re-audit #3):
+/// within a single consensus round, several transactions can commit and change the
+/// state (the root moves while `next_round` is unchanged), so a `(txid, round)`-only
+/// key could serve a preview computed against an older state. Including the root
+/// guarantees a cached preview is only ever reused for the EXACT state it was
+/// computed against — never stale.
+type SimKey = ([u8; 32], u64, [u8; 32]);
+
+/// `/simulate` result cache keyed by `SimKey` (re-audit #3): an identical tx
+/// re-simulated against the identical committed state is served from here instead
+/// of re-running the WASM, closing the "replay one signed tx to force endless
+/// dry-runs" DoS. Bounded FIFO (evict oldest) so it cannot grow without limit.
 const SIM_CACHE_MAX: usize = 8192;
 struct SimCache {
-    map: std::collections::HashMap<[u8; 32], (u64, qchain_execution::SimOutcome)>,
-    order: std::collections::VecDeque<[u8; 32]>,
+    map: std::collections::HashMap<SimKey, qchain_execution::SimOutcome>,
+    order: std::collections::VecDeque<SimKey>,
 }
 static SIM_CACHE: std::sync::LazyLock<std::sync::Mutex<SimCache>> = std::sync::LazyLock::new(|| {
     std::sync::Mutex::new(SimCache { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new() })
 });
-/// Cache hit ONLY when the cached entry is for the SAME round (never serve a
-/// stale-round preview). Returns a clone of the cached outcome.
-fn sim_cache_get(txid: &[u8; 32], round: u64) -> Option<qchain_execution::SimOutcome> {
+fn sim_cache_get(key: &SimKey) -> Option<qchain_execution::SimOutcome> {
     let cache = SIM_CACHE.lock().ok()?;
-    match cache.map.get(txid) {
-        Some((r, out)) if *r == round => Some(out.clone()),
-        _ => None,
-    }
+    cache.map.get(key).cloned()
 }
-fn sim_cache_put(txid: [u8; 32], round: u64, outcome: &qchain_execution::SimOutcome) {
+fn sim_cache_put(key: SimKey, outcome: &qchain_execution::SimOutcome) {
     let Ok(mut cache) = SIM_CACHE.lock() else { return };
-    if cache.map.insert(txid, (round, outcome.clone())).is_none() {
-        cache.order.push_back(txid);
+    if cache.map.insert(key, outcome.clone()).is_none() {
+        cache.order.push_back(key);
         while cache.order.len() > SIM_CACHE_MAX {
             if let Some(old) = cache.order.pop_front() {
                 cache.map.remove(&old);
@@ -419,6 +422,18 @@ fn sim_cache_put(txid: [u8; 32], round: u64, outcome: &qchain_execution::SimOutc
         }
     }
 }
+
+/// SINGLEFLIGHT for `/simulate` (re-audit #4): coalesces concurrent identical
+/// dry-runs. Several requests for the SAME `SimKey` can race past the cache before
+/// the first stores its result; without this each would re-run the WASM. The map
+/// holds a `watch::Receiver<Option<SimOutcome>>` published by the ONE runner —
+/// waiters clone the receiver and await the value instead of duplicating the work.
+/// `watch` is lost-wakeup-free: a receiver cloned AFTER the runner already
+/// published sees the value immediately (`borrow().is_some()`), so no waiter ever
+/// hangs. Bounded implicitly by `SIM_CACHE_MAX`-scale traffic + the runner always
+/// removing its entry when done.
+static SIM_INFLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<SimKey, tokio::sync::watch::Receiver<Option<qchain_execution::SimOutcome>>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// How long a captured point-in-time snapshot stays servable before the node
 /// re-captures a fresh one (see `CachedSnapshot`). Long enough that a client
@@ -2082,30 +2097,85 @@ impl Engine {
         // hold the lock (it would stall try_commit/propose_round) nor run on the
         // async runtime (WASM compile/exec is CPU-blocking). So run it on a
         // blocking thread with the lock already dropped.
-        let (snapshot, round) = {
+        let (snapshot, round, state_root) = {
             let state = self.state.lock().await;
             let round = state.next_round;
-            (state.ledger.simulate_snapshot(tx, &SIM_FEE_COLLECTOR), round)
+            // Capture the committed STATE ROOT together with the round: it pins the
+            // exact state the dry-run runs against, so the cache key can't serve a
+            // preview computed against a different state within the same round.
+            let state_root = state.ledger.merkle_root();
+            (state.ledger.simulate_snapshot(tx, &SIM_FEE_COLLECTOR), round, state_root)
         };
-        // TXID CACHE (re-audit QCH-SIMULATE #3): a dry-run is a pure function of
-        // the MESSAGE + the committed round (`run_simulation` uses the presigned
-        // path — no signature in the result). So an identical tx replayed within
-        // the SAME round yields the identical outcome; serve it from a small
-        // round-scoped cache instead of re-compiling+running the WASM. This kills
-        // the "reuse one public signed tx to force endless identical dry-runs"
-        // vector — the expensive WASM work runs at most once per (txid, round).
-        // Keyed by the canonical txid (message hash, #186); scoped to `round` so
-        // a stale-round result is never served.
+        // CACHE (re-audit #3): a dry-run is a pure function of the MESSAGE + the
+        // committed round + the committed state (`run_simulation` uses the presigned
+        // path — no signature in the result). Keyed by `(txid, round, state_root)`
+        // so an identical tx re-simulated against the IDENTICAL state is served from
+        // the cache — never a stale-state preview — closing the "reuse one signed
+        // tx to force endless identical dry-runs" vector.
         let txid = tx.txid();
-        if let Some(cached) = sim_cache_get(&txid, round) {
+        let key: SimKey = (txid, round, state_root);
+        if let Some(cached) = sim_cache_get(&key) {
             return Some(cached);
         }
-        let tx = tx.clone();
-        let outcome = tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
-            .await
-            .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"));
-        sim_cache_put(txid, round, &outcome);
-        Some(outcome)
+        // SINGLEFLIGHT (re-audit #4): only ONE runner executes a given `key`; other
+        // concurrent identical requests await its published result instead of
+        // duplicating the WASM work. `Wait` awaits the runner's `watch` value;
+        // `Run(sender)` means we are that runner.
+        enum Flight {
+            Wait(tokio::sync::watch::Receiver<Option<qchain_execution::SimOutcome>>),
+            Run(tokio::sync::watch::Sender<Option<qchain_execution::SimOutcome>>),
+        }
+        let flight = {
+            // std Mutex — held only for these O(1) map ops, never across an await.
+            let mut inflight = SIM_INFLIGHT.lock().unwrap();
+            // Re-check the cache under this lock: a runner may have finished
+            // (removed its inflight entry + populated the cache) between our miss
+            // above and acquiring this lock.
+            if let Some(cached) = sim_cache_get(&key) {
+                return Some(cached);
+            }
+            match inflight.get(&key) {
+                Some(rx) => Flight::Wait(rx.clone()),
+                None => {
+                    let (tx_ch, rx_ch) = tokio::sync::watch::channel(None);
+                    inflight.insert(key, rx_ch);
+                    Flight::Run(tx_ch)
+                }
+            }
+        };
+        match flight {
+            Flight::Wait(mut rx) => {
+                // Await the runner's result. `watch` is lost-wakeup-free: if the
+                // runner already published before we cloned, `borrow()` is `Some`
+                // and we return without awaiting.
+                loop {
+                    if let Some(out) = rx.borrow().clone() {
+                        return Some(out);
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // runner dropped the sender without publishing
+                    }
+                }
+                // Rare fall-through (runner errored): the cache may still have been
+                // populated; otherwise report a cheap coalescing failure.
+                sim_cache_get(&key).or_else(|| Some(qchain_execution::SimOutcome::rejected("simulation coalescing failed")))
+            }
+            Flight::Run(sender) => {
+                let tx = tx.clone();
+                let outcome = tokio::task::spawn_blocking(move || qchain_execution::Ledger::run_simulation(snapshot, &tx, &SIM_FEE_COLLECTOR, round))
+                    .await
+                    .unwrap_or_else(|_| qchain_execution::SimOutcome::rejected("simulation task failed"));
+                sim_cache_put(key, &outcome);
+                // Remove the inflight entry BEFORE publishing so a late waiter that
+                // missed the notify re-checks the cache (already populated).
+                {
+                    let mut inflight = SIM_INFLIGHT.lock().unwrap();
+                    inflight.remove(&key);
+                }
+                let _ = sender.send(Some(outcome.clone()));
+                Some(outcome)
+            }
+        }
     }
 
     /// v7 reward/unbonding timing for the wallet's staking progress bars:

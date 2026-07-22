@@ -3206,16 +3206,30 @@ async function bridgeSignAndSubmit(tx){
   const me=myAddress();
   const acct=await api("/api/account/"+encodeURIComponent(me));
   const nonce=BigInt(acct.nonce||0);
-  const node=await api("/api/node").catch(()=>({}));
+  const node=await api("/api/node").catch(()=>null);
+  // EXPIRACIÓN OBLIGATORIA, FAIL-CLOSED (re-audit #5): una tx de contrato SIEMPRE
+  // lleva una ventana de validez corta. Si no podemos obtener la ronda actual del
+  // nodo, NO se firma — nunca una tx de contrato sin expiración. La ronda 0
+  // (génesis) igual produce una expiración POSITIVA (0 + 120 = 120), así que
+  // valid_until_round nunca queda en 0 (que el nodo interpreta como "sin caducidad").
+  if(!node || node.online===false || !Number.isFinite(Number(node.next_round))){
+    throw new Error("no se pudo obtener la ronda actual del nodo; no se firma una transacción de contrato sin expiración");
+  }
   const bfpb=BigInt(node.base_fee_per_byte||180);
-  // Ventana de validez corta: expira ~120 rondas después de la ronda actual
-  // (re-audit #4). 0 = sin expiración sólo si el nodo no reporta la ronda.
-  const curRound=BigInt(node.next_round||0);
-  const validUntil = curRound>0n ? (curRound + CONTRACT_TX_TTL_ROUNDS) : 0n;
+  const curRound=BigInt(Math.trunc(Number(node.next_round)));
+  const validUntil = curRound + CONTRACT_TX_TTL_ROUNDS; // siempre > 0 (fail-closed)
   if(tx.kind==="deployProgram"){
-    const bytes=Uint8Array.from(tx.moduleBytes||[]);
-    if(!bytes.length) throw new Error("el .wasm está vacío");
-    if(bytes.length>MAX_MODULE_BYTES) throw new Error("el .wasm supera el máximo de "+(MAX_MODULE_BYTES/1024)+" KB");
+    // VALIDAR EL TAMAÑO Y CADA BYTE **ANTES** DE CONVERTIR (re-audit #6): un origen
+    // autorizado pero comprometido podría mandar un arreglo enorme o con valores
+    // fuera de rango; comprobar tipo → tope de 256 KiB → cada elemento 0..255, y
+    // recién ahí construir el Uint8Array (que asigna memoria). El chequeo de tamaño
+    // va antes del bucle, así que nunca se itera un arreglo sin cota.
+    const mb=tx.moduleBytes;
+    if(!Array.isArray(mb) && !(mb instanceof Uint8Array)) throw new Error("el módulo WASM debe ser un arreglo de bytes");
+    if(!mb.length) throw new Error("el .wasm está vacío");
+    if(mb.length>MAX_MODULE_BYTES) throw new Error("el .wasm supera el máximo de "+(MAX_MODULE_BYTES/1024)+" KB");
+    for(let i=0;i<mb.length;i++){ const b=mb[i]; if(!Number.isInteger(b)||b<0||b>255) throw new Error("byte inválido en la posición "+i+" del módulo WASM (se esperaba 0..255)"); }
+    const bytes=Uint8Array.from(mb);
     const kb=(bytes.length/1024).toFixed(1);
     // FIRMAR primero (sin transmitir), luego SIMULAR la tx firmada, y recién
     // mostrar la aprobación con el resultado real (fee + cambios de saldo). La
@@ -3267,15 +3281,21 @@ async function bridgeSignAndSubmit(tx){
     try{ prog=await api("/api/program/"+encodeURIComponent(pid)); }catch(e){ prog=null; }
     const ch = prog ? String(prog.code_hash||"").toLowerCase() : "";
     const known = KNOWN_CONTRACTS[ch];
-    const verified = known ? ("✅ verificado — "+known) : "⚠ NO verificado (código desconocido — no confíes en la identidad de este contrato)";
+    const verified = known ? ("✅ verificado — "+known) : "⚠ NO verificado — código/ABI desconocido; no confíes en la identidad de este contrato";
+    // PROCEDENCIA COMPLETA (re-audit #7): mostrar el code_hash y el deployer
+    // COMPLETOS (no abreviados), el entry point, y si hay ABI/código verificado.
+    // Un code_hash abreviado puede colisionar visualmente — el usuario debe poder
+    // comparar el hash entero contra el que publicó el autor.
     const provenance = prog ? [
-      ["Code hash", short(prog.code_hash||"")],
+      ["Code hash (completo)", String(prog.code_hash||"")],
       ["Verificación", verified],
-      ["Desplegado por", short(prog.deployer||"")],
+      ["ABI / código fuente", known ? "plantilla oficial del SDK (interfaz conocida)" : "no disponible / no verificado"],
+      ["Desplegado por (completo)", String(prog.deployer||"—")],
+      ["Entry point", String(prog.entry_point||"—")],
       ["Tamaño del código", ((Number(prog.size_bytes||0))/1024).toFixed(1)+" KB"],
     ] : [["Contrato","⚠ NO existe un contrato desplegado en esta dirección"]];
     if(!prog && !note) note="No hay un contrato desplegado en esa dirección — la llamada fallaría. Verificá la dirección.";
-    else if(prog && !known && !blocked && !note) note="El código de este contrato NO coincide con ninguna compilación conocida. Confirmá que confiás en quién lo desplegó antes de aprobar.";
+    else if(prog && !known && !blocked && !note) note="El código de este contrato NO coincide con ninguna compilación conocida y NO tiene ABI verificada. Las cuentas y los argumentos i64 de abajo NO tienen una interpretación humana confiable: no podés saber con certeza qué hará este contrato con ellos. Confirmá que confiás en quién lo desplegó antes de aprobar.";
     const lines=[
       ["Acción","Llamar un contrato"],
       ["Contrato", pid],

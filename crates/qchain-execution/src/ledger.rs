@@ -1073,7 +1073,31 @@ impl Ledger {
     /// pre-staking-reward behavior, whenever nothing is delegated yet
     /// (`staking::accrue_reward_pool` reports this via its `bool` return
     /// rather than this method re-deriving total stake).
-    fn credit_validator_share(&mut self, fee_collector: Pubkey, validator_share: u64, params: &EconomicParams) -> Result<(), ExecError> {
+    /// Credit `amount` to `pk`'s balance, into the in-flight `working` set when
+    /// `pk` is present there, otherwise directly to the store. Used by the
+    /// deferred fee distribution (re-audit #1): when the block proposer is ALSO
+    /// the payer (`fee_collector == payer`, a validator submitting its own tx),
+    /// the payer IS in `working`, and the commit loop overwrites the store with
+    /// `working` — so a store-only credit would be clobbered and the proposer
+    /// would silently lose its own fee. Crediting into `working` when present
+    /// makes the credit survive the commit. On the error path the caller passes
+    /// `None` (working is discarded on error, so the credit must persist via the
+    /// store). Mirrors the pre-existing gas-fee path's `working.entry(*fee_collector)`
+    /// treatment, generalized so the byte fee is safe too.
+    fn credit_fee_target(&mut self, working: Option<&mut HashMap<Pubkey, Account>>, pk: Pubkey, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        if let Some(w) = working {
+            if let Some(acc) = w.get_mut(&pk) {
+                acc.balance = acc.balance.saturating_add(amount);
+                return;
+            }
+        }
+        self.credit(pk, amount);
+    }
+
+    fn credit_validator_share(&mut self, working: Option<&mut HashMap<Pubkey, Account>>, fee_collector: Pubkey, validator_share: u64, params: &EconomicParams) -> Result<(), ExecError> {
         if validator_share == 0 {
             return Ok(());
         }
@@ -1102,14 +1126,14 @@ impl Ledger {
             if let Some(pool) = accounts.remove(&STAKING_REWARDS_POOL_ID) {
                 self.write_account(STAKING_REWARDS_POOL_ID, pool);
             }
-            self.credit(fee_collector, commission);
+            self.credit_fee_target(working, fee_collector, commission);
             self.validator_earned = self.validator_earned.saturating_add(commission);
             self.pool_earned = self.pool_earned.saturating_add(pool_share);
             self.note_validator_commission(fee_collector, commission);
         } else {
             // No delegators yet: the validator keeps the whole non-burned
             // share (its commission is effectively 100% of it).
-            self.credit(fee_collector, validator_share);
+            self.credit_fee_target(working, fee_collector, validator_share);
             self.validator_earned = self.validator_earned.saturating_add(validator_share);
             self.note_validator_commission(fee_collector, validator_share);
         }
@@ -1653,27 +1677,23 @@ impl Ledger {
         payer_account.nonce += 1;
         self.write_account(tx.message.payer, payer_account.clone());
 
-        // Base (byte) fee split. Under v7 (`economics_v7` on) it's the 45/45/10
-        // route (burn / pool / admin), replacing the v6 50/50 burn/validators
-        // split and dropping `staking_commission_bps`. The priority tip is NOT
-        // burned in either mode: it goes 100% to the proposer, as the whole
-        // point is to reward the validator that included a congested tx.
-        if self.economics_v7 {
-            self.route_fee_v7(byte_fee);
-        } else {
-            let burn_share = byte_fee / 2;
-            let validator_share = byte_fee - burn_share;
-            self.total_burned = self.total_burned.saturating_add(burn_share);
-            self.fee_burned = self.fee_burned.saturating_add(burn_share);
-            self.credit_validator_share(*fee_collector, validator_share, &params)?;
-        }
-        if priority_fee > 0 {
-            // 100% of the tip to the proposer's own account (liquid commission,
-            // tracked like the base commission so the dashboard reflects it).
-            self.credit(*fee_collector, priority_fee);
-            self.validator_earned = self.validator_earned.saturating_add(priority_fee);
-            self.note_validator_commission(*fee_collector, priority_fee);
-        }
+        // SIM/EXEC EQUIVALENCE (re-audit #1, CRÍTICO): the fee is only RESERVED
+        // here — the payer was just debited `upfront_fee`. DISTRIBUTING the
+        // proposer's commission (crediting `fee_collector`, the burn/pool/admin
+        // route, and the priority tip) is DEFERRED until AFTER every instruction
+        // has executed (see "DEFERRED FEE DISTRIBUTION" below). A contract must
+        // observe an IDENTICAL world in a `/simulate` dry-run (which uses a
+        // fictitious `fee_collector`) and in real execution (the real block
+        // proposer), so NO `fee_collector`-dependent state write may land before
+        // the contract runs — otherwise a malicious contract could read the
+        // proposer's credited balance, detect the fictitious sim address, and
+        // behave differently at execution than it did in the preview. Reserving
+        // now + distributing after execution closes that class entirely. The
+        // deferred credit still lands BEFORE `root_after` is captured, so the
+        // committed state and the STARK receipt stay byte-identical to
+        // distributing here — the only observable change is that a contract no
+        // longer sees the proposer credited mid-run (which it could never target
+        // anyway, the proposer being unknown at signing time).
 
         // Advance the EIP-1559-style dynamic base fee for subsequent rounds.
         // Placed here - after the fee is charged, before the instructions run
@@ -1700,7 +1720,16 @@ impl Ledger {
         }
 
         let mut total_gas_fee = 0u64;
-        for ix in &tx.message.instructions {
+        // Execute every instruction, capturing the FIRST error into `exec_result`
+        // and stopping — instead of returning immediately. Why not `?`/early-return:
+        // the reserved base+priority fee is now distributed AFTER this loop (re-audit
+        // #1), so an instruction that fails must still fall through to that
+        // distribution (supply conservation / "you pay for attempted execution",
+        // exactly like the pre-reorder order that paid the fee out BEFORE the loop).
+        // On error the tx still does not commit: `working` and any receipt are
+        // discarded when we return right after distributing (before the commit loop).
+        let mut exec_result: Result<(), ExecError> = Ok(());
+        'exec: for ix in &tx.message.instructions {
             // DEPLOY-TIME VALIDATION (QCH-WASM-002): a `DeployProgram` must
             // carry bytecode that actually compiles and exports its declared
             // entry point. Reject at DEPLOY so a bad contract never persists
@@ -1708,9 +1737,8 @@ impl Ledger {
             // Deterministic — the same wasmtime on every node accepts/rejects
             // the same bytes, so this is fork-free and adds no new fork surface
             // beyond what execution already requires; it also warms the module
-            // cache. Same early-`Err` semantics as any other instruction
-            // failure (the fee epoch already ticked above at
-            // `advance_dynamic_fee`; `working` is discarded).
+            // cache. Same "attempted-execution fee still charged, `working`
+            // discarded" semantics as any other instruction failure.
             if ix.program_id == Pubkey::system_program_id() {
                 if let Ok(SystemInstruction::DeployProgram { module_bytes, entry_point, .. }) = SystemInstruction::try_from_slice(&ix.data) {
                     // Enforce the size cap BEFORE compiling, so an oversized
@@ -1719,13 +1747,19 @@ impl Ledger {
                     // it here first keeps the compile off the oversized path.
                     if module_bytes.len() <= crate::native::MAX_PROGRAM_BYTECODE_BYTES {
                         if let Err(e) = self.wasm.validate_deploy(&module_bytes, &entry_point) {
-                            return Err(ExecError::ProgramError(format!("invalid contract at deploy: {e}")));
+                            exec_result = Err(ExecError::ProgramError(format!("invalid contract at deploy: {e}")));
+                            break 'exec;
                         }
                     }
                 }
             }
             match self.programs.get(&ix.program_id) {
-                Some(Program::Native(native)) => native.process(&mut working, ix, &tx.message.payer, current_round)?,
+                Some(Program::Native(native)) => {
+                    if let Err(e) = native.process(&mut working, ix, &tx.message.payer, current_round) {
+                        exec_result = Err(e);
+                        break 'exec;
+                    }
+                }
                 Some(Program::Wasm { module_bytes, entry_point }) => {
                     let module_bytes = module_bytes.clone();
                     let entry_point = entry_point.clone();
@@ -1736,7 +1770,10 @@ impl Ledger {
                     // `host_is_signer`, so the sentinel authorizes nothing.
                     match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round, Pubkey::new([0u8; 32])) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
-                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
+                        Err(e) => {
+                            exec_result = Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e));
+                            break 'exec;
+                        }
                     }
                 }
                 // Not one of the fixed native programs - check whether a
@@ -1749,13 +1786,20 @@ impl Ledger {
                 // read-only from the invoking instruction's perspective,
                 // not part of the mutable working set.
                 None => {
-                    let program_account = self
-                        .store
-                        .get(&ix.program_id)
-                        .filter(|a| a.owner == crate::ids::LOADER_PROGRAM_ID)
-                        .ok_or(ExecError::UnknownProgram(ix.program_id))?;
-                    let program_data = crate::native::WasmProgramData::try_from_slice(&program_account.data)
-                        .map_err(|e| ExecError::ProgramError(format!("corrupt deployed program data: {e}")))?;
+                    let program_account = match self.store.get(&ix.program_id).filter(|a| a.owner == crate::ids::LOADER_PROGRAM_ID) {
+                        Some(a) => a,
+                        None => {
+                            exec_result = Err(ExecError::UnknownProgram(ix.program_id));
+                            break 'exec;
+                        }
+                    };
+                    let program_data = match crate::native::WasmProgramData::try_from_slice(&program_account.data) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            exec_result = Err(ExecError::ProgramError(format!("corrupt deployed program data: {e}")));
+                            break 'exec;
+                        }
+                    };
                     // CODE-HASH INTEGRITY (re-audit #4, fail-loud): the account
                     // advertises a `code_hash` (what QScan shows and what a client
                     // pins via `verify-program`); prove it actually describes the
@@ -1766,9 +1810,10 @@ impl Ledger {
                     // it, same fail-loud stance `SledStore` takes on corrupt data.
                     let actual_code_hash: [u8; 32] = sha3::Sha3_256::digest(&program_data.module_bytes).into();
                     if actual_code_hash != program_account.code_hash {
-                        return Err(ExecError::ProgramError(
+                        exec_result = Err(ExecError::ProgramError(
                             "deployed program bytecode does not match its advertised code_hash (corrupt program account)".into(),
                         ));
+                        break 'exec;
                     }
                     match self.run_wasm_instruction(
                         &program_data.module_bytes,
@@ -1784,11 +1829,75 @@ impl Ledger {
                         program_data.deployer,
                     ) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
-                        Err(e) => return Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e)),
+                        Err(e) => {
+                            exec_result = Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e));
+                            break 'exec;
+                        }
                     }
                 }
             }
         }
+
+        // DEFERRED FEE DISTRIBUTION (re-audit #1, CRÍTICO — sim/exec equivalence):
+        // every instruction has now executed, so it's safe to split and pay out
+        // the reserved base (byte) fee + priority tip. Placed AFTER execution (a
+        // contract never sees the proposer credited → identical world in
+        // `/simulate` and in real execution) but BEFORE the receipt is captured
+        // below (the credit lands in `root_after`, keeping the STARK receipt chain
+        // intact and the committed state byte-identical to the pre-reorder order —
+        // crediting is additive, so its position within the function doesn't change
+        // the final balances or the burn counters). Under v7 (`economics_v7` on)
+        // it's the 45/45/10 route (burn / pool / admin), dropping the v6
+        // `staking_commission_bps`; the v6 path is the 50/50 burn/validators split
+        // via `credit_validator_share`. The priority tip is NOT burned in either
+        // mode: 100% to the proposer (the whole point of a congestion tip).
+        // This runs on BOTH the success AND the instruction-error path (the loop
+        // captured any error into `exec_result` and stopped instead of returning),
+        // so the RESERVED fee is always distributed — supply conservation holds
+        // even for a tx whose instruction failed ("you pay for attempted
+        // execution"), exactly like the pre-reorder order that paid out before the
+        // loop. On the WASM trap path `bill_trapped_wasm_fuel` already charged the
+        // ADDITIONAL trap fee (fuel) before we got here, so there's no double
+        // charge: that path bills fuel, this block distributes the reserved
+        // byte+priority. The gas fee (success path only) is distributed separately
+        // below (also post-execution).
+        //
+        // CLOBBER-SAFETY (re-audit #1): on the SUCCESS path the proposer's credit
+        // must go INTO `working` when the proposer is present there (the realistic
+        // case being `fee_collector == payer` — a validator submitting its own tx —
+        // since the payer is always in `working`), or the commit loop below would
+        // overwrite it and the validator would lose its own fee. On the ERROR path
+        // `working` is discarded when we return, so the credit must persist via the
+        // store — pass `None`. The burn counters and the v7 pool/admin singletons
+        // are addressed directly (never in a normal `working`), same assumption the
+        // gas-fee route already relies on.
+        let success = exec_result.is_ok();
+        if self.economics_v7 {
+            self.route_fee_v7(byte_fee);
+        } else {
+            let burn_share = byte_fee / 2;
+            let validator_share = byte_fee - burn_share;
+            self.total_burned = self.total_burned.saturating_add(burn_share);
+            self.fee_burned = self.fee_burned.saturating_add(burn_share);
+            let w = if success { Some(&mut working) } else { None };
+            self.credit_validator_share(w, *fee_collector, validator_share, &params)?;
+        }
+        if priority_fee > 0 {
+            // 100% of the tip to the proposer's own account (liquid commission,
+            // tracked like the base commission so the dashboard reflects it).
+            let w = if success { Some(&mut working) } else { None };
+            self.credit_fee_target(w, *fee_collector, priority_fee);
+            self.validator_earned = self.validator_earned.saturating_add(priority_fee);
+            self.note_validator_commission(*fee_collector, priority_fee);
+        }
+
+        // An instruction failed: the reserved fee was just distributed and the
+        // payer debit is committed, but the transaction does NOT commit its
+        // effects — `working` (and any would-be receipt) is discarded by returning
+        // here, before the receipt capture / commit loop below. Byte-identical
+        // committed state to the pre-reorder order, which returned the error from
+        // inside the loop after having distributed the fee before the loop.
+        exec_result?;
 
         // A real, live-confirmed bug this closes (see `project-lessons-
         // learned`): the dust sweep (below) can still zero a resulting
@@ -2041,7 +2150,7 @@ impl Ledger {
                     // if it errors, that error is arguably more informative
                     // than the original trap, but the trap is what the
                     // caller actually asked about, so it still wins.
-                    let _ = self.credit_validator_share(*fee_collector, validator_share, &params);
+                    let _ = self.credit_validator_share(None, *fee_collector, validator_share, &params);
                     }
                 }
             }
@@ -4485,6 +4594,110 @@ mod tests {
             ledger.store().get(&victim.pubkey()).map(|a| a.data).unwrap_or_default().is_empty(),
             "la data de la víctima quedó intacta"
         );
+    }
+
+    /// Records the balance of `accounts[1]` (into `accounts[0]`'s data, LE u64)
+    /// as the contract observes it MID-execution — so a test can read back exactly
+    /// what the contract saw while running.
+    const OBSERVE_ACCT1_BALANCE_WAT: &str = r#"
+        (module
+            (import "env" "host_get_balance" (func $get_balance (param i32) (result i64)))
+            (import "env" "host_set_data" (func $set_data (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "obs") (param $unused i64)
+                (i64.store (i32.const 0) (call $get_balance (i32.const 1)))
+                (drop (call $set_data (i32.const 0) (i32.const 0) (i32.const 8)))
+            )
+        )
+    "#;
+
+    /// Re-audit #1 (CRÍTICO — sim/exec equivalence): the block proposer's fee
+    /// commission is distributed only AFTER the contract runs, so a contract that
+    /// reads the proposer's balance mid-execution sees the SAME (pre-credit) value
+    /// whether it runs in a `/simulate` dry-run (a fictitious `fee_collector`) or in
+    /// real execution (the real proposer) — closing the "detect the fictitious sim
+    /// address and misbehave at execution" class. Proven directly: the contract
+    /// records `fee_collector`'s observed balance; it must equal the PRE-tx balance,
+    /// NOT pre-tx + this tx's commission. And the fee is still distributed: the
+    /// proposer's stored balance IS credited afterward.
+    #[test]
+    fn a_contract_sees_the_fee_collector_uncredited_during_execution() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 50_000_000);
+        let program_pk = deploy_wat(&mut ledger, OBSERVE_ACCT1_BALANCE_WAT, "obs", &deployer, &validator);
+
+        ledger.credit(validator, 7_000_000);
+        let fc_before = ledger.get_balance(&validator); // the real pre-tx balance
+
+        let user = Keypair::generate().unwrap();
+        ledger.credit(user.pubkey(), 50_000_000);
+
+        // The call names [signer, fee_collector]; the contract reads balance[1].
+        let call = Instruction {
+            program_id: program_pk,
+            accounts: vec![user.pubkey(), validator],
+            data: 0i64.to_le_bytes().to_vec(),
+        };
+        let tx = Transaction::new_signed(&user, 0, [0u8; 32], 50_000_000, vec![call]).unwrap();
+        ledger.apply_transaction(&tx, &validator, 1).unwrap();
+
+        // What the contract SAW mid-execution == fee_collector's pre-tx balance,
+        // NOT pre-tx + the commission it earned from this very tx. If the fee were
+        // distributed BEFORE execution, this would be strictly greater than fc_before.
+        let observed = ledger
+            .store()
+            .get(&user.pubkey())
+            .map(|a| u64::from_le_bytes(a.data[..8].try_into().unwrap()))
+            .unwrap();
+        assert_eq!(
+            observed, fc_before,
+            "the contract must observe the fee_collector BEFORE its commission was credited (sim/exec equivalence)"
+        );
+
+        // The fee IS still distributed: the proposer's stored balance ended ABOVE
+        // its pre-tx value (it earned this tx's commission, just after execution).
+        let fc_after = ledger.get_balance(&validator);
+        assert!(fc_after > fc_before, "the fee is still distributed to the proposer, just after execution (got {fc_after}, was {fc_before})");
+    }
+
+    /// Re-audit #1 clobber-safety: when the proposer is ALSO the payer (a validator
+    /// submitting its own tx), the deferred commission must be credited INTO the
+    /// working set, not clobbered by the working-map commit. A plain self-transfer
+    /// where `fee_collector == payer`: the payer/proposer must end with exactly
+    /// `start - burn_half` (it pays the byte fee but earns its own non-burned half
+    /// back as commission), never LESS (which a clobber would cause) and the total
+    /// supply is conserved (only the burn leaves circulation).
+    #[test]
+    fn a_validator_paying_its_own_tx_does_not_lose_its_fee_to_the_commit() {
+        let mut ledger = new_test_ledger();
+        let validator = Keypair::generate().unwrap(); // proposer == payer
+        let start = 100_000_000_000u64;
+        ledger.credit(validator.pubkey(), start);
+        let dest = Keypair::generate().unwrap().pubkey();
+
+        let amount = 1_000_000u64;
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![validator.pubkey(), dest],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&validator, 0, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        let fee = ledger.apply_transaction(&tx, &validator.pubkey(), 1).unwrap();
+
+        // With no delegators, the validator keeps the whole non-burned half of the
+        // byte fee as direct commission. So its net cost is only the burned half.
+        let burn = fee / 2;
+        let payer_after = ledger.get_balance(&validator.pubkey());
+        assert_eq!(
+            payer_after,
+            start - amount - burn,
+            "the proposer/payer must recover its own commission (no clobber); net cost is only the burned half"
+        );
+        assert_eq!(ledger.get_balance(&dest), amount, "the recipient got the transfer");
+        // Supply conservation: only the burn left circulation.
+        assert_eq!(payer_after + amount, start - burn, "only the burned half left circulation");
     }
 
     /// SDK v0.3 — PDA (estado propio del programa). Reclama la PDA de este
