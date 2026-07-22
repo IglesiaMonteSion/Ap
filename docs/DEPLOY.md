@@ -206,6 +206,32 @@ clave de validador) detrás del proxy público, y mantener el nodo validador en
 loopback/privado. Así una tormenta de simulaciones nunca compite por CPU con el
 consenso.
 
+### Réplica read-only de simulación en un comando (`deploy/install-sim-replica.sh`)
+
+Automatiza esa separación. Una **réplica** es un nodo en modo seguidor (sincroniza
+el estado y sigue la cadena, pero **no** valida ni propone) con el RPC **público**
+y el rate limit de `/simulate` **forzado**. Si se cae o la saturan, el consenso
+**no** se ve afectado. Corré esto en una VPS **distinta** a la del validador:
+
+```sh
+# el config PÚBLICO de la red lo da cualquier nodo que ya corra (validators+
+# genesis, SIN claves); --sync-peer es el RPC de un nodo vivo para ponerse al día.
+sudo ./deploy/install-sim-replica.sh \
+    --config config-publico-de-la-red.json \
+    --sync-peer http://<ip-de-un-nodo-vivo>:8080 \
+    --behind-proxy          # si le ponés Cloudflare/nginx adelante (recomendado)
+
+sudo ./deploy/install-sim-replica.sh --uninstall     # baja el servicio (no toca datos)
+```
+
+Es un envoltorio fino sobre `install-node.sh --modo unirse --rpc-public`: reusa
+toda la maquinaria probada (Docker, identidad P2P, adaptación del config,
+firewall, systemd) y sólo agrega el endurecimiento del endpoint de simulación
+(`simulate_rate_limit_per_10s`, `rpc_behind_trusted_proxy` con `--behind-proxy`).
+Escalás corriéndolo en varias VPS y balanceando `/simulate` entre ellas
+(round-robin en tu nginx/Cloudflare). **Nunca** le pongas claves de valor: es una
+ventana de lectura/simulación, sin autenticación por diseño.
+
 **Aislamiento de claves entre servicios.** Cada servicio ve solo el directorio
 que necesita, montado por volumen en su contenedor:
 
@@ -385,6 +411,31 @@ Con ntfy: instalá la app ntfy en el teléfono y suscribite al mismo canal — l
 avisos llegan como notificación push, sin cuenta ni servidor propio. También:
 `--discord <webhook>`, `--slack <webhook>`, o `--webhook <url>` (POST JSON
 `{"text": "..."}`). Quitar el monitor: `sudo ./deploy/monitor-node.sh --uninstall`.
+
+## Vigilante de runtime con IA (`deploy/qchain-watchdog.py`)
+
+El escalón siguiente a `monitor-node.sh`: un servicio **read-only** de dos capas
+que corre **fuera** del validador y vigila un nodo vivo (tarea #183, Fase B — ver
+`docs/AI-RUNTIME-WATCHDOG.md`). **Capa 1** (heurísticas deterministas, SIN IA,
+siempre corriendo) sondea `/status`, `/economics`, `/resources` y opcional
+cross-check de `/root` entre nodos, y dispara señales con umbrales fijos (consenso
+congelado, fee disparado, mempool creciendo, RAM/disco, **fork** si dos nodos
+reportan roots distintos a la misma ronda, ...). **Capa 2** (Claude como analista,
+sólo si hay `ANTHROPIC_API_KEY`) correlaciona señales débiles en un veredicto con
+acción **humana** recomendada — advisory, nunca actúa.
+
+```sh
+./deploy/qchain-watchdog.py --selftest                     # autotest offline (sin red)
+sudo ./deploy/qchain-watchdog.py --install --rpc http://<ip>:8080 \
+    --ntfy https://ntfy.sh/mi-canal --cross-check http://<ip-otro-nodo>:8080
+# Capa 2 (opcional): la API key va en el entorno del servicio, NUNCA en el repo:
+sudo sh -c 'echo "ANTHROPIC_API_KEY=sk-ant-..." > /etc/qchain-watchdog.env'
+sudo chmod 600 /etc/qchain-watchdog.env && sudo systemctl restart qchain-watchdog
+```
+
+Modelo de seguridad: read-only, sin llaves de la cadena, sin poder de acción
+destructiva (peor caso = "mandó una alerta falsa"); **inerte** sin la API key (la
+Capa 1 corre igual). Corrélo en una caja **aparte** del validador.
 
 ## Explorador QScan (`deploy/install-indexer.sh`)
 
