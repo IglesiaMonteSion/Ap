@@ -918,14 +918,30 @@ async fn main() -> anyhow::Result<()> {
     // accident. We warn rather than refuse to start, so a legitimate setup that
     // fronts the RPC with its own rate limiting (nginx/Cloudflare) isn't broken;
     // the actionable fix is `rpc_rate_limit_per_10s` in the config (see #196).
-    if !config.rpc_addr.ip().is_loopback() && config.rpc_rate_limit_per_10s.filter(|&n| n > 0).is_none() {
+    // "Reachable by remote clients" = a non-loopback bind OR a loopback bind the
+    // operator declared to sit behind a trusted same-host proxy (the Cloudflare
+    // tunnel / local nginx case): in both, the real clients are remote.
+    let rpc_public = !config.rpc_addr.ip().is_loopback() || config.rpc_behind_trusted_proxy;
+    if rpc_public && config.rpc_rate_limit_per_10s.filter(|&n| n > 0).is_none() {
         tracing::warn!(
-            "SECURITY: rpc_addr {} is PUBLIC (non-loopback) but no per-IP rate limit is set - the unauthenticated RPC is exposed unmetered. Set `rpc_rate_limit_per_10s` in the config, or front the RPC with your own rate limiting, or bind rpc_addr to 127.0.0.1 and reach it via a tunnel.",
+            "SECURITY: rpc_addr {} is reachable by remote clients (public bind or rpc_behind_trusted_proxy) but no GENERAL per-IP rate limit is set - the unauthenticated read/submit RPC is exposed unmetered (POST /simulate IS protected mandatorily; this is about the other endpoints). Set `rpc_rate_limit_per_10s` in the config, or front the RPC with your own rate limiting, or bind rpc_addr to 127.0.0.1 and reach it via a tunnel.",
             config.rpc_addr
         );
     }
+    // The `/simulate` limiter is MANDATORY whenever the RPC is reachable by remote
+    // clients (never None/0) — its own per-IP + per-txid gate on the most expensive
+    // unauthenticated endpoint. On a genuinely private loopback bind it stays opt-in
+    // (`simulate_rate_limit_per_10s`). With a trusted proxy the per-IP gate keys on
+    // the real client via X-Forwarded-For (see `SimRateLimiter::for_rpc`).
+    let sim_limiter = rpc::SimRateLimiter::for_rpc(config.rpc_addr, config.simulate_rate_limit_per_10s, config.rpc_behind_trusted_proxy);
+    if sim_limiter.is_some() && rpc_public {
+        tracing::info!(
+            "POST /simulate: mandatory per-IP + per-txid rate limit ACTIVE ({})",
+            if config.rpc_behind_trusted_proxy { "loopback behind trusted proxy - per-IP keyed on X-Forwarded-For" } else { "public RPC" }
+        );
+    }
     let flush_engine = engine.clone();
-    let app = rpc::router(engine, config.rpc_rate_limit_per_10s);
+    let app = rpc::router(engine, config.rpc_rate_limit_per_10s, sim_limiter);
     // `into_make_service_with_connect_info` so the (opt-in) per-IP rate limiter
     // can read each client's address (task #196). Harmless when the limiter is
     // off — no layer consults it.

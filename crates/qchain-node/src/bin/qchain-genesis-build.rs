@@ -288,6 +288,8 @@ fn main() -> anyhow::Result<()> {
             treasury_authority: treasury_authority.clone(),
             treasury_amount,
             rpc_rate_limit_per_10s: None,
+            simulate_rate_limit_per_10s: None,
+            rpc_behind_trusted_proxy: false,
             remote_signer: None,
         };
         // Every output config shares the same validators+genesis (+ folded genesis

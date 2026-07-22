@@ -145,6 +145,49 @@ abre el puerto), o en una instalación existente editá `rpc_addr` en
 Lo recomendado sigue siendo **no** exponerlo: para acceso remoto puntual usá un
 túnel SSH (`ssh -L 8080:127.0.0.1:8080 usuario@vps`).
 
+**Rate limit del RPC público (dos capas).**
+
+- **`POST /simulate` — OBLIGATORIO cuando el RPC es alcanzable por clientes
+  remotos.** Es el endpoint más caro sin autenticar (corre un verify de firma
+  post-cuántica y puede compilar y ejecutar WASM, con un pool chico de simulaciones
+  concurrentes). Cuando `rpc_addr` NO es loopback —**o** es loopback pero está
+  detrás de un proxy de confianza (`rpc_behind_trusted_proxy: true`, ver abajo)— el
+  nodo **fuerza** un rate limit dedicado a `/simulate` — por IP (default 8/10 s,
+  nunca por debajo del piso 5, **ventana deslizante sin baneo** para no bloquear a
+  todos los que comparten una IP) **y** por txid (ventana, sin baneo — evita el
+  replay distribuido de una misma tx firmada sin que un flooder pueda banear el
+  txid de una víctima) — y **nunca** acepta `None`/`0` en ese caso; responde `429`
+  de inmediato al superar el límite. Ajustable con `simulate_rate_limit_per_10s` en
+  el `config.json` (recomendado 5–10). En un loopback genuinamente privado queda
+  opt-in. La coalescencia por txid+ronda+state_root (singleflight) y el tope de
+  ejecuciones WASM concurrentes están siempre activos.
+- **Resto de endpoints — opt-in.** El rate limit GENERAL por IP (`rpc_rate_limit_per_10s`,
+  read/submit) sigue siendo opcional; **activalo** si exponés el RPC público (o
+  poné un proxy con su propio rate limit). Sin él, el nodo avisa fuerte al arrancar.
+
+> **Detrás de un reverse-proxy (el túnel de Cloudflare `cloudflared`, o nginx/Caddy
+> local):** si dejás el `rpc_addr` en loopback y publicás vía un proxy en el MISMO
+> host, poné **`"rpc_behind_trusted_proxy": true`** en el `config.json`. Con eso:
+> (1) el `/simulate` obligatorio se activa aunque el bind sea loopback (si no, un
+> RPC tunelizado quedaría SIN esa protección), y (2) el rate limit por IP lee el
+> cliente real del header **`X-Forwarded-For`** — pero **sólo** cuando el peer TCP
+> directo es loopback (el proxy local), así un cliente que pega un bind público
+> DIRECTO nunca puede falsificarlo. Usa el último hop del header (el que agregó tu
+> proxy de confianza), así una `X-Forwarded-For` inyectada por el cliente queda a
+> la izquierda y se ignora — asume **un** proxy de confianza (el caso documentado
+> cloudflared / nginx local). **No lo pongas** en un bind público directo ni si tu
+> proxy no está en el mismo host. Alternativamente, dejá que el proxy haga su
+> propio rate limit — pero el `/simulate` obligatorio del nodo es la red de
+> seguridad que no depende de configurar bien el proxy.
+
+**Producción: separá el RPC público de simulación del validador de consenso.**
+Un `/simulate` público es superficie de ataque (CPU: verify PQC + WASM). Lo ideal
+para mainnet es **no** exponerlo desde el mismo proceso que produce bloques: correr
+uno o más nodos de **sólo-lectura/simulación** (misma red, mismo `chain_id`, sin
+clave de validador) detrás del proxy público, y mantener el nodo validador en
+loopback/privado. Así una tormenta de simulaciones nunca compite por CPU con el
+consenso.
+
 **Aislamiento de claves entre servicios.** Cada servicio ve solo el directorio
 que necesita, montado por volumen en su contenedor:
 

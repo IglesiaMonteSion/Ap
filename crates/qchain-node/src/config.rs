@@ -245,6 +245,37 @@ pub struct NodeConfig {
     #[serde(default)]
     pub rpc_rate_limit_per_10s: Option<u32>,
 
+    /// Per-IP rate limit **for `POST /simulate` specifically** (QCH-SIMULATE DoS).
+    /// `/simulate` is the single most expensive unauthenticated endpoint — each
+    /// call runs a hybrid PQC signature verify and can compile+run WASM, and only
+    /// a small pool of concurrent simulations exists — so unlike the general
+    /// `rpc_rate_limit_per_10s` (opt-in), this limiter is **MANDATORY whenever the
+    /// RPC is PUBLIC** (`rpc_addr` non-loopback): the node forces it on with a safe
+    /// default and never honours `None`/`0` on a public bind (a value below the
+    /// floor is raised to it). On a loopback-private RPC (the default) it stays
+    /// opt-in — the operator's own box, negligible risk. Recommended 5–10 per IP
+    /// per 10 s. Node-LOCAL policy: not folded into `chain_id`, no consensus/wire
+    /// impact. (Per-txid coalescing and the concurrent-WASM cap are always on; see
+    /// `rpc.rs`/`engine.rs`.)
+    #[serde(default)]
+    pub simulate_rate_limit_per_10s: Option<u32>,
+
+    /// Set to `true` when this RPC sits behind a TRUSTED reverse proxy on the SAME
+    /// host (the Cloudflare named/quick tunnel `cloudflared`, or a local
+    /// nginx/Caddy) — i.e. `rpc_addr` stays on loopback and the public entrypoint is
+    /// the proxy. Two effects: (1) the mandatory `/simulate` limiter is treated as
+    /// PUBLIC and forced on even though `rpc_addr` is loopback (otherwise a tunnelled
+    /// RPC — the project's own recommended exposure — would ship with NO `/simulate`
+    /// protection); (2) the per-client IP is read from the `X-Forwarded-For` header
+    /// **only when the direct TCP peer is loopback** (the local proxy), so rate
+    /// limiting meters the real client instead of collapsing the whole internet into
+    /// the single proxy IP. Trusting `X-Forwarded-For` is gated on the loopback-peer
+    /// check so a client hitting a DIRECT public bind can never spoof it. Leave
+    /// `false` for a direct bind or a truly private loopback RPC. Node-LOCAL; not in
+    /// `chain_id`.
+    #[serde(default)]
+    pub rpc_behind_trusted_proxy: bool,
+
     /// **Firmante remoto / HSM de la clave de consenso** (tarea #193). Cuando es
     /// `Some("<host:puerto>")`, la clave que firma bloques NO se lee de
     /// `keypair_path` ni vive en este proceso: el nodo se conecta a un
@@ -385,6 +416,8 @@ mod tests {
             treasury_authority: None,
             treasury_amount: None,
             rpc_rate_limit_per_10s: None,
+            simulate_rate_limit_per_10s: None,
+            rpc_behind_trusted_proxy: false,
             remote_signer: None,
         }
     }

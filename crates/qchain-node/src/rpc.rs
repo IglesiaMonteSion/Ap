@@ -88,20 +88,223 @@ async fn rate_limit_mw(
     next.run(req).await
 }
 
-pub fn router(engine: Arc<Engine>, rpc_rate_limit_per_10s: Option<u32>) -> Router {
+// ————————————————————————————————————————————————————————————————————————
+// Dedicated, MANDATORY-when-public rate limiter for `POST /simulate`
+// ————————————————————————————————————————————————————————————————————————
+// `/simulate` is the single most expensive UNAUTHENTICATED endpoint: each call
+// runs a hybrid PQC signature verify and can compile+run WASM, and only a small
+// pool of concurrent simulations exists (`MAX_CONCURRENT_SIMULATIONS`). The
+// singleflight (`SIM_INFLIGHT`, keyed by txid+round+state_root) already coalesces
+// IDENTICAL concurrent requests, but a flood of DISTINCT signed txs — or a
+// distributed replay of ONE signed tx (whose PQC verify runs BEFORE the result
+// cache is consulted) — can still occupy every slot and burn CPU. So this limiter
+// is not optional: whenever the RPC is reachable by remote clients it is forced
+// on and never honours `None`/`0`. It caps two dimensions in a 10 s sliding
+// window, both WINDOW-ONLY (no ban):
+//   * PER IP  — the request source. Window-only, deliberately NOT a ban: a ban
+//     would lock out every legitimate user who shares one address — e.g. all
+//     clients behind a reverse proxy that doesn't forward the real IP — for the
+//     whole ban period.
+//   * PER TXID — how often ONE transaction is simulated node-wide (kills the
+//     distributed single-tx replay that per-IP alone can't, since each botnet IP
+//     stays under its own cap). Window-only so an attacker can't get a victim's
+//     txid banned by pre-flooding it.
+// A "max one ACTIVE simulation per txid+state_root" is the existing singleflight,
+// and "max N concurrent WASM executions" is `MAX_CONCURRENT_SIMULATIONS` — both
+// unchanged; this adds the missing per-IP/per-txid admission gate in front.
+//
+// Honest residual (bounded, not closed): a large BOTNET of distinct IPs each
+// simulating DISTINCT signed txs stays under both caps, so it can still keep the
+// WASM pool busy. That flood is bounded by the `MAX_CONCURRENT_SIMULATIONS`
+// semaphore (it never exhausts memory or spawns unbounded work — excess requests
+// get an immediate 429 from `try_acquire`) and is answered operationally by
+// horizontal scaling: run the public simulation RPC on read-only replicas,
+// separate from the consensus validator (see `docs/DEPLOY.md`).
+
+/// Default per-IP `/simulate` cap (10 s window) when the RPC is public and the
+/// operator didn't set one — mid-range of the recommended 5–10.
+pub const DEFAULT_SIM_PER_IP_10S: u32 = 8;
+/// Floor a public `/simulate` per-IP cap can never go below (so a config of 0 /
+/// an absurdly low value can't neuter the protection on a public bind).
+pub const MIN_SIM_PER_IP_10S: u32 = 5;
+/// Per-txid `/simulate` cap (10 s window), node-wide. Generous — a legitimate
+/// wallet simulates a given tx once or twice before sending, never near this — so
+/// it only ever trips on abusive replay of one signed tx.
+pub const SIM_PER_TXID_10S: u32 = 20;
+
+/// A bounded per-key sliding-window counter. Window-only (no ban): the excess in
+/// a window gets a 429 and the key recovers automatically on the next window.
+/// Used for BOTH the per-IP and per-txid `/simulate` gates.
+struct WindowMap<K> {
+    map: std::collections::HashMap<K, Window>,
+    last_gc: std::time::Instant,
+}
+
+struct Window {
+    start: std::time::Instant,
+    count: u32,
+}
+
+impl<K: std::hash::Hash + Eq> WindowMap<K> {
+    fn new() -> Self {
+        Self { map: std::collections::HashMap::new(), last_gc: std::time::Instant::now() }
+    }
+
+    /// `true` = within `limit` for the current window. Bounded and GC-THROTTLED:
+    /// the expired-entry sweep runs at most once per second, so a spray of
+    /// distinct keys can't force an `O(n)` `retain` on every request (the
+    /// amplification a naive "GC whenever full" invites — the sweep would find
+    /// nothing to drop yet still rescan the whole map per request). When the map
+    /// is full of still-live entries a brand-new key is rejected (fail closed)
+    /// rather than growing the map or rescanning; that's only reachable under an
+    /// active distinct-key flood and self-heals as elapsed windows are GC'd.
+    fn allow(&mut self, key: K, limit: u32, now: std::time::Instant) -> bool {
+        if self.map.len() >= MAX_TRACKED_IPS && now.duration_since(self.last_gc) >= std::time::Duration::from_secs(1) {
+            self.map.retain(|_, w| now.duration_since(w.start) < RL_WINDOW);
+            self.last_gc = now;
+        }
+        if self.map.len() >= MAX_TRACKED_IPS && !self.map.contains_key(&key) {
+            return false;
+        }
+        let w = self.map.entry(key).or_insert(Window { start: now, count: 0 });
+        if now.duration_since(w.start) >= RL_WINDOW {
+            w.start = now;
+            w.count = 0;
+        }
+        w.count = w.count.saturating_add(1);
+        w.count <= limit
+    }
+}
+
+/// Per-IP + per-txid sliding-window limiter for `/simulate`. Cheap `O(1)` counters
+/// under a plain mutex; both maps are bounded and GC-throttled so the limiter
+/// can't itself be an OOM or a CPU-amplification vector.
+#[derive(Clone)]
+pub struct SimRateLimiter {
+    per_ip: Arc<std::sync::Mutex<WindowMap<std::net::IpAddr>>>,
+    per_txid: Arc<std::sync::Mutex<WindowMap<[u8; 32]>>>,
+    ip_limit: u32,
+    txid_limit: u32,
+    /// Resolve the client IP from `X-Forwarded-For` — but ONLY when the direct TCP
+    /// peer is loopback (our trusted same-host proxy). See
+    /// `NodeConfig::rpc_behind_trusted_proxy`.
+    trust_proxy: bool,
+}
+
+impl SimRateLimiter {
+    fn new(ip_limit: u32, txid_limit: u32, trust_proxy: bool) -> Self {
+        Self {
+            per_ip: Arc::new(std::sync::Mutex::new(WindowMap::new())),
+            per_txid: Arc::new(std::sync::Mutex::new(WindowMap::new())),
+            ip_limit,
+            txid_limit,
+            trust_proxy,
+        }
+    }
+
+    /// Build the `/simulate` limiter for a given RPC bind. **Mandatory when the
+    /// RPC is reachable by remote clients** — either a non-loopback `rpc_addr`, OR
+    /// a loopback bind the operator declared to sit behind a trusted same-host
+    /// proxy (`trust_proxy`, the Cloudflare-tunnel / local-nginx case where the
+    /// real clients are remote even though the TCP peer is loopback). In that case
+    /// it is always `Some`, with the per-IP cap forced to at least
+    /// `MIN_SIM_PER_IP_10S` (a `None`/`0`/too-low config is raised to a safe
+    /// value). On a genuinely private loopback RPC (no trusted proxy) it is opt-in:
+    /// `Some` only if the operator set a positive value, else `None` (the
+    /// operator's own box; local dev/tests aren't throttled).
+    pub fn for_rpc(rpc_addr: std::net::SocketAddr, configured_per_ip: Option<u32>, trust_proxy: bool) -> Option<Self> {
+        let public = !rpc_addr.ip().is_loopback() || trust_proxy;
+        let configured = configured_per_ip.filter(|&n| n > 0);
+        let ip_limit = if public {
+            configured.unwrap_or(DEFAULT_SIM_PER_IP_10S).max(MIN_SIM_PER_IP_10S)
+        } else {
+            // Genuinely private loopback: opt-in only.
+            configured?
+        };
+        Some(Self::new(ip_limit, SIM_PER_TXID_10S, trust_proxy))
+    }
+
+    /// `true` = allowed. Per-IP sliding window, window-only (no ban).
+    fn allow_ip(&self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let mut m = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+        m.allow(ip, self.ip_limit, now)
+    }
+
+    /// `true` = allowed. Per-txid sliding window, window-only (a ban keyed by an
+    /// attacker-suppliable txid would let one flooder lock out a victim's tx).
+    fn allow_txid(&self, txid: [u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let mut m = self.per_txid.lock().unwrap_or_else(|e| e.into_inner());
+        m.allow(txid, self.txid_limit, now)
+    }
+}
+
+/// The client IP the per-IP gate keys on. Normally the direct TCP peer. When the
+/// node is declared behind a trusted SAME-HOST proxy (`trust_proxy`) AND the
+/// direct peer is loopback (that proxy), use the RIGHTMOST `X-Forwarded-For` hop
+/// — the address the trusted proxy actually saw the client on. The rightmost is
+/// the value our immediate proxy appended, so a client that injects its own
+/// `X-Forwarded-For` can't spoof past it (its forgery ends up to the LEFT). This
+/// assumes a SINGLE trusted hop (the documented cloudflared / local-nginx setup);
+/// a missing or unparseable header falls back to the peer (fail safe, no panic).
+/// `trust_proxy` is never honoured for a non-loopback peer — an unauthenticated
+/// header from a direct remote is ignored.
+fn client_ip(trust_proxy: bool, peer: std::net::IpAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+    if trust_proxy && peer.is_loopback() {
+        if let Some(last) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|xff| xff.rsplit(',').next())
+        {
+            if let Ok(ip) = last.trim().parse::<std::net::IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    peer
+}
+
+/// Per-route middleware for `/simulate`: the PER-IP gate, run BEFORE the body is
+/// even parsed so a flood (well-formed or not) is rejected with 429 immediately,
+/// before any permit/verify/WASM. The per-TXID gate runs inside `simulate_tx`
+/// (it needs the parsed tx's txid).
+async fn simulate_ip_rate_limit_mw(
+    State(rl): State<SimRateLimiter>,
+    conn: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(axum::extract::ConnectInfo(addr)) = conn {
+        let ip = client_ip(rl.trust_proxy, addr.ip(), req.headers());
+        if !rl.allow_ip(ip) {
+            return (StatusCode::TOO_MANY_REQUESTS, "simulate rate limit exceeded for your IP - slow down").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+pub fn router(engine: Arc<Engine>, rpc_rate_limit_per_10s: Option<u32>, sim_limiter: Option<SimRateLimiter>) -> Router {
     // Opt-in per-IP rate limiter (task #196). `None`/`0` → not layered at all.
-    let base = base_router(engine);
+    let base = base_router(engine, sim_limiter);
     match rpc_rate_limit_per_10s.filter(|&n| n > 0) {
         Some(limit) => base.layer(axum::middleware::from_fn_with_state(RateLimiter::new(limit), rate_limit_mw)),
         None => base,
     }
 }
 
-fn base_router(engine: Arc<Engine>) -> Router {
-    Router::new()
+fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>) -> Router {
+    // `/simulate` gets its dedicated per-IP middleware (when present) AND the
+    // limiter is threaded to the handler as an `Extension` for the per-txid gate.
+    let simulate = match &sim_limiter {
+        Some(rl) => post(simulate_tx).layer(axum::middleware::from_fn_with_state(rl.clone(), simulate_ip_rate_limit_mw)),
+        None => post(simulate_tx),
+    };
+    let router = Router::new()
         .route("/", get(explorer))
         .route("/tx", post(submit_tx))
-        .route("/simulate", post(simulate_tx))
+        .route("/simulate", simulate)
         .route("/account/:address", get(get_account))
         .route("/stake/:address", get(get_stake))
         .route("/stake_v7/:address", get(get_stake_v7))
@@ -127,7 +330,14 @@ fn base_router(engine: Arc<Engine>) -> Router {
         .route("/snapshot/meta", get(snapshot_meta))
         .route("/snapshot", get(snapshot))
         .route("/snapshot/page", get(snapshot_page))
-        .with_state(engine)
+        .with_state(engine);
+    // Thread the `/simulate` limiter to the handler (per-txid gate). An Extension
+    // layer is a no-op for every other route; `simulate_tx` reads it via an
+    // `Option<Extension<..>>` so it simply skips the per-txid gate when absent.
+    match sim_limiter {
+        Some(rl) => router.layer(axum::Extension(rl)),
+        None => router,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -269,7 +479,22 @@ fn classify_sim_change(c: &qchain_execution::SimAccountChange) -> (bool, bool) {
 /// it can show the user the real fee + resulting balances + whether it would
 /// succeed — instead of signing/broadcasting blind. Read-only: runs on a scratch
 /// ledger, never touches consensus/state (see `Ledger::simulate`).
-async fn simulate_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+async fn simulate_tx(
+    State(engine): State<Arc<Engine>>,
+    sim_rl: Option<axum::Extension<SimRateLimiter>>,
+    Json(tx): Json<Transaction>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // PER-TXID rate gate (mandatory when the RPC is public; absent Extension =
+    // loopback with no limiter). Runs BEFORE `simulate_transaction`, so an abusive
+    // replay of ONE signed tx is rejected with 429 IMMEDIATELY — before the PQC
+    // verify (which happens ahead of the result-cache lookup) and before any WASM.
+    // The per-IP gate already ran in the route middleware; this catches a
+    // distributed single-tx replay that stays under each IP's cap.
+    if let Some(axum::Extension(rl)) = &sim_rl {
+        if !rl.allow_txid(tx.txid()) {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "this transaction is being simulated too frequently - retry shortly".to_string()));
+        }
+    }
     // `None` = the node is at its simulation-concurrency cap. Respond 429 (Too
     // Many Requests) so the caller backs off instead of the node queueing an
     // unbounded backlog of expensive dry-runs (re-audit QCH-SIMULATE DoS).
@@ -906,5 +1131,91 @@ mod tests {
         assert!(!rl.allow(a), "still banned");
         // A different IP has its own independent bucket.
         assert!(rl.allow(b), "a separate IP is unaffected");
+    }
+
+    /// The dedicated `/simulate` limiter is MANDATORY whenever the RPC is reachable
+    /// by remote clients — a public (non-loopback) bind, OR a loopback bind behind a
+    /// trusted proxy: `for_rpc` returns `Some` there and never a per-IP cap below the
+    /// floor, even if the operator set `None`, `0`, or a too-low value. On a
+    /// genuinely private loopback bind (no trusted proxy) it is opt-in.
+    #[test]
+    fn simulate_limiter_is_mandatory_on_a_public_bind() {
+        let public: std::net::SocketAddr = "203.0.113.7:8080".parse().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Public + unset -> forced on at the default.
+        let rl = SimRateLimiter::for_rpc(public, None, false).expect("public bind must always have a /simulate limiter");
+        assert_eq!(rl.ip_limit, DEFAULT_SIM_PER_IP_10S);
+        // Public + 0/None-ish -> forced to the floor, never disabled.
+        assert_eq!(SimRateLimiter::for_rpc(public, Some(0), false).unwrap().ip_limit, DEFAULT_SIM_PER_IP_10S, "0 is treated as unset -> default");
+        assert_eq!(SimRateLimiter::for_rpc(public, Some(2), false).unwrap().ip_limit, MIN_SIM_PER_IP_10S, "a too-low value is raised to the floor");
+        assert_eq!(SimRateLimiter::for_rpc(public, Some(9), false).unwrap().ip_limit, 9, "a value at/above the floor is honoured");
+        assert_eq!(rl.txid_limit, SIM_PER_TXID_10S, "per-txid cap is always set");
+
+        // Genuinely private loopback (no trusted proxy) + unset -> off; + positive -> opt-in on.
+        assert!(SimRateLimiter::for_rpc(loopback, None, false).is_none(), "loopback unset -> no limiter");
+        assert!(SimRateLimiter::for_rpc(loopback, Some(0), false).is_none(), "loopback 0 -> no limiter");
+        assert_eq!(SimRateLimiter::for_rpc(loopback, Some(3), false).unwrap().ip_limit, 3, "loopback honours an explicit opt-in value verbatim");
+
+        // Loopback BEHIND A TRUSTED PROXY -> treated as public: mandatory, floored,
+        // and `trust_proxy` is recorded so the middleware reads X-Forwarded-For.
+        let proxied = SimRateLimiter::for_rpc(loopback, None, true).expect("loopback+trusted-proxy must have a /simulate limiter");
+        assert_eq!(proxied.ip_limit, DEFAULT_SIM_PER_IP_10S, "trusted-proxy loopback is forced on at the default");
+        assert!(proxied.trust_proxy, "trust_proxy flag is recorded");
+        assert_eq!(SimRateLimiter::for_rpc(loopback, Some(2), true).unwrap().ip_limit, MIN_SIM_PER_IP_10S, "trusted-proxy floors a too-low value too");
+    }
+
+    /// The `/simulate` per-IP and per-txid gates are BOTH window-only (no ban): the
+    /// excess in a window is rejected but a fresh window lets the key through again,
+    /// and a different key has its own independent bucket. Window-only per-IP avoids
+    /// locking out every user sharing one address (behind a proxy); window-only
+    /// per-txid stops one flooder from banning a victim's tx.
+    #[test]
+    fn simulate_limiter_per_ip_and_per_txid_are_window_only() {
+        let rl = SimRateLimiter::new(3, 2, false);
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        // Per-IP: up to the cap, then rejected while the window stands.
+        assert!(rl.allow_ip(a) && rl.allow_ip(a) && rl.allow_ip(a), "up to the cap allowed");
+        assert!(!rl.allow_ip(a), "over the cap -> rejected");
+        assert!(!rl.allow_ip(a), "still over the cap in this window");
+        assert!(rl.allow_ip(b), "a separate IP is unaffected");
+        // Per-txid: up to the cap, then throttled, and a different txid is unaffected.
+        let t1 = [1u8; 32];
+        let t2 = [2u8; 32];
+        assert!(rl.allow_txid(t1) && rl.allow_txid(t1), "up to the txid cap allowed");
+        assert!(!rl.allow_txid(t1), "over the txid cap -> throttled");
+        assert!(rl.allow_txid(t2), "a different txid is unaffected");
+    }
+
+    /// `client_ip` reads `X-Forwarded-For` ONLY when trusted AND the direct peer is
+    /// loopback (our same-host proxy), uses the RIGHTMOST hop (spoof-resistant), and
+    /// falls back to the peer on a missing/garbage header. It never trusts the
+    /// header from a direct remote peer or when trust is off.
+    #[test]
+    fn client_ip_resolves_xff_only_from_a_trusted_loopback_proxy() {
+        let loop_peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let remote_peer: IpAddr = "198.51.100.2".parse().unwrap();
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        // Trusted proxy + loopback peer -> use XFF.
+        assert_eq!(client_ip(true, loop_peer, &h), client);
+        // Trust off -> ignore the (unauthenticated) header, use the peer.
+        assert_eq!(client_ip(false, loop_peer, &h), loop_peer);
+        // Trusted but the direct peer is NOT loopback -> not our proxy, ignore XFF.
+        assert_eq!(client_ip(true, remote_peer, &h), remote_peer);
+
+        // Multiple hops: the RIGHTMOST value (what our trusted proxy appended) wins,
+        // so a client-injected leftmost value is ignored (spoof-resistant).
+        let mut h2 = axum::http::HeaderMap::new();
+        h2.insert("x-forwarded-for", "1.2.3.4, 203.0.113.9".parse().unwrap());
+        assert_eq!(client_ip(true, loop_peer, &h2), client);
+
+        // Garbage header -> fall back to the peer, never panic.
+        let mut h3 = axum::http::HeaderMap::new();
+        h3.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(client_ip(true, loop_peer, &h3), loop_peer);
     }
 }
