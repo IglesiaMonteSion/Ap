@@ -36,6 +36,7 @@ NO_BUILD=0
 RPC_PORT="8080"
 WALLET_PORT="8090"
 CONNECT_ORIGIN=""
+BEHIND_PROXY=0
 
 decir()  { printf '\n==> %s\n' "$1"; }
 error()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
@@ -57,6 +58,12 @@ Opciones:
                          Sin esto, el puente queda apagado (la wallet ignora todo
                          postMessage). Habilita desplegar/interactuar contratos
                          desde QScan firmando acá.
+  --behind-proxy         La wallet está detrás de un reverse-proxy de CONFIANZA en
+                         el mismo host (túnel de Cloudflare, nginx/Caddy local).
+                         Activa el modo proxy seguro: rate-limita /api/simulate por
+                         la IP REAL del cliente (CF-Connecting-IP / X-Forwarded-For,
+                         sólo desde el proxy loopback) y se la reenvía saneada al
+                         nodo. Ponelo SIEMPRE que sirvas la wallet por un túnel.
   --image <nombre>       Imagen Docker a usar (por defecto qchain:latest).
   --home <ruta>          Carpeta de qchain (por defecto /opt/qchain).
   --no-build             No construir la imagen desde el código aunque falte.
@@ -73,6 +80,7 @@ while [ $# -gt 0 ]; do
     --port) WALLET_PORT="${2:-}"; shift 2 ;;
     --rpc-port) RPC_PORT="${2:-}"; shift 2 ;;
     --connect-origin) CONNECT_ORIGIN="${2:-}"; shift 2 ;;
+    --behind-proxy) BEHIND_PROXY=1; shift ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --home) QCHAIN_HOME="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
@@ -221,6 +229,13 @@ sed -i "s#--port 8090#--port $WALLET_PORT#" /etc/systemd/system/qchain-wallet.se
 if [ -n "$CONNECT_ORIGIN" ]; then
   sed -i "s#--bind 0.0.0.0 --port $WALLET_PORT#--bind 0.0.0.0 --port $WALLET_PORT --connect-origin $CONNECT_ORIGIN#" /etc/systemd/system/qchain-wallet.service
   echo "Puente wallet-connect habilitado: la wallet aceptará pedidos de firma desde $CONNECT_ORIGIN"
+fi
+# Modo proxy seguro: rate-limita /api/simulate por la IP real del cliente (leída
+# de CF-Connecting-IP / X-Forwarded-For sólo desde el proxy loopback) y se la
+# reenvía saneada al nodo. Se agrega una sola vez (idempotente).
+if [ "$BEHIND_PROXY" -eq 1 ] && ! grep -q -- '--behind-trusted-proxy' /etc/systemd/system/qchain-wallet.service; then
+  sed -i "s#--bind 0.0.0.0 --port $WALLET_PORT#--bind 0.0.0.0 --port $WALLET_PORT --behind-trusted-proxy#" /etc/systemd/system/qchain-wallet.service
+  echo "Modo proxy seguro habilitado: /api/simulate se limita por la IP real del cliente y se reenvía saneada al nodo."
 fi
 systemctl daemon-reload
 systemctl enable --now qchain-wallet

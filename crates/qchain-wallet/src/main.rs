@@ -17,13 +17,14 @@
 //! possible (`--bind`) but warned against loudly.
 
 use axum::body::Body;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
-use axum::response::{Html, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use std::net::SocketAddr;
 use clap::Parser;
 use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{Keypair, Pubkey};
@@ -34,6 +35,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod keystore;
+mod ratelimit;
+
+use ratelimit::{resolve_client_ip, SimRateLimiter};
 
 #[derive(Parser)]
 #[command(about = "Wallet web local para qchain: crear wallets, ver balances y transferir")]
@@ -77,6 +81,26 @@ struct Cli {
     /// la variable de entorno QCHAIN_CONNECT_ORIGIN.
     #[arg(long)]
     connect_origin: Option<String>,
+    /// Poné este flag cuando la wallet esté detrás de un reverse-proxy de CONFIANZA
+    /// en el MISMO host (el túnel de Cloudflare `cloudflared`, o un nginx/Caddy
+    /// local) — es decir, la wallet queda bindeada a loopback y el punto de entrada
+    /// público es el proxy. Efectos: (1) el rate limit OBLIGATORIO de `/api/simulate`
+    /// se activa aunque el bind sea loopback (si no, una wallet tunelizada — la
+    /// exposición recomendada del proyecto — quedaría SIN esa protección); (2) la IP
+    /// del cliente se lee de `CF-Connecting-IP` o `X-Forwarded-For`, pero SÓLO cuando
+    /// el peer TCP directo es loopback (el proxy local), y se reenvía saneada al nodo
+    /// para que su segundo rate limit por IP no agrupe a todos bajo 127.0.0.1. También
+    /// por la variable de entorno QCHAIN_WALLET_BEHIND_PROXY (=1/true).
+    #[arg(long)]
+    behind_trusted_proxy: bool,
+    /// Cap por IP de `POST /api/simulate` en una ventana de 10 s. `/simulate` corre
+    /// un verify de firma post-cuántica y puede compilar+ejecutar WASM en el nodo,
+    /// así que es la superficie más cara. OBLIGATORIO cuando la wallet es alcanzable
+    /// por clientes remotos (bind no-loopback, o `--behind-trusted-proxy`): un valor
+    /// ausente usa el default (8) y uno muy bajo se sube al piso (5); en un loopback
+    /// genuinamente privado queda opt-in. También por QCHAIN_WALLET_SIMULATE_RL.
+    #[arg(long)]
+    simulate_rate_limit_per_10s: Option<u32>,
 }
 
 struct AppState {
@@ -114,6 +138,11 @@ struct AppState {
     /// the bridge is OFF (the wallet ignores all postMessage). See the bridge
     /// listener in `wasm_wallet.html`.
     connect_origin: Option<String>,
+    /// Dedicated per-IP + per-txid rate limiter for the public `/api/simulate`
+    /// proxy. `Some` (mandatory) when the wallet is reachable by remote clients
+    /// (a non-loopback bind or `behind_trusted_proxy`); `None` on a genuinely
+    /// private loopback bind unless explicitly opted in. See `ratelimit.rs`.
+    sim_limiter: Option<SimRateLimiter>,
 }
 
 #[tokio::main]
@@ -126,6 +155,21 @@ async fn main() -> anyhow::Result<()> {
     let password = cli.password.or_else(|| std::env::var("QCHAIN_WALLET_PASSWORD").ok()).filter(|s| !s.is_empty());
     let exposed = cli.bind != "127.0.0.1" && cli.bind != "localhost";
     let loopback_bound = cli.bind == "127.0.0.1" || cli.bind == "localhost" || cli.bind == "::1";
+
+    // Trusted-proxy mode (Cloudflare tunnel / local nginx on the same host): from
+    // the flag or the env var (`1`/`true`).
+    let behind_proxy = cli.behind_trusted_proxy
+        || std::env::var("QCHAIN_WALLET_BEHIND_PROXY")
+            .ok()
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+    let sim_rl_configured = cli
+        .simulate_rate_limit_per_10s
+        .or_else(|| std::env::var("QCHAIN_WALLET_SIMULATE_RL").ok().and_then(|s| s.trim().parse().ok()));
+    // MANDATORY when the wallet is reachable by remote clients (public bind or a
+    // trusted proxy) — its own per-IP + per-txid gate on the most expensive proxy
+    // endpoint. Opt-in on a genuinely private loopback bind.
+    let sim_limiter = SimRateLimiter::for_wallet(exposed, behind_proxy, sim_rl_configured);
 
     // The custodial wallet (server holds the keys) is only reachable when it's
     // safe: either we're localhost-only, or a password is set. Exposed with no
@@ -165,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("QCHAIN_CONNECT_ORIGIN").ok())
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty()),
+        sim_limiter: sim_limiter.clone(),
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -198,7 +243,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/stake/:address", get(stake_ep))
         .route("/api/stake_v7/:address", get(stake_v7_ep))
         .route("/api/relay-tx", post(relay_tx))
-        .route("/api/simulate", post(simulate_tx))
+        // `/api/simulate` gets its dedicated per-IP rate-limit middleware (when the
+        // limiter is present): the gate runs BEFORE the handler reads the body, so
+        // a flood is rejected with 429 without buffering/forwarding anything.
+        .route(
+            "/api/simulate",
+            match &state.sim_limiter {
+                Some(_) => post(simulate_tx).layer(axum::middleware::from_fn_with_state(state.clone(), simulate_rate_limit_mw)),
+                None => post(simulate_tx),
+            },
+        )
         .route("/api/config", get(config))
         .route("/api/node", get(node_status))
         // Info pública (no expone claves): el QR es solo la dirección
@@ -248,7 +302,21 @@ async fn main() -> anyhow::Result<()> {
         println!("*** la clave viaja SIN cifrar - para uso serio poné un proxy con HTTPS (TLS)");
         println!("*** adelante. Para un testnet sin valor real, alcanza.");
     }
-    axum::serve(listener, app).await?;
+    match &sim_limiter {
+        Some(_) if exposed || behind_proxy => {
+            println!(
+                "Rate limit /api/simulate: OBLIGATORIO ACTIVO ({})",
+                if behind_proxy { "detrás de proxy de confianza - IP del cliente vía CF-Connecting-IP / X-Forwarded-For, reenviada saneada al nodo" } else { "bind público directo - IP del cliente = peer TCP" }
+            );
+        }
+        Some(_) => println!("Rate limit /api/simulate: activo (opt-in en loopback)"),
+        None => {}
+    }
+    // `into_make_service_with_connect_info` so the `/api/simulate` limiter can read
+    // each client's peer address (and, behind a trusted proxy, resolve the real
+    // client from CF-Connecting-IP / X-Forwarded-For). Harmless for every other
+    // route.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -624,25 +692,78 @@ async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> R
     Ok(Json(v))
 }
 
+/// The real client IP resolved by `simulate_rate_limit_mw`, stashed in the request
+/// extensions so `simulate_tx` can forward it, sanitized, to the node.
+#[derive(Clone, Copy)]
+struct ClientIp(std::net::IpAddr);
+
+/// Per-route middleware for `POST /api/simulate`: the PER-IP gate, run BEFORE the
+/// handler reads/forwards the body so a flood is rejected with 429 immediately.
+/// It resolves the REAL client IP (peer, or the trusted proxy's forwarded IP) and
+/// stashes it in the request extensions for the handler to forward to the node.
+/// FAILS CLOSED (429) when no trustworthy client identity can be established —
+/// never bucketing every user under the proxy's loopback address.
+async fn simulate_rate_limit_mw(State(st): State<Arc<AppState>>, conn: Option<ConnectInfo<SocketAddr>>, mut req: Request, next: Next) -> Response {
+    let Some(rl) = st.sim_limiter.clone() else {
+        return next.run(req).await;
+    };
+    let Some(ConnectInfo(peer)) = conn else {
+        // No peer address (shouldn't happen with into_make_service_with_connect_info).
+        // Fail closed: without a client identity we can't rate-limit safely.
+        return ApiError::too_many("no se pudo determinar la IP del cliente").into_response();
+    };
+    let Some(ip) = resolve_client_ip(rl.trust_proxy(), peer.ip(), req.headers()) else {
+        return ApiError::too_many("no se pudo identificar el cliente de forma confiable detrás del proxy").into_response();
+    };
+    if !rl.allow_ip(ip) {
+        return ApiError::too_many("simulación: demasiadas solicitudes desde tu IP - probá de nuevo en unos segundos").into_response();
+    }
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
+}
+
 /// DRY-RUN a browser-signed transaction against the node's `/simulate` (read-only)
 /// so the wallet can show the user the real predicted outcome (fee, resulting
 /// balance, success/failure) BEFORE they authorize broadcasting it — QCH-WALLET-001.
 /// Nothing is committed; the node runs it on a scratch ledger.
-async fn simulate_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+///
+/// The public edge for `/simulate` is HERE (not the node): the per-IP gate ran in
+/// `simulate_rate_limit_mw`; this adds the per-txid gate and forwards the resolved
+/// real client IP to the node as a SANITIZED `X-Forwarded-For` so the node's own
+/// per-IP limiter meters real clients (not `127.0.0.1`).
+async fn simulate_tx(State(st): State<Arc<AppState>>, client_ip: Option<Extension<ClientIp>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
     const MAX_RELAY_BODY: usize = 256 * 1024;
     if body.len() > MAX_RELAY_BODY {
         return Err(ApiError::bad(format!("transacción demasiado grande ({} bytes, máximo {})", body.len(), MAX_RELAY_BODY)));
     }
-    let resp = st
-        .http
-        .post(format!("{}/simulate", st.rpc))
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(ApiError::internal)?;
-    if !resp.status().is_success() {
+    // Per-txid gate (defense in depth on top of the node's own): a wallet-wide
+    // window cap on how often ONE signed tx is simulated. Best-effort — if the
+    // body doesn't parse as a Transaction the node is the authority, so we forward
+    // it and let the node decide; the per-IP gate already ran.
+    if let Some(rl) = &st.sim_limiter {
+        if let Ok(tx) = serde_json::from_slice::<Transaction>(&body) {
+            if !rl.allow_txid(tx.txid()) {
+                return Err(ApiError::too_many("simulación: esta transacción se está simulando demasiado seguido - probá en unos segundos"));
+            }
+        }
+    }
+    let mut outbound = st.http.post(format!("{}/simulate", st.rpc)).header("content-type", "application/json");
+    // Forward the resolved real client IP to the node as a SINGLE, sanitized
+    // X-Forwarded-For (we build a fresh request, so any client-supplied header is
+    // dropped — the node reads the rightmost hop, which is exactly this value).
+    // Only when a limiter is active; a private loopback dev setup forwards nothing.
+    if let Some(Extension(ClientIp(ip))) = client_ip {
+        outbound = outbound.header("X-Forwarded-For", ip.to_string());
+    }
+    let resp = outbound.body(body.to_vec()).send().await.map_err(ApiError::internal)?;
+    let status = resp.status();
+    if !status.is_success() {
         let msg = resp.text().await.unwrap_or_default();
+        // Surface a downstream rate-limit as a 429 (not a 400), so the browser
+        // sees the real throttle instead of a generic "bad request".
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ApiError::too_many(if msg.is_empty() { "simulación: límite de solicitudes del nodo alcanzado".to_string() } else { msg }));
+        }
         return Err(ApiError::bad(format!("el nodo no pudo simular la transacción: {msg}")));
     }
     let v: Value = resp.json().await.map_err(ApiError::internal)?;
@@ -1000,6 +1121,9 @@ impl ApiError {
     fn internal(e: impl std::fmt::Display) -> Self {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     }
+    fn too_many(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::TOO_MANY_REQUESTS, msg.into())
+    }
 }
 
 impl axum::response::IntoResponse for ApiError {
@@ -1024,5 +1148,93 @@ mod tests {
         // Length is not what's compared (hashes are fixed 32 bytes): a short and
         // a long non-matching password both simply return false.
         assert!(!ct_password_eq("a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    /// FULL-PATH integration test: client → (trusted proxy sets CF-Connecting-IP) →
+    /// wallet `/api/simulate` (real middleware + handler) → node. A real mock node
+    /// records the `X-Forwarded-For` it receives. Proves, over real HTTP:
+    ///  - a client is 429'd after its per-IP window cap (at the WALLET edge),
+    ///  - a DIFFERENT real client keeps working (its own bucket),
+    ///  - a request with NO trustworthy client identity fails CLOSED (429),
+    ///  - the node receives each client's REAL IP, sanitized — never `127.0.0.1`
+    ///    (so users are not collapsed into the loopback-proxy bucket).
+    #[tokio::test]
+    async fn full_path_client_proxy_wallet_node_meters_and_forwards_the_real_ip() {
+        use std::sync::{Arc, Mutex};
+
+        // --- mock node: record every X-Forwarded-For seen on /simulate ---
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_h = seen.clone();
+        let mock = super::Router::new().route(
+            "/simulate",
+            super::post(move |headers: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                let s = seen_h.clone();
+                async move {
+                    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("<none>").to_string();
+                    s.lock().unwrap().push(xff);
+                    super::Json(serde_json::json!({ "ok": true }))
+                }
+            }),
+        );
+        let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let maddr = ml.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(ml, mock).await.unwrap() });
+
+        // --- wallet: the REAL /api/simulate route (real mw + handler), trusted
+        // proxy, pointing at the mock node. A public/proxied limiter is floored at
+        // MIN_SIM_PER_IP_10S (5), so the effective per-IP cap here is 5. ---
+        const CAP: usize = 5;
+        let rl = super::SimRateLimiter::for_wallet(false, true, Some(CAP as u32)).unwrap();
+        let st = Arc::new(super::AppState {
+            rpc: format!("http://{maddr}"),
+            wallets_dir: std::path::PathBuf::from("."),
+            fee_limit: 10_000_000,
+            http: reqwest::Client::new(),
+            password: None,
+            custodial_enabled: false,
+            loopback_bound: true,
+            faucet: None,
+            connect_origin: None,
+            sim_limiter: Some(rl),
+        });
+        let app = super::Router::new()
+            .route("/api/simulate", super::post(super::simulate_tx).layer(axum::middleware::from_fn_with_state(st.clone(), super::simulate_rate_limit_mw)))
+            .with_state(st);
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(wl, app.into_make_service_with_connect_info::<super::SocketAddr>()).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{waddr}/api/simulate");
+        let post = |cf: Option<&'static str>| {
+            let mut b = client.post(&url).header("content-type", "application/json").body("{}");
+            if let Some(ip) = cf {
+                b = b.header("CF-Connecting-IP", ip);
+            }
+            b.send()
+        };
+
+        // Client A: CAP allowed, the next over the per-IP cap → 429 (wallet edge).
+        let mut a = Vec::new();
+        for _ in 0..CAP + 1 {
+            a.push(post(Some("203.0.113.7")).await.unwrap().status().as_u16());
+        }
+        let mut expect_a = vec![200u16; CAP];
+        expect_a.push(429);
+        assert_eq!(a, expect_a, "per-IP window cap at the wallet edge");
+
+        // Client B: a different real client is unaffected (its own bucket).
+        assert_eq!(post(Some("198.51.100.4")).await.unwrap().status().as_u16(), 200, "a different real client keeps working");
+
+        // No trustworthy identity (no CF-Connecting-IP / X-Forwarded-For) → fail closed.
+        assert_eq!(post(None).await.unwrap().status().as_u16(), 429, "missing client identity → fail closed");
+
+        // The node received the REAL client IPs, sanitized — never the loopback
+        // proxy, never nothing. (The 429'd and fail-closed requests never reached it.)
+        let got = seen.lock().unwrap().clone();
+        assert!(got.iter().all(|x| x != "127.0.0.1" && x != "<none>"), "node must never see the loopback proxy or an empty IP: {got:?}");
+        assert!(got.contains(&"203.0.113.7".to_string()), "client A's real IP reached the node: {got:?}");
+        assert!(got.contains(&"198.51.100.4".to_string()), "client B's real IP reached the node: {got:?}");
+        assert_eq!(got.len(), CAP + 1, "exactly the admitted requests reached the node (CAP from A + 1 from B): {got:?}");
     }
 }

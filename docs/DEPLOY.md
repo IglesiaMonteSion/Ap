@@ -180,6 +180,24 @@ túnel SSH (`ssh -L 8080:127.0.0.1:8080 usuario@vps`).
 > propio rate limit — pero el `/simulate` obligatorio del nodo es la red de
 > seguridad que no depende de configurar bien el proxy.
 
+**El borde público real es la WALLET, no el nodo.** Los usuarios no llaman al RPC
+del nodo directo: van `usuario → Cloudflare/nginx → wallet web → nodo`. Por eso la
+wallet (`qchain-wallet`) rate-limita ELLA MISMA su proxy `POST /api/simulate` por
+la IP REAL del cliente y se la reenvía SANEADA al nodo, para que el segundo rate
+limit del nodo también mida clientes reales en vez de agrupar a todos bajo
+`127.0.0.1` (la IP con que la wallet, en el mismo host, habla con el nodo). Se
+activa con **`--behind-trusted-proxy`** en la wallet (o `QCHAIN_WALLET_BEHIND_PROXY=1`):
+la wallet lee la IP del cliente de `CF-Connecting-IP` / `X-Forwarded-For` **sólo
+cuando el peer TCP directo es loopback** (el túnel/nginx local), la usa para su
+propia ventana de 10 s por IP (default 8, piso 5, `--simulate-rate-limit-per-10s`),
+responde `429` antes de reenviar, y FALLA CERRADO (429) si no puede identificar al
+cliente (nunca agrupa a todos bajo el proxy). El nodo, del otro lado, va con
+`rpc_behind_trusted_proxy:true` + `simulate_rate_limit_per_10s:8` para leer esa IP
+reenviada. **El instalador lo configura solo** cuando instalás con `--con-tunel`
+(nodo: los dos campos en `config.json`; wallet: `--behind-proxy` en el servicio) —
+no hace falta editar nada a mano. Un `singleflight` por txid+ronda+state_root y el
+tope de 4 simulaciones WASM concurrentes siguen siempre activos en el nodo.
+
 **Producción: separá el RPC público de simulación del validador de consenso.**
 Un `/simulate` público es superficie de ataque (CPU: verify PQC + WASM). Lo ideal
 para mainnet es **no** exponerlo desde el mismo proceso que produce bloques: correr

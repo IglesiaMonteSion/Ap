@@ -589,6 +589,24 @@ if command -v python3 >/dev/null 2>&1; then
     || error "$QCHAIN_HOME/config.json no es JSON válido - revisá cómo se generó/copió antes de continuar."
 fi
 
+# Detrás de un túnel/proxy público (Cloudflare, nginx), el RPC del nodo se
+# alcanza vía la wallet (loopback → nodo), así que su rate limit por IP vería
+# todo como 127.0.0.1. Marcamos el nodo como "detrás de un proxy de confianza"
+# para que (a) el rate limit OBLIGATORIO de /simulate se active aunque el RPC sea
+# loopback, y (b) el nodo lea la IP real que la wallet le reenvía saneada por
+# X-Forwarded-For (segundo rate limit por IP, defensa en profundidad). Idempotente.
+if [ "$CON_TUNEL" -eq 1 ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$QCHAIN_HOME/config.json" <<'PY' || echo "AVISO: no pude fijar el modo proxy seguro en config.json (seguí a mano: rpc_behind_trusted_proxy:true, simulate_rate_limit_per_10s:8)."
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["rpc_behind_trusted_proxy"] = True
+c.setdefault("simulate_rate_limit_per_10s", 8)
+json.dump(c, open(p, "w"), indent=2)
+PY
+  log "modo proxy seguro activado en config.json (rpc_behind_trusted_proxy=true, simulate_rate_limit_per_10s=8)"
+fi
+
 chmod 600 "$QCHAIN_HOME/keypair.json" "$QCHAIN_HOME/config.json" 2>/dev/null || true
 [ -f "$QCHAIN_HOME/wallet.json" ] && chmod 600 "$QCHAIN_HOME/wallet.json"
 
@@ -758,6 +776,11 @@ if [ "$INSTALAR_WALLET" -eq 1 ]; then
   # Sin interacción (--yes): que la wallet genere y muestre una contraseña
   # fuerte, en vez de quedarse esperando que la tipeen.
   [ "$ASUMIR_SI" -eq 1 ] && WALLET_ARGS+=(--generar-password --yes)
+  # Detrás del túnel de Cloudflare, la wallet queda expuesta pero su cliente
+  # directo es el túnel (loopback): activamos el modo proxy seguro para que
+  # limite por la IP REAL del usuario (CF-Connecting-IP / X-Forwarded-For) y se
+  # la reenvíe saneada al nodo, en vez de agrupar a todos bajo 127.0.0.1.
+  [ "$CON_TUNEL" -eq 1 ] && WALLET_ARGS+=(--behind-proxy)
   QCHAIN_HOME="$QCHAIN_HOME" "$SCRIPT_DIR/install-wallet.sh" "${WALLET_ARGS[@]}" \
     || echo "La wallet no se pudo instalar ahora, pero tu nodo sigue funcionando. Podés instalarla después con: sudo ./install-wallet.sh"
 else
