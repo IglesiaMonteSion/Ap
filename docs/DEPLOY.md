@@ -125,6 +125,29 @@ sirve RPC). Qué pasa después depende de la red:
 El instalador aplica varias defensas por defecto — no hay que configurar nada,
 pero conviene entender el modelo para no aflojarlo por accidente.
 
+**Almacenamiento ATÓMICO (motor `redb`, el default de mainnet).** El estado de
+la cadena se guarda con **redb** (ACID, pure-Rust). Cada ronda comprometida se
+persiste en **UNA sola transacción atómica y fsync-durable** que incluye TODO
+junto: los saldos y nonces del pagador y el receptor, los fees/quema/pools, el
+staking y la tesorería, los parámetros económicos, y el **checkpoint de la ronda
+ejecutada** (la raíz Merkle se deriva del estado, así que es siempre consistente
+por construcción). Es **todo o nada**: un corte de energía ve la ronda entera o
+ninguna parte — el estado y la ronda **nunca** pueden quedar desfasados (medio
+estado guardado). Si una escritura o el flush fallan, **el nodo se DETIENE**
+(halt), nunca continúa con una advertencia sobre estado a medio escribir; systemd
+lo reinicia y retoma desde la última ronda commiteada atómicamente.
+
+- Es el valor por defecto (`storage_engine: "redb"`): no hay que configurar nada.
+- Una red existente sobre el motor viejo (`sled`) **migra sola a redb al reiniciar
+  con esta versión** (verificado: el set de cuentas migrado debe ser idéntico; los
+  archivos sled quedan de respaldo). Es una elección NODE-LOCAL: no cambia el
+  state root / consenso / `chain_id`, no es un hard fork, e interopera con nodos en
+  cualquier motor.
+- **No usar `sled` como motor de producción**: sled 0.34 NO commitea el estado y
+  la ronda en una sola transacción (queda un checkpoint en archivo aparte, dos
+  operaciones no atómicas) y retiene multi-GB bajo ráfagas. Queda sólo por
+  compatibilidad/dev (`storage_engine: "sled"`).
+
 **RPC privado por defecto.** El JSON-RPC del nodo (`rpc_addr`) bindea a
 `127.0.0.1`, así que **solo es accesible desde la propia máquina** (o por un
 túnel SSH). El instalador **no abre su puerto en el firewall** cuando detecta

@@ -907,8 +907,27 @@ impl Ledger {
     /// `StateStore::flush`). Called on a graceful shutdown so a restart never
     /// resumes from a `round_checkpoint` that is ahead of the persisted account
     /// state. No-op for the in-memory store.
-    pub fn flush(&self) {
-        self.store.flush();
+    pub fn flush(&self) -> anyhow::Result<()> {
+        self.store.flush()
+    }
+
+    /// Stage a metadata value (the node's executed-round checkpoint / economics
+    /// counters) to commit ATOMICALLY with the account writes in the next
+    /// `flush()`. See `StateStore::put_meta`.
+    pub fn put_meta(&mut self, key: &str, value: Vec<u8>) {
+        self.store.put_meta(key, value);
+    }
+
+    /// Read a metadata value previously committed via `put_meta` + `flush`.
+    pub fn get_meta(&self, key: &str) -> Option<Vec<u8>> {
+        self.store.get_meta(key)
+    }
+
+    /// Whether the backing store commits `put_meta` atomically with the account
+    /// writes (true only for `RedbStore`). The node uses this to decide whether
+    /// to fold the round checkpoint into the state commit or keep a separate file.
+    pub fn store_supports_atomic_meta(&self) -> bool {
+        self.store.supports_atomic_meta()
     }
 
     /// Whether the underlying store buffers writes and must be `flush`ed each

@@ -154,16 +154,21 @@ pub struct NodeConfig {
     #[serde(default)]
     pub compressed_state_tree: bool,
     /// On-disk storage engine for the account state (only meaningful with a
-    /// `data_dir`). `"sled"` (the default, and what every existing config
-    /// resolves to) is the original `sled` 0.34 store - unchanged, byte-identical
-    /// behavior. `"redb"` selects the modern pure-Rust `RedbStore` (mmap'd, ACID),
-    /// whose in-RAM mirror + per-round flush keeps memory flat under a write burst
-    /// (fixing sled 0.34's measured multi-GB flood RSS). This is a NODE-LOCAL
-    /// storage choice - it does NOT change the state root, wire, consensus, or
-    /// `chain_id`, so it is NOT a hard fork and nodes on different engines
-    /// interoperate. A node set to `"redb"` whose `data_dir` still holds a legacy
-    /// sled state auto-migrates it once on startup (verified: the migrated account
-    /// set must be identical), keeping the sled files as a backup.
+    /// `data_dir`). `"redb"` (THE DEFAULT — production/mainnet) selects the modern
+    /// pure-Rust `RedbStore` (mmap'd, ACID): it commits each round's account
+    /// writes AND the executed-round checkpoint AND the economics counters in ONE
+    /// atomic, fsync-durable transaction, so a power loss can never leave half the
+    /// state saved (the round and the state can never diverge). It also keeps
+    /// memory flat under a write burst (fixing sled 0.34's measured multi-GB flood
+    /// RSS). `"sled"` is the legacy/dev engine (sled 0.34) — it does NOT commit
+    /// state and round in one transaction, so it is NOT for production; kept only
+    /// for back-compat. This is a NODE-LOCAL storage choice — it does NOT change
+    /// the state root, wire, consensus, or `chain_id`, so it is NOT a hard fork and
+    /// nodes on different engines interoperate. A node on `"redb"` whose `data_dir`
+    /// still holds a legacy sled state auto-migrates it once on startup (verified:
+    /// the migrated account set must be identical), keeping the sled files as a
+    /// backup — so an existing network flips to the atomic engine by just
+    /// restarting on this version (the field now defaults to `"redb"`).
     #[serde(default = "default_storage_engine")]
     pub storage_engine: String,
     /// Authenticated P2P transport (task #176). `false` (the default, every
@@ -291,7 +296,15 @@ pub struct NodeConfig {
 }
 
 fn default_storage_engine() -> String {
-    "sled".to_string()
+    // redb is the production/mainnet default: it commits the round's account
+    // writes AND the executed-round checkpoint in ONE atomic, fsync-durable
+    // transaction (see `RedbStore`), so a power loss can never leave half the
+    // state saved. sled 0.34 is NOT used as the production default — it does not
+    // commit state and round in one transaction and retains multi-GB under a
+    // write burst. An existing config without this field, and a data_dir still
+    // holding a legacy sled state, auto-migrates to redb once on startup
+    // (verified: the migrated account set must be identical; sled files kept).
+    "redb".to_string()
 }
 
 fn default_round_interval_ms() -> u64 {
@@ -407,7 +420,7 @@ mod tests {
             validator_rotation: false,
             epoch_rounds: None,
             compressed_state_tree: false,
-            storage_engine: "sled".to_string(),
+            storage_engine: "redb".to_string(),
             authenticated_transport: false,
             encrypted_transport: false,
             economics_v7: false,

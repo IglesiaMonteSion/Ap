@@ -63,7 +63,7 @@ fn migrate_sled_to_redb(dir: &std::path::Path, redb_path: &std::path::Path) -> a
         for (k, v) in &sled_accounts {
             redb.set(*k, v.clone());
         }
-        redb.flush();
+        redb.flush().map_err(|e| anyhow::anyhow!("migration flush into redb failed: {e}"))?;
     }
     // Verify: reopen the redb file fresh and compare its account set to sled's.
     let redb = RedbStore::open(redb_path)?;
@@ -277,7 +277,18 @@ async fn main() -> anyhow::Result<()> {
     let (round_checkpoint_path, mut next_round) = match &config.data_dir {
         Some(dir) => {
             let path = dir.join("round_checkpoint");
-            let resumed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            // ATOMIC engine (redb): read the round from the store's committed
+            // metadata FIRST — it was committed in the SAME transaction as the
+            // account state, so it is ALWAYS consistent with it (both durable
+            // together or neither). Fall back to the legacy checkpoint file for a
+            // pre-atomic redb DB or the sled/in-memory path.
+            let from_meta = store
+                .get_meta("next_round")
+                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(u64::from_le_bytes);
+            let resumed = from_meta
+                .or_else(|| std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()))
+                .unwrap_or(0);
             (Some(path), resumed)
         }
         None => (None, 0),
@@ -287,7 +298,16 @@ async fn main() -> anyhow::Result<()> {
     // checkpoint. Persist it so a later ordinary restart resumes correctly.
     if let Some(round) = synced_round {
         next_round = round;
-        if let Some(path) = &round_checkpoint_path {
+        if store.supports_atomic_meta() {
+            // Commit the just-installed snapshot accounts AND the resume round in
+            // ONE atomic transaction, so a crash right after sync leaves a
+            // consistent (state, round) pair on disk — never a round ahead of an
+            // empty account set. Refuse to start if it can't be made durable.
+            store.put_meta("next_round", round.to_le_bytes().to_vec());
+            if let Err(e) = store.flush() {
+                anyhow::bail!("failed to durably commit the state-sync snapshot: {e}");
+            }
+        } else if let Some(path) = &round_checkpoint_path {
             let _ = std::fs::write(path, round.to_string());
         }
     }
@@ -767,15 +787,20 @@ async fn main() -> anyhow::Result<()> {
     // so they don't reset to zero on every restart. A missing/corrupt file just
     // starts the counters at zero (the pre-persistence behavior).
     let economics_path: Option<std::path::PathBuf> = config.data_dir.as_ref().map(|dir| dir.join("economics"));
-    if let Some(path) = &economics_path {
-        if let Ok(bytes) = std::fs::read(path) {
-            match borsh::BorshDeserialize::try_from_slice(&bytes) {
-                Ok(snap) => {
-                    ledger.import_economics(snap);
-                    tracing::info!("restored persisted economics counters from {}", path.display());
-                }
-                Err(e) => tracing::warn!("ignoring a corrupt economics snapshot ({e}); starting counters at zero"),
+    // ATOMIC engine (redb): the economics counters were committed IN the per-round
+    // state transaction, so read them from the store metadata FIRST — consistent
+    // with the account state. Fall back to the legacy file (sled path / a
+    // pre-atomic redb DB).
+    let econ_bytes: Option<Vec<u8>> = ledger
+        .get_meta("economics")
+        .or_else(|| economics_path.as_ref().and_then(|p| std::fs::read(p).ok()));
+    if let Some(bytes) = econ_bytes {
+        match borsh::BorshDeserialize::try_from_slice(&bytes) {
+            Ok(snap) => {
+                ledger.import_economics(snap);
+                tracing::info!("restored persisted economics counters");
             }
+            Err(e) => tracing::warn!("ignoring a corrupt economics snapshot ({e}); starting counters at zero"),
         }
     }
 

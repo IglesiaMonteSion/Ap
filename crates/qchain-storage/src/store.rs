@@ -37,9 +37,40 @@ pub trait StateStore: Send + Sync {
     /// process death) can already be ahead of them, so a restart can silently
     /// drop committed transactions. A node flushes this (and its sibling sled
     /// logs) on SIGTERM/SIGINT so the documented `systemctl restart` /
-    /// `update-node.sh` flow is fully durable. Default no-op for the in-memory
-    /// store (nothing to flush).
-    fn flush(&self) {}
+    /// `update-node.sh` flow is fully durable. Default `Ok` for the in-memory
+    /// store (nothing to persist).
+    ///
+    /// RETURNS a `Result` (mainnet atomicity work): a failed commit is FATAL for
+    /// a ledger — the node HALTS rather than continue on half-written state. It
+    /// must never be papered over as a warning. For `RedbStore` a single `flush`
+    /// commits the round's account writes AND the staged metadata
+    /// (`put_meta`) in ONE atomic, fsync-durable transaction, so account state
+    /// and the executed-round checkpoint can never split across a power loss.
+    fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Stage a small metadata value (the node uses this for the executed-round
+    /// checkpoint and the economics counters) to be committed in the SAME atomic
+    /// transaction as the account writes at the next [`flush`](Self::flush). This
+    /// is what makes account state and the round number impossible to split
+    /// across a crash. Default no-op (a store without atomic metadata).
+    fn put_meta(&mut self, _key: &str, _value: Vec<u8>) {}
+
+    /// Read back a metadata value previously committed via `put_meta` + `flush`.
+    /// Default `None`.
+    fn get_meta(&self, _key: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// True only for a genuinely transactional engine (`RedbStore`) where
+    /// `put_meta` values commit ATOMICALLY with the account writes. When true the
+    /// node folds the round/economics checkpoint into the state commit (one
+    /// all-or-nothing operation); when false it keeps a separate best-effort
+    /// checkpoint file (the legacy sled/in-memory, non-production path).
+    fn supports_atomic_meta(&self) -> bool {
+        false
+    }
 
     /// Whether this store buffers writes in memory and needs the node to
     /// `flush()` it regularly (each committed round), not only on shutdown.
@@ -57,6 +88,7 @@ pub trait StateStore: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     accounts: BTreeMap<Pubkey, Account>,
+    meta: BTreeMap<String, Vec<u8>>,
 }
 
 impl InMemoryStore {
@@ -80,6 +112,18 @@ impl StateStore for InMemoryStore {
 
     fn iter(&self) -> Box<dyn Iterator<Item = (Pubkey, Account)> + '_> {
         Box::new(self.accounts.iter().map(|(k, v)| (*k, v.clone())))
+    }
+
+    // In-memory metadata is process-local (nothing survives a restart anyway),
+    // so it's a plain map. `supports_atomic_meta` stays false: an in-memory node
+    // has no crash to be atomic against, and the node's `round_checkpoint_path`
+    // is `None` for it, so it never reaches the atomic-commit path.
+    fn put_meta(&mut self, key: &str, value: Vec<u8>) {
+        self.meta.insert(key.to_string(), value);
+    }
+
+    fn get_meta(&self, key: &str) -> Option<Vec<u8>> {
+        self.meta.get(key).cloned()
     }
 }
 
@@ -159,10 +203,13 @@ impl StateStore for SledStore {
         }))
     }
 
-    fn flush(&self) {
-        if let Err(e) = self.db.flush() {
-            eprintln!("warning: failed to flush the sled state store: {e}");
-        }
+    fn flush(&self) -> anyhow::Result<()> {
+        // Fail-loud (mainnet atomicity work): a flush failure is returned so the
+        // node can HALT, never continue on possibly-lost writes. NOTE: sled is
+        // the legacy/dev engine — it does NOT commit account writes and the
+        // round checkpoint in one transaction (`supports_atomic_meta` is false),
+        // so it is not the production/mainnet engine. Use `redb`.
+        self.db.flush().map(|_| ()).map_err(|e| anyhow::anyhow!("failed to flush the sled state store: {e}"))
     }
 }
 
@@ -200,9 +247,15 @@ pub struct RedbStore {
     /// the node only ever touches this store single-threaded under the ledger
     /// lock, so the mutex is never actually contended.
     dirty: std::sync::Mutex<std::collections::HashSet<Pubkey>>,
+    /// Staged metadata (executed-round checkpoint, economics counters), mirror +
+    /// dirty set, committed in the SAME `flush()` transaction as the accounts so
+    /// state and round can never split across a crash (mainnet atomicity work).
+    meta_mem: BTreeMap<String, Vec<u8>>,
+    meta_dirty: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 const REDB_ACCOUNTS: redb::TableDefinition<'static, &'static [u8], &'static [u8]> = redb::TableDefinition::new("accounts");
+const REDB_META: redb::TableDefinition<'static, &'static [u8], &'static [u8]> = redb::TableDefinition::new("meta");
 
 impl RedbStore {
     /// Opens (creating if absent) a redb database at `path` (a single file, e.g.
@@ -232,7 +285,32 @@ impl RedbStore {
             Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => anyhow::bail!("opening the accounts table in the redb state database at {} failed: {e}", path.display()),
         }
-        Ok(RedbStore { db, mem, dirty: std::sync::Mutex::new(std::collections::HashSet::new()) })
+        // Load the metadata table (round checkpoint, economics) into its mirror.
+        // A brand-new (or pre-atomic-commit) database has no `meta` table yet;
+        // treat "table missing" as empty so an existing redb DB migrates
+        // seamlessly (the node then falls back to the legacy checkpoint file).
+        let mut meta_mem = BTreeMap::new();
+        match rtx.open_table(REDB_META) {
+            Ok(table) => {
+                use redb::ReadableTable;
+                let iter = table.iter().map_err(|e| anyhow::anyhow!("iterating the redb meta table at {} failed: {e}", path.display()))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| anyhow::anyhow!("reading a meta entry from {} failed: {e}", path.display()))?;
+                    let key = String::from_utf8(k.value().to_vec())
+                        .map_err(|e| anyhow::anyhow!("corrupt redb meta key at {}: {e}", path.display()))?;
+                    meta_mem.insert(key, v.value().to_vec());
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => anyhow::bail!("opening the meta table in the redb state database at {} failed: {e}", path.display()),
+        }
+        Ok(RedbStore {
+            db,
+            mem,
+            dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+            meta_mem,
+            meta_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
     }
 
     /// Number of live accounts (for migration reporting / tests).
@@ -264,41 +342,71 @@ impl StateStore for RedbStore {
         Box::new(self.mem.iter().map(|(k, v)| (*k, v.clone())))
     }
 
-    fn flush(&self) {
+    fn put_meta(&mut self, key: &str, value: Vec<u8>) {
+        self.meta_mem.insert(key.to_string(), value);
+        self.meta_dirty.lock().expect("meta dirty set mutex is never poisoned").insert(key.to_string());
+    }
+
+    fn get_meta(&self, key: &str) -> Option<Vec<u8>> {
+        self.meta_mem.get(key).cloned()
+    }
+
+    fn supports_atomic_meta(&self) -> bool {
+        true
+    }
+
+    /// ATOMIC per-round commit (mainnet). Every dirty ACCOUNT (payer/receiver
+    /// balance+nonce, fee pools, staking, treasury, economic params) AND every
+    /// staged META value (the executed-round checkpoint, the economics counters)
+    /// commit in ONE redb write transaction, fsync-durable (`Durability::Immediate`).
+    /// It is all-or-nothing: a power loss either sees the whole round or none of
+    /// it — the account state and the round number can never split. On ANY error
+    /// this returns `Err` and does NOT clear the dirty sets; the node treats that
+    /// as FATAL and halts (it must never continue on half-written state).
+    fn flush(&self) -> anyhow::Result<()> {
         let mut dirty = self.dirty.lock().expect("dirty set mutex is never poisoned");
-        if dirty.is_empty() {
-            return;
+        let mut meta_dirty = self.meta_dirty.lock().expect("meta dirty set mutex is never poisoned");
+        if dirty.is_empty() && meta_dirty.is_empty() {
+            return Ok(());
         }
-        // Commit every dirty key's current mirror state to redb in one
-        // transaction: present in `mem` => upsert, absent => delete.
-        let commit = || -> anyhow::Result<()> {
-            let wtx = self.db.begin_write()?;
-            {
-                let mut table = wtx.open_table(REDB_ACCOUNTS)?;
-                for key in dirty.iter() {
-                    match self.mem.get(key) {
-                        Some(account) => {
-                            let bytes = borsh::to_vec(account).expect("Account always serializes");
-                            table.insert(key.to_bytes().as_slice(), bytes.as_slice())?;
-                        }
-                        None => {
-                            table.remove(key.to_bytes().as_slice())?;
-                        }
+        let mut wtx = self.db.begin_write()?;
+        // Fsync the commit so it survives a power loss — the whole point of the
+        // atomic-storage guarantee. (Immediate is redb's default, set explicitly.)
+        wtx.set_durability(redb::Durability::Immediate);
+        {
+            let mut table = wtx.open_table(REDB_ACCOUNTS)?;
+            for key in dirty.iter() {
+                match self.mem.get(key) {
+                    Some(account) => {
+                        let bytes = borsh::to_vec(account).expect("Account always serializes");
+                        table.insert(key.to_bytes().as_slice(), bytes.as_slice())?;
+                    }
+                    None => {
+                        table.remove(key.to_bytes().as_slice())?;
                     }
                 }
             }
-            wtx.commit()?;
-            Ok(())
-        };
-        match commit() {
-            // Clear the dirty set only once the commit succeeded, so a transient
-            // failure retries the same keys on the next flush.
-            Ok(()) => dirty.clear(),
-            // A failed commit is serious for a ledger, but `flush` is also called
-            // from the shutdown path - log loudly and keep the keys dirty rather
-            // than panic; the node re-derives from the DAG on restart.
-            Err(e) => eprintln!("warning: failed to flush the redb state store: {e}"),
         }
+        {
+            let mut mtable = wtx.open_table(REDB_META)?;
+            for key in meta_dirty.iter() {
+                match self.meta_mem.get(key) {
+                    Some(value) => {
+                        mtable.insert(key.as_bytes(), value.as_slice())?;
+                    }
+                    None => {
+                        mtable.remove(key.as_bytes())?;
+                    }
+                }
+            }
+        }
+        wtx.commit()?;
+        // Clear only AFTER the commit fsynced, so a failed commit retries the
+        // same keys next time (and, since the node halts on the returned Err,
+        // never on a half-applied state).
+        dirty.clear();
+        meta_dirty.clear();
+        Ok(())
     }
 
     fn needs_periodic_flush(&self) -> bool {
@@ -611,7 +719,7 @@ mod tests {
             store.set(key, sample_account(42));
             store.set(Pubkey::new([7u8; 32]), sample_account(7));
             store.remove(&Pubkey::new([7u8; 32])); // a dirty delete must also persist
-            store.flush(); // durability happens here, not on a timer
+            store.flush().unwrap(); // durability happens here, not on a timer
         }
         let reopened = RedbStore::open(&redb_path(dir.path())).unwrap();
         assert_eq!(reopened.get(&key), Some(sample_account(42)));
@@ -631,6 +739,117 @@ mod tests {
         }
         let reopened = RedbStore::open(&redb_path(dir.path())).unwrap();
         assert!(reopened.is_empty(), "unflushed writes must not survive (crash-loss bound)");
+    }
+
+    // ---- ATOMIC per-round commit: state + round can never split (mainnet) -----
+
+    /// The whole point of the atomicity work: a round's ACCOUNT writes AND its
+    /// executed-round checkpoint commit in ONE transaction, so a crash at ANY
+    /// stage of the round leaves either the WHOLE previous round or the WHOLE new
+    /// round on disk — never a mix (e.g. the round advanced but the payer's debit
+    /// lost, or vice versa). This models a validator that:
+    ///   round 1: writes 4 accounts (payer, receiver, fee pool, staking) + round=1, commits;
+    ///   round 2: writes the same 4 accounts to new values + round=2, then CRASHES
+    ///            before the commit (dropping the store without `flush`).
+    /// After the crash the reopened store must show the FULL round-1 state and
+    /// round=1 — not a single round-2 write, and definitely not round=2 with
+    /// stale accounts.
+    #[test]
+    fn redb_a_crash_before_commit_keeps_the_whole_previous_round_never_a_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let payer = Pubkey::new([1u8; 32]);
+        let receiver = Pubkey::new([2u8; 32]);
+        let fee_pool = Pubkey::new([3u8; 32]);
+        let staking = Pubkey::new([4u8; 32]);
+        // Round 1: a full, committed round.
+        {
+            let mut s = RedbStore::open(&redb_path(dir.path())).unwrap();
+            s.set(payer, sample_account(1000));
+            s.set(receiver, sample_account(0));
+            s.set(fee_pool, sample_account(0));
+            s.set(staking, sample_account(0));
+            s.put_meta("next_round", 1u64.to_le_bytes().to_vec());
+            s.flush().unwrap();
+        }
+        // Round 2: stage every write + the round advance, then CRASH before flush.
+        {
+            let mut s = RedbStore::open(&redb_path(dir.path())).unwrap();
+            s.set(payer, sample_account(900)); // debited
+            s.set(receiver, sample_account(90)); // credited
+            s.set(fee_pool, sample_account(10)); // fee
+            s.set(staking, sample_account(5)); // reward
+            s.put_meta("next_round", 2u64.to_le_bytes().to_vec());
+            // <-- power loss here: `s` is dropped WITHOUT flush().
+        }
+        // Recovery: the entire round-1 state, consistent with round=1. Not one
+        // round-2 write survived, and the round did NOT advance.
+        let r = RedbStore::open(&redb_path(dir.path())).unwrap();
+        assert_eq!(r.get(&payer), Some(sample_account(1000)), "payer must NOT be debited by the uncommitted round");
+        assert_eq!(r.get(&receiver), Some(sample_account(0)), "receiver must NOT be credited");
+        assert_eq!(r.get(&fee_pool), Some(sample_account(0)));
+        assert_eq!(r.get(&staking), Some(sample_account(0)));
+        assert_eq!(r.get_meta("next_round"), Some(1u64.to_le_bytes().to_vec()), "the round must NOT have advanced without its state");
+    }
+
+    /// The success side: once a round commits, ALL of it is durable together —
+    /// every account write AND the round number — and they agree on reopen.
+    #[test]
+    fn redb_a_committed_round_restores_state_and_round_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let payer = Pubkey::new([1u8; 32]);
+        let receiver = Pubkey::new([2u8; 32]);
+        {
+            let mut s = RedbStore::open(&redb_path(dir.path())).unwrap();
+            s.set(payer, sample_account(900));
+            s.set(receiver, sample_account(90));
+            s.put_meta("next_round", 7u64.to_le_bytes().to_vec());
+            s.put_meta("economics", vec![1, 2, 3, 4]); // opaque economics blob rides along
+            s.flush().unwrap();
+        }
+        let r = RedbStore::open(&redb_path(dir.path())).unwrap();
+        assert_eq!(r.get(&payer), Some(sample_account(900)));
+        assert_eq!(r.get(&receiver), Some(sample_account(90)));
+        assert_eq!(r.get_meta("next_round"), Some(7u64.to_le_bytes().to_vec()));
+        assert_eq!(r.get_meta("economics"), Some(vec![1, 2, 3, 4]));
+    }
+
+    /// Crashing at each successive stage WITHIN a round all collapse to the same
+    /// safe outcome (the previous committed round), because nothing touches disk
+    /// until the single `flush`. This walks the stages explicitly: after the
+    /// payer write, after the receiver write, after staging the round meta —
+    /// each a fresh reopen of a store that never flushed — and every one recovers
+    /// round 0 (the genesis-committed baseline), proving no intermediate write
+    /// leaks to disk.
+    #[test]
+    fn redb_kill_at_each_stage_of_a_round_always_recovers_the_last_committed_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let payer = Pubkey::new([1u8; 32]);
+        let receiver = Pubkey::new([2u8; 32]);
+        // Baseline committed round 0.
+        {
+            let mut s = RedbStore::open(&redb_path(dir.path())).unwrap();
+            s.set(payer, sample_account(500));
+            s.put_meta("next_round", 0u64.to_le_bytes().to_vec());
+            s.flush().unwrap();
+        }
+        // Enumerate the crash stages of the next round; none may reach disk.
+        for stage in 0..3u8 {
+            {
+                let mut s = RedbStore::open(&redb_path(dir.path())).unwrap();
+                s.set(payer, sample_account(400)); // stage 0: payer written
+                if stage >= 1 {
+                    s.set(receiver, sample_account(100));
+                }
+                if stage >= 2 {
+                    s.put_meta("next_round", 1u64.to_le_bytes().to_vec());
+                }
+                // crash (drop without flush) at this stage
+            }
+            let r = RedbStore::open(&redb_path(dir.path())).unwrap();
+            assert_eq!(r.get(&payer), Some(sample_account(500)), "stage {stage}: payer must be the committed baseline");
+            assert!(r.get(&receiver).is_none(), "stage {stage}: receiver write must not leak to disk");
+            assert_eq!(r.get_meta("next_round"), Some(0u64.to_le_bytes().to_vec()), "stage {stage}: round must not advance");
+        }
     }
 
     #[test]

@@ -557,6 +557,50 @@ fn persist_round_checkpoint(state: &EngineState) {
     }
 }
 
+/// A durable-write failure is FATAL for a validator (mainnet atomicity work):
+/// continuing would risk a restart resuming from a round whose state was never
+/// persisted — a silent fork / lost transactions. Log loudly and HALT the
+/// process rather than continue on half-written state (never warn-and-continue,
+/// which is exactly what the atomicity requirement forbids). On restart the node
+/// resumes from the last ATOMICALLY committed round (state + round together),
+/// and the operator's systemd `Restart=on-failure` brings it back.
+fn fatal_persist_failure(context: &str, err: &anyhow::Error) -> ! {
+    tracing::error!("FATAL: {context} could not be persisted durably: {err}. Halting the node to avoid running on half-written state.");
+    std::process::exit(1);
+}
+
+/// ATOMIC per-round durability (mainnet). Commits the round's ACCOUNT writes
+/// (payer/receiver balance+nonce, fee pools, burn, staking, treasury, economic
+/// params) AND the executed-round checkpoint AND the economics counters in ONE
+/// transaction, so a crash can never leave the round ahead of the state or vice
+/// versa. On the transactional engine (`RedbStore`) this is a single fsync-durable
+/// redb commit; a failure is FATAL (halt). On the legacy sled/in-memory path
+/// (non-production) it is the pre-existing two-op ordering (state flush, then the
+/// checkpoint file), with a flush failure still fatal.
+fn persist_round_atomic(state: &mut EngineState) {
+    if state.ledger.store_supports_atomic_meta() {
+        state.ledger.put_meta("next_round", state.next_round.to_le_bytes().to_vec());
+        // Economics counters (report-only) ride along in the SAME atomic commit.
+        match borsh::to_vec(&state.ledger.export_economics()) {
+            Ok(bytes) => state.ledger.put_meta("economics", bytes),
+            Err(e) => tracing::warn!("could not encode economics for the atomic commit: {e}"),
+        }
+        if let Err(e) = state.ledger.flush() {
+            fatal_persist_failure("atomic round+state commit", &e);
+        }
+    } else {
+        // Legacy sled/in-memory: make the account state durable BEFORE the
+        // checkpoint file advances (so a crash between them resumes from a round
+        // whose state IS persisted). A state flush failure is still fatal.
+        if state.ledger.store_needs_periodic_flush() {
+            if let Err(e) = state.ledger.flush() {
+                fatal_persist_failure("state flush", &e);
+            }
+        }
+        persist_round_checkpoint(state);
+    }
+}
+
 /// Prunes a best-effort append-only `sled` log (the receipt / staking-event
 /// logs) down to at most `max` entries, removing the OLDEST first. Keys are
 /// monotonic `generate_id()` big-endian ids, so a forward `iter()` yields
@@ -1085,7 +1129,17 @@ impl Engine {
     /// next boot, re-catching up as new transactions commit.
     async fn persist_economics(&self) {
         let Some(path) = &self.economics_path else { return };
-        let snap = { self.state.lock().await.ledger.export_economics() };
+        let (snap, atomic) = {
+            let st = self.state.lock().await;
+            (st.ledger.export_economics(), st.ledger.store_supports_atomic_meta())
+        };
+        // On the transactional engine the economics counters are committed IN the
+        // per-round atomic state transaction (persist_round_atomic), so the
+        // separate file is redundant — skip it. The file remains the mechanism
+        // for the legacy sled/in-memory path only.
+        if atomic {
+            return;
+        }
         match borsh::to_vec(&snap) {
             Ok(bytes) => {
                 // Write to a temp file then rename, so a crash mid-write never
@@ -1129,8 +1183,13 @@ impl Engine {
     /// flow is fully durable. Takes the state lock so it flushes a consistent
     /// point-in-time (any in-flight commit finishes first).
     pub async fn flush_all(&self) {
-        let state = self.state.lock().await;
-        state.ledger.flush();
+        let mut state = self.state.lock().await;
+        // ATOMIC commit of the account state + round + economics (mainnet). On
+        // the transactional engine each round was already committed atomically in
+        // propose_round; this is the final safety commit of any residual writes,
+        // folding the round in so state and round stay consistent. A failure is
+        // fatal — better to halt than exit "cleanly" having lost state.
+        persist_round_atomic(&mut state);
         for (name, db) in [
             ("dag", &self.cert_log),
             ("batches", &self.batch_log),
@@ -4275,14 +4334,11 @@ impl Engine {
             };
             state.own_pending_vertex = Some((vertex.clone(), sig.clone()));
             state.next_round = round + 1;
-            // For a write-buffering store (RedbStore), make the account state
-            // durable BEFORE the round_checkpoint advances - otherwise a crash
-            // could resume from a round whose state was never flushed. No-op for
-            // sled (its own timer handles it) and in-memory.
-            if state.ledger.store_needs_periodic_flush() {
-                state.ledger.flush();
-            }
-            persist_round_checkpoint(&state);
+            // ATOMIC per-round durability (mainnet): commit the round's account
+            // writes AND the executed-round checkpoint (AND economics counters)
+            // in ONE transaction, so a crash can never split state and round. A
+            // commit failure HALTS the node (fatal), never continues.
+            persist_round_atomic(&mut state);
             state.voted_for.insert((round, self.self_id), digest);
             (vertex, sig, worker_batches)
         };
