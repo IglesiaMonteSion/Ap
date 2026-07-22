@@ -205,6 +205,21 @@ async fn main() -> anyhow::Result<()> {
     // startup (never silently run a mainnet with a plaintext/unauthenticated P2P
     // transport). No-op for a testnet (`mainnet` false, the default).
     config.validate_mainnet_transport()?;
+
+    // MANDATORY MAINNET PROFILE (task #211): when `network_profile: "mainnet"`
+    // (or the legacy `mainnet: true`), REFUSE TO START unless every hard
+    // production protection is present — data_dir, redb, auth+encrypted P2P,
+    // remote signer, a private validator RPC, a state-sync trust anchor, explicit
+    // RPC limits, and explicit v7 economics. Accumulates ALL missing pieces into
+    // one clear error. No-op for a testnet (the default). Log the network
+    // fingerprint so an operator can confirm every node shares the SAME config.
+    config.validate_network_profile()?;
+    if config.is_mainnet_profile() {
+        tracing::info!(
+            "network_profile: MAINNET — all hard protections satisfied. network fingerprint: {} (MUST be identical on every node)",
+            hex::encode(config.network_fingerprint())
+        );
+    }
     if config.encrypted_transport && !config.authenticated_transport {
         anyhow::bail!("encrypted_transport requires authenticated_transport (encryption without authentication is meaningless)");
     }

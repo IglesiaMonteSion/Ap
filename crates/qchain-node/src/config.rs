@@ -7,8 +7,26 @@
 
 use qchain_crypto::{Pubkey, PublicKeyBundle};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+
+/// Is this IP safe as a PRIVATE validator RPC bind (loopback or a
+/// non-globally-routable / RFC1918 / unique-local address)? A mainnet
+/// validator must NOT serve its mutating RPC on a publicly routable address
+/// (task #211, "RPC del validador en red privada"): public `/simulate` and
+/// `/tx` belong on a read-only relay/replica (`install-sim-replica.sh`), never
+/// on the box that also runs consensus.
+fn is_private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        // NOTE: the UNSPECIFIED address (0.0.0.0 / ::) is deliberately NOT
+        // allowed — binding a validator's RPC to it exposes the RPC on EVERY
+        // interface (publicly reachable), the opposite of "private".
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        // `is_unique_local` (fc00::/7) is stable only recently; check the
+        // high-order bits directly so this compiles on the pinned toolchain.
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.octets()[0] & 0xfe) == 0xfc,
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ValidatorConfig {
@@ -323,6 +341,25 @@ pub struct NodeConfig {
     /// (que ya es un cutover coordinado).
     #[serde(default)]
     pub mainnet: bool,
+
+    /// **Perfil de red obligatorio (`"mainnet"` / `"testnet"`).** El `mainnet: bool`
+    /// de arriba sólo exige auth+cifrado; este campo es la POSTURA COMPLETA de
+    /// producción: cuando vale `"mainnet"`, el nodo SE NIEGA A ARRANCAR
+    /// (`validate_network_profile` fail-stop) si falta CUALQUIERA de las
+    /// protecciones duras — `data_dir`, almacenamiento transaccional (`redb`),
+    /// transporte P2P autenticado, transporte cifrado, firmante remoto, RPC del
+    /// validador en red privada (loopback/RFC1918, nunca ruteable), trust anchor
+    /// de state-sync, límites de RPC explícitos (general+`/simulate`+`/tx`),
+    /// parámetros económicos explícitos (v7 con la tasa BAKED, no derivada por
+    /// f64), y el fingerprint de red que TODOS los nodos deben compartir (se loguea
+    /// al arrancar para comparar entre nodos → 'configuración idéntica entre
+    /// nodos'). `None` (el default) o `"testnet"` no imponen nada — un testnet
+    /// corre exactamente como antes, byte-idéntico. Un valor desconocido se rechaza
+    /// al cargar (fail-loud ante un typo). Es una elección node-LOCAL de operación:
+    /// **NO se pliega en `chain_id`** (no cambia consenso/estado/wire); acumula
+    /// TODOS los faltantes en un solo error para arreglarlos en una pasada.
+    #[serde(default)]
+    pub network_profile: Option<String>,
 }
 
 fn default_storage_engine() -> String {
@@ -445,6 +482,162 @@ impl NodeConfig {
         }
         Ok(())
     }
+
+    /// `true` when this node is configured for the MAINNET profile — either the
+    /// explicit `network_profile: "mainnet"` (the full posture) or the legacy
+    /// `mainnet: true` transport flag. A `"testnet"`/`None` profile is not mainnet.
+    pub fn is_mainnet_profile(&self) -> bool {
+        matches!(self.network_profile.as_deref(), Some("mainnet")) || self.mainnet
+    }
+
+    /// **Perfil de red obligatorio — tarea #211.** Cuando el nodo corre bajo el
+    /// perfil `"mainnet"` (o el legacy `mainnet: true`), esto EXIGE que TODAS las
+    /// protecciones duras de producción estén presentes y hace fail-stop al
+    /// arrancar si falta cualquiera — **acumulando TODAS las faltas en un solo
+    /// error** para que un operador las arregle en una pasada, en vez de rebotar
+    /// una por una. Un perfil `None`/`"testnet"` es un no-op → un testnet corre
+    /// exactamente como antes (byte-idéntico). También valida que el string de
+    /// perfil sea uno conocido (fail-loud ante un typo como `"mainet"`).
+    ///
+    /// Las 11 protecciones exigidas (el pedido del usuario, sin omitir nada):
+    /// 1. `data_dir` — estado persistente en disco (sin `data_dir` el nodo corre
+    ///    in-memory y pierde todo al reiniciar).
+    /// 2. Almacenamiento transaccional — `storage_engine == "redb"` (commit atómico
+    ///    estado+ronda+economía; `sled` NO commitea en una transacción → prohibido).
+    /// 3. Transporte P2P autenticado — `authenticated_transport`.
+    /// 4. Transporte cifrado — `encrypted_transport`.
+    /// 5. Firmante remoto — `remote_signer` (la clave de consenso fuera del proceso).
+    /// 6. RPC del validador en red privada — `rpc_addr` loopback/RFC1918, nunca
+    ///    ruteable (el `/simulate`+`/tx` público va en un relay/réplica read-only).
+    /// 7. Trust anchor para state-sync — `require_state_sync_trust_anchor`, y si hay
+    ///    `state_sync_peers` entonces el `(round, root)` pinneado debe estar seteado.
+    /// 8. Límites de RPC — los tres explícitos y > 0 (`rpc_rate_limit_per_10s`,
+    ///    `simulate_rate_limit_per_10s`, `tx_rate_limit_per_10s`). Los límites de
+    ///    P2P (conexión/IP/timeouts/cuotas) son SIEMPRE activos por construcción.
+    /// 9. Parámetros económicos explícitos — `economics_v7` con la tasa BAKED
+    ///    (`quanto_rate_fp`, determinista cross-plataforma, no f64) y
+    ///    `rounds_per_quanto` fijado.
+    /// 10. Configuración idéntica entre nodos — se loguea `network_fingerprint()`
+    ///     al arrancar; todos los nodos deben compartirlo (comparación cross-nodo).
+    /// 11. TLS en wallet/servicios públicos — el RPC del validador NO se expone
+    ///     directo (req 6); la wallet exige TLS/proxy en su propio perfil mainnet
+    ///     (ver `qchain-wallet`), y el nodo lo documenta.
+    pub fn validate_network_profile(&self) -> anyhow::Result<()> {
+        // Reject an unknown profile string outright (a typo must fail loud, not
+        // silently fall back to testnet and ship a mainnet with no protections).
+        if let Some(p) = self.network_profile.as_deref() {
+            if p != "mainnet" && p != "testnet" {
+                anyhow::bail!(
+                    "network_profile {p:?} is not a known profile — use \"mainnet\" or \"testnet\" (or omit the field for a testnet)."
+                );
+            }
+        }
+        if !self.is_mainnet_profile() {
+            return Ok(());
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+
+        // 1. data_dir (persistent state).
+        if self.data_dir.is_none() {
+            missing.push("data_dir: set a persistent state directory (an in-memory store loses all state on restart)".into());
+        }
+        // 2. transactional storage.
+        if self.storage_engine != "redb" {
+            missing.push(format!(
+                "storage_engine: must be \"redb\" (atomic state+round+economics commit), got {:?} — \"sled\" is dev-only and not transactional",
+                self.storage_engine
+            ));
+        }
+        // 3. authenticated P2P transport.
+        if !self.authenticated_transport {
+            missing.push("authenticated_transport: set true (per-connection ML-DSA handshake) — mandatory P2P authentication".into());
+        }
+        // 4. encrypted P2P transport.
+        if !self.encrypted_transport {
+            missing.push("encrypted_transport: set true (ML-KEM-768 + ChaCha20-Poly1305) — mandatory P2P confidentiality".into());
+        }
+        // 5. remote signer (consensus key out of process).
+        if self.remote_signer.is_none() {
+            missing.push("remote_signer: set \"host:port\" of a qchain-remote-signer/HSM so the block-signing key is NOT in the node process".into());
+        }
+        // 6. validator RPC on a private network.
+        if !is_private_or_loopback(self.rpc_addr.ip()) {
+            missing.push(format!(
+                "rpc_addr: {} is a publicly routable address — a mainnet validator's mutating RPC must bind a private/loopback address; expose a read-only relay/replica (install-sim-replica.sh) for public /simulate and /tx instead",
+                self.rpc_addr
+            ));
+        }
+        // 7. trust anchor for state-sync.
+        if !self.require_state_sync_trust_anchor {
+            missing.push("require_state_sync_trust_anchor: set true — never trust a source peer's claimed root, only a pinned (round, root)".into());
+        }
+        if !self.state_sync_peers.is_empty()
+            && (self.state_sync_trusted_root.is_none() || self.state_sync_trusted_round.is_none())
+        {
+            missing.push("state_sync_trusted_root + state_sync_trusted_round: pin the out-of-band (round, root) — state_sync_peers is set but the trust anchor is incomplete".into());
+        }
+        // 8. explicit RPC limits (P2P limits are always-on by construction).
+        for (name, v) in [
+            ("rpc_rate_limit_per_10s", self.rpc_rate_limit_per_10s),
+            ("simulate_rate_limit_per_10s", self.simulate_rate_limit_per_10s),
+            ("tx_rate_limit_per_10s", self.tx_rate_limit_per_10s),
+        ] {
+            if v.unwrap_or(0) == 0 {
+                missing.push(format!("{name}: set an explicit positive per-IP rate limit (mandatory RPC DoS bound for mainnet)"));
+            }
+        }
+        // 9. explicit economic parameters.
+        if !self.economics_v7 {
+            missing.push("economics_v7: set true — a mainnet runs the explicit v7 economics (bond/emission/fee split), not the legacy defaults".into());
+        } else {
+            if self.quanto_rate_fp.is_none() {
+                missing.push("quanto_rate_fp: bake the exact integer rate (deterministic cross-platform) — do not let each node derive it via f64".into());
+            }
+            if self.rounds_per_quanto.is_none() {
+                missing.push("rounds_per_quanto: set the explicit quanto length (part of the network config hash)".into());
+            }
+        }
+
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "network_profile=\"mainnet\": REFUSING TO START — {} mandatory protection(s) missing:\n  - {}\n\nFix all of them (see docs/DEPLOY.md 'Perfil mainnet'). Every node in the network must share the same network fingerprint {} (compare across nodes).",
+                missing.len(),
+                missing.join("\n  - "),
+                hex::encode(self.network_fingerprint()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// **Fingerprint de red — el req 'configuración idéntica entre nodos' (#211).**
+    /// Hash SHA3-256 de los campos que TODOS los nodos de una red DEBEN compartir
+    /// para no forkear ni fallar el handshake: `chain_id` (que ya pliega
+    /// validators+genesis+economics+compressed) + las elecciones network-wide que
+    /// NO están en `chain_id` pero igual deben coincidir (auth/cifrado del
+    /// transporte, rotación + epoch_rounds, el propio perfil). Se loguea al
+    /// arrancar; un operador compara el hex entre nodos — si difieren, un nodo está
+    /// mal configurado. NO se pliega en `chain_id` (es diagnóstico, no consenso).
+    pub fn network_fingerprint(&self) -> [u8; 32] {
+        use sha3::{Digest, Sha3_256};
+        let mut h = Sha3_256::new();
+        h.update(b"qchain-network-fingerprint-v1");
+        h.update(self.chain_id());
+        h.update([
+            self.authenticated_transport as u8,
+            self.encrypted_transport as u8,
+            self.validator_rotation as u8,
+            self.compressed_state_tree as u8,
+            self.economics_v7 as u8,
+        ]);
+        h.update(self.epoch_rounds().to_le_bytes());
+        // The profile string is part of the shared posture (all nodes mainnet, or
+        // all testnet — a mixed set is a misconfiguration).
+        h.update(self.network_profile.as_deref().unwrap_or("").as_bytes());
+        h.update([self.mainnet as u8]);
+        h.finalize().into()
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +675,7 @@ mod tests {
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             mainnet: false,
+            network_profile: None,
         }
     }
 
@@ -611,5 +805,108 @@ mod tests {
         m.authenticated_transport = true;
         m.encrypted_transport = true;
         assert!(m.validate_mainnet_transport().is_ok(), "mainnet with auth + encryption is allowed");
+    }
+
+    fn one_validator() -> Vec<ValidatorConfig> {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }]
+    }
+
+    /// Build a config that satisfies EVERY mainnet-profile requirement, so a test
+    /// can then knock out one field at a time and assert it fail-stops.
+    fn mainnet_config_with(validators: Vec<ValidatorConfig>) -> NodeConfig {
+        let mut c = config_with(validators, vec![]);
+        c.network_profile = Some("mainnet".into());
+        c.data_dir = Some(PathBuf::from("/var/lib/qchain"));
+        c.storage_engine = "redb".into();
+        c.authenticated_transport = true;
+        c.encrypted_transport = true;
+        c.remote_signer = Some("127.0.0.1:9200".into());
+        c.rpc_addr = "127.0.0.1:28001".parse().unwrap(); // private
+        c.require_state_sync_trust_anchor = true;
+        c.rpc_rate_limit_per_10s = Some(64);
+        c.simulate_rate_limit_per_10s = Some(8);
+        c.tx_rate_limit_per_10s = Some(16);
+        c.economics_v7 = true;
+        c.quanto_rate_fp = Some(310_537_755_655_371);
+        c.rounds_per_quanto = Some(86_400);
+        c
+    }
+
+    /// Task #211: the mandatory mainnet profile fail-stops when ANY hard
+    /// protection is missing, accumulates all failures, and passes when every one
+    /// is present — while a testnet is never constrained.
+    #[test]
+    fn mainnet_profile_requires_every_hard_protection() {
+        // Fully-configured mainnet passes.
+        let full = mainnet_config_with(one_validator());
+        assert!(full.validate_network_profile().is_ok(), "a fully-protected mainnet must start; err: {:?}", full.validate_network_profile().err());
+
+        // A testnet (no profile) is never constrained even with everything off.
+        let testnet = config_with(one_validator(), vec![]);
+        assert!(testnet.validate_network_profile().is_ok(), "a testnet is never constrained");
+
+        // An unknown profile string fails loud.
+        let mut typo = mainnet_config_with(one_validator());
+        typo.network_profile = Some("mainet".into());
+        assert!(typo.validate_network_profile().is_err(), "an unknown profile string must fail loud");
+
+        // Knock out each protection individually — every one must fail-stop.
+        let knockouts: Vec<(&str, Box<dyn Fn(&mut NodeConfig)>)> = vec![
+            ("data_dir", Box::new(|c: &mut NodeConfig| c.data_dir = None)),
+            ("storage_engine", Box::new(|c: &mut NodeConfig| c.storage_engine = "sled".into())),
+            ("authenticated_transport", Box::new(|c: &mut NodeConfig| c.authenticated_transport = false)),
+            ("encrypted_transport", Box::new(|c: &mut NodeConfig| c.encrypted_transport = false)),
+            ("remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = None)),
+            ("public rpc_addr", Box::new(|c: &mut NodeConfig| c.rpc_addr = "8.8.8.8:28001".parse().unwrap())),
+            ("trust_anchor", Box::new(|c: &mut NodeConfig| c.require_state_sync_trust_anchor = false)),
+            ("rpc_rate_limit", Box::new(|c: &mut NodeConfig| c.rpc_rate_limit_per_10s = None)),
+            ("simulate_rate_limit", Box::new(|c: &mut NodeConfig| c.simulate_rate_limit_per_10s = Some(0))),
+            ("tx_rate_limit", Box::new(|c: &mut NodeConfig| c.tx_rate_limit_per_10s = None)),
+            ("economics_v7", Box::new(|c: &mut NodeConfig| c.economics_v7 = false)),
+            ("quanto_rate_fp", Box::new(|c: &mut NodeConfig| c.quanto_rate_fp = None)),
+            ("rounds_per_quanto", Box::new(|c: &mut NodeConfig| c.rounds_per_quanto = None)),
+        ];
+        for (name, knock) in knockouts {
+            let mut c = mainnet_config_with(one_validator());
+            knock(&mut c);
+            assert!(c.validate_network_profile().is_err(), "mainnet with {name} missing must fail-stop");
+        }
+
+        // When a state_sync peer is set, the anchor's (round, root) must be pinned.
+        let mut sync = mainnet_config_with(one_validator());
+        sync.state_sync_peers = vec!["http://127.0.0.1:28002".into()];
+        assert!(sync.validate_network_profile().is_err(), "state_sync_peers with no pinned (round,root) must fail-stop");
+        sync.state_sync_trusted_root = Some("00".repeat(32));
+        sync.state_sync_trusted_round = Some(100);
+        assert!(sync.validate_network_profile().is_ok(), "state_sync with a full pinned anchor passes");
+
+        // The legacy `mainnet: true` flag also triggers the full profile.
+        let mut legacy = mainnet_config_with(one_validator());
+        legacy.network_profile = None;
+        legacy.mainnet = true;
+        assert!(legacy.validate_network_profile().is_ok(), "legacy mainnet:true satisfied is OK");
+        legacy.remote_signer = None;
+        assert!(legacy.validate_network_profile().is_err(), "legacy mainnet:true also enforces the full profile");
+    }
+
+    /// The network fingerprint changes when a network-wide field changes, and is
+    /// identical for two nodes that differ only in per-validator fields.
+    #[test]
+    fn network_fingerprint_covers_network_wide_config() {
+        let validators = one_validator();
+        let a = mainnet_config_with(validators.clone());
+
+        // Per-validator field differs (same validators/genesis) → identical.
+        let mut b = mainnet_config_with(validators.clone());
+        b.rpc_addr = "127.0.0.1:29999".parse().unwrap();
+        b.listen_addr = "127.0.0.1:35099".parse().unwrap();
+        b.data_dir = Some(PathBuf::from("/other/dir"));
+        assert_eq!(a.network_fingerprint(), b.network_fingerprint(), "per-validator fields must not change the fingerprint");
+
+        // A network-wide field differs → fingerprint must change.
+        let mut c = mainnet_config_with(validators);
+        c.encrypted_transport = false;
+        assert_ne!(a.network_fingerprint(), c.network_fingerprint(), "a network-wide field change must change the fingerprint");
     }
 }

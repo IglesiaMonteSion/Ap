@@ -186,6 +186,69 @@ tenerlos activos juntos (cutover coordinado):
 En un **testnet** (`mainnet` ausente/`false`, el default) no se impone nada — la
 red del usuario sigue exactamente como está.
 
+### Perfil de red obligatorio: `"network_profile": "mainnet"` (tarea #211)
+
+`mainnet: true` sólo exige auth+cifrado. Para la **POSTURA COMPLETA de
+producción**, poné `"network_profile": "mainnet"` en el `config.json` de TODOS
+los nodos: el nodo **SE NIEGA A ARRANCAR** si falta CUALQUIERA de las
+protecciones duras, y **acumula TODAS las faltas en un solo error** (las
+arreglás en una pasada, no una por una). Exige:
+
+| Protección | Campo del config |
+|---|---|
+| Estado persistente | `data_dir` seteado |
+| Almacenamiento transaccional | `storage_engine: "redb"` (commit atómico estado+ronda+economía) |
+| Transporte P2P autenticado | `authenticated_transport: true` |
+| Transporte cifrado | `encrypted_transport: true` |
+| Firmante remoto (clave fuera del proceso) | `remote_signer: "host:port"` |
+| RPC del validador en red privada | `rpc_addr` loopback/RFC1918 (nunca ruteable) |
+| Trust anchor de state-sync | `require_state_sync_trust_anchor: true` (+ `state_sync_trusted_root`/`_round` si hay `state_sync_peers`) |
+| Límites de RPC explícitos | `rpc_rate_limit_per_10s`, `simulate_rate_limit_per_10s`, `tx_rate_limit_per_10s` (> 0) |
+| Parámetros económicos explícitos | `economics_v7: true` + `quanto_rate_fp` BAKED + `rounds_per_quanto` |
+| Configuración idéntica entre nodos | el nodo loguea el **network fingerprint** al arrancar — comparalo entre TODOS los nodos |
+| TLS en wallet/servicios públicos | la wallet exige `--behind-trusted-proxy` bajo su propio `--network-profile mainnet` (TLS en el proxy) |
+
+Los **límites de P2P** (conexión global/por-IP, timeouts, cuotas de ancho de
+banda, ban temporal, batch-vertex gating) son **SIEMPRE activos por
+construcción** — no necesitan config. Ejemplo mínimo de un `config.json`
+mainnet (además de `validators`/`genesis`/`keypair_path`/`listen_addr`):
+
+```json
+{
+  "network_profile": "mainnet",
+  "data_dir": "data",
+  "storage_engine": "redb",
+  "authenticated_transport": true,
+  "encrypted_transport": true,
+  "remote_signer": "127.0.0.1:9200",
+  "rpc_addr": "127.0.0.1:8080",
+  "require_state_sync_trust_anchor": true,
+  "rpc_rate_limit_per_10s": 64,
+  "simulate_rate_limit_per_10s": 8,
+  "tx_rate_limit_per_10s": 16,
+  "economics_v7": true,
+  "quanto_rate_fp": 310537755655371,
+  "rounds_per_quanto": 86400
+}
+```
+
+**Fingerprint de red (config idéntica).** Al arrancar en perfil mainnet el nodo
+loguea `network fingerprint: <hex>`. Es el hash de los campos que TODOS los nodos
+DEBEN compartir (chain_id + auth/cifrado + rotación + perfil). **Comparalo entre
+todos los nodos**: si difiere, un nodo está mal configurado (y forkearía o
+fallaría el handshake). `qchain-genesis-build --network-profile mainnet` **bakea
+el perfil** en cada config generado (el operador completa después los campos
+per-nodo: `remote_signer`, `data_dir`, límites).
+
+Podés arrancar un genesis mainnet con el flag: `qchain-genesis-build …
+--network-profile mainnet --economics-v7 --quanto-rate-fp <n> --rounds-per-quanto <n>`.
+
+**Wallet mainnet (TLS obligatorio).** La wallet exige TLS: corré
+`qchain-wallet --network-profile mainnet --behind-trusted-proxy` (o
+`QCHAIN_WALLET_NETWORK_PROFILE=mainnet`). Si no está detrás de un reverse-proxy
+que termine TLS (túnel de Cloudflare / nginx / Caddy con HTTPS), **la wallet se
+DETIENE** — un servicio público de mainnet nunca se sirve en HTTP en claro.
+
 **RPC privado por defecto.** El JSON-RPC del nodo (`rpc_addr`) bindea a
 `127.0.0.1`, así que **solo es accesible desde la propia máquina** (o por un
 túnel SSH). El instalador **no abre su puerto en el firewall** cuando detecta

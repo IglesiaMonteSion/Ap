@@ -117,6 +117,14 @@ struct Cli {
     /// 1 QCH = 1e9). Requires `--treasury-authority`. Max 9223372036 QCH.
     #[arg(long)]
     treasury_qch: Option<u64>,
+    /// Bake the network profile (`mainnet` / `testnet`, task #211) into every
+    /// generated config. With `--network-profile mainnet`, each node REFUSES TO
+    /// START until the operator fills in the per-node mainnet protections
+    /// (data_dir, remote_signer, RPC limits, a private rpc_addr, the state-sync
+    /// trust anchor) — this bakes the posture, the operator completes it. Omitted =
+    /// no profile (a testnet).
+    #[arg(long)]
+    network_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +301,7 @@ fn main() -> anyhow::Result<()> {
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             mainnet: false,
+            network_profile: cli.network_profile.clone(),
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's

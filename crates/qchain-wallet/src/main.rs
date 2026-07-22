@@ -110,6 +110,15 @@ struct Cli {
     /// opt-in en loopback privado. También por `QCHAIN_WALLET_TX_RL`.
     #[arg(long)]
     tx_rate_limit_per_10s: Option<u32>,
+
+    /// Perfil de red (`mainnet` / `testnet`, tarea #211). En `mainnet` la wallet
+    /// SE NIEGA A ARRANCAR si no está detrás de un reverse-proxy de CONFIANZA que
+    /// termine TLS (`--behind-trusted-proxy`): un servicio público de mainnet DEBE
+    /// servirse por HTTPS (túnel de Cloudflare / nginx / Caddy con TLS), nunca HTTP
+    /// en claro a internet. Ausente / `testnet` = sin requisito, como antes.
+    /// También por `QCHAIN_WALLET_NETWORK_PROFILE`.
+    #[arg(long)]
+    network_profile: Option<String>,
 }
 
 struct AppState {
@@ -189,6 +198,27 @@ async fn main() -> anyhow::Result<()> {
         .tx_rate_limit_per_10s
         .or_else(|| std::env::var("QCHAIN_WALLET_TX_RL").ok().and_then(|s| s.trim().parse().ok()));
     let tx_limiter = SimRateLimiter::for_wallet(exposed, behind_proxy, tx_rl_configured);
+
+    // MANDATORY MAINNET PROFILE (task #211, req 11 — TLS in wallet/public
+    // services). Under `network_profile: mainnet` the wallet REFUSES TO START
+    // unless it sits behind a TLS-terminating trusted proxy (`--behind-trusted-
+    // proxy`): a mainnet public service must be HTTPS, never plaintext HTTP to the
+    // internet. A no-op for a testnet (the default). Fail-loud on a typo.
+    let network_profile = cli
+        .network_profile
+        .or_else(|| std::env::var("QCHAIN_WALLET_NETWORK_PROFILE").ok())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    if let Some(p) = network_profile.as_deref() {
+        if p != "mainnet" && p != "testnet" {
+            anyhow::bail!("network_profile {p:?} is not a known profile — use \"mainnet\" or \"testnet\".");
+        }
+        if p == "mainnet" && !behind_proxy {
+            anyhow::bail!(
+                "network_profile=\"mainnet\": REFUSING TO START — the wallet must sit behind a TLS-terminating trusted proxy (pass --behind-trusted-proxy / QCHAIN_WALLET_BEHIND_PROXY=1, and front it with a Cloudflare tunnel or nginx/Caddy that terminates HTTPS). A mainnet public service must be served over TLS, never plaintext HTTP."
+            );
+        }
+    }
 
     // The custodial wallet (server holds the keys) is only reachable when it's
     // safe: either we're localhost-only, or a password is set. Exposed with no
