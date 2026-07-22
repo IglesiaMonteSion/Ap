@@ -87,9 +87,42 @@ enum CapturedProof {
 use std::collections::HashMap;
 use wasmtime::Val;
 
-/// Fuel budget for the WASM half of a transaction. A real deployment would
-/// derive this from `Message.fee_limit`; fixed here for phase 1 simplicity.
+/// ABSOLUTE per-instruction fuel ceiling — a liveness cap, NOT the fee budget.
+/// A single WASM instruction may never run more than this much fuel no matter
+/// how large the payer's `fee_limit` is, so one transaction can never hang a
+/// node with unbounded compute (even if the payer could pay for it). The REAL
+/// per-call fuel is the SMALLER of this ceiling and the fee-limit-derived budget
+/// (see [`wasm_fuel_budget`]): a contract is given exactly the fuel the payer's
+/// signed `fee_limit` can still pay for, and this constant only caps the top end.
 pub const DEFAULT_FUEL_LIMIT: u64 = 5_000_000;
+
+/// MAINNET-CRITICAL — the fuel a WASM instruction is allowed to run, derived
+/// from the payer's SIGNED `fee_limit` (not a fixed constant). The runtime must
+/// meter the contract to exactly this many fuel units so it can NEVER cost more
+/// than the payer authorized:
+///
+///   gas_budget  = fee_limit - upfront_fee(byte+priority) - gas_already_consumed
+///   fuel_budget = min(gas_budget / gas_price_per_fuel, DEFAULT_FUEL_LIMIT)
+///
+/// `upfront_fee` (byte fee + priority tip) is subtracted, not just the byte fee,
+/// because BOTH are part of the total the payer pays within `fee_limit`; and the
+/// gas already consumed by earlier instructions in the same tx is subtracted so
+/// the cumulative fee can't exceed `fee_limit`. Because fuel is capped at
+/// `budget / gas_price`, a contract that tries to run past the budget traps
+/// (out of fuel) having consumed at most `budget` worth of gas — so
+/// `upfront_fee + Σ gas_fee ≤ fee_limit` holds BY CONSTRUCTION, and the wasted
+/// compute of a rejected call is bounded by what the payer paid, closing the
+/// "sign a low fee_limit, force up to DEFAULT_FUEL_LIMIT of free compute per
+/// call, then let the tx be rejected" amplification. `gas_price_per_fuel` is
+/// governance-bounded to `>= 1` (a zero price is rejected), but we guard the
+/// division defensively: a zero price would make gas free, so fall back to the
+/// absolute ceiling rather than divide by zero.
+pub fn wasm_fuel_budget(gas_budget: u64, gas_price_per_fuel: u64) -> u64 {
+    if gas_price_per_fuel == 0 {
+        return DEFAULT_FUEL_LIMIT;
+    }
+    (gas_budget / gas_price_per_fuel).min(DEFAULT_FUEL_LIMIT)
+}
 
 pub enum Program {
     Native(Box<dyn NativeProgram>),
@@ -1810,7 +1843,16 @@ impl Ledger {
                     // recorded deployer. Zero sentinel; `host_get_deployer`
                     // returns all-zero and a contract pairs it with
                     // `host_is_signer`, so the sentinel authorizes nothing.
-                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round, Pubkey::new([0u8; 32])) {
+                    // FUEL FROM THE SIGNED fee_limit (mainnet-critical): meter the
+                    // contract to exactly what the payer can still pay for, so a
+                    // call can never cost more than `fee_limit` and can never burn
+                    // more than the paid-for compute. `total_gas_fee` is the gas
+                    // already consumed by earlier instructions in this same tx.
+                    let gas_budget = tx.message.fee_limit
+                        .saturating_sub(upfront_fee)
+                        .saturating_sub(total_gas_fee);
+                    let fuel_limit = wasm_fuel_budget(gas_budget, params.gas_price_per_fuel);
+                    match self.run_wasm_instruction(&module_bytes, &entry_point, ix, &tx.message.payer, &mut working, params.gas_price_per_fuel, current_round, Pubkey::new([0u8; 32]), fuel_limit) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => {
                             exec_result = Err(self.bill_trapped_wasm_fuel(&tx.message.payer, fee_collector, upfront_fee, tx.message.fee_limit, e));
@@ -1857,6 +1899,12 @@ impl Ledger {
                         ));
                         break 'exec;
                     }
+                    // FUEL FROM THE SIGNED fee_limit (mainnet-critical) — see the
+                    // in-memory-program call site above for the rationale.
+                    let gas_budget = tx.message.fee_limit
+                        .saturating_sub(upfront_fee)
+                        .saturating_sub(total_gas_fee);
+                    let fuel_limit = wasm_fuel_budget(gas_budget, params.gas_price_per_fuel);
                     match self.run_wasm_instruction(
                         &program_data.module_bytes,
                         &program_data.entry_point,
@@ -1869,6 +1917,7 @@ impl Ledger {
                         // exposed to the contract via `host_get_deployer` so its
                         // `init` can require the caller to be the deployer.
                         program_data.deployer,
+                        fuel_limit,
                     ) {
                         Ok(fee) => total_gas_fee = total_gas_fee.saturating_add(fee),
                         Err(e) => {
@@ -2241,6 +2290,11 @@ impl Ledger {
         gas_price_per_fuel: u64,
         current_round: Round,
         deployer: Pubkey,
+        // Fuel the contract is allowed to run — derived by the caller from the
+        // payer's signed `fee_limit` (see `wasm_fuel_budget`). The runtime meters
+        // to exactly this, so a call never costs more than `fee_limit` and never
+        // burns more than the paid-for compute.
+        fuel_limit: u64,
     ) -> Result<u64, ExecError> {
         // SECURITY — reject ALIASED accounts (the same pubkey named twice in
         // `ix.accounts`). The conservation and debit-authorization checks below
@@ -2304,13 +2358,14 @@ impl Ledger {
         // spend fuel - real execution hasn't started yet.
         let result = self
             .wasm
-            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, current_round, deployer, DEFAULT_FUEL_LIMIT)
+            .call(module_bytes, entry_point, &args, ix.program_id, ix.accounts.clone(), accounts, is_signer, current_round, deployer, fuel_limit)
             .map_err(|e| ExecError::Wasm { message: e.to_string(), fuel_consumed: 0 })?;
 
         // Real, live-confirmed vulnerability closed here (see
         // `project-lessons-learned`): a contract that burns real fuel (up
-        // to `DEFAULT_FUEL_LIMIT`) and then traps - deliberately, via
-        // `unreachable`, or by simply running out of fuel - used to report
+        // to its fee-limit-derived `fuel_limit` budget) and then traps -
+        // deliberately, via `unreachable`, or by simply running out of the
+        // metered fuel budget (out of gas) - used to report
         // success or failure with no distinction from an instant trap,
         // because `WasmExecutor::call` never surfaced fuel spent before a
         // trap. Confirmed live: a deployed contract with an expensive loop
@@ -5217,5 +5272,136 @@ mod tests {
         let sum_after = sum(&ledger);
         let burned_delta = ledger.total_burned - burned_before;
         assert_eq!(sum_before - sum_after, burned_delta, "supply must drop by exactly the burned fee");
+    }
+
+    // ---- MAINNET-CRITICAL: WASM fuel derived from the signed fee_limit --------
+
+    #[test]
+    fn wasm_fuel_budget_derives_from_the_signed_fee_limit_and_caps_at_the_ceiling() {
+        // fuel = min(gas_budget / gas_price, DEFAULT_FUEL_LIMIT).
+        // Plenty of budget → capped at the absolute liveness ceiling.
+        assert_eq!(wasm_fuel_budget(u64::MAX, 1), DEFAULT_FUEL_LIMIT);
+        assert_eq!(wasm_fuel_budget(10_000_000, 1), DEFAULT_FUEL_LIMIT);
+        // Tight budget → exactly budget / price (below the ceiling).
+        assert_eq!(wasm_fuel_budget(1_000, 1), 1_000);
+        assert_eq!(wasm_fuel_budget(1_000, 10), 100);
+        assert_eq!(wasm_fuel_budget(999, 10), 99); // integer division (never over-grants)
+        // No budget → zero fuel (a contract gets no compute it can't pay for).
+        assert_eq!(wasm_fuel_budget(0, 1), 0);
+        // Zero price would divide-by-zero: fall back to the ceiling, never panic.
+        assert_eq!(wasm_fuel_budget(1_000, 0), DEFAULT_FUEL_LIMIT);
+    }
+
+    // A contract that runs a long loop and then RETURNS normally (no trap), so it
+    // succeeds when given enough fuel and traps OUT OF FUEL when the fee-limit
+    // budget is too tight — the exact case the fix meters.
+    const BUSY_LOOP_SUCCEED_WAT: &str = r#"
+        (module
+            (func (export "go")
+                (local $i i64)
+                (local.set $i (i64.const 300000))
+                (block
+                    (loop
+                        (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                        (br_if 1 (i64.eqz (local.get $i)))
+                        (br 0)))))
+    "#;
+
+    fn deploy_busy_loop(ledger: &mut Ledger, validator: &Pubkey) -> Pubkey {
+        let deployer = Keypair::generate().unwrap();
+        ledger.credit(deployer.pubkey(), 100_000_000);
+        let salt = 0u32.to_le_bytes().to_vec();
+        let program_pk = crate::native::derive_program_address(&deployer.pubkey(), &salt);
+        let module_bytes = wat::parse_str(BUSY_LOOP_SUCCEED_WAT).unwrap();
+        let deploy_ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![program_pk],
+            data: borsh::to_vec(&SystemInstruction::DeployProgram { module_bytes, entry_point: "go".into(), salt }).unwrap(),
+        };
+        let deploy_tx = Transaction::new_signed(&deployer, 0, [0u8; 32], 100_000_000, vec![deploy_ix]).unwrap();
+        ledger.apply_transaction(&deploy_tx, validator, 0).unwrap();
+        program_pk
+    }
+
+    // Measure a busy-loop call's parts against a fresh caller: the byte fee (the
+    // upfront cost, priority 0) and the loop's gas at a GENEROUS limit where it
+    // succeeds. Returns (byte_fee, loop_gas). All applies are at round 0, so the
+    // dynamic base fee never rolls and `byte_fee` is stable across the test.
+    fn measure_busy_loop(ledger: &mut Ledger, validator: &Pubkey, call_ix: &Instruction) -> (u64, u64) {
+        let caller = Keypair::generate().unwrap();
+        ledger.credit(caller.pubkey(), 100_000_000);
+        let tx = Transaction::new_signed(&caller, 0, [0u8; 32], 100_000_000, vec![call_ix.clone()]).unwrap();
+        let byte_fee = ledger.current_params().base_fee_per_byte.saturating_mul(tx.byte_size() as u64);
+        let before = ledger.get_balance(&caller.pubkey());
+        ledger.apply_transaction(&tx, validator, 0).unwrap();
+        let full_cost = before - ledger.get_balance(&caller.pubkey());
+        (byte_fee, full_cost - byte_fee)
+    }
+
+    #[test]
+    fn wasm_fuel_is_metered_to_the_signed_fee_limit_and_never_exceeds_it() {
+        let validator = Keypair::generate().unwrap().pubkey();
+        let mut ledger = new_test_ledger();
+        let program_pk = deploy_busy_loop(&mut ledger, &validator);
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+        let (byte_fee, loop_gas) = measure_busy_loop(&mut ledger, &validator, &call_ix);
+        assert!(loop_gas > 1000, "the busy loop must consume real gas (got {loop_gas})");
+
+        // TIGHT fee_limits whose gas budget (limit - byte_fee) is CLEARLY below
+        // what the full loop needs, so the contract RUNS OUT OF FUEL (traps)
+        // instead of finishing. Under the OLD code it was handed the fixed
+        // DEFAULT_FUEL_LIMIT, ran to completion, and only THEN had the tx
+        // rejected for exceeding fee_limit — charging just the byte fee for real
+        // compute (a DoS). The fix meters it to the budget: the call fails, and
+        // the charge is EXACTLY the signed fee_limit (its whole budget consumed),
+        // never a unit more, never the OLD byte-fee-only amount.
+        for budget in [loop_gas / 2, loop_gas / 4, 100] {
+            let limit = byte_fee + budget; // gas budget = limit - byte_fee = `budget`
+            let caller = Keypair::generate().unwrap();
+            ledger.credit(caller.pubkey(), 100_000_000);
+            let tx = Transaction::new_signed(&caller, 0, [0u8; 32], limit, vec![call_ix.clone()]).unwrap();
+            let b = ledger.get_balance(&caller.pubkey());
+            let res = ledger.apply_transaction(&tx, &validator, 0);
+            let charged = b - ledger.get_balance(&caller.pubkey());
+            assert!(res.is_err(), "a call whose budget ({budget}) < loop gas ({loop_gas}) must FAIL (out of fuel)");
+            assert!(charged <= limit, "NEVER charge more than the signed fee_limit: charged {charged}, limit {limit}");
+            assert_eq!(charged, limit, "an out-of-fuel call consumes its whole budget → charge == fee_limit exactly");
+            assert!(charged > byte_fee, "the payer must be billed for the fuel actually burned, not just the byte fee");
+        }
+    }
+
+    #[test]
+    fn wasm_simulation_and_execution_charge_identically_under_a_tight_fee_limit() {
+        // sim/exec equivalence: /simulate must show EXACTLY what real execution
+        // charges — both go through apply_transaction_inner → run_wasm_instruction
+        // with the same fee-limit-derived fuel budget, so success/failure AND the
+        // fee must match to the unit, for a generous AND tight fee_limits.
+        let validator = Keypair::generate().unwrap().pubkey();
+        let mut ledger = new_test_ledger();
+        let program_pk = deploy_busy_loop(&mut ledger, &validator);
+        let call_ix = Instruction { program_id: program_pk, accounts: vec![], data: vec![] };
+        let (byte_fee, loop_gas) = measure_busy_loop(&mut ledger, &validator, &call_ix);
+
+        let cases = [
+            (100_000_000u64, true),               // generous → succeeds
+            (byte_fee + loop_gas / 2, false),     // tight → traps out of fuel
+            (byte_fee + 100, false),              // barely any gas budget → traps
+        ];
+        for (limit, expect_ok) in cases {
+            let caller = Keypair::generate().unwrap();
+            ledger.credit(caller.pubkey(), 100_000_000);
+            let tx = Transaction::new_signed(&caller, 0, [0u8; 32], limit, vec![call_ix.clone()]).unwrap();
+
+            // SIMULATE first (against the pre-apply state), then really apply.
+            let sim = ledger.simulate(&tx, &validator, 0);
+            let before = ledger.get_balance(&caller.pubkey());
+            let real = ledger.apply_transaction(&tx, &validator, 0);
+            let real_cost = before - ledger.get_balance(&caller.pubkey());
+
+            assert_eq!(sim.ok, real.is_ok(), "sim ok flag must match real execution (limit {limit})");
+            assert_eq!(sim.ok, expect_ok, "expected ok={expect_ok} at limit {limit}");
+            assert_eq!(sim.fee, real_cost, "sim fee ({}) must equal the real charge ({real_cost}) at limit {limit}", sim.fee);
+            assert!(real_cost <= limit, "real charge must never exceed the signed fee_limit");
+        }
     }
 }
