@@ -1097,7 +1097,36 @@ impl Ledger {
         self.credit(pk, amount);
     }
 
-    fn credit_validator_share(&mut self, working: Option<&mut HashMap<Pubkey, Account>>, fee_collector: Pubkey, validator_share: u64, params: &EconomicParams) -> Result<(), ExecError> {
+    /// Read a fee-target account from `working` when it's present there (a contract
+    /// named it in `ix.accounts`), else from the store. Used by the fee
+    /// distribution so an accrual/credit reads the SAME copy the commit loop will
+    /// write — see `write_fee_account` for why (fee-clobber fix).
+    fn read_fee_account(&self, working: Option<&HashMap<Pubkey, Account>>, pk: &Pubkey) -> Option<Account> {
+        working.and_then(|w| w.get(pk).cloned()).or_else(|| self.store.get(pk))
+    }
+
+    /// Write a fee-target account: INTO `working` when it's already present there
+    /// (so the commit loop persists this value instead of clobbering it with the
+    /// stale pre-fee copy), otherwise directly to the store. This closes the
+    /// fee-clobber class (re-audit "reparto de fees sobrescrito"): a malicious
+    /// contract that names a fee singleton (VALIDATOR_FEE_POOL_ID / ADMIN_FEE_WALLET
+    /// / STAKING_REWARDS_POOL_ID / STAKING_STATS_ID) in `ix.accounts` pulls it into
+    /// `working`; a store-only fee write would then be overwritten by the commit
+    /// loop and the fee would vanish (value destruction while the counters lie that
+    /// it was paid). On the ERROR path the caller passes `None` (working is
+    /// discarded on error, so the write must persist via the store, and there is no
+    /// commit to clobber it).
+    fn write_fee_account(&mut self, working: Option<&mut HashMap<Pubkey, Account>>, pk: Pubkey, account: Account) {
+        if let Some(w) = working {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = w.entry(pk) {
+                e.insert(account);
+                return;
+            }
+        }
+        self.write_account(pk, account);
+    }
+
+    fn credit_validator_share(&mut self, mut working: Option<&mut HashMap<Pubkey, Account>>, fee_collector: Pubkey, validator_share: u64, params: &EconomicParams) -> Result<(), ExecError> {
         if validator_share == 0 {
             return Ok(());
         }
@@ -1113,20 +1142,28 @@ impl Ledger {
         // then it keeps the network alive instead of halting it.
         let pool_share = validator_share.saturating_sub(commission);
 
+        // Seed the accrual map from `working` when the singleton is present there
+        // (a contract named it), else from the store — so `accrue_reward_pool`
+        // reads/updates the SAME account copy the commit loop will write, and the
+        // accrued pool is written back with `write_fee_account` (into `working`
+        // when present). Without this, a store-only pool write is clobbered by the
+        // commit and BOTH the balance credit AND the reward-per-share accrual
+        // vanish. `STAKING_STATS_ID` is only READ by the accrual (total_staked), so
+        // it needs seeding but no write-back.
         let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
-        if let Some(stats) = self.store.get(&STAKING_STATS_ID) {
+        if let Some(stats) = self.read_fee_account(working.as_deref(), &STAKING_STATS_ID) {
             accounts.insert(STAKING_STATS_ID, stats);
         }
-        if let Some(pool) = self.store.get(&STAKING_REWARDS_POOL_ID) {
+        if let Some(pool) = self.read_fee_account(working.as_deref(), &STAKING_REWARDS_POOL_ID) {
             accounts.insert(STAKING_REWARDS_POOL_ID, pool);
         }
 
         let credited = crate::staking::accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, pool_share)?;
         if credited {
             if let Some(pool) = accounts.remove(&STAKING_REWARDS_POOL_ID) {
-                self.write_account(STAKING_REWARDS_POOL_ID, pool);
+                self.write_fee_account(working.as_deref_mut(), STAKING_REWARDS_POOL_ID, pool);
             }
-            self.credit_fee_target(working, fee_collector, commission);
+            self.credit_fee_target(working.as_deref_mut(), fee_collector, commission);
             self.validator_earned = self.validator_earned.saturating_add(commission);
             self.pool_earned = self.pool_earned.saturating_add(pool_share);
             self.note_validator_commission(fee_collector, commission);
@@ -1153,16 +1190,21 @@ impl Ledger {
     /// immune, §12) and the admin wallet's system-owner. The counters keep
     /// `fee_burned` honest and route the validator share to `pool_earned` (the
     /// pool, not a per-proposer credit). Mirrors `fees_v7::route_fee` exactly.
-    fn route_fee_v7(&mut self, fee: u64) {
+    fn route_fee_v7(&mut self, mut working: Option<&mut HashMap<Pubkey, Account>>, fee: u64) {
         let split = crate::fees_v7::fee_split(fee);
         self.total_burned = self.total_burned.saturating_add(split.burn);
         self.fee_burned = self.fee_burned.saturating_add(split.burn);
+        // Credit through `credit_fee_target` (into `working` when the singleton is
+        // present there, else the store) — so a contract that names
+        // VALIDATOR_FEE_POOL_ID / ADMIN_FEE_WALLET in `ix.accounts` cannot have the
+        // credit clobbered by the commit loop (fee-clobber fix). `None` on the
+        // error/trap path (working discarded).
         if split.validator > 0 {
-            self.credit(VALIDATOR_FEE_POOL_ID, split.validator);
+            self.credit_fee_target(working.as_deref_mut(), VALIDATOR_FEE_POOL_ID, split.validator);
             self.pool_earned = self.pool_earned.saturating_add(split.validator);
         }
         if split.admin > 0 {
-            self.credit(ADMIN_FEE_WALLET, split.admin);
+            self.credit_fee_target(working, ADMIN_FEE_WALLET, split.admin);
         }
     }
 
@@ -1862,18 +1904,22 @@ impl Ledger {
         // byte+priority. The gas fee (success path only) is distributed separately
         // below (also post-execution).
         //
-        // CLOBBER-SAFETY (re-audit #1): on the SUCCESS path the proposer's credit
-        // must go INTO `working` when the proposer is present there (the realistic
-        // case being `fee_collector == payer` — a validator submitting its own tx —
-        // since the payer is always in `working`), or the commit loop below would
-        // overwrite it and the validator would lose its own fee. On the ERROR path
-        // `working` is discarded when we return, so the credit must persist via the
-        // store — pass `None`. The burn counters and the v7 pool/admin singletons
-        // are addressed directly (never in a normal `working`), same assumption the
-        // gas-fee route already relies on.
+        // CLOBBER-SAFETY (re-audit "reparto de fees sobrescrito"): on the SUCCESS
+        // path EVERY fee credit — the proposer, the v7 validator pool + admin
+        // wallet, and the v6 staking-reward pool — must go INTO `working` when that
+        // target is present there, or the commit loop below would overwrite it with
+        // the stale pre-fee copy and the fee would VANISH (value destruction while
+        // the counters lie that it was paid). A malicious contract can force this by
+        // naming a fee singleton (VALIDATOR_FEE_POOL_ID / ADMIN_FEE_WALLET /
+        // STAKING_REWARDS_POOL_ID / STAKING_STATS_ID) or the fee_collector in its
+        // `ix.accounts`. `route_fee_v7` / `credit_validator_share` / `credit_fee_target`
+        // now take the `working` overlay and route each credit through it (see
+        // `write_fee_account`). On the ERROR path `working` is discarded when we
+        // return, so credits must persist via the store — pass `None`.
         let success = exec_result.is_ok();
         if self.economics_v7 {
-            self.route_fee_v7(byte_fee);
+            let w = if success { Some(&mut working) } else { None };
+            self.route_fee_v7(w, byte_fee);
         } else {
             let burn_share = byte_fee / 2;
             let validator_share = byte_fee - burn_share;
@@ -1926,10 +1972,24 @@ impl Ledger {
         let would_be_dust_swept = |account: &Account| -> bool {
             account.owner == Pubkey::system_program_id() && account.balance > 0 && account.balance < params.dust_threshold
         };
+        // Don't capture a receipt for a transfer whose `from`/`to` is ALSO a
+        // fee-distribution target (the block proposer, the v7 validator fee pool or
+        // admin wallet, or the v6 staking-reward pool). The `qchain-stark` AIR models
+        // ONLY `to_after == to_before + amount` and `from_after == from_before - amount
+        // - fee`; but the fee distribution above ALSO credits these accounts, so if
+        // one of them is the transfer's `to` (a fixed address a user can send to,
+        // e.g. ADMIN_FEE_WALLET), `to_after` would be `to_before + amount + fee_share`
+        // and the circuit's conservation check would fail. Same honest stance as the
+        // dust-sweep exclusion: skip the receipt for a transfer the circuit cannot
+        // represent, rather than capture one guaranteed to fail self-verification.
+        // (Latent pre-existing edge: the fee has always landed on these accounts;
+        // this just stops mis-capturing a receipt for it.)
+        let fee_targets = [*fee_collector, VALIDATOR_FEE_POOL_ID, ADMIN_FEE_WALLET, STAKING_REWARDS_POOL_ID];
         let pre_capture = pre_capture.filter(|(from, to, ..)| {
             let from_swept = working.get(from).is_some_and(&would_be_dust_swept);
             let to_swept = working.get(to).is_some_and(&would_be_dust_swept);
-            !from_swept && !to_swept
+            let touches_fee_target = fee_targets.contains(from) || fee_targets.contains(to);
+            !from_swept && !to_swept && !touches_fee_target
         });
         if let Some((from, to, amount, from_before, to_before, root_before, from_proof_before, to_proof_before)) = pre_capture {
             // Same real semantics the old `OverlayStore { base: self.store,
@@ -2014,12 +2074,13 @@ impl Ledger {
             }
             payer_after.balance -= total_gas_fee;
             if self.economics_v7 {
-                // v7: same 45/45/10 route as the byte fee. The pool/admin
-                // singletons aren't in `working` (a normal contract call never
-                // names them), so crediting them directly via the store - as
-                // `route_fee_v7` does - is correct and won't be clobbered by
-                // the working-map commit below.
-                self.route_fee_v7(total_gas_fee);
+                // v7: same 45/45/10 route as the byte fee. Pass the `working`
+                // overlay so that if a contract named VALIDATOR_FEE_POOL_ID /
+                // ADMIN_FEE_WALLET in `ix.accounts` (pulling them into `working`),
+                // `route_fee_v7` credits INTO `working` and the commit loop below
+                // won't clobber the credit (fee-clobber fix). When they're absent
+                // (the normal case) it credits the store directly, unchanged.
+                self.route_fee_v7(Some(&mut working), total_gas_fee);
             } else {
             self.total_burned = self.total_burned.saturating_add(total_gas_fee / 2);
             self.fee_burned = self.fee_burned.saturating_add(total_gas_fee / 2);
@@ -2053,16 +2114,24 @@ impl Ledger {
         }
 
         for (pk, mut account) in working {
-            // Never dust-sweep the fee collector (block proposer): on the WASM
-            // gas path it is seeded into `working` from its real store balance
-            // and credited its gas share here, so a proposer whose accumulated
-            // balance is still below `dust_threshold` (e.g. its first small fee)
-            // would otherwise have its legitimately-earned fee zeroed and burned
-            // - value destruction the normal (non-gas) path never suffers,
-            // because there the proposer is never placed in `working`. (Singleton
-            // program accounts are already immune: they are program-owned, not
-            // system-owned, so the owner check below excludes them.)
-            if pk != *fee_collector
+            // Never dust-sweep a FEE-DISTRIBUTION TARGET: the block proposer
+            // (`fee_collector`), the v7 validator fee pool / admin wallet, or the v6
+            // reward pool. On the WASM gas path (and, since the fee-clobber fix, the
+            // byte path too) these are seeded into `working` from their real store
+            // balance and credited their fee share here, so one whose accumulated
+            // balance is still below `dust_threshold` (e.g. `ADMIN_FEE_WALLET`, which
+            // takes only 10% of each fee and is system-owned) would otherwise have
+            // its legitimately-earned fee zeroed and burned — value destruction the
+            // normal (non-`working`) path never suffers, because there these accounts
+            // are credited directly to the store and never placed in `working`. A
+            // malicious contract can force them into `working` by naming a fee
+            // singleton in `ix.accounts`; excluding the whole `fee_targets` set here
+            // (a strict superset of the old `fee_collector`-only guard — `fee_targets[0]`
+            // IS `fee_collector`) closes the "fee swept instead of paid" edge that the
+            // clobber fix would otherwise open. The two program-owned pools are already
+            // immune via the owner check below; this makes the guarantee explicit and
+            // adds the system-owned `ADMIN_FEE_WALLET`.
+            if !fee_targets.contains(&pk)
                 && account.owner == Pubkey::system_program_id()
                 && account.balance > 0
                 && account.balance < params.dust_threshold
@@ -2136,8 +2205,11 @@ impl Ledger {
                     payer_account.balance -= charge;
                     self.write_account(*payer, payer_account);
                     if self.economics_v7 {
-                        // v7: 45/45/10 route (same as the byte/gas paths).
-                        self.route_fee_v7(charge);
+                        // v7: 45/45/10 route (same as the byte/gas paths). `None`
+                        // for the working overlay: the trap discards `working`
+                        // (this returns the error), so the credit must persist via
+                        // the store and there's no commit loop to clobber it.
+                        self.route_fee_v7(None, charge);
                     } else {
                     let burn_share = charge / 2;
                     let validator_share = charge - burn_share;
@@ -3450,6 +3522,169 @@ mod tests {
         ledger.apply_transaction(&mk(0), &validator, 0).unwrap();
         ledger.apply_transaction(&mk(1), &validator, 100).unwrap();
         assert_eq!(ledger.total_emitted, 0, "no stake -> no emission");
+    }
+
+    /// A NOOP contract (0 args, empty `ix.data`) that does nothing but is CALLED
+    /// naming fee-distribution singletons in `ix.accounts`. Used to reproduce the
+    /// fee-clobber vector: the singletons get pulled into the outer `working`
+    /// overlay, so a fee credit written directly to the store would be overwritten
+    /// by the commit loop (fee vanishing while the counters lie it was paid).
+    const NOOP_NAMES_FEE_SINGLETONS_WAT: &str = r#"(module (func (export "go")))"#;
+
+    /// Sum of every balance across the whole store — the total QCH supply in
+    /// circulation right now. Used to assert fee conservation (nothing minted /
+    /// destroyed except the counted burn).
+    fn total_supply(l: &Ledger) -> u128 {
+        l.store().iter().map(|(_, a)| a.balance as u128).sum()
+    }
+
+    /// FEE-CLOBBER (re-audit "reparto de fees sobrescrito"), v7 path: a contract
+    /// that names `VALIDATOR_FEE_POOL_ID` and `ADMIN_FEE_WALLET` in `ix.accounts`
+    /// pulls them into the outer `working` overlay. The v7 45/45/10 fee split must
+    /// still land on those singletons (routed THROUGH `working`, not the store),
+    /// so the commit loop persists the credit instead of clobbering it with the
+    /// stale pre-fee copy. Verifies no commission vanishes and total supply is
+    /// conserved (Σ balances after == Σ before − burn delta).
+    #[test]
+    fn v7_fee_split_is_not_clobbered_when_a_contract_names_the_fee_pools() {
+        let mut ledger = new_test_ledger_v7(8);
+        let deployer = Keypair::generate().unwrap();
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 500_000_000);
+
+        // Seed the v7 fee singletons so they PRE-EXIST in the store — only then are
+        // they pulled into `working` when the contract names them (the clobber
+        // precondition). The pool is program-owned (dust-sweep immune, §12); the
+        // admin wallet is a real system-owned wallet.
+        ledger.store.set(VALIDATOR_FEE_POOL_ID, Account::new_wallet(STAKING_PROGRAM_ID));
+        ledger.store.set(ADMIN_FEE_WALLET, Account::new_wallet(Pubkey::system_program_id()));
+
+        let program_pk = deploy_wat(&mut ledger, NOOP_NAMES_FEE_SINGLETONS_WAT, "go", &deployer, &validator);
+
+        let caller = Keypair::generate().unwrap();
+        ledger.credit(caller.pubkey(), 500_000_000);
+
+        // Snapshot AFTER the deploy (which already credited the singletons its own
+        // fee share) so we measure only the CALL's fee distribution as deltas.
+        let supply_before = total_supply(&ledger);
+        let burn_before = ledger.fee_burned;
+        let pool_before = ledger.get_balance(&VALIDATOR_FEE_POOL_ID);
+        let admin_before = ledger.get_balance(&ADMIN_FEE_WALLET);
+
+        // The contract EXPLICITLY names the fee singletons (empty data = the NOOP's
+        // 0-arg entry). A NOOP touches none of them, so the ledger boundary accepts
+        // the call — but they are now in `working`.
+        let call_ix = Instruction {
+            program_id: program_pk,
+            accounts: vec![VALIDATOR_FEE_POOL_ID, ADMIN_FEE_WALLET],
+            data: vec![],
+        };
+        let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+        let fee_charged = ledger.apply_transaction(&call_tx, &validator, 0).unwrap();
+
+        // The 45% validator share and 10% admin share LANDED on the singletons —
+        // not clobbered back to their pre-call value by the commit loop.
+        let pool_delta = ledger.get_balance(&VALIDATOR_FEE_POOL_ID) - pool_before;
+        let admin_delta = ledger.get_balance(&ADMIN_FEE_WALLET) - admin_before;
+        let burn_delta = ledger.fee_burned - burn_before;
+        assert!(pool_delta > 0, "the v7 validator fee pool must be credited, not clobbered (got delta {pool_delta})");
+        assert!(admin_delta > 0, "the v7 admin wallet must be credited, not clobbered (got delta {admin_delta})");
+
+        // NO COMMISSION VANISHED: the whole fee charged is accounted for by
+        // pool + admin + burn (byte and gas fees each split 45/45/10; their sum is
+        // exactly the fee). If a credit were clobbered, this would be short.
+        assert_eq!(
+            pool_delta + admin_delta + burn_delta,
+            fee_charged,
+            "every unit of the v7 fee is accounted for by pool + admin + burn (no clobber)"
+        );
+
+        // SUPPLY CONSERVED: the only value that left circulation is the burn. The
+        // payer's fee was fully re-credited to pool + admin (no unit vanished).
+        let supply_after = total_supply(&ledger);
+        assert_eq!(
+            supply_after,
+            supply_before - burn_delta as u128,
+            "total supply conserved: after == before − burn (no fee vanished into a clobber)"
+        );
+    }
+
+    /// FEE-CLOBBER (re-audit "reparto de fees sobrescrito"), v6 path with real
+    /// delegators: a contract that names `STAKING_REWARDS_POOL_ID` AND the
+    /// `fee_collector` (proposer) in `ix.accounts` pulls both into `working`. With
+    /// `total_staked > 0`, the v6 50/50 split routes the validator share to a
+    /// direct proposer commission + the reward-pool accrual — BOTH must survive
+    /// the commit (routed through `working`), and total supply must be conserved.
+    #[test]
+    fn v6_reward_pool_accrual_and_proposer_commission_are_not_clobbered() {
+        let mut ledger = new_test_ledger();
+        let deployer = Keypair::generate().unwrap();
+        // The validator IS the fee_collector (proposer). The contract names it.
+        let validator = Keypair::generate().unwrap().pubkey();
+        ledger.credit(deployer.pubkey(), 500_000_000);
+
+        // Seed `total_staked > 0` so the accrual credits the POOL (not the whole
+        // share to the validator directly), plus an empty reward pool. Both are the
+        // clobber targets a contract can name.
+        let total_staked: u64 = 63_072_000_000;
+        ledger.store.set(
+            STAKING_STATS_ID,
+            Account { data: borsh::to_vec(&total_staked).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        ledger.store.set(
+            STAKING_REWARDS_POOL_ID,
+            Account { data: borsh::to_vec(&crate::staking::RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        // Seed the proposer so it PRE-EXISTS (the clobber precondition — else it
+        // isn't in `working`).
+        ledger.store.set(validator, Account::new_wallet(Pubkey::system_program_id()));
+
+        let program_pk = deploy_wat(&mut ledger, NOOP_NAMES_FEE_SINGLETONS_WAT, "go", &deployer, &validator);
+
+        let caller = Keypair::generate().unwrap();
+        ledger.credit(caller.pubkey(), 500_000_000);
+
+        // Snapshot AFTER the deploy (which already credited the proposer its gas
+        // share) so we measure only the CALL's fee distribution as deltas.
+        let supply_before = total_supply(&ledger);
+        let burn_before = ledger.fee_burned;
+        let pool_before = ledger.get_balance(&STAKING_REWARDS_POOL_ID);
+        let validator_before = ledger.get_balance(&validator);
+
+        // The contract names the reward pool AND the proposer in `ix.accounts`.
+        let call_ix = Instruction {
+            program_id: program_pk,
+            accounts: vec![STAKING_REWARDS_POOL_ID, validator],
+            data: vec![],
+        };
+        let call_tx = Transaction::new_signed(&caller, 0, [0u8; 32], 50_000_000, vec![call_ix]).unwrap();
+        let fee_charged = ledger.apply_transaction(&call_tx, &validator, 0).unwrap();
+
+        // Both the reward-pool accrual AND the proposer's direct commission survived
+        // the commit — neither was clobbered back to its pre-call value.
+        let pool_delta = ledger.get_balance(&STAKING_REWARDS_POOL_ID) - pool_before;
+        let validator_delta = ledger.get_balance(&validator) - validator_before;
+        let burn_delta = ledger.fee_burned - burn_before;
+        assert!(pool_delta > 0, "the v6 reward pool accrual must be credited, not clobbered (got delta {pool_delta})");
+        assert!(validator_delta > 0, "the proposer commission must be credited, not clobbered (got delta {validator_delta})");
+
+        // NO COMMISSION VANISHED: the whole fee charged is accounted for by the
+        // reward pool + the proposer's direct commission + the burn (byte fee 50/50,
+        // gas fee 50/50; the non-burned validator share splits into pool + proposer
+        // commission). A clobber of either credit would make this short.
+        assert_eq!(
+            pool_delta + validator_delta + burn_delta,
+            fee_charged,
+            "every unit of the v6 fee is accounted for by pool + proposer commission + burn (no clobber)"
+        );
+
+        // SUPPLY CONSERVED: only the burn left circulation.
+        let supply_after = total_supply(&ledger);
+        assert_eq!(
+            supply_after,
+            supply_before - burn_delta as u128,
+            "total supply conserved: after == before − burn (no reward/commission vanished into a clobber)"
+        );
     }
 
     #[test]
