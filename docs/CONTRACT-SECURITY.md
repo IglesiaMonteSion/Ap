@@ -85,6 +85,65 @@ a quién). Eso es responsabilidad del contrato. Checklist:
   el pagador igual paga el fee de su intento (no es un reintento gratis para un
   atacante). No "sigas de largo" ante una condición inesperada.
 
+### 7. Guardas de contratos FINANCIEROS (slippage / precio máx / deadline / estado esperado)
+Si tu contrato mueve valor a un precio que puede cambiar entre que el usuario
+FIRMA y que la tx EJECUTA (un swap, una subasta, un préstamo, comprar un NFT), el
+usuario necesita protegerse de recibir algo peor de lo que aceptó — el patrón
+`amountOutMin` + `deadline` de Uniswap. **El LEDGER no puede hacerlo por vos: no
+sabe qué significa "precio" o "monto de salida" para tu contrato** — es lógica de
+negocio tuya. Pero es fácil, y estos límites deben viajar como ARGS de la
+instrucción (i64), fijados por el usuario al firmar, y chequearse con `require!`
+ANTES de comprometer la operación:
+
+- **`min_amount_out` (anti-slippage):** el usuario dice "acepto AL MENOS N de
+  salida". `require!(amount_out >= min_out, ...)`.
+- **precio máximo:** "no pagues más de P por unidad".
+  `require!(precio_efectivo <= max_price, ...)`.
+- **estado esperado:** "ejecuta sólo si el pool/oráculo está como lo vi". Leé el
+  estado actual con `read_u64(get_data(idx, ...))` y `require!(actual == esperado, ...)`.
+- **deadline:** hoy se hace a **nivel de TRANSACCIÓN** con `valid_until_round` (la
+  wallet lo pone OBLIGATORIO y corto, y el nodo lo enforza en admisión + ejecución,
+  #191) — una orden vieja atascada en el mempool NO se ejecuta a un precio de hace
+  horas. No hay un reloj in-contract todavía (un `host_get_round` sería un syscall
+  futuro si algún contrato necesita un deadline interno distinto del de la tx).
+
+Ejemplo — un swap que respeta slippage + precio máximo (los `require!` abortan la
+tx si el resultado real es peor que lo aceptado; el pagador sólo pierde el fee):
+
+```rust
+use qchain_sdk::{entrypoint, require, abort, add_u64, sub_u64};
+
+fn handle(args: [i64; 4]) {
+    // El usuario firma: [selector, amount_in, min_out, max_price]. min_out y
+    // max_price son los LÍMITES que aceptó — fijos en el momento de firmar.
+    let [sel, amount_in, min_out, max_price] = args;
+    match sel {
+        1 => {
+            let amount_in  = amount_in as u64;
+            let min_out    = min_out   as u64;
+            let max_price  = max_price as u64;
+
+            // Cotización AL MOMENTO DE EJECUTAR (pudo moverse desde que firmó):
+            let amount_out = quote(amount_in);
+            // Anti-slippage: nunca menos de lo que el usuario aceptó.
+            require!(amount_out >= min_out, "slippage: recibirias menos de lo aceptado");
+            // Precio máximo (in por cada out); evita dividir por cero.
+            let precio = amount_in / amount_out.max(1);
+            require!(precio <= max_price, "precio por encima del maximo aceptado");
+
+            // ... ejecutar el intercambio con add_u64/sub_u64 (overflow-safe) ...
+        }
+        _ => abort(),
+    }
+}
+entrypoint!(handle);
+```
+
+Regla mental: **cualquier valor que el usuario querría fijar "yo acepto como
+máximo/mínimo X" debe ser un ARG firmado, no algo que el contrato calcule solo** —
+si el contrato decide el límite por su cuenta, no hay protección real para el
+usuario. El `deadline` corto ya lo garantiza la wallet vía `valid_until_round`.
+
 ---
 
 ## Ejemplo de referencia auditado
