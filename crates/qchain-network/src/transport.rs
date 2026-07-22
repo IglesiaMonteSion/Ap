@@ -24,16 +24,17 @@
 //!    text/hex encoding, with zero change to what's actually being sent.
 
 use crate::handshake::{client_handshake, server_handshake, AuthState};
+use crate::limits::{BandwidthMeter, ConnTracker, IpGuard, P2pLimits};
 use crate::message::{Envelope, NetMessage};
 use crate::session::Session;
 use qchain_core::ValidatorId;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 
 /// A cached outbound connection: the TCP stream plus, when the encrypted
 /// transport is on, the AEAD `Session` established during the handshake. The
@@ -88,6 +89,69 @@ const CONNECTION_REKEY_FRAMES: u64 = 1 << 20; // 1,048,576 frames
 /// load while still bounding a flood. Auth-off transport never touches this.
 const MAX_CONCURRENT_INBOUND_HANDSHAKES: usize = 256;
 
+/// Global hard ceiling on any single frame's body length. The largest legitimate
+/// message (a quorum certificate at a large validator set — measured ~1.12 MB at
+/// n=500) fits far under this; it only bounds the pre-decode allocation a
+/// malformed length prefix could otherwise drive. Tightened from the old 64 MiB
+/// to 16 MiB (still ~14x a measured n=500 certificate, room for very large sets).
+const GLOBAL_FRAME_CAP: usize = 16 * 1024 * 1024;
+
+/// Once a message's length prefix (header) has been read, its body must arrive
+/// within this window (task #208 — slowloris defense). A peer that announces "a
+/// 1 MiB message follows" then trickles the body one byte per minute is dropped.
+/// Generous for a real ~1 MiB message even on a slow link, far tighter than a
+/// trickle.
+const BODY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long an ESTABLISHED connection may sit idle waiting for the next message's
+/// header before it is recycled. Two live validators exchange traffic every round
+/// (empty vertices are still proposed + broadcast every `round_interval_ms`, as
+/// low as 500 ms) plus a version announce every ~30 s, so 180 s is ~360 idle
+/// rounds — a connection quiet that long is dead/wedged, and recycling it (the
+/// peer re-dials) is harmless. Bounds "connect, send one message, then hold the
+/// connection open forever." The FIRST message keeps the tighter
+/// `FIRST_ENVELOPE_TIMEOUT`.
+const IDLE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The per-connection read timeouts, bundled to keep `handle_inbound`'s
+/// signature readable.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    first: Duration,
+    idle: Duration,
+    body: Duration,
+}
+
+impl Timeouts {
+    const DEFAULT: Timeouts = Timeouts { first: FIRST_ENVELOPE_TIMEOUT, idle: IDLE_MESSAGE_TIMEOUT, body: BODY_TIMEOUT };
+}
+
+/// Per-message-type wire-size cap (length prefix + body), enforced AFTER the
+/// envelope is decoded so its type is known. `GLOBAL_FRAME_CAP` bounds the
+/// pre-decode allocation; this rejects, e.g., a 16 MiB "Vote" that fit under the
+/// global cap but is absurd for its type. Every cap is a generous multiple of the
+/// real measured message so honest traffic never trips it, and none exceeds
+/// `GLOBAL_FRAME_CAP`.
+fn max_frame_len_for(msg: &NetMessage) -> usize {
+    match msg {
+        // Tiny fixed-shape control messages (a digest + one signature at most).
+        NetMessage::Vote { .. }
+        | NetMessage::CertificateRequest { .. }
+        | NetMessage::WorkerBatchRequest { .. }
+        | NetMessage::VersionAnnounce { .. } => 64 * 1024,
+        // One transaction (~5.5 KB, capped at MAX_TRANSACTION_BYTES=320 KB) + overhead.
+        NetMessage::TransactionGossip(_) => 512 * 1024,
+        // A vertex plus the author's signature.
+        NetMessage::VertexProposal { .. } => 512 * 1024,
+        // One worker lane's batch of transactions (bounded in practice by the
+        // per-round inclusion byte cap, ~1 MiB); 8 MiB is generous headroom.
+        NetMessage::WorkerBatchGossip { .. } | NetMessage::WorkerBatchResponse { .. } => 8 * 1024 * 1024,
+        // A quorum certificate — the largest type; one hybrid signature per
+        // signer, scaling with the validator set.
+        NetMessage::CertificateBroadcast(_) | NetMessage::CertificateResponse(_) => GLOBAL_FRAME_CAP,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub id: ValidatorId,
@@ -124,28 +188,49 @@ pub struct Network {
     /// `Envelope` and drops, so a mismatch simply fails to connect (the
     /// coordinated-cutover requirement for this wire-breaking change).
     auth: Option<Arc<AuthState>>,
+    /// Inbound-connection accounting (task #208): global/per-IP connection caps,
+    /// one-connection-per-identity, per-peer bandwidth quota and temporary bans.
+    /// Always present (generous defaults); consulted only on the accept path, so
+    /// it never touches the outbound send path.
+    conn_tracker: Arc<ConnTracker>,
 }
 
-/// Reads one length-prefixed frame and decodes it into an `Envelope`. When
-/// `session` is `Some`, the frame body is AEAD ciphertext that is opened (and
-/// the frame counter advanced) before Borsh-decoding; when `None`, the body is
-/// the plaintext Borsh envelope — byte-identical to the pre-encryption wire.
-async fn read_envelope(stream: &mut TcpStream, session: Option<&mut Session>) -> anyhow::Result<Envelope> {
-    let len = stream.read_u32_le().await? as usize;
-    // A sanity bound - real message sizes here are at most a handful of
-    // megabytes (a batch of PQC-signed transactions); this just stops a
-    // malformed length prefix from causing an unbounded allocation. The AEAD
-    // tag adds only 16 bytes, so the bound is unaffected by encryption.
-    if len > 64 * 1024 * 1024 {
-        anyhow::bail!("rejecting oversized message: {len} bytes");
+/// Reads one length-prefixed frame with independent **idle** (waiting for the
+/// next message's header) and **body** (once the header arrived — slowloris
+/// defense, task #208) timeouts, decodes it into an `Envelope`, and enforces the
+/// per-type size cap. Returns the envelope plus the number of WIRE bytes it
+/// consumed (for per-peer bandwidth metering). When `session` is `Some`, the
+/// frame body is AEAD ciphertext that is opened (and the frame counter advanced)
+/// before Borsh-decoding; when `None`, the body is the plaintext Borsh envelope —
+/// byte-identical to the pre-encryption wire.
+async fn read_envelope_timed(stream: &mut TcpStream, session: Option<&mut Session>, idle: Duration, body: Duration) -> anyhow::Result<(Envelope, usize)> {
+    // Header: wait up to `idle` for the next message to begin. Bounds "connect,
+    // send one message, then hold the connection open forever."
+    let len = tokio::time::timeout(idle, stream.read_u32_le())
+        .await
+        .map_err(|_| anyhow::anyhow!("idle timeout waiting for the next message header after {idle:?}"))?? as usize;
+    // Global pre-decode allocation bound (the largest legitimate message fits far
+    // under this; the per-type cap below is the tight, type-aware bound).
+    if len > GLOBAL_FRAME_CAP {
+        anyhow::bail!("rejecting oversized message: {len} bytes (global cap {GLOBAL_FRAME_CAP})");
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
+    // Body: once a header announced `len` bytes, they must all arrive within
+    // `body`. A trickle (slowloris) or a mid-body stall is dropped here.
+    tokio::time::timeout(body, stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("message body read timed out after {body:?} (header announced {len} bytes)"))??;
     let plaintext = match session {
         Some(s) => s.open(&buf)?,
         None => buf,
     };
-    Ok(borsh::from_slice(&plaintext)?)
+    let envelope: Envelope = borsh::from_slice(&plaintext)?;
+    let wire = len.saturating_add(4); // 4-byte length prefix + body
+    let cap = max_frame_len_for(&envelope.message);
+    if wire > cap {
+        anyhow::bail!("rejecting a {wire}-byte message over its {cap}-byte per-type cap");
+    }
+    Ok((envelope, wire))
 }
 
 /// Writes one length-prefixed frame. When `session` is `Some`, the Borsh bytes
@@ -153,6 +238,12 @@ async fn read_envelope(stream: &mut TcpStream, session: Option<&mut Session>) ->
 /// when `None`, the plaintext Borsh is written — byte-identical to before.
 async fn write_envelope(stream: &mut TcpStream, session: Option<&mut Session>, envelope: &Envelope) -> anyhow::Result<()> {
     let bytes = borsh::to_vec(envelope)?;
+    // Defensive bug-guard: never emit a frame over its per-type cap (we never
+    // do in practice — this catches a future message type that outgrew its cap).
+    let cap = max_frame_len_for(&envelope.message);
+    if bytes.len().saturating_add(4) > cap {
+        anyhow::bail!("refusing to send a {}-byte message over its {cap}-byte per-type cap", bytes.len().saturating_add(4));
+    }
     let frame = match session {
         Some(s) => s.seal(&bytes)?,
         None => bytes,
@@ -192,7 +283,21 @@ const FIRST_ENVELOPE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// messages once it's proven itself with at least one, and timing out
 /// *that* would fight the persistent-connection optimization instead of
 /// the actual attack (open many connections, send nothing, ever).
-async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, NetMessage)>, first_envelope_timeout: std::time::Duration, auth: Option<Arc<AuthState>>, handshake_permits: Option<Arc<Semaphore>>) {
+#[allow(clippy::too_many_arguments)] // each argument is a distinct dependency of one connection's lifecycle
+async fn handle_inbound(
+    mut stream: TcpStream,
+    peer_ip: IpAddr,
+    mut guard: IpGuard,
+    tracker: Arc<ConnTracker>,
+    tx: mpsc::Sender<(ValidatorId, NetMessage)>,
+    timeouts: Timeouts,
+    auth: Option<Arc<AuthState>>,
+    handshake_permits: Option<Arc<Semaphore>>,
+) {
+    // `guard` (an `IpGuard`) frees this connection's global + per-IP + per-
+    // identity accounting slots the moment this function returns, for ANY reason
+    // (handshake failure, timeout, abuse, framing error, forced supersede).
+    //
     // When authenticated transport is on, prove identities before a single
     // envelope is read. A connection that fails the handshake (a non-member,
     // a wrong-network peer, a bad signature, or a stall) is dropped here,
@@ -223,26 +328,76 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
         }
         None => (None, None),
     };
+    // One connection per validator identity (auth on): register this connection
+    // and force-close any OLDER one from the same id — a fresh reconnect (after a
+    // network blip) supersedes a stale half-open connection instead of being
+    // rejected. `close` is this connection's own close-notify; the read loop
+    // selects on it so a later supersede drops THIS connection cleanly. With auth
+    // off there is no authenticated id, so per-IP accounting (already applied by
+    // `admit_ip`) is the bound and there is no per-identity signal.
+    let close: Option<Arc<Notify>> = match authed_id {
+        Some(id) => match tracker.bind_validator(&mut guard, id) {
+            Some(n) => Some(n),
+            None => {
+                tracing::debug!("dropping inbound connection from temporarily-banned validator {id}");
+                return;
+            }
+        },
+        None => None,
+    };
     let attributed = |envelope: &Envelope| authed_id.unwrap_or(envelope.from);
-
-    let first = match tokio::time::timeout(first_envelope_timeout, read_envelope(&mut stream, session.as_mut())).await {
-        Ok(Ok(envelope)) => envelope,
-        Ok(Err(e)) => {
-            tracing::debug!("inbound connection closed: {e}");
-            return;
-        }
-        Err(_) => {
-            tracing::debug!("dropping a connection that sent nothing within {first_envelope_timeout:?}");
-            return;
+    // Per-peer bandwidth quota (task #208): a peer that sustains well over budget
+    // across several windows is temporarily banned and dropped.
+    let mut meter = BandwidthMeter::new(&tracker.limits);
+    let ban_abuser = |why: &str| {
+        tracing::warn!("temporarily banning an abusive peer ({why}): ip={peer_ip} id={authed_id:?}");
+        tracker.ban_ip(peer_ip);
+        if let Some(id) = authed_id {
+            tracker.ban_id(id);
         }
     };
-    if tx.send((attributed(&first), first.message)).await.is_err() {
-        return; // engine shut down
+
+    // The FIRST message keeps the tighter `first` timeout ("connect then send
+    // nothing"); subsequent header reads use the generous `idle` timeout so a
+    // legitimately idle persistent connection isn't recycled prematurely.
+    match read_envelope_timed(&mut stream, session.as_mut(), timeouts.first, timeouts.body).await {
+        Ok((envelope, wire)) => {
+            if !meter.record(wire) {
+                ban_abuser("bandwidth quota exceeded");
+                return;
+            }
+            if tx.send((attributed(&envelope), envelope.message)).await.is_err() {
+                return; // engine shut down
+            }
+        }
+        Err(e) => {
+            tracing::debug!("inbound connection closed before its first message: {e}");
+            return;
+        }
     }
 
     loop {
-        match read_envelope(&mut stream, session.as_mut()).await {
-            Ok(envelope) => {
+        // Race the next message against a supersede signal (a fresher connection
+        // for the same identity). `notify_one` stores a permit, so a supersede
+        // that fires mid-dispatch is still observed on the next iteration.
+        let read = read_envelope_timed(&mut stream, session.as_mut(), timeouts.idle, timeouts.body);
+        let res = match &close {
+            Some(notify) => tokio::select! {
+                biased;
+                _ = notify.notified() => {
+                    tracing::debug!("closing a superseded inbound connection from {authed_id:?}");
+                    return;
+                }
+                r = read => r,
+            },
+            None => read.await,
+        };
+        match res {
+            Ok((envelope, wire)) => {
+                if !meter.record(wire) {
+                    ban_abuser("bandwidth quota exceeded");
+                    return;
+                }
                 let from = attributed(&envelope);
                 if tx.send((from, envelope.message)).await.is_err() {
                     return; // engine shut down
@@ -260,14 +415,27 @@ async fn handle_inbound(mut stream: TcpStream, tx: mpsc::Sender<(ValidatorId, Ne
     }
 }
 
-async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>, auth: Option<Arc<AuthState>>, handshake_permits: Option<Arc<Semaphore>>) {
+async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<(ValidatorId, NetMessage)>, auth: Option<Arc<AuthState>>, handshake_permits: Option<Arc<Semaphore>>, tracker: Arc<ConnTracker>) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                let ip = peer.ip();
+                // Global cap + per-IP cap + ban check, all before spawning a task
+                // or touching the still-unauthenticated stream. A refused
+                // connection is dropped immediately (the stream closes on drop).
+                let guard = match tracker.admit_ip(ip) {
+                    Some(g) => g,
+                    None => {
+                        tracing::debug!("refusing an inbound connection from {ip} (connection cap or temporary ban)");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let tx = tx.clone();
                 let auth = auth.clone();
                 let permits = handshake_permits.clone();
-                tokio::spawn(handle_inbound(stream, tx, FIRST_ENVELOPE_TIMEOUT, auth, permits));
+                let tracker = tracker.clone();
+                tokio::spawn(handle_inbound(stream, ip, guard, tracker, tx, Timeouts::DEFAULT, auth, permits));
             }
             Err(e) => {
                 // Back off instead of busy-spinning: a transient accept error
@@ -296,25 +464,46 @@ impl Network {
     /// `auth: None` is byte-identical to `start` (phase-1 unauthenticated
     /// transport). `auth: Some(_)` runs the per-connection ML-DSA handshake
     /// (task #176) on every inbound and outbound connection before any
-    /// envelope flows.
+    /// envelope flows. Uses the default P2P connection limits.
     pub async fn start_with_auth(
         self_id: ValidatorId,
         listen_addr: SocketAddr,
         peers: Vec<PeerInfo>,
         auth: Option<Arc<AuthState>>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<(ValidatorId, NetMessage)>)> {
+        Self::start_with_auth_limited(self_id, listen_addr, peers, auth, P2pLimits::default()).await
+    }
+
+    /// Like `start_with_auth`, but with explicit P2P connection/quota `limits`
+    /// (task #208): global/per-IP connection caps, one-connection-per-identity,
+    /// per-peer bandwidth quota and temporary bans. Always applied on the accept
+    /// path; the defaults are generous, so honest traffic never trips them.
+    pub async fn start_with_auth_limited(
+        self_id: ValidatorId,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        auth: Option<Arc<AuthState>>,
+        limits: P2pLimits,
+    ) -> anyhow::Result<(Self, mpsc::Receiver<(ValidatorId, NetMessage)>)> {
         let listener = TcpListener::bind(listen_addr).await?;
         let (tx, rx) = mpsc::channel(4096);
         // Only allocate the handshake-concurrency semaphore when auth is on;
         // the auth-off accept path never acquires it (byte-identical to before).
         let handshake_permits = auth.as_ref().map(|_| Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_HANDSHAKES)));
-        tokio::spawn(accept_loop(listener, tx, auth.clone(), handshake_permits));
-        Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()), auth }, rx))
+        let conn_tracker = ConnTracker::new(limits);
+        tokio::spawn(accept_loop(listener, tx, auth.clone(), handshake_permits, conn_tracker.clone()));
+        Ok((Network { self_id, peers: StdRwLock::new(peers), connections: Mutex::new(HashMap::new()), auth, conn_tracker }, rx))
     }
 
     /// A snapshot of the current peer set.
     pub fn peers(&self) -> Vec<PeerInfo> {
         self.peers.read().expect("peers lock not poisoned").clone()
+    }
+
+    /// Current number of live inbound connections (task #208 accounting) — a
+    /// read-only DoS-visibility metric an operator dashboard can surface.
+    pub fn live_inbound_connections(&self) -> usize {
+        self.conn_tracker.live_connections()
     }
 
     /// Replace the peer set (phase-3.3 dynamic rotation). The caller passes the
@@ -632,8 +821,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_inbound(stream, tx, std::time::Duration::from_millis(200), None, None).await;
+            let (stream, peer) = listener.accept().await.unwrap();
+            let tracker = crate::limits::ConnTracker::new(P2pLimits::default());
+            let guard = tracker.admit_ip(peer.ip()).unwrap();
+            let timeouts = Timeouts { first: std::time::Duration::from_millis(200), idle: std::time::Duration::from_millis(200), body: std::time::Duration::from_millis(200) };
+            handle_inbound(stream, peer.ip(), guard, tracker, tx, timeouts, None, None).await;
         });
 
         // Connect but deliberately never write anything - the exact
@@ -647,6 +839,40 @@ mod tests {
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
         assert!(outcome.is_ok(), "handle_inbound must return within the timeout window, not hang forever");
         assert!(outcome.unwrap().is_none(), "a silent connection must never produce a message");
+    }
+
+    /// Slowloris (task #208): a peer that sends a length prefix announcing a
+    /// large body, then never delivers the body, must be dropped by the BODY
+    /// timeout — not hold the connection open trickling forever. Uses a tiny
+    /// body timeout so the test doesn't wait the real 60s.
+    #[tokio::test]
+    async fn a_connection_that_stalls_mid_body_is_dropped_by_the_body_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let tracker = crate::limits::ConnTracker::new(P2pLimits::default());
+            let guard = tracker.admit_ip(peer.ip()).unwrap();
+            // Generous first/idle so the header IS read; tiny body timeout so the
+            // stall-after-header is what trips.
+            let timeouts = Timeouts {
+                first: std::time::Duration::from_secs(2),
+                idle: std::time::Duration::from_secs(2),
+                body: std::time::Duration::from_millis(150),
+            };
+            handle_inbound(stream, peer.ip(), guard, tracker, tx, timeouts, None, None).await;
+        });
+
+        // Announce a 4096-byte body, then send nothing more (classic slowloris).
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_u32_le(4096).await.unwrap();
+        conn.flush().await.unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert!(outcome.is_ok(), "handle_inbound must return once the body timeout fires, not hang on a half-sent message");
+        assert!(outcome.unwrap().is_none(), "a stalled-mid-body connection must never produce a message");
     }
 
     fn sample_signature() -> qchain_crypto::MultiSignature {

@@ -291,6 +291,7 @@ fn main() -> anyhow::Result<()> {
             simulate_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
+            mainnet: false,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's

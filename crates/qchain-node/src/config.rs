@@ -293,6 +293,21 @@ pub struct NodeConfig {
     /// validador, sin cambio de red/consenso/wire.
     #[serde(default)]
     pub remote_signer: Option<String>,
+
+    /// **Postura de MAINNET (obligatorio auth + cifrado P2P).** `false` (el
+    /// default, y lo que resuelve todo config existente) no impone nada — un
+    /// testnet corre exactamente como antes. `true` hace OBLIGATORIOS al arrancar
+    /// tanto `authenticated_transport` (handshake ML-DSA por conexión) como
+    /// `encrypted_transport` (ML-KEM-768 + ChaCha20-Poly1305): el nodo SE DETIENE
+    /// con un error claro si `mainnet` está activo pero cualquiera de los dos
+    /// falta. Así la autenticación y el cifrado post-cuánticos del transporte
+    /// dejan de ser opt-in y pasan a ser un requisito duro para producción, sin
+    /// cambiar el default del testnet del usuario. Es una elección node-LOCAL de
+    /// operación: **NO se pliega en `chain_id`** (no cambia consenso/estado/wire),
+    /// aunque para que la red arranque TODOS los nodos deben tener auth+cifrado
+    /// (que ya es un cutover coordinado).
+    #[serde(default)]
+    pub mainnet: bool,
 }
 
 fn default_storage_engine() -> String {
@@ -397,6 +412,24 @@ impl NodeConfig {
     pub fn epoch_rounds(&self) -> u64 {
         self.epoch_rounds.unwrap_or(qchain_consensus::schedule::DEFAULT_EPOCH_ROUNDS)
     }
+
+    /// Enforce the MAINNET transport requirement (task #208): when `mainnet` is
+    /// set, both authenticated (ML-DSA) AND encrypted (ML-KEM + ChaCha20-Poly1305)
+    /// P2P transport are mandatory. Returns an error naming exactly what is
+    /// missing so the node can fail-stop at startup instead of silently running a
+    /// mainnet with an unauthenticated/plaintext transport. A no-op when `mainnet`
+    /// is false (every existing config), so a testnet is unaffected.
+    pub fn validate_mainnet_transport(&self) -> anyhow::Result<()> {
+        if self.mainnet && !(self.authenticated_transport && self.encrypted_transport) {
+            anyhow::bail!(
+                "mainnet=true requires BOTH authenticated_transport (ML-DSA) AND encrypted_transport (ML-KEM + ChaCha20-Poly1305) — \
+                 got authenticated_transport={}, encrypted_transport={}. Post-quantum P2P authentication and encryption are mandatory for mainnet.",
+                self.authenticated_transport,
+                self.encrypted_transport,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +465,7 @@ mod tests {
             simulate_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
+            mainnet: false,
         }
     }
 
@@ -533,5 +567,33 @@ mod tests {
         let c_plain = config_with(vec![plain], vec![]);
         let c_cold = config_with(vec![with_withdrawal], vec![]);
         assert_ne!(c_plain.chain_id(), c_cold.chain_id(), "setting a withdrawal address folds it into the network's own chain_id");
+    }
+
+    /// Task #208: with `mainnet` set, the node must refuse to start unless BOTH
+    /// authenticated AND encrypted P2P transport are on; a testnet (`mainnet`
+    /// false, the default) is never constrained.
+    #[test]
+    fn mainnet_requires_authenticated_and_encrypted_transport() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
+
+        // Testnet default: no requirement, always OK.
+        let testnet = config_with(validators.clone(), vec![]);
+        assert!(testnet.validate_mainnet_transport().is_ok(), "a testnet is never constrained");
+
+        // mainnet with neither / only auth / only encryption → rejected.
+        let mut m = config_with(validators.clone(), vec![]);
+        m.mainnet = true;
+        assert!(m.validate_mainnet_transport().is_err(), "mainnet with plaintext unauth transport must fail-stop");
+        m.authenticated_transport = true;
+        assert!(m.validate_mainnet_transport().is_err(), "mainnet with auth but no encryption must fail-stop");
+        m.authenticated_transport = false;
+        m.encrypted_transport = true;
+        assert!(m.validate_mainnet_transport().is_err(), "mainnet with encryption but no auth must fail-stop");
+
+        // mainnet with both → OK.
+        m.authenticated_transport = true;
+        m.encrypted_transport = true;
+        assert!(m.validate_mainnet_transport().is_ok(), "mainnet with auth + encryption is allowed");
     }
 }

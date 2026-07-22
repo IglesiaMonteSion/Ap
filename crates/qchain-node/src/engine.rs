@@ -472,6 +472,17 @@ const ROUND_STATE_RETENTION: Round = 512;
 /// snapshot territory, out of scope for reactive per-digest resync.
 const BATCH_RETENTION_ROUNDS: Round = 1_024;
 
+/// Per-`(gossiper, round)` cap on DISTINCT UNREFERENCED (speculative) worker
+/// batches admitted to the RAM cache (task #208 — "límite de batches por
+/// validador y ronda"). A validator legitimately gossips at most `WORKER_COUNT`
+/// of its own batches for a given round; `4 * WORKER_COUNT` is generous headroom
+/// (re-gossip, slight round skew) while bounding a junk-batch flood. A batch that
+/// is REFERENCED by a validated vertex/certificate (in `wanted_batches`) is
+/// always admitted — it is needed — so this only bounds speculative intake, and
+/// even a wrongly-dropped speculative batch is recovered via `request_missing_
+/// batches` when its vertex arrives, so the cap can never cause permanent loss.
+const SPECULATIVE_BATCHES_PER_VALIDATOR_ROUND: u32 = 4 * WORKER_COUNT as u32;
+
 /// A vertex proposal whose `round` is more than this far ahead of our own
 /// `next_round` is rejected before voting. A legitimate proposal is at most a
 /// round or two ahead of the local frontier; a peer genuinely this far behind
@@ -701,6 +712,25 @@ pub struct EngineState {
     /// peer to fetch them (`WorkerBatchRequest`), evicted only once no peer
     /// resyncing within that window could still need them.
     pub batch_seen_round: HashMap<Digest, Round>,
+    /// Worker-batch digests referenced by a validated `VertexProposal`/
+    /// `Certificate` this node has seen, with the round they were referenced (for
+    /// pruning). A batch is only written to the on-disk batch log once its digest
+    /// is in here — i.e. "no persistir un batch sin relacionarlo primero con un
+    /// vértice válido" (task #208). A batch that arrives via gossip BEFORE its
+    /// vertex is cached in RAM speculatively (bounded, see `speculative_batches`)
+    /// and promoted to disk the moment a vertex references it. Bounded by the
+    /// round window in `prune_stale_round_state`; if a speculative batch is ever
+    /// dropped and later turns out to be needed, the resync path
+    /// (`request_missing_batches`) re-fetches it, so no permanent loss.
+    pub wanted_batches: HashMap<Digest, Round>,
+    /// Per-`(gossiper, round)` count of DISTINCT UNREFERENCED (speculative)
+    /// worker batches admitted this round — the "límite de batches por validador y
+    /// ronda" (task #208). A validator legitimately gossips at most `WORKER_COUNT`
+    /// of its own batches per round, so a small multiple of that is generous for
+    /// honest traffic and rejects a flood of junk batches from filling RAM. A
+    /// referenced (wanted) batch is exempt (it's needed). Bounded by the round
+    /// window in `prune_stale_round_state`.
+    pub speculative_batches: HashMap<(ValidatorId, Round), u32>,
     pub pending_votes: HashMap<Digest, HashMap<ValidatorId, MultiSignature>>,
     pub own_pending_vertex: Option<(Vertex, MultiSignature)>,
     pub next_round: Round,
@@ -1226,6 +1256,82 @@ impl Engine {
             }
         }
     }
+
+    /// Mark each of `batch_digests` as **wanted** — referenced by a validated
+    /// vertex/certificate (task #208, "relacionar el batch con un vértice
+    /// válido"). This is the gate that lets a batch be persisted to disk: a
+    /// wanted batch that is already cached (arrived speculatively before its
+    /// vertex) is PROMOTED to the on-disk batch log now (idempotent if already
+    /// there). Locks internally; called right beside `request_missing_batches`.
+    async fn mark_batches_wanted(&self, batch_digests: &[(WorkerId, Digest)]) {
+        if batch_digests.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let round = state.next_round;
+        for (_, digest) in batch_digests {
+            state.wanted_batches.entry(*digest).or_insert(round);
+            // `.cloned()` ends the immutable `state.batches` borrow before the
+            // `self.persist_batch` call (which never touches `state`).
+            if let Some(batch) = state.batches.get(digest).cloned() {
+                self.persist_batch(digest, &batch);
+            }
+        }
+    }
+
+    /// Admit a gossiped/served worker batch (task #208 — the disk/RAM-flood
+    /// gates). A batch REFERENCED by a validated vertex/certificate (in
+    /// `wanted_batches`) is persisted + cached normally (it's needed, and a
+    /// `WorkerBatchResponse` to our own request is always for a wanted digest). An
+    /// UNREFERENCED (speculative) batch is cached in RAM ONLY — never written to
+    /// disk until a vertex references it — and only under the per-`(from, round)`
+    /// speculative cap, so a validator can't flood junk batches into RAM or disk.
+    /// Even a speculative batch dropped by the cap is recovered via
+    /// `request_missing_batches` if its vertex later arrives, so no permanent loss.
+    fn admit_gossiped_batch(&self, state: &mut EngineState, from: ValidatorId, batch: Batch) {
+        let digest = batch.digest();
+        match decide_batch_admission(state, from, &digest) {
+            BatchAdmission::Persist => {
+                self.persist_batch(&digest, &batch);
+                cache_batch(state, batch);
+            }
+            BatchAdmission::Speculative => cache_batch(state, batch),
+            BatchAdmission::Drop => {
+                tracing::debug!("dropping a worker batch from {from} (already cached, or per-round speculative cap {SPECULATIVE_BATCHES_PER_VALIDATOR_ROUND} reached)");
+            }
+        }
+    }
+}
+
+/// The admission verdict for a gossiped worker batch (task #208).
+#[derive(Debug, PartialEq, Eq)]
+enum BatchAdmission {
+    /// Referenced by a valid vertex/cert → cache AND persist to disk.
+    Persist,
+    /// Unreferenced but within the per-round cap → cache in RAM only (no disk).
+    Speculative,
+    /// Already cached, or the per-`(from, round)` speculative cap is reached.
+    Drop,
+}
+
+/// Pure admission decision for a gossiped batch — testable without an `Engine`.
+/// Mutates only the speculative per-`(from, round)` counter (the count IS part of
+/// the decision); it never caches or persists (the caller does that per the
+/// verdict). See `EngineState::wanted_batches`/`speculative_batches`.
+fn decide_batch_admission(state: &mut EngineState, from: ValidatorId, digest: &Digest) -> BatchAdmission {
+    if state.wanted_batches.contains_key(digest) {
+        return BatchAdmission::Persist;
+    }
+    if state.batches.contains_key(digest) {
+        return BatchAdmission::Drop; // already cached from an earlier gossip
+    }
+    let key = (from, state.next_round);
+    let count = state.speculative_batches.entry(key).or_insert(0);
+    if *count >= SPECULATIVE_BATCHES_PER_VALIDATOR_ROUND {
+        return BatchAdmission::Drop;
+    }
+    *count += 1;
+    BatchAdmission::Speculative
 }
 
 #[derive(Serialize)]
@@ -2892,8 +2998,9 @@ impl Engine {
                 }
                 {
                     let mut state = self.state.lock().await;
-                    self.persist_batch(&batch.digest(), &batch);
-                    cache_batch(&mut state, batch);
+                    // Persist to disk ONLY if a valid vertex references it; else
+                    // cache speculatively in RAM under the per-round cap (task #208).
+                    self.admit_gossiped_batch(&mut state, from, batch);
                 }
                 // A newly-arrived batch may be exactly the one blocking the
                 // head of `pending_execution` - drain the queue now instead of
@@ -2979,6 +3086,10 @@ impl Engine {
                     return;
                 }
                 self.request_missing_parents(&vertex.parents, vertex.round.saturating_sub(1), from).await;
+                // Relate the referenced batches to this validated vertex before
+                // requesting/admitting them (task #208): a referenced batch may be
+                // persisted, an unreferenced (speculative) one may not.
+                self.mark_batches_wanted(&vertex.batch_digests).await;
                 self.request_missing_batches(&vertex.batch_digests, from).await;
                 let key = (vertex.round, vertex.author);
                 {
@@ -3116,6 +3227,9 @@ impl Engine {
                     self.insert_certificate(&mut state, cert);
                 }
                 self.request_missing_parents(&parents, parent_round, from).await;
+                // Relate the certificate's batches to it before requesting/admitting
+                // them (task #208) — a referenced batch may be persisted.
+                self.mark_batches_wanted(&batch_digests).await;
                 self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
             }
@@ -3155,6 +3269,9 @@ impl Engine {
                     self.insert_certificate(&mut state, cert);
                 }
                 self.request_missing_parents(&parents, parent_round, from).await;
+                // Relate the certificate's batches to it before requesting/admitting
+                // them (task #208) — a referenced batch may be persisted.
+                self.mark_batches_wanted(&batch_digests).await;
                 self.request_missing_batches(&batch_digests, from).await;
                 self.try_commit().await;
             }
@@ -3184,8 +3301,10 @@ impl Engine {
                 }
                 {
                     let mut state = self.state.lock().await;
-                    self.persist_batch(&batch.digest(), &batch);
-                    cache_batch(&mut state, batch);
+                    // A response is always for a digest we requested (referenced by
+                    // a vertex/cert → in `wanted_batches`), so this persists + caches
+                    // it normally; the speculative path is unreachable here (task #208).
+                    self.admit_gossiped_batch(&mut state, from, batch);
                 }
                 // A re-synced batch may unblock the head of `pending_execution`
                 // and/or satisfy a deferred availability-gated vote.
@@ -3579,6 +3698,12 @@ impl Engine {
             state.pending_availability_votes.retain(|_, v| v.2 >= round_horizon);
             // Same round-window bound for the /rounds telemetry (read-only).
             state.round_committed.retain(|&r, _| r >= round_horizon);
+            // Bound the batch-vertex-relation maps (task #208) by the same round
+            // window. A wanted digest older than this is either already committed
+            // (persisted) or unreachable via reactive resync; the speculative
+            // per-round counters reset with each round.
+            state.wanted_batches.retain(|_, &mut round| round >= round_horizon);
+            state.speculative_batches.retain(|&(_, round), _| round >= round_horizon);
         }
 
         // Bound the nonce-pipelining cursor map to payers that still have queued
@@ -4149,6 +4274,10 @@ impl Engine {
         // (`request_missing_batches` re-acquires it and then sends). No-op in
         // steady state (`missing_to_request` is `None`).
         if let Some((missing, author)) = missing_to_request {
+            // These batches block a COMMITTED certificate's execution, so they are
+            // referenced by a valid vertex/cert — mark them wanted so the resync
+            // response is persistable when it arrives (task #208; idempotent).
+            self.mark_batches_wanted(&missing).await;
             self.request_missing_batches(&missing, author).await;
         }
         // Blocking disk writes, now off the state lock (see the note at the top).
@@ -4529,6 +4658,8 @@ mod tests {
             pipeline_next: HashMap::new(),
             batches: HashMap::new(),
             batch_seen_round: HashMap::new(),
+            wanted_batches: HashMap::new(),
+            speculative_batches: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round: 0,
@@ -5123,5 +5254,49 @@ mod tests {
         assert_eq!(effective_stark_proof_limit(Some(10_000), 10_000), MAX_STARK_PROOF_RECEIPTS, "an explicit huge limit must still be capped");
         assert_eq!(effective_stark_proof_limit(Some(10), 10_000), 10, "a real request smaller than the cap must be honored exactly");
         assert_eq!(effective_stark_proof_limit(Some(10_000), 3), 3, "requesting more than exists must still only prove what exists");
+    }
+
+    /// Task #208: a gossiped batch is only persisted (`Persist`) once a valid
+    /// vertex/cert references it (`wanted_batches`); an unreferenced one is cached
+    /// speculatively in RAM only (`Speculative`) up to the per-`(from, round)`
+    /// cap, after which further unreferenced batches are `Drop`ped — bounding the
+    /// disk/RAM flood without ever dropping a needed batch.
+    #[test]
+    fn a_gossiped_batch_is_persisted_only_when_a_vertex_references_it_and_speculative_intake_is_capped() {
+        let mut state = new_state();
+        let from = qchain_crypto::Pubkey::new([9u8; 32]);
+
+        // A digest referenced by a validated vertex/cert → Persist.
+        let wanted: Digest = [1u8; 32];
+        state.wanted_batches.insert(wanted, state.next_round);
+        assert_eq!(decide_batch_admission(&mut state, from, &wanted), BatchAdmission::Persist);
+
+        // A fresh, UNREFERENCED digest under the cap → Speculative (RAM only), and
+        // the per-(from, round) counter advances. Distinct digests each round.
+        for i in 0..SPECULATIVE_BATCHES_PER_VALIDATOR_ROUND {
+            let mut d = [0u8; 32];
+            d[0] = 100;
+            d[1] = i as u8;
+            assert_eq!(decide_batch_admission(&mut state, from, &d), BatchAdmission::Speculative, "batch {i} is within the speculative cap");
+        }
+        // One past the cap for the same (from, round) → Drop.
+        let over = [200u8; 32];
+        assert_eq!(decide_batch_admission(&mut state, from, &over), BatchAdmission::Drop, "beyond the per-round speculative cap → dropped");
+
+        // A DIFFERENT gossiper has its own bucket — not starved by the first.
+        let other = qchain_crypto::Pubkey::new([8u8; 32]);
+        let od = [201u8; 32];
+        assert_eq!(decide_batch_admission(&mut state, other, &od), BatchAdmission::Speculative, "a different validator's speculative bucket is independent");
+
+        // A digest already cached (from an earlier gossip) → Drop (nothing new).
+        let cached: Digest = [3u8; 32];
+        state.batches.insert(cached, Batch { transactions: vec![] });
+        assert_eq!(decide_batch_admission(&mut state, from, &cached), BatchAdmission::Drop, "an already-cached batch is not re-admitted");
+
+        // Even after being over-cap, a NEWLY-referenced digest is still Persist
+        // (a needed batch is never blocked by the speculative cap).
+        let now_wanted = [200u8; 32];
+        state.wanted_batches.insert(now_wanted, state.next_round);
+        assert_eq!(decide_batch_admission(&mut state, from, &now_wanted), BatchAdmission::Persist, "a referenced batch is admitted regardless of the speculative cap");
     }
 }

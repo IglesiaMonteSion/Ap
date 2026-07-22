@@ -201,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
     // Encryption requires authentication (there is no verified peer to bind an
     // encrypted channel to otherwise). Reject a misconfiguration loudly rather
     // than silently ignoring the flag.
+    // MAINNET posture (task #208): auth + encryption are MANDATORY. Fail-stop at
+    // startup (never silently run a mainnet with a plaintext/unauthenticated P2P
+    // transport). No-op for a testnet (`mainnet` false, the default).
+    config.validate_mainnet_transport()?;
     if config.encrypted_transport && !config.authenticated_transport {
         anyhow::bail!("encrypted_transport requires authenticated_transport (encryption without authentication is meaningless)");
     }
@@ -838,6 +842,8 @@ async fn main() -> anyhow::Result<()> {
             pipeline_next: HashMap::new(),
             batches: reloaded_batches,
             batch_seen_round: reloaded_batch_rounds,
+            wanted_batches: HashMap::new(),
+            speculative_batches: HashMap::new(),
             pending_votes: HashMap::new(),
             own_pending_vertex: None,
             next_round,

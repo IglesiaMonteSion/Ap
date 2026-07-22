@@ -148,6 +148,44 @@ lo reinicia y retoma desde la última ronda commiteada atómicamente.
   operaciones no atómicas) y retiene multi-GB bajo ráfagas. Queda sólo por
   compatibilidad/dev (`storage_engine: "sled"`).
 
+**Endurecimiento del P2P (SIEMPRE activo, defaults generosos).** El transporte
+P2P aplica en la capa de conexión, por defecto y sin configurar nada, defensas de
+DoS que el tráfico honesto de validadores nunca dispara (son cotas amplias):
+
+- **Límite global de conexiones** entrantes + **límite por IP** de origen.
+- **Una conexión válida por identidad de validador** (con auth): una reconexión
+  fresca reemplaza a la conexión vieja/colgada de esa misma identidad.
+- **Timeouts** de cabecera (idle), de cuerpo (defensa slowloris: si un peer
+  anuncia un mensaje grande y no lo entrega, se corta) y de mensaje completo.
+- **Tamaño máximo POR TIPO de mensaje** (un "Vote" de 16 MB se rechaza aunque
+  entre bajo el tope global).
+- **Cuota de ancho de banda por peer** (ventana móvil, con histéresis).
+- **Baneo temporal** de un peer abusivo (por IP y/o identidad).
+- **Batches: no se persisten a disco sin relacionarlos primero con un vértice
+  válido** — un batch gossipeado que ningún vértice referencia se cachea sólo en
+  RAM (acotado por un cap por-validador-y-ronda), y se persiste recién cuando un
+  vértice válido lo referencia. Cierra el flood de RAM+disco sin romper el resync.
+
+**MAINNET: auth + cifrado P2P OBLIGATORIOS.** Poné `"mainnet": true` en el
+`config.json` de TODOS los nodos para exigir, al arrancar, tanto
+`authenticated_transport` (handshake ML-DSA) como `encrypted_transport`
+(ML-KEM-768 + ChaCha20-Poly1305). Si `mainnet` está activo y falta cualquiera de
+los dos, **el nodo se DETIENE con un error claro** en vez de correr una mainnet
+con transporte sin autenticar/en claro. Es una elección node-LOCAL (no cambia el
+`chain_id`), pero como auth+cifrado son wire-breaking, TODOS los nodos deben
+tenerlos activos juntos (cutover coordinado):
+
+```json
+{
+  "mainnet": true,
+  "authenticated_transport": true,
+  "encrypted_transport": true
+}
+```
+
+En un **testnet** (`mainnet` ausente/`false`, el default) no se impone nada — la
+red del usuario sigue exactamente como está.
+
 **RPC privado por defecto.** El JSON-RPC del nodo (`rpc_addr`) bindea a
 `127.0.0.1`, así que **solo es accesible desde la propia máquina** (o por un
 túnel SSH). El instalador **no abre su puerto en el firewall** cuando detecta
