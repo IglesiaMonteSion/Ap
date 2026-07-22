@@ -428,6 +428,153 @@ static SNAPSHOT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_
 const MAX_CONCURRENT_SIMULATIONS: usize = 4;
 static SIMULATE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SIMULATIONS);
 
+/// Caps concurrent hybrid-PQC signature VERIFICATIONS on the UNTRUSTED admission
+/// paths — RPC `POST /tx` (`submit_transaction`) AND the P2P `TransactionGossip`
+/// handler (task #210). A signed transaction's verify is ~150µs of Ed25519 +
+/// ML-DSA-65; a flood of DISTINCT signed txs (each a fresh keypair, so the
+/// per-txid gate can't coalesce them, and the SigVerifyCache can't hit) would
+/// otherwise pin every core on verification and starve consensus. This global
+/// permit (shared by both paths) is taken with `try_acquire` (NON-blocking) and
+/// held ONLY across the verify, so at most this many verifies run at once no
+/// matter how much the RPC + gossip inbound piles up; excess RPC submissions get
+/// an immediate 429, excess gossip is dropped. It does NOT gate the commit-time
+/// verify (`verify_signatures_cached`), which is trusted consensus work on an
+/// already-committed batch and must never be throttled. Generous — honest
+/// admission is far below this; it only ever bites under an active flood.
+const MAX_CONCURRENT_TX_VERIFY: usize = 8;
+static TX_VERIFY_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_TX_VERIFY);
+
+/// Sliding-window length for every per-IP / per-txid / per-payer / global rate
+/// counter (task #196/#210). Shared by `rpc.rs`'s limiters and the engine's
+/// `AdmissionQuota` so all windows are the same length.
+pub(crate) const RL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cap on entries any rate-limit map tracks, so the limiter itself can never be
+/// turned into an OOM by a spray of distinct keys (IPs / payers / txids).
+pub(crate) const MAX_TRACKED_IPS: usize = 100_000;
+
+/// One key's counter within the current window.
+pub(crate) struct Window {
+    pub(crate) start: std::time::Instant,
+    pub(crate) count: u32,
+}
+
+/// A bounded, GC-throttled per-key sliding-window counter. Window-only (no ban):
+/// the excess in a window gets rejected and the key recovers automatically on the
+/// next window. Shared by the `/simulate` + `/tx` per-IP/per-txid gates and the
+/// engine's per-payer admission quota.
+pub(crate) struct WindowMap<K> {
+    map: std::collections::HashMap<K, Window>,
+    last_gc: std::time::Instant,
+}
+
+impl<K: std::hash::Hash + Eq> WindowMap<K> {
+    pub(crate) fn new() -> Self {
+        Self { map: std::collections::HashMap::new(), last_gc: std::time::Instant::now() }
+    }
+
+    /// `true` = within `limit` for the current window. Bounded and GC-THROTTLED:
+    /// the expired-entry sweep runs at most once per second, so a spray of
+    /// distinct keys can't force an `O(n)` `retain` on every call. When the map is
+    /// full of still-live entries a brand-new key is rejected (fail closed) rather
+    /// than growing the map or rescanning; that's only reachable under an active
+    /// distinct-key flood and self-heals as elapsed windows are GC'd.
+    pub(crate) fn allow(&mut self, key: K, limit: u32, now: std::time::Instant) -> bool {
+        if self.map.len() >= MAX_TRACKED_IPS && now.duration_since(self.last_gc) >= std::time::Duration::from_secs(1) {
+            self.map.retain(|_, w| now.duration_since(w.start) < RL_WINDOW);
+            self.last_gc = now;
+        }
+        if self.map.len() >= MAX_TRACKED_IPS && !self.map.contains_key(&key) {
+            return false;
+        }
+        let w = self.map.entry(key).or_insert(Window { start: now, count: 0 });
+        if now.duration_since(w.start) >= RL_WINDOW {
+            w.start = now;
+            w.count = 0;
+        }
+        w.count = w.count.saturating_add(1);
+        w.count <= limit
+    }
+}
+
+/// GLOBAL admission-rate ceiling (10 s sliding window) across BOTH admission entry
+/// points (RPC `/tx` + gossip) — the absolute cap on how many transactions this
+/// node will ADMIT into its mempool per window regardless of source IP or payer,
+/// so even a distributed botnet of distinct IPs and distinct payers (each under
+/// its own per-IP, per-payer, and per-txid cap) cannot make the node admit,
+/// gossip, and batch-verify unbounded work. Deliberately far above any honest
+/// network's real throughput (the node's own apply ceiling is well under this),
+/// so it never bites legitimate traffic — a pure DoS backstop.
+const GLOBAL_ADMISSION_PER_10S: u32 = 20_000;
+/// PER-PAYER admission-rate ceiling (10 s sliding window) across both entry
+/// points — bounds how fast ONE key (e.g. a compromised/abusive single account,
+/// or a misbehaving faucet/exchange hot wallet) can inject admissions, on top of
+/// the per-payer mempool QUEUE-DEPTH cap (`MAX_MEMPOOL_TXS_PER_PAYER`, which
+/// bounds how many sit queued, not the rate). Generous (a real high-frequency
+/// sender stays under it) so it only trips on a single-key flood.
+pub(crate) const PER_PAYER_ADMISSION_PER_10S: u32 = 2_000;
+
+/// Global + per-payer admission-rate quota (task #210), shared by the RPC and
+/// gossip admission paths. Two bounded, GC-throttled sliding-window counters (a
+/// single global window + a per-payer `WindowMap`), so a flood — whether from one
+/// IP, many IPs, one payer, or many payers — has an absolute admission ceiling
+/// beyond the per-IP / per-txid / per-payer-queue caps. Lives behind its own
+/// `std::sync::Mutex` on `Engine` (NOT the async consensus state lock), so it can
+/// be checked BEFORE the signature verify (saving that CPU on a rejected flood)
+/// without touching the state lock. Checked on the CLAIMED payer pre-verify: a
+/// distinct-payer flood is bounded by the global window, a single-key flood by
+/// the per-payer window.
+pub struct AdmissionQuota {
+    global: Window,
+    per_payer: WindowMap<Pubkey>,
+}
+
+impl AdmissionQuota {
+    fn new() -> Self {
+        Self { global: Window { start: std::time::Instant::now(), count: 0 }, per_payer: WindowMap::new() }
+    }
+    /// `true` = this admission is within BOTH the global and the per-payer window.
+    /// Increments both counters; a rejection by either still counts toward both
+    /// (a flooder that trips the cap keeps its window full, which is the point).
+    pub(crate) fn allow(&mut self, payer: &Pubkey) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.global.start) >= RL_WINDOW {
+            self.global.start = now;
+            self.global.count = 0;
+        }
+        self.global.count = self.global.count.saturating_add(1);
+        let global_ok = self.global.count <= GLOBAL_ADMISSION_PER_10S;
+        let payer_ok = self.per_payer.allow(*payer, PER_PAYER_ADMISSION_PER_10S, now);
+        global_ok && payer_ok
+    }
+}
+
+impl Default for AdmissionQuota {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The outcome of an RPC transaction submission, so the `/tx` handler can map a
+/// throttle to **429 Too Many Requests** (the client should back off and retry)
+/// distinct from a genuine **400 Bad Request** (the tx is invalid/expired/
+/// unaffordable and retrying unchanged won't help). Task #210.
+pub enum SubmitError {
+    /// The node is over a rate/concurrency limit (verify-permit exhausted or the
+    /// global/per-payer admission quota tripped) — HTTP 429, retry shortly.
+    Busy(String),
+    /// The transaction is genuinely rejected (bad signature / wrong chain / too
+    /// large / expired / unaffordable / mempool full) — HTTP 400.
+    Rejected(String),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Busy(m) | SubmitError::Rejected(m) => f.write_str(m),
+        }
+    }
+}
+
 /// The identity of a `/simulate` dry-run: `(canonical txid, committed round,
 /// committed state root)`. A dry-run is a pure function of the MESSAGE, the round
 /// (expiration + the effective fee's idle decay depend on it), AND the committed
@@ -1145,6 +1292,12 @@ pub struct Engine {
     /// HashSet lookup/insert) so it never contends the async consensus state
     /// lock. See `SigVerifyCache` for why a cache hit is safe.
     pub sig_cache: std::sync::Mutex<SigVerifyCache>,
+    /// Global + per-payer transaction ADMISSION-rate quota (task #210), shared by
+    /// the RPC `/tx` and the P2P `TransactionGossip` admission paths. Its own
+    /// `std::sync::Mutex` (tiny critical section: two counter bumps) so it is
+    /// checked BEFORE the ~150µs PQC verify and WITHOUT touching the async
+    /// consensus state lock — a flood is rejected before any crypto is spent.
+    pub admission_quota: std::sync::Mutex<AdmissionQuota>,
 }
 
 /// How long a `/resources` disk-size reading is reused before the `data_dir`
@@ -2251,7 +2404,7 @@ impl Engine {
     /// one validator's RPC, but every validator now learns about the
     /// transaction regardless of whether this one later includes it in a
     /// worker batch.
-    pub async fn submit_transaction(&self, tx: Transaction) -> anyhow::Result<[u8; 32]> {
+    pub async fn submit_transaction(&self, tx: Transaction) -> Result<[u8; 32], SubmitError> {
         // Cheap plaintext field compare FIRST, before the ~150µs hybrid PQC
         // verify: a wrong-network transaction is rejected either way, so this is
         // behaviour-identical, but it means junk aimed at another chain_id can't
@@ -2260,20 +2413,36 @@ impl Engine {
         // comment for the full reproduction (one signed transfer, replayed
         // verbatim across two separate testnets, executed identically on both).
         if tx.message.chain_id != self.chain_id {
-            anyhow::bail!("transaction's chain_id does not match this network");
+            return Err(SubmitError::Rejected("transaction's chain_id does not match this network".into()));
         }
         // Tope de tamaño de tx (#192) — barato, antes del verify PQC de ~150µs.
         if tx.byte_size() > MAX_TRANSACTION_BYTES {
-            anyhow::bail!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size());
+            return Err(SubmitError::Rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size())));
+        }
+        // GLOBAL + PER-PAYER admission quota (task #210), checked BEFORE the
+        // expensive verify so a flood is rejected without spending crypto CPU. On
+        // the CLAIMED payer: a distinct-payer flood is bounded by the global cap, a
+        // single-key flood by the per-payer cap. A trip → 429 (retry shortly).
+        if !self.admission_quota.lock().unwrap_or_else(|e| e.into_inner()).allow(&tx.message.payer) {
+            return Err(SubmitError::Busy("admission rate limit exceeded - retry shortly".into()));
         }
         // Verify the hybrid PQC signature, skipping it if we already verified
         // these exact bytes true (the SigVerifyCache, #196), and caching a fresh
-        // pass so the commit-time verify can skip it too.
+        // pass so the commit-time verify can skip it too. The verify runs while
+        // holding a VERIFY-CONCURRENCY permit (task #210): at most
+        // `MAX_CONCURRENT_TX_VERIFY` admission verifies run at once across the RPC
+        // + gossip paths, so a flood of DISTINCT signed txs (no cache hit) can't
+        // pin every core. `try_acquire` is non-blocking → over the cap = 429
+        // (bounded waiting = zero), taken AFTER the cheap checks + quota so junk
+        // never even consumes a permit.
         let content_hash = tx.hash();
         let cached = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).contains(&content_hash);
         if !cached {
+            let Ok(_permit) = TX_VERIFY_PERMITS.try_acquire() else {
+                return Err(SubmitError::Busy("signature-verification capacity reached - retry shortly".into()));
+            };
             if !tx.verify_signature() {
-                anyhow::bail!("invalid transaction signature");
+                return Err(SubmitError::Rejected("invalid transaction signature".into()));
             }
             self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(content_hash);
         }
@@ -2284,13 +2453,13 @@ impl Engine {
             // en la ronda actual del nodo — early-reject barato (la ejecución la
             // rechazaría igual, de forma determinista).
             if tx_is_expired(&tx, state.next_round) {
-                anyhow::bail!("transaction expired: valid until round {}, current round is {}", tx.message.valid_until_round, state.next_round);
+                return Err(SubmitError::Rejected(format!("transaction expired: valid until round {}, current round is {}", tx.message.valid_until_round, state.next_round)));
             }
             if !payer_can_afford_admission(&state, &tx) {
-                anyhow::bail!("payer cannot afford this transaction's byte fee");
+                return Err(SubmitError::Rejected("payer cannot afford this transaction's byte fee".into()));
             }
             if !admit_to_mempool(&mut state, tx.clone()) {
-                anyhow::bail!("payer already has the maximum number of queued transactions ({MAX_MEMPOOL_TXS_PER_PAYER})");
+                return Err(SubmitError::Rejected(format!("payer already has the maximum number of queued transactions ({MAX_MEMPOOL_TXS_PER_PAYER})")));
             }
         }
         self.network.broadcast(&NetMessage::TransactionGossip(tx)).await;
@@ -3033,12 +3202,29 @@ impl Engine {
                     tracing::warn!("dropping gossiped transaction from {from}: too large ({} bytes)", tx.byte_size());
                     return;
                 }
+                // GLOBAL + PER-PAYER admission quota (task #210) — the SAME ceiling
+                // the RPC path applies, so gossip can't be the unmetered back door:
+                // a peer (or anyone reaching the P2P port) re-broadcasting a flood
+                // is bounded by the same global/per-payer windows before any crypto.
+                if !self.admission_quota.lock().unwrap_or_else(|e| e.into_inner()).allow(&tx.message.payer) {
+                    tracing::warn!("dropping gossiped transaction from {from}: admission rate limit exceeded");
+                    return;
+                }
                 // Verify (or skip via the SigVerifyCache, #196) + cache. Gossip
                 // sees the same tx from multiple peers, so the cache hit rate here
-                // is high — this is the main gossip-amplification saving.
+                // is high — this is the main gossip-amplification saving. A cache
+                // MISS runs the verify under the shared VERIFY-CONCURRENCY permit
+                // (task #210): at most `MAX_CONCURRENT_TX_VERIFY` verifies run at
+                // once across RPC + gossip, so a distinct-tx gossip flood can't pin
+                // every core. Over the cap → drop (gossip can't 429); the tx
+                // re-syncs later if a vertex references its batch.
                 let content_hash = tx.hash();
                 let cached = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner()).contains(&content_hash);
                 if !cached {
+                    let Ok(_permit) = TX_VERIFY_PERMITS.try_acquire() else {
+                        tracing::warn!("dropping gossiped transaction from {from}: signature-verification capacity reached");
+                        return;
+                    };
                     if !tx.verify_signature() {
                         tracing::warn!("dropping gossiped transaction from {from} with an invalid signature");
                         return;

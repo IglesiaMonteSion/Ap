@@ -265,6 +265,21 @@ pub struct NodeConfig {
     #[serde(default)]
     pub simulate_rate_limit_per_10s: Option<u32>,
 
+    /// Per-IP rate limit **for `POST /tx` specifically** (task #210). `/tx`
+    /// receives a SIGNED transaction and runs a hybrid PQC verify per call — the
+    /// second-most-expensive unauthenticated endpoint — so like
+    /// `simulate_rate_limit_per_10s` this limiter is **MANDATORY whenever the RPC
+    /// is reachable by remote clients** (a non-loopback `rpc_addr`, OR a loopback
+    /// bind declared behind a trusted proxy): the node forces it on with a safe
+    /// default and never honours `None`/`0` on a public bind (a too-low value is
+    /// raised to the floor). On a genuinely private loopback RPC it stays opt-in.
+    /// A per-txid resubmission cap + a global/per-payer admission quota + a
+    /// concurrent-verify cap are ALWAYS on regardless (see `rpc.rs`/`engine.rs`).
+    /// Recommended ~10–16 per IP per 10 s. Node-LOCAL: not folded into `chain_id`,
+    /// no consensus/wire impact.
+    #[serde(default)]
+    pub tx_rate_limit_per_10s: Option<u32>,
+
     /// Set to `true` when this RPC sits behind a TRUSTED reverse proxy on the SAME
     /// host (the Cloudflare named/quick tunnel `cloudflared`, or a local
     /// nginx/Caddy) — i.e. `rpc_addr` stays on loopback and the public entrypoint is
@@ -463,6 +478,7 @@ mod tests {
             treasury_amount: None,
             rpc_rate_limit_per_10s: None,
             simulate_rate_limit_per_10s: None,
+            tx_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             mainnet: false,

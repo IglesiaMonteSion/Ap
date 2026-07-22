@@ -222,6 +222,20 @@ túnel SSH (`ssh -L 8080:127.0.0.1:8080 usuario@vps`).
   el `config.json` (recomendado 5–10). En un loopback genuinamente privado queda
   opt-in. La coalescencia por txid+ronda+state_root (singleflight) y el tope de
   ejecuciones WASM concurrentes están siempre activos.
+- **`POST /tx` — OBLIGATORIO cuando el RPC es alcanzable por clientes remotos (task
+  #210).** `/tx` recibe una transacción FIRMADA y corre un verify post-cuántico por
+  llamada — la segunda superficie más cara. Con la MISMA política que `/simulate`, el
+  nodo fuerza en `/tx` un rate limit **por IP** (default 16/10 s, piso 8, ventana sin
+  baneo) **y por txid** (ventana, sin baneo — mata el reenvío distribuido de una
+  misma tx firmada), rechaza con `429` **antes de parsear/verificar la firma**, y
+  nunca acepta `None`/`0` en un bind público. Ajustable con `tx_rate_limit_per_10s`.
+  Además, SIEMPRE activos (sin importar el bind, y compartidos con la ruta de gossip
+  P2P): un **tope de verificaciones de firma concurrentes** (a lo sumo 8 verifies de
+  admisión a la vez, así un flood de tx firmadas distintas no clava todos los cores)
+  y una **cuota de admisión GLOBAL + por-pagador** (un techo absoluto de tx/ventana
+  que el nodo admite, y por clave, así un botnet de IPs/pagadores distintos tampoco
+  puede inflar el trabajo). El cap de tamaño de tx (#192) y el chequeo de solvencia
+  del pagador ya eran previos.
 - **Resto de endpoints — opt-in.** El rate limit GENERAL por IP (`rpc_rate_limit_per_10s`,
   read/submit) sigue siendo opcional; **activalo** si exponés el RPC público (o
   poné un proxy con su propio rate limit). Sin él, el nodo avisa fuerte al arrancar.
@@ -243,8 +257,9 @@ túnel SSH (`ssh -L 8080:127.0.0.1:8080 usuario@vps`).
 
 **El borde público real es la WALLET, no el nodo.** Los usuarios no llaman al RPC
 del nodo directo: van `usuario → Cloudflare/nginx → wallet web → nodo`. Por eso la
-wallet (`qchain-wallet`) rate-limita ELLA MISMA su proxy `POST /api/simulate` por
-la IP REAL del cliente y se la reenvía SANEADA al nodo, para que el segundo rate
+wallet (`qchain-wallet`) rate-limita ELLA MISMA sus proxies `POST /api/simulate` **y
+`POST /api/relay-tx`** (el reenvío de una tx firmada al `/tx` del nodo, task #210)
+por la IP REAL del cliente y se la reenvía SANEADA al nodo, para que el segundo rate
 limit del nodo también mida clientes reales en vez de agrupar a todos bajo
 `127.0.0.1` (la IP con que la wallet, en el mismo host, habla con el nodo). Se
 activa con **`--behind-trusted-proxy`** en la wallet (o `QCHAIN_WALLET_BEHIND_PROXY=1`):
@@ -259,13 +274,18 @@ reenviada. **El instalador lo configura solo** cuando instalás con `--con-tunel
 no hace falta editar nada a mano. Un `singleflight` por txid+ronda+state_root y el
 tope de 4 simulaciones WASM concurrentes siguen siempre activos en el nodo.
 
-**Producción: separá el RPC público de simulación del validador de consenso.**
-Un `/simulate` público es superficie de ataque (CPU: verify PQC + WASM). Lo ideal
-para mainnet es **no** exponerlo desde el mismo proceso que produce bloques: correr
-uno o más nodos de **sólo-lectura/simulación** (misma red, mismo `chain_id`, sin
-clave de validador) detrás del proxy público, y mantener el nodo validador en
-loopback/privado. Así una tormenta de simulaciones nunca compite por CPU con el
-consenso.
+**Producción: separá el RPC público (simulación + admisión de tx) del validador de
+consenso.** Un `/simulate` público **y** un `/tx` público son superficie de ataque
+(CPU: verify PQC + WASM en simulación, verify PQC por tx en admisión — task #210).
+Lo ideal para mainnet es **no** exponer ninguno de los dos desde el mismo proceso
+que produce bloques: correr uno o más nodos de **sólo-lectura/relay** (misma red,
+mismo `chain_id`, **sin** clave de validador) detrás del proxy público — reciben
+`/simulate` y `/tx`, verifican la firma, y GOSSIPean la tx admitida al validador por
+P2P — y mantener el nodo validador en loopback/privado. Así ni una tormenta de
+simulaciones ni un flood de tx firmadas compiten por CPU con el consenso; el
+validador sólo ve tx ya verificadas llegando por el canal P2P (a su vez acotado por
+el mismo tope de verify concurrente + la cuota de admisión global/por-pagador, que
+están SIEMPRE activos en todo nodo).
 
 ### Réplica read-only de simulación en un comando (`deploy/install-sim-replica.sh`)
 

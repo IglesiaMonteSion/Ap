@@ -289,6 +289,7 @@ fn main() -> anyhow::Result<()> {
             treasury_amount,
             rpc_rate_limit_per_10s: None,
             simulate_rate_limit_per_10s: None,
+            tx_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             mainnet: false,

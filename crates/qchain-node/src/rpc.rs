@@ -32,9 +32,10 @@ struct IpState {
     banned_until: Option<std::time::Instant>,
 }
 
-const RL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+// `RL_WINDOW` and `MAX_TRACKED_IPS` + the `WindowMap`/`Window` primitives now live
+// in `engine.rs` (shared with the engine's per-payer admission quota, task #210).
+use crate::engine::{WindowMap, MAX_TRACKED_IPS, RL_WINDOW};
 const RL_BAN: std::time::Duration = std::time::Duration::from_secs(60);
-const MAX_TRACKED_IPS: usize = 100_000;
 
 impl RateLimiter {
     fn new(limit: u32) -> Self {
@@ -132,49 +133,19 @@ pub const MIN_SIM_PER_IP_10S: u32 = 5;
 /// it only ever trips on abusive replay of one signed tx.
 pub const SIM_PER_TXID_10S: u32 = 20;
 
-/// A bounded per-key sliding-window counter. Window-only (no ban): the excess in
-/// a window gets a 429 and the key recovers automatically on the next window.
-/// Used for BOTH the per-IP and per-txid `/simulate` gates.
-struct WindowMap<K> {
-    map: std::collections::HashMap<K, Window>,
-    last_gc: std::time::Instant,
-}
-
-struct Window {
-    start: std::time::Instant,
-    count: u32,
-}
-
-impl<K: std::hash::Hash + Eq> WindowMap<K> {
-    fn new() -> Self {
-        Self { map: std::collections::HashMap::new(), last_gc: std::time::Instant::now() }
-    }
-
-    /// `true` = within `limit` for the current window. Bounded and GC-THROTTLED:
-    /// the expired-entry sweep runs at most once per second, so a spray of
-    /// distinct keys can't force an `O(n)` `retain` on every request (the
-    /// amplification a naive "GC whenever full" invites — the sweep would find
-    /// nothing to drop yet still rescan the whole map per request). When the map
-    /// is full of still-live entries a brand-new key is rejected (fail closed)
-    /// rather than growing the map or rescanning; that's only reachable under an
-    /// active distinct-key flood and self-heals as elapsed windows are GC'd.
-    fn allow(&mut self, key: K, limit: u32, now: std::time::Instant) -> bool {
-        if self.map.len() >= MAX_TRACKED_IPS && now.duration_since(self.last_gc) >= std::time::Duration::from_secs(1) {
-            self.map.retain(|_, w| now.duration_since(w.start) < RL_WINDOW);
-            self.last_gc = now;
-        }
-        if self.map.len() >= MAX_TRACKED_IPS && !self.map.contains_key(&key) {
-            return false;
-        }
-        let w = self.map.entry(key).or_insert(Window { start: now, count: 0 });
-        if now.duration_since(w.start) >= RL_WINDOW {
-            w.start = now;
-            w.count = 0;
-        }
-        w.count = w.count.saturating_add(1);
-        w.count <= limit
-    }
-}
+/// Default per-IP `POST /tx` cap (10 s window) when the RPC is public and the
+/// operator didn't set one. Generous — a normal user broadcasts a handful of
+/// signed transactions per 10 s; this only bites a flood.
+pub const DEFAULT_TX_PER_IP_10S: u32 = 16;
+/// Floor a public `/tx` per-IP cap can never go below (a `0`/too-low config on a
+/// public bind is raised to this, so the protection can't be neutered).
+pub const MIN_TX_PER_IP_10S: u32 = 8;
+/// Per-txid `/tx` cap (10 s window), node-wide. A client resubmitting the SAME
+/// signed transaction more than this in a window is throttled (kills the
+/// distributed single-tx resubmission replay that per-IP alone can't catch, since
+/// each botnet IP stays under its own cap). Window-only so an attacker can't get
+/// a victim's txid banned by pre-flooding it.
+pub const TX_PER_TXID_10S: u32 = 10;
 
 /// Per-IP + per-txid sliding-window limiter for `/simulate`. Cheap `O(1)` counters
 /// under a plain mutex; both maps are bounded and GC-throttled so the limiter
@@ -285,25 +256,109 @@ async fn simulate_ip_rate_limit_mw(
     next.run(req).await
 }
 
-pub fn router(engine: Arc<Engine>, rpc_rate_limit_per_10s: Option<u32>, sim_limiter: Option<SimRateLimiter>) -> Router {
+// ————————————————————————————————————————————————————————————————————————
+// Dedicated, MANDATORY-when-public rate limiter for `POST /tx` (task #210)
+// ————————————————————————————————————————————————————————————————————————
+// `/tx` receives a SIGNED transaction and, like `/simulate`, runs a hybrid PQC
+// signature verify per call — the second-most-expensive unauthenticated endpoint.
+// It gets the same shape of protection as `/simulate`: a per-IP gate (route
+// middleware, before the body is parsed) + a per-txid gate (in the handler, kills
+// distributed single-tx resubmission) + real-IP resolution behind a trusted
+// proxy. The verify-CONCURRENCY cap and the global/per-payer admission quota live
+// in the engine (`TX_VERIFY_PERMITS`, `AdmissionQuota`), shared with the gossip
+// path, so those bound the actual crypto work regardless of source.
+
+/// Per-IP + per-txid sliding-window limiter for `POST /tx` — the twin of
+/// `SimRateLimiter`, with `/tx`-tuned caps. Cheap `O(1)` counters under a plain
+/// mutex; both maps are bounded + GC-throttled so the limiter can't itself be an
+/// OOM/CPU-amplification vector.
+#[derive(Clone)]
+pub struct TxRateLimiter {
+    per_ip: Arc<std::sync::Mutex<WindowMap<std::net::IpAddr>>>,
+    per_txid: Arc<std::sync::Mutex<WindowMap<[u8; 32]>>>,
+    ip_limit: u32,
+    txid_limit: u32,
+    trust_proxy: bool,
+}
+
+impl TxRateLimiter {
+    /// Build the `/tx` limiter for a given RPC bind, with the SAME mandatory-when-
+    /// public policy as `SimRateLimiter::for_rpc`: forced on (per-IP cap raised to
+    /// at least `MIN_TX_PER_IP_10S`) whenever the RPC is reachable by remote
+    /// clients (non-loopback bind OR behind a trusted same-host proxy); opt-in on
+    /// a genuinely private loopback RPC (`Some` only if the operator set a
+    /// positive value).
+    pub fn for_rpc(rpc_addr: std::net::SocketAddr, configured_per_ip: Option<u32>, trust_proxy: bool) -> Option<Self> {
+        let public = !rpc_addr.ip().is_loopback() || trust_proxy;
+        let configured = configured_per_ip.filter(|&n| n > 0);
+        let ip_limit = if public {
+            configured.unwrap_or(DEFAULT_TX_PER_IP_10S).max(MIN_TX_PER_IP_10S)
+        } else {
+            configured?
+        };
+        Some(Self {
+            per_ip: Arc::new(std::sync::Mutex::new(WindowMap::new())),
+            per_txid: Arc::new(std::sync::Mutex::new(WindowMap::new())),
+            ip_limit,
+            txid_limit: TX_PER_TXID_10S,
+            trust_proxy,
+        })
+    }
+    fn allow_ip(&self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        self.per_ip.lock().unwrap_or_else(|e| e.into_inner()).allow(ip, self.ip_limit, now)
+    }
+    fn allow_txid(&self, txid: [u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        self.per_txid.lock().unwrap_or_else(|e| e.into_inner()).allow(txid, self.txid_limit, now)
+    }
+}
+
+/// Per-route middleware for `POST /tx`: the PER-IP gate, run BEFORE the body is
+/// parsed so a flood is rejected with 429 immediately — before any parse, quota,
+/// permit, or PQC verify. The per-TXID gate runs inside `submit_tx` (it needs the
+/// parsed tx's txid).
+async fn tx_ip_rate_limit_mw(
+    State(rl): State<TxRateLimiter>,
+    conn: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(axum::extract::ConnectInfo(addr)) = conn {
+        let ip = client_ip(rl.trust_proxy, addr.ip(), req.headers());
+        if !rl.allow_ip(ip) {
+            return (StatusCode::TOO_MANY_REQUESTS, "tx submission rate limit exceeded for your IP - slow down").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+pub fn router(engine: Arc<Engine>, rpc_rate_limit_per_10s: Option<u32>, sim_limiter: Option<SimRateLimiter>, tx_limiter: Option<TxRateLimiter>) -> Router {
     // Opt-in per-IP rate limiter (task #196). `None`/`0` → not layered at all.
-    let base = base_router(engine, sim_limiter);
+    let base = base_router(engine, sim_limiter, tx_limiter);
     match rpc_rate_limit_per_10s.filter(|&n| n > 0) {
         Some(limit) => base.layer(axum::middleware::from_fn_with_state(RateLimiter::new(limit), rate_limit_mw)),
         None => base,
     }
 }
 
-fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>) -> Router {
+fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limiter: Option<TxRateLimiter>) -> Router {
     // `/simulate` gets its dedicated per-IP middleware (when present) AND the
     // limiter is threaded to the handler as an `Extension` for the per-txid gate.
     let simulate = match &sim_limiter {
         Some(rl) => post(simulate_tx).layer(axum::middleware::from_fn_with_state(rl.clone(), simulate_ip_rate_limit_mw)),
         None => post(simulate_tx),
     };
+    // `/tx` gets the same treatment: dedicated per-IP middleware + the limiter
+    // threaded to `submit_tx` (as an Extension) for the per-txid gate.
+    let tx = match &tx_limiter {
+        Some(rl) => post(submit_tx).layer(axum::middleware::from_fn_with_state(rl.clone(), tx_ip_rate_limit_mw)),
+        None => post(submit_tx),
+    };
     let router = Router::new()
         .route("/", get(explorer))
-        .route("/tx", post(submit_tx))
+        .route("/tx", tx)
         .route("/simulate", simulate)
         .route("/account/:address", get(get_account))
         .route("/stake/:address", get(get_stake))
@@ -334,7 +389,13 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>) -> Rout
     // Thread the `/simulate` limiter to the handler (per-txid gate). An Extension
     // layer is a no-op for every other route; `simulate_tx` reads it via an
     // `Option<Extension<..>>` so it simply skips the per-txid gate when absent.
-    match sim_limiter {
+    let router = match sim_limiter {
+        Some(rl) => router.layer(axum::Extension(rl)),
+        None => router,
+    };
+    // Same for the `/tx` limiter's per-txid gate (`submit_tx` reads it via an
+    // `Option<Extension<TxRateLimiter>>`).
+    match tx_limiter {
         Some(rl) => router.layer(axum::Extension(rl)),
         None => router,
     }
@@ -424,8 +485,28 @@ async fn explorer() -> impl axum::response::IntoResponse {
     )
 }
 
-async fn submit_tx(State(engine): State<Arc<Engine>>, Json(tx): Json<Transaction>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let hash = engine.submit_transaction(tx).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+async fn submit_tx(
+    State(engine): State<Arc<Engine>>,
+    tx_rl: Option<axum::Extension<TxRateLimiter>>,
+    Json(tx): Json<Transaction>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // PER-TXID rate gate (mandatory when the RPC is public; absent Extension =
+    // loopback with no limiter). Runs BEFORE `submit_transaction`, so an abusive
+    // resubmission of ONE signed tx is rejected with 429 IMMEDIATELY — before the
+    // admission quota, the verify permit, or the PQC verify. The per-IP gate
+    // already ran in the route middleware; this catches a distributed single-tx
+    // resubmission that stays under each IP's cap.
+    if let Some(axum::Extension(rl)) = &tx_rl {
+        if !rl.allow_txid(tx.txid()) {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "this transaction is being submitted too frequently - retry shortly".to_string()));
+        }
+    }
+    // Map the engine's typed outcome: a rate/concurrency throttle → 429 (retry),
+    // a genuine rejection → 400 (retrying unchanged won't help). Task #210.
+    let hash = engine.submit_transaction(tx).await.map_err(|e| match e {
+        crate::engine::SubmitError::Busy(m) => (StatusCode::TOO_MANY_REQUESTS, m),
+        crate::engine::SubmitError::Rejected(m) => (StatusCode::BAD_REQUEST, m),
+    })?;
     Ok(Json(json!({ "hash": hex::encode(hash) })))
 }
 
@@ -1186,6 +1267,72 @@ mod tests {
         assert!(rl.allow_txid(t1) && rl.allow_txid(t1), "up to the txid cap allowed");
         assert!(!rl.allow_txid(t1), "over the txid cap -> throttled");
         assert!(rl.allow_txid(t2), "a different txid is unaffected");
+    }
+
+    /// The dedicated `/tx` limiter (task #210) is MANDATORY on a public bind (or a
+    /// trusted-proxy loopback) and opt-in on a private loopback — the SAME policy as
+    /// `/simulate`, with `/tx`-tuned caps.
+    #[test]
+    fn tx_limiter_is_mandatory_on_a_public_bind() {
+        let public: std::net::SocketAddr = "203.0.113.7:8080".parse().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let rl = TxRateLimiter::for_rpc(public, None, false).expect("public bind must always have a /tx limiter");
+        assert_eq!(rl.ip_limit, DEFAULT_TX_PER_IP_10S);
+        assert_eq!(rl.txid_limit, TX_PER_TXID_10S, "per-txid cap always set");
+        assert_eq!(TxRateLimiter::for_rpc(public, Some(0), false).unwrap().ip_limit, DEFAULT_TX_PER_IP_10S, "0 -> default");
+        assert_eq!(TxRateLimiter::for_rpc(public, Some(2), false).unwrap().ip_limit, MIN_TX_PER_IP_10S, "too-low raised to the floor");
+        assert_eq!(TxRateLimiter::for_rpc(public, Some(12), false).unwrap().ip_limit, 12, "a value above the floor is honoured");
+        // Private loopback: opt-in.
+        assert!(TxRateLimiter::for_rpc(loopback, None, false).is_none(), "loopback unset -> no limiter");
+        assert_eq!(TxRateLimiter::for_rpc(loopback, Some(4), false).unwrap().ip_limit, 4, "loopback honours an explicit opt-in value");
+        // Trusted-proxy loopback -> treated as public.
+        let proxied = TxRateLimiter::for_rpc(loopback, None, true).expect("trusted-proxy loopback must have a /tx limiter");
+        assert_eq!(proxied.ip_limit, DEFAULT_TX_PER_IP_10S);
+        assert!(proxied.trust_proxy);
+    }
+
+    /// The `/tx` per-IP + per-txid gates are window-only with independent buckets,
+    /// exactly like `/simulate` — a `/tx` flood from one IP (or one resubmitted
+    /// txid) is throttled while a different IP/txid is unaffected.
+    #[test]
+    fn tx_limiter_per_ip_and_per_txid_are_window_only() {
+        let public: std::net::SocketAddr = "203.0.113.7:8080".parse().unwrap();
+        // Force small caps via a public build then check the counting.
+        let rl = TxRateLimiter::for_rpc(public, Some(MIN_TX_PER_IP_10S), false).unwrap();
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        for _ in 0..MIN_TX_PER_IP_10S {
+            assert!(rl.allow_ip(a));
+        }
+        assert!(!rl.allow_ip(a), "over the per-IP cap -> throttled");
+        assert!(rl.allow_ip(b), "a separate IP is unaffected");
+        let t1 = [7u8; 32];
+        let t2 = [8u8; 32];
+        for _ in 0..TX_PER_TXID_10S {
+            assert!(rl.allow_txid(t1));
+        }
+        assert!(!rl.allow_txid(t1), "over the per-txid cap -> throttled (resubmission flood)");
+        assert!(rl.allow_txid(t2), "a different txid is unaffected");
+    }
+
+    /// The engine's global + per-payer admission quota (task #210): admissions are
+    /// allowed up to the per-payer cap, then throttled for THAT payer while a
+    /// different payer is unaffected; and the global cap bounds the total across all
+    /// payers. Uses tiny reflection-free caps by constructing many payers.
+    #[test]
+    fn admission_quota_bounds_per_payer_then_global() {
+        use crate::engine::AdmissionQuota;
+        let mut q = AdmissionQuota::default();
+        let p1 = Pubkey::new([1u8; 32]);
+        let p2 = Pubkey::new([2u8; 32]);
+        // Per-payer: a single payer can admit up to its cap, then it's throttled,
+        // while a second payer still gets through (independent bucket).
+        let cap = crate::engine::PER_PAYER_ADMISSION_PER_10S;
+        for _ in 0..cap {
+            assert!(q.allow(&p1));
+        }
+        assert!(!q.allow(&p1), "one payer over its per-payer admission cap -> throttled");
+        assert!(q.allow(&p2), "a different payer is unaffected by p1's cap");
     }
 
     /// `client_ip` reads `X-Forwarded-For` ONLY when trusted AND the direct peer is

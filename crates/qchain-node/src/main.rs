@@ -854,6 +854,7 @@ async fn main() -> anyhow::Result<()> {
         round_interval_ms: config.round_interval_ms,
         disk_size_cache: std::sync::Mutex::new(None),
         sig_cache: std::sync::Mutex::new(qchain_node::engine::SigVerifyCache::new(qchain_node::engine::MAX_SIG_CACHE)),
+        admission_quota: std::sync::Mutex::new(qchain_node::engine::AdmissionQuota::default()),
         snapshot_cache: tokio::sync::Mutex::new(None),
         state: tokio::sync::Mutex::new(EngineState {
             ledger,
@@ -992,8 +993,20 @@ async fn main() -> anyhow::Result<()> {
             if config.rpc_behind_trusted_proxy { "loopback behind trusted proxy - per-IP keyed on X-Forwarded-For" } else { "public RPC" }
         );
     }
+    // The `/tx` limiter (task #210): same mandatory-when-public policy — it
+    // protects the SIGNED-transaction submission endpoint (per-IP + per-txid),
+    // complementing the always-on engine-side verify-concurrency cap + global/
+    // per-payer admission quota. On a private loopback RPC it's opt-in
+    // (`tx_rate_limit_per_10s`).
+    let tx_limiter = rpc::TxRateLimiter::for_rpc(config.rpc_addr, config.tx_rate_limit_per_10s, config.rpc_behind_trusted_proxy);
+    if tx_limiter.is_some() && rpc_public {
+        tracing::info!(
+            "POST /tx: mandatory per-IP + per-txid rate limit ACTIVE ({}); global/per-payer admission quota + concurrent-verify cap always on",
+            if config.rpc_behind_trusted_proxy { "loopback behind trusted proxy - per-IP keyed on X-Forwarded-For" } else { "public RPC" }
+        );
+    }
     let flush_engine = engine.clone();
-    let app = rpc::router(engine, config.rpc_rate_limit_per_10s, sim_limiter);
+    let app = rpc::router(engine, config.rpc_rate_limit_per_10s, sim_limiter, tx_limiter);
     // `into_make_service_with_connect_info` so the (opt-in) per-IP rate limiter
     // can read each client's address (task #196). Harmless when the limiter is
     // off — no layer consults it.

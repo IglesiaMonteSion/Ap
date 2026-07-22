@@ -101,6 +101,15 @@ struct Cli {
     /// genuinamente privado queda opt-in. También por QCHAIN_WALLET_SIMULATE_RL.
     #[arg(long)]
     simulate_rate_limit_per_10s: Option<u32>,
+
+    /// Cap por IP de `POST /api/relay-tx` en una ventana de 10 s (task #210).
+    /// `/api/relay-tx` reenvía una transacción FIRMADA al `/tx` del nodo, que corre
+    /// un verify de firma post-cuántica por llamada — la segunda superficie más
+    /// cara. Mismo modelo que `/api/simulate`: OBLIGATORIO cuando la wallet es
+    /// alcanzable por clientes remotos (bind no-loopback o `--behind-trusted-proxy`),
+    /// opt-in en loopback privado. También por `QCHAIN_WALLET_TX_RL`.
+    #[arg(long)]
+    tx_rate_limit_per_10s: Option<u32>,
 }
 
 struct AppState {
@@ -143,6 +152,11 @@ struct AppState {
     /// (a non-loopback bind or `behind_trusted_proxy`); `None` on a genuinely
     /// private loopback bind unless explicitly opted in. See `ratelimit.rs`.
     sim_limiter: Option<SimRateLimiter>,
+    /// Dedicated per-IP + per-txid rate limiter for the public `/api/relay-tx`
+    /// proxy (task #210) — the SIGNED-transaction relay to the node's `/tx`. Same
+    /// mandatory-when-public policy as `sim_limiter`. Independent window from
+    /// simulate so a user simulating a lot never blocks their sends.
+    tx_limiter: Option<SimRateLimiter>,
 }
 
 #[tokio::main]
@@ -170,6 +184,11 @@ async fn main() -> anyhow::Result<()> {
     // trusted proxy) — its own per-IP + per-txid gate on the most expensive proxy
     // endpoint. Opt-in on a genuinely private loopback bind.
     let sim_limiter = SimRateLimiter::for_wallet(exposed, behind_proxy, sim_rl_configured);
+    // Same mandatory-when-public policy for the `/api/relay-tx` limiter (task #210).
+    let tx_rl_configured = cli
+        .tx_rate_limit_per_10s
+        .or_else(|| std::env::var("QCHAIN_WALLET_TX_RL").ok().and_then(|s| s.trim().parse().ok()));
+    let tx_limiter = SimRateLimiter::for_wallet(exposed, behind_proxy, tx_rl_configured);
 
     // The custodial wallet (server holds the keys) is only reachable when it's
     // safe: either we're localhost-only, or a password is set. Exposed with no
@@ -210,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty()),
         sim_limiter: sim_limiter.clone(),
+        tx_limiter: tx_limiter.clone(),
     });
 
     // Public routes: the non-custodial (WASM) wallet holds NO keys on the
@@ -242,7 +262,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/:address", get(account_ep))
         .route("/api/stake/:address", get(stake_ep))
         .route("/api/stake_v7/:address", get(stake_v7_ep))
-        .route("/api/relay-tx", post(relay_tx))
+        // `/api/relay-tx` gets its dedicated per-IP rate-limit middleware (when the
+        // limiter is present): the gate runs BEFORE the handler reads/forwards the
+        // signed tx, so a flood is rejected with 429 without forwarding anything to
+        // the node (task #210).
+        .route(
+            "/api/relay-tx",
+            match &state.tx_limiter {
+                Some(_) => post(relay_tx).layer(axum::middleware::from_fn_with_state(state.clone(), relay_rate_limit_mw)),
+                None => post(relay_tx),
+            },
+        )
         // `/api/simulate` gets its dedicated per-IP rate-limit middleware (when the
         // limiter is present): the gate runs BEFORE the handler reads the body, so
         // a flood is rejected with 429 without buffering/forwarding anything.
@@ -310,6 +340,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(_) => println!("Rate limit /api/simulate: activo (opt-in en loopback)"),
+        None => {}
+    }
+    match &tx_limiter {
+        Some(_) if exposed || behind_proxy => println!(
+            "Rate limit /api/relay-tx: OBLIGATORIO ACTIVO ({})",
+            if behind_proxy { "detrás de proxy de confianza - IP del cliente vía CF-Connecting-IP / X-Forwarded-For, reenviada saneada al nodo" } else { "bind público directo - IP del cliente = peer TCP" }
+        ),
+        Some(_) => println!("Rate limit /api/relay-tx: activo (opt-in en loopback)"),
         None => {}
     }
     // `into_make_service_with_connect_info` so the `/api/simulate` limiter can read
@@ -663,7 +701,7 @@ async fn proposal_ep(State(st): State<Arc<AppState>>, Path(address): Path<String
 /// Relay a browser-signed transaction (raw signed-Transaction JSON) to the
 /// node's `/tx`. The server never signs anything - it just forwards, so the
 /// key stays in the browser. Same-origin relay avoids the node needing CORS.
-async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+async fn relay_tx(State(st): State<Arc<AppState>>, client_ip: Option<Extension<ClientIp>>, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
     // A signed Transaction (hybrid Ed25519+ML-DSA-65, ~5.5KB) is small; the
     // node itself already caps `/tx` bodies. Cap here too so this open relay
     // can't be used to shovel arbitrarily large payloads at the node in a
@@ -676,20 +714,60 @@ async fn relay_tx(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> R
             MAX_RELAY_BODY
         )));
     }
-    let resp = st
-        .http
-        .post(format!("{}/tx", st.rpc))
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(ApiError::internal)?;
-    if !resp.status().is_success() {
+    // Per-txid gate (task #210): a wallet-wide window cap on how often ONE signed
+    // tx is relayed — kills the distributed single-tx resubmission that per-IP
+    // alone can't catch. Best-effort: if the body doesn't parse as a Transaction
+    // the node is the authority, so forward and let it decide (the per-IP gate
+    // already ran in `relay_rate_limit_mw`).
+    if let Some(rl) = &st.tx_limiter {
+        if let Ok(tx) = serde_json::from_slice::<Transaction>(&body) {
+            if !rl.allow_txid(tx.txid()) {
+                return Err(ApiError::too_many("esta transacción se está enviando demasiado seguido - probá en unos segundos"));
+            }
+        }
+    }
+    let mut outbound = st.http.post(format!("{}/tx", st.rpc)).header("content-type", "application/json");
+    // Forward the resolved real client IP to the node as a SINGLE, sanitized
+    // X-Forwarded-For (a fresh request, so any client-supplied header is dropped),
+    // so the node's own per-IP `/tx` limiter meters the real client, not `127.0.0.1`.
+    if let Some(Extension(ClientIp(ip))) = client_ip {
+        outbound = outbound.header("X-Forwarded-For", ip.to_string());
+    }
+    let resp = outbound.body(body.to_vec()).send().await.map_err(ApiError::internal)?;
+    let status = resp.status();
+    if !status.is_success() {
         let msg = resp.text().await.unwrap_or_default();
+        // Propagate a downstream throttle as a real 429 (not a 400), so the browser
+        // sees the actual rate-limit and backs off instead of showing "bad request".
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ApiError::too_many(if msg.is_empty() { "el nodo alcanzó su límite de solicitudes - probá en unos segundos".to_string() } else { msg }));
+        }
         return Err(ApiError::bad(format!("el nodo rechazó la transacción: {msg}")));
     }
     let v: Value = resp.json().await.map_err(ApiError::internal)?;
     Ok(Json(v))
+}
+
+/// Per-route middleware for `POST /api/relay-tx`: the PER-IP gate, run BEFORE the
+/// handler forwards the signed tx. Resolves the REAL client IP (peer, or the
+/// trusted proxy's forwarded IP), fails CLOSED (429) when no trustworthy identity
+/// can be established, and stashes the IP for `relay_tx` to forward sanitized to
+/// the node. Task #210 — the twin of `simulate_rate_limit_mw`.
+async fn relay_rate_limit_mw(State(st): State<Arc<AppState>>, conn: Option<ConnectInfo<SocketAddr>>, mut req: Request, next: Next) -> Response {
+    let Some(rl) = st.tx_limiter.clone() else {
+        return next.run(req).await;
+    };
+    let Some(ConnectInfo(peer)) = conn else {
+        return ApiError::too_many("no se pudo determinar la IP del cliente").into_response();
+    };
+    let Some(ip) = resolve_client_ip(rl.trust_proxy(), peer.ip(), req.headers()) else {
+        return ApiError::too_many("no se pudo identificar el cliente de forma confiable detrás del proxy").into_response();
+    };
+    if !rl.allow_ip(ip) {
+        return ApiError::too_many("demasiadas transacciones desde tu IP - probá de nuevo en unos segundos").into_response();
+    }
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
 }
 
 /// The real client IP resolved by `simulate_rate_limit_mw`, stashed in the request
