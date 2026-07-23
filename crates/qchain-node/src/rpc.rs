@@ -378,6 +378,7 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limi
         .route("/validators", get(validators))
         .route("/validator_registry", get(validator_registry))
         .route("/validator_v7_registry", get(validator_v7_registry))
+        .route("/treasury", get(treasury))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
         .route("/chain_id", get(chain_id))
@@ -1063,6 +1064,69 @@ async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json
         })
         .collect();
     Ok(Json(json!({ "current_quanto": current_quanto, "validators": validators })))
+}
+
+/// `/treasury` - the FULL on-chain multisig treasury state (task #222): signers,
+/// threshold, timelock, per-op + per-window limits, current window usage, and
+/// every pending operation with its approvals and (once approved) its executable
+/// round. This IS the public, auditable event log — deterministic consensus state,
+/// stronger than a log line. Absent treasury → `{ "configured": false }`.
+async fn treasury(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::TREASURY_ACCOUNT_ID;
+    use qchain_execution::treasury_v7::{TreasuryOp, TreasuryState};
+    let Some(acct) = engine.get_account(&TREASURY_ACCOUNT_ID).await else {
+        return Ok(Json(json!({ "configured": false })));
+    };
+    // Decode the multisig state, or lift a legacy 32-byte single authority.
+    let state = TreasuryState::try_from_slice(&acct.data).ok().or_else(|| {
+        if acct.data.len() == 32 {
+            qchain_crypto::Pubkey::try_from_slice(&acct.data).ok().map(TreasuryState::single)
+        } else {
+            None
+        }
+    });
+    let Some(state) = state else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "treasury account does not decode".into()));
+    };
+    let current_round = engine.status().await.next_round;
+    let pending: Vec<serde_json::Value> = state
+        .pending
+        .iter()
+        .map(|p| {
+            let ready = p.ready_round(state.timelock_rounds);
+            let kind = match &p.op {
+                TreasuryOp::Release { amount, destination } => json!({ "type": "release", "amount": amount.to_string(), "destination": destination.to_string() }),
+                TreasuryOp::SetSigners { signers, threshold } => json!({ "type": "set_signers", "signers": signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "threshold": threshold }),
+                TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds } => json!({ "type": "set_policy", "timelock_rounds": timelock_rounds, "max_per_release": max_per_release.to_string(), "max_per_window": max_per_window.to_string(), "window_rounds": window_rounds }),
+            };
+            json!({
+                "id": p.id,
+                "op": kind,
+                "proposed_round": p.proposed_round,
+                "approvals": p.approvals.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "approval_count": p.approvals.len(),
+                "threshold": state.threshold,
+                "threshold_reached_round": p.threshold_reached_round,
+                "executable_round": ready,
+                "executable_now": ready.map(|r| current_round >= r).unwrap_or(false),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "configured": true,
+        "balance": acct.balance.to_string(),
+        "signers": state.signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "threshold": state.threshold,
+        "timelock_rounds": state.timelock_rounds,
+        "max_per_release": state.max_per_release.to_string(),
+        "max_per_window": state.max_per_window.to_string(),
+        "window_rounds": state.window_rounds,
+        "window_start_round": state.window_start_round,
+        "released_in_window": state.released_in_window.to_string(),
+        "current_round": current_round,
+        "pending": pending,
+    })))
 }
 
 /// `/active_validators` - the ACTIVE validator set for the current epoch,

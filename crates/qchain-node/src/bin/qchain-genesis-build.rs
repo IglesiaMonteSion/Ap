@@ -114,9 +114,38 @@ struct Cli {
     #[arg(long)]
     treasury_authority: Option<String>,
     /// (v7) how much QCH to lock in the genesis treasury (converted to units:
-    /// 1 QCH = 1e9). Requires `--treasury-authority`. Max 9223372036 QCH.
+    /// 1 QCH = 1e9). Requires `--treasury-authority` OR `--treasury-signer`.
+    /// Max 9223372036 QCH.
     #[arg(long)]
     treasury_qch: Option<u64>,
+    /// (v7, task #222) a base58 treasury MULTISIG signer (repeatable). With
+    /// `--treasury-qch`, seeds the treasury under an M-of-N multisig instead of a
+    /// single authority — no single key can release funds. Folded into `chain_id`.
+    #[arg(long = "treasury-signer")]
+    treasury_signers: Vec<String>,
+    /// (v7) M for the treasury multisig (e.g. 3 for 3-of-5). 0 = majority
+    /// (floor(N/2)+1). Only meaningful with `--treasury-signer`.
+    #[arg(long, default_value_t = 0)]
+    treasury_threshold: u8,
+    /// (v7) rounds a treasury operation is timelocked after reaching its threshold
+    /// before it may execute (review window). 0 = none.
+    #[arg(long, default_value_t = 0)]
+    treasury_timelock_rounds: u64,
+    /// (v7) per-operation cap on a treasury release, in whole QCH (0 = no cap).
+    #[arg(long, default_value_t = 0)]
+    treasury_max_per_release_qch: u64,
+    /// (v7) rolling-window cap on treasury releases, in whole QCH (0 = no cap).
+    #[arg(long, default_value_t = 0)]
+    treasury_max_per_window_qch: u64,
+    /// (v7) length of the rolling treasury release-accounting window in rounds
+    /// (0 = disabled).
+    #[arg(long, default_value_t = 0)]
+    treasury_window_rounds: u64,
+    /// (v7, task #222) base58 administrative-fee wallet: the destination of the
+    /// 10% admin fee, configured at genesis instead of a hidden constant. Point it
+    /// at the multisig treasury to protect admin revenue. Folded into `chain_id`.
+    #[arg(long)]
+    admin_fee_wallet: Option<String>,
     /// (v7) enable the **HARD-CAP supply model** (task #221): total supply can
     /// NEVER exceed the cap because staking emission is DRAWN from a pre-minted
     /// reserve instead of minted. The node also refuses to start if the genesis
@@ -277,23 +306,57 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Resolve the genesis treasury (v7): validate the authority is a real address
-    // and the QCH amount is present + in range, then convert QCH → units (1e9).
-    let (treasury_authority, treasury_amount): (Option<String>, Option<u64>) = match (&cli.treasury_authority, cli.treasury_qch) {
-        (Some(auth), Some(qch)) => {
-            if !cli.economics_v7 {
-                anyhow::bail!("--treasury-authority/--treasury-qch require --economics-v7");
-            }
-            auth.parse::<qchain_crypto::Pubkey>()
-                .map_err(|e| anyhow::anyhow!("--treasury-authority is not a valid base58 address: {e}"))?;
-            if qch > 9_223_372_036 {
-                anyhow::bail!("--treasury-qch too large (max 9223372036 QCH)");
-            }
-            (Some(auth.clone()), Some(qch.saturating_mul(1_000_000_000)))
+    // Resolve the genesis treasury (v7). A MULTISIG (--treasury-signer, task #222)
+    // takes precedence over a single --treasury-authority. Either way the QCH
+    // amount must be present + in range.
+    let treasury_amount: Option<u64> = if let Some(qch) = cli.treasury_qch {
+        if !cli.economics_v7 {
+            anyhow::bail!("--treasury-qch requires --economics-v7");
         }
-        (None, None) => (None, None),
-        _ => anyhow::bail!("--treasury-authority and --treasury-qch must be given together"),
+        if qch > 9_223_372_036 {
+            anyhow::bail!("--treasury-qch too large (max 9223372036 QCH)");
+        }
+        Some(qch.saturating_mul(1_000_000_000))
+    } else {
+        None
     };
+    let treasury_authority: Option<String> = if !cli.treasury_signers.is_empty() {
+        // Multisig path: validate every signer address and the threshold.
+        if treasury_amount.is_none() {
+            anyhow::bail!("--treasury-signer requires --treasury-qch");
+        }
+        for s in &cli.treasury_signers {
+            s.parse::<qchain_crypto::Pubkey>()
+                .map_err(|e| anyhow::anyhow!("--treasury-signer '{s}' is not a valid base58 address: {e}"))?;
+        }
+        let n = cli.treasury_signers.len();
+        let m = if cli.treasury_threshold == 0 { n / 2 + 1 } else { cli.treasury_threshold as usize };
+        if m == 0 || m > n {
+            anyhow::bail!("--treasury-threshold {} must be 1..={n}", cli.treasury_threshold);
+        }
+        println!("treasury: {m}-of-{n} MULTISIG (timelock {} rounds, per-op {} QCH, per-window {} QCH/{} rounds)",
+            cli.treasury_timelock_rounds, cli.treasury_max_per_release_qch, cli.treasury_max_per_window_qch, cli.treasury_window_rounds);
+        None // signers path — no single authority
+    } else {
+        // Single-authority path (backward compatible; 1-of-1).
+        match (&cli.treasury_authority, treasury_amount) {
+            (Some(auth), Some(_)) => {
+                if !cli.economics_v7 {
+                    anyhow::bail!("--treasury-authority requires --economics-v7");
+                }
+                auth.parse::<qchain_crypto::Pubkey>()
+                    .map_err(|e| anyhow::anyhow!("--treasury-authority is not a valid base58 address: {e}"))?;
+                Some(auth.clone())
+            }
+            (None, None) => None,
+            _ => anyhow::bail!("--treasury-authority and --treasury-qch must be given together (or use --treasury-signer)"),
+        }
+    };
+    // Validate the admin-fee wallet override, if given.
+    if let Some(admin) = &cli.admin_fee_wallet {
+        admin.parse::<qchain_crypto::Pubkey>()
+            .map_err(|e| anyhow::anyhow!("--admin-fee-wallet '{admin}' is not a valid base58 address: {e}"))?;
+    }
 
     // Resolve the HARD-CAP supply model (v7, #221). Validate ranges, then check the
     // genesis split FITS the cap here (the node re-checks at startup) so the
@@ -373,6 +436,13 @@ fn main() -> anyhow::Result<()> {
             rounds_per_quanto: cli.rounds_per_quanto,
             treasury_authority: treasury_authority.clone(),
             treasury_amount,
+            treasury_signers: cli.treasury_signers.clone(),
+            treasury_threshold: cli.treasury_threshold,
+            treasury_timelock_rounds: cli.treasury_timelock_rounds,
+            treasury_max_per_release_qch: cli.treasury_max_per_release_qch,
+            treasury_max_per_window_qch: cli.treasury_max_per_window_qch,
+            treasury_window_rounds: cli.treasury_window_rounds,
+            admin_fee_wallet: cli.admin_fee_wallet.clone(),
             hard_cap_supply: cli.hard_cap_supply,
             supply_cap_qch,
             emission_reserve_qch,
@@ -427,6 +497,9 @@ fn main() -> anyhow::Result<()> {
                 supply_cap_qch.unwrap_or(qchain_execution::economics_v7::MAX_SUPPLY_QCH),
                 emission_reserve_qch.unwrap_or(0),
             );
+        }
+        if let Some(admin) = &cli.admin_fee_wallet {
+            println!("admin fee wallet: {admin} (the 10% admin fee is credited here — genesis-configured, folded into the chain_id).");
         }
     }
     if cli.compressed_state_tree {

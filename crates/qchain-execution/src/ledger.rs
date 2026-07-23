@@ -306,6 +306,7 @@ pub struct SimSnapshot {
     quanto_rate_fp: u128,
     rounds_per_quanto: u64,
     hard_cap_supply: bool,
+    admin_fee_wallet: Pubkey,
 }
 
 /// Persistable snapshot of a `Ledger`'s running economic counters. Written to
@@ -409,6 +410,12 @@ pub struct Ledger {
     /// model (emission minted). A fresh-genesis, chain_id-folded decision — never
     /// toggled on a live chain.
     hard_cap_supply: bool,
+    /// Destination of the 10% administrative fee share (task #222). Defaults to the
+    /// compiled-in `ids::ADMIN_FEE_WALLET` constant; the node overrides it from the
+    /// genesis config (`admin_fee_wallet`, folded into chain_id) so the address is a
+    /// GENESIS decision, not a hidden constant — and can be pointed at the multisig
+    /// treasury so administrative funds are multisig-protected too.
+    admin_fee_wallet: Pubkey,
     /// v7 participation (§21.2): per-quanto `(validator, credits, opportunities)`
     /// tallies the NODE feeds in from the committed order (which validators had a
     /// committed certificate in each of the quanto's rounds vs which were in the
@@ -485,6 +492,7 @@ impl Ledger {
             quanto_rate_fp: 0,
             rounds_per_quanto: 0,
             hard_cap_supply: false,
+            admin_fee_wallet: crate::ids::ADMIN_FEE_WALLET,
             participation_by_quanto: std::collections::HashMap::new(),
         })
     }
@@ -515,6 +523,19 @@ impl Ledger {
     /// a reserve, never minted).
     pub fn is_hard_cap_supply(&self) -> bool {
         self.hard_cap_supply
+    }
+
+    /// Override the destination of the 10% administrative fee share (task #222).
+    /// The node sets this from the genesis config so the admin address is a
+    /// genesis decision (folded into chain_id), not a hidden constant — and can be
+    /// pointed at the multisig treasury. Defaults to `ids::ADMIN_FEE_WALLET`.
+    pub fn set_admin_fee_wallet(&mut self, wallet: Pubkey) {
+        self.admin_fee_wallet = wallet;
+    }
+
+    /// The configured administrative-fee destination.
+    pub fn admin_fee_wallet(&self) -> Pubkey {
+        self.admin_fee_wallet
     }
 
     /// Total QCH supply currently in existence: the sum of EVERY account balance in
@@ -599,7 +620,7 @@ impl Ledger {
         // payer, the fee collector, EVERY protocol singleton, and each
         // instruction's program account + declared accounts. A missed read only
         // dents preview accuracy, never safety.
-        let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, crate::ids::TREASURY_ACCOUNT_ID, crate::ids::EMISSION_RESERVE_ID];
+        let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, self.admin_fee_wallet, crate::ids::TREASURY_ACCOUNT_ID, crate::ids::EMISSION_RESERVE_ID];
         for i in 1u8..=15u8 {
             want.push(Pubkey::new([i; 32]));
         }
@@ -630,6 +651,7 @@ impl Ledger {
             quanto_rate_fp: self.quanto_rate_fp(),
             rounds_per_quanto: self.rounds_per_quanto(),
             hard_cap_supply: self.is_hard_cap_supply(),
+            admin_fee_wallet: self.admin_fee_wallet,
         }
     }
 
@@ -638,7 +660,7 @@ impl Ledger {
     /// [`SimSnapshot`] — so a slow WASM compile/exec never touches consensus.
     pub fn run_simulation(snapshot: SimSnapshot, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
         use qchain_storage::InMemoryStore;
-        let SimSnapshot { accounts, before, payer_before, compressed, economics_v7, quanto_rate_fp, rounds_per_quanto, hard_cap_supply } = snapshot;
+        let SimSnapshot { accounts, before, payer_before, compressed, economics_v7, quanto_rate_fp, rounds_per_quanto, hard_cap_supply, admin_fee_wallet } = snapshot;
         let mut scratch = InMemoryStore::new();
         for (pk, a) in accounts {
             scratch.set(pk, a);
@@ -653,6 +675,7 @@ impl Ledger {
         ) {
             Ok(mut l) => {
                 l.set_hard_cap_supply(hard_cap_supply);
+                l.set_admin_fee_wallet(admin_fee_wallet);
                 l
             }
             Err(e) => {
@@ -1285,8 +1308,14 @@ impl Ledger {
                     return Err(format!("v7 economic pool {name} is MISSING post-genesis — refusing to start"));
                 }
             }
-            // Treasury: optional (only if the network configured one) — decode if present.
-            let treasok = |d: &[u8]| crate::treasury_v7::TreasuryState::try_from_slice(d).is_ok();
+            // Treasury: optional (only if the network configured one) — decode if
+            // present. Accept the multisig `TreasuryState` OR a legacy 32-byte
+            // single-authority blob (brick-safe: a pre-#222 treasury still boots and
+            // runs as a 1-of-1 until upgraded via SetSigners).
+            let treasok = |d: &[u8]| {
+                crate::treasury_v7::TreasuryState::try_from_slice(d).is_ok()
+                    || (d.len() == 32 && Pubkey::try_from_slice(d).is_ok())
+            };
             decodes_if_present(crate::ids::TREASURY_ACCOUNT_ID, "TREASURY", &treasok)?;
         }
         Ok(())
@@ -1458,7 +1487,10 @@ impl Ledger {
             self.pool_earned = self.pool_earned.saturating_add(split.validator);
         }
         if split.admin > 0 {
-            self.credit_fee_target(working, ADMIN_FEE_WALLET, split.admin);
+            // Credit the CONFIGURED admin wallet (genesis decision, task #222) — may
+            // be the multisig treasury so administrative revenue is multisig-protected.
+            let admin = self.admin_fee_wallet;
+            self.credit_fee_target(working, admin, split.admin);
         }
     }
 

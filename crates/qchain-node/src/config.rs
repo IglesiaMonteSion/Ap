@@ -252,11 +252,51 @@ pub struct NodeConfig {
     #[serde(default)]
     pub treasury_authority: Option<String>,
     /// v7 genesis treasury amount, in QCH-units (1 QCH = 1e9). Minted LOCKED into
-    /// `TREASURY_ACCOUNT_ID` at genesis (owned by the treasury program; only a
-    /// `Release` signed by `treasury_authority` moves it). Only meaningful with
-    /// `economics_v7` + `treasury_authority`; part of the network config hash.
+    /// `TREASURY_ACCOUNT_ID` at genesis (owned by the treasury program; only an
+    /// approved multisig operation moves it). Only meaningful with `economics_v7`
+    /// plus either `treasury_signers` or `treasury_authority`; part of the network
+    /// config hash.
     #[serde(default)]
     pub treasury_amount: Option<u64>,
+
+    /// **MULTISIG treasury** (task #222): the M-of-N set of base58 signer addresses
+    /// (cold keys) that control the genesis-locked treasury. When set (non-empty),
+    /// the treasury is seeded as an M-of-N multisig instead of a single authority —
+    /// no single key can release funds or change control. `treasury_threshold` is
+    /// M. Requires `treasury_amount`. Part of the network config hash (folded into
+    /// `chain_id`). A network that sets `treasury_authority` instead gets a 1-of-1.
+    #[serde(default)]
+    pub treasury_signers: Vec<String>,
+    /// M — distinct signers required to authorize a treasury operation (e.g. 3 for
+    /// a 3-of-5). Only meaningful with `treasury_signers`; 0 defaults to a majority
+    /// (`floor(N/2)+1`). Part of the network config hash.
+    #[serde(default)]
+    pub treasury_threshold: u8,
+    /// Mandatory delay (rounds) after a treasury operation reaches its approval
+    /// threshold before it may execute (the review window). 0 = no timelock. Part
+    /// of the network config hash.
+    #[serde(default)]
+    pub treasury_timelock_rounds: u64,
+    /// Per-operation cap on a single treasury release, in whole QCH (0 = no cap).
+    /// Part of the network config hash.
+    #[serde(default)]
+    pub treasury_max_per_release_qch: u64,
+    /// Rolling-window cap on treasury releases, in whole QCH (0 = no cap), over
+    /// `treasury_window_rounds`. Part of the network config hash.
+    #[serde(default)]
+    pub treasury_max_per_window_qch: u64,
+    /// Length (rounds) of the rolling release-accounting window (0 = disabled).
+    /// Part of the network config hash.
+    #[serde(default)]
+    pub treasury_window_rounds: u64,
+    /// **Administrative-fee wallet** (task #222): base58 destination of the 10%
+    /// admin fee share, configured at GENESIS instead of a hidden compile-time
+    /// constant. When set it overrides `ids::ADMIN_FEE_WALLET` and is folded into
+    /// `chain_id`. Point it at the multisig treasury (or any multisig-controlled
+    /// address) so administrative revenue is multisig-protected too. Absent = the
+    /// legacy constant (byte-identical for existing networks).
+    #[serde(default)]
+    pub admin_fee_wallet: Option<String>,
 
     /// **HARD-CAP supply model** (SPEC §5, task #221 — the "definitive supply"
     /// decision). When `true` (only meaningful with `economics_v7`), staking
@@ -520,6 +560,28 @@ impl NodeConfig {
                 bytes.extend_from_slice(auth.as_bytes());
                 bytes.extend_from_slice(&amt.to_le_bytes());
             }
+            // Multisig treasury (#222): the signer set + threshold + timelock +
+            // limits are all part of the genesis identity, folded in ONLY when a
+            // multisig is configured (a single-authority or no-treasury network keeps
+            // its chain_id unchanged).
+            if !self.treasury_signers.is_empty() {
+                bytes.extend_from_slice(b"treasury-multisig-v1");
+                for s in &self.treasury_signers {
+                    bytes.extend_from_slice(s.trim().as_bytes());
+                    bytes.push(0);
+                }
+                bytes.push(self.treasury_threshold);
+                bytes.extend_from_slice(&self.treasury_timelock_rounds.to_le_bytes());
+                bytes.extend_from_slice(&self.treasury_max_per_release_qch.to_le_bytes());
+                bytes.extend_from_slice(&self.treasury_max_per_window_qch.to_le_bytes());
+                bytes.extend_from_slice(&self.treasury_window_rounds.to_le_bytes());
+            }
+            // The administrative-fee wallet is genesis state (it changes where the
+            // 10% admin fee is credited = consensus), folded in only when overridden.
+            if let Some(admin) = &self.admin_fee_wallet {
+                bytes.extend_from_slice(b"admin-fee-wallet-v1");
+                bytes.extend_from_slice(admin.trim().as_bytes());
+            }
             // Hard-cap supply (§5, #221): the cap + the pre-minted emission reserve
             // are part of the genesis economics identity, so a hard-cap network is a
             // distinct chain. Only folded when enabled, so an inflationary v7 network
@@ -584,6 +646,55 @@ impl NodeConfig {
     /// can't wrap; the genesis gate then rejects it for exceeding the cap.
     pub fn emission_reserve_atoms(&self) -> u64 {
         self.emission_reserve_qch.unwrap_or(0).saturating_mul(qchain_core::UNITS_PER_QCH)
+    }
+
+    /// The resolved MULTISIG treasury state (task #222), or `None` when no multisig
+    /// is configured (the caller then falls back to `treasury_authority` for a
+    /// 1-of-1, or seeds no treasury). Parses the base58 signers, resolves the
+    /// threshold (0 → majority `floor(N/2)+1`), and converts the QCH limits to
+    /// atoms. Only meaningful with `economics_v7`.
+    pub fn treasury_multisig_state(&self) -> anyhow::Result<Option<qchain_execution::treasury_v7::TreasuryState>> {
+        if self.treasury_signers.is_empty() {
+            return Ok(None);
+        }
+        let mut signers = Vec::with_capacity(self.treasury_signers.len());
+        for s in &self.treasury_signers {
+            signers.push(
+                s.trim()
+                    .parse::<qchain_crypto::Pubkey>()
+                    .map_err(|e| anyhow::anyhow!("treasury_signers entry '{s}' is not a valid base58 address: {e}"))?,
+            );
+        }
+        let n = signers.len();
+        let threshold = if self.treasury_threshold == 0 { (n / 2 + 1) as u8 } else { self.treasury_threshold };
+        qchain_execution::treasury_v7::validate_signer_set(&signers, threshold)
+            .map_err(|e| anyhow::anyhow!("invalid treasury signer set: {e:?}"))?;
+        let units = qchain_core::UNITS_PER_QCH;
+        Ok(Some(qchain_execution::treasury_v7::TreasuryState {
+            signers,
+            threshold,
+            timelock_rounds: self.treasury_timelock_rounds,
+            max_per_release: self.treasury_max_per_release_qch.saturating_mul(units),
+            max_per_window: self.treasury_max_per_window_qch.saturating_mul(units),
+            window_rounds: self.treasury_window_rounds,
+            window_start_round: 0,
+            released_in_window: 0,
+            next_op_id: 0,
+            pending: Vec::new(),
+        }))
+    }
+
+    /// The resolved administrative-fee wallet (task #222): the configured override
+    /// parsed to a `Pubkey`, or `None` = use the compiled-in `ids::ADMIN_FEE_WALLET`.
+    pub fn admin_fee_wallet_pubkey(&self) -> anyhow::Result<Option<qchain_crypto::Pubkey>> {
+        match &self.admin_fee_wallet {
+            None => Ok(None),
+            Some(s) => Ok(Some(
+                s.trim()
+                    .parse::<qchain_crypto::Pubkey>()
+                    .map_err(|e| anyhow::anyhow!("admin_fee_wallet '{s}' is not a valid base58 address: {e}"))?,
+            )),
+        }
     }
 
     /// Rounds per epoch for validator rotation (the config override, or the
@@ -804,6 +915,13 @@ mod tests {
             rounds_per_quanto: None,
             treasury_authority: None,
             treasury_amount: None,
+            treasury_signers: Vec::new(),
+            treasury_threshold: 0,
+            treasury_timelock_rounds: 0,
+            treasury_max_per_release_qch: 0,
+            treasury_max_per_window_qch: 0,
+            treasury_window_rounds: 0,
+            admin_fee_wallet: None,
             hard_cap_supply: false,
             supply_cap_qch: None,
             emission_reserve_qch: None,
@@ -902,6 +1020,48 @@ mod tests {
         cap3.emission_reserve_qch = Some(40_000_000);
         assert_ne!(cap.chain_id(), cap3.chain_id(), "the emission reserve is part of the config hash");
         assert_eq!(cap3.emission_reserve_atoms(), 40_000_000u64 * qchain_core::UNITS_PER_QCH);
+    }
+
+    /// The MULTISIG treasury + admin-fee wallet (task #222) fold into `chain_id`
+    /// ONLY when configured, so a network without them keeps its chain_id, and any
+    /// change to the signer set / threshold / limits / admin address is a distinct
+    /// chain. Also confirms the resolvers parse + default correctly.
+    #[test]
+    fn multisig_treasury_and_admin_wallet_fold_into_chain_id_only_when_set() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
+        let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
+        let s: Vec<String> = (0..5).map(|_| Keypair::generate().unwrap().pubkey().to_string()).collect();
+
+        // Build a multisig config from the given threshold/timelock.
+        let mk_ms = |threshold: u8, timelock: u64| {
+            let mut c = config_with_v7(&validators, &genesis);
+            c.treasury_signers = s.clone();
+            c.treasury_threshold = threshold;
+            c.treasury_amount = Some(1_000_000_000);
+            c.treasury_timelock_rounds = timelock;
+            c
+        };
+        let base = config_with_v7(&validators, &genesis);
+        let ms = mk_ms(3, 100);
+        // A multisig config is a distinct chain from the plain v7 config.
+        assert_ne!(base.chain_id(), ms.chain_id(), "a multisig treasury is a distinct chain");
+        // The threshold is part of the identity.
+        assert_ne!(ms.chain_id(), mk_ms(4, 100).chain_id(), "the threshold is part of the config hash");
+        // The timelock/limits are part of the identity.
+        assert_ne!(ms.chain_id(), mk_ms(3, 200).chain_id(), "the timelock is part of the config hash");
+        // Resolver: builds a valid 3-of-5 state.
+        let state = ms.treasury_multisig_state().unwrap().unwrap();
+        assert_eq!(state.signers.len(), 5);
+        assert_eq!(state.threshold, 3);
+        assert_eq!(state.timelock_rounds, 100);
+
+        // The admin-fee wallet folds in only when set.
+        let mut aw = config_with_v7(&validators, &genesis);
+        aw.admin_fee_wallet = Some(Keypair::generate().unwrap().pubkey().to_string());
+        assert_ne!(base.chain_id(), aw.chain_id(), "an admin-fee wallet override is a distinct chain");
+        assert!(aw.admin_fee_wallet_pubkey().unwrap().is_some());
+        assert!(base.admin_fee_wallet_pubkey().unwrap().is_none(), "no override = the compiled-in constant");
     }
 
     /// The real, live-confirmed gap this closes (see

@@ -287,12 +287,14 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
-    /// v7 treasury: release (unlock+send) locked treasury funds to an address.
-    /// The keypair MUST be the treasury authority set at genesis.
-    TreasuryRelease {
+    /// v7 treasury (MULTISIG, #222): PROPOSE releasing locked funds to an address.
+    /// The keypair MUST be one of the treasury signers; the proposal counts as its
+    /// approval. Prints the operation id — other signers `treasury-approve` it, then
+    /// (after the timelock) anyone `treasury-execute`s it.
+    TreasuryProposeRelease {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
-        /// The treasury AUTHORITY keypair (the only key allowed to release).
+        /// A treasury SIGNER keypair (cold key).
         #[arg(short, long)]
         keypair: PathBuf,
         /// Destination address receiving the released QCH.
@@ -306,21 +308,93 @@ enum Command {
         #[arg(long, default_value_t = 50_000_000)]
         fee_limit: u64,
     },
-    /// v7 treasury: rotate the release authority to a new address (current
-    /// authority signs). Moves no funds.
-    TreasurySetAuthority {
+    /// v7 treasury (MULTISIG): PROPOSE rotating the signer set + threshold
+    /// (recovery / substituting a lost or compromised key). Moves no funds.
+    TreasuryProposeSetSigners {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
-        /// The CURRENT treasury authority keypair.
+        /// A current treasury SIGNER keypair.
         #[arg(short, long)]
         keypair: PathBuf,
-        /// The new authority address.
-        #[arg(long)]
-        new_authority: String,
+        /// A new signer base58 address (repeatable).
+        #[arg(long = "signer")]
+        signers: Vec<String>,
+        /// M for the new M-of-N (0 = majority).
+        #[arg(long, default_value_t = 0)]
+        threshold: u8,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 50_000_000)]
         fee_limit: u64,
+    },
+    /// v7 treasury (MULTISIG): PROPOSE changing the timelock + limits.
+    TreasuryProposeSetPolicy {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        timelock_rounds: u64,
+        #[arg(long, default_value_t = 0)]
+        max_per_release_qch: u64,
+        #[arg(long, default_value_t = 0)]
+        max_per_window_qch: u64,
+        #[arg(long, default_value_t = 0)]
+        window_rounds: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 treasury (MULTISIG): APPROVE a pending operation as a signer.
+    TreasuryApprove {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        op_id: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 treasury (MULTISIG): EXECUTE an approved+timelocked operation
+    /// (permissionless — any keypair pays the tx fee). For a Release, pass `--to`
+    /// (the approved destination).
+    TreasuryExecute {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        op_id: u64,
+        /// The approved destination (required for a Release op).
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 treasury (MULTISIG): CANCEL a pending operation as a signer.
+    TreasuryCancel {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        op_id: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 treasury: print the full on-chain multisig state (signers, threshold,
+    /// timelock, limits, window usage, and every pending operation with approvals).
+    TreasuryStatus {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
     },
     /// Propose activating a new algorithm registry entry.
     ProposeActivate {
@@ -1475,37 +1549,75 @@ fn main() -> anyhow::Result<()> {
             println!("submitted: {body}");
             println!("un-jailed v7 validator {target} - rejoins the active committee at the next epoch");
         }
-        Command::TreasuryRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
-            let authority = qchain_crypto::read_keypair_file(&keypair)?;
+        Command::TreasuryProposeRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
             let dest: qchain_crypto::Pubkey = to.parse().map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
-            let data = borsh::to_vec(&qchain_execution::treasury_v7::TreasuryV7Instruction::Release { amount })?;
-            let body = submit_instruction(
-                &rpc,
-                &authority,
-                qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
-                vec![authority.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID, dest],
-                data,
-                nonce,
-                fee_limit,
-            )?;
+            let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount, destination: dest } })?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("released {amount} units ({} QCH) from the treasury to {dest}", amount / 1_000_000_000);
+            println!("proposed a release of {amount} units ({} QCH) to {dest} — other signers approve, then execute after the timelock. See `treasury-status` for the op id.", amount / 1_000_000_000);
         }
-        Command::TreasurySetAuthority { rpc, keypair, new_authority, nonce, fee_limit } => {
-            let authority = qchain_crypto::read_keypair_file(&keypair)?;
-            let new_auth: qchain_crypto::Pubkey = new_authority.parse().map_err(|e| anyhow::anyhow!("invalid --new-authority address: {e}"))?;
-            let data = borsh::to_vec(&qchain_execution::treasury_v7::TreasuryV7Instruction::SetAuthority)?;
-            let body = submit_instruction(
-                &rpc,
-                &authority,
-                qchain_execution::ids::TREASURY_V7_PROGRAM_ID,
-                vec![authority.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID, new_auth],
-                data,
-                nonce,
-                fee_limit,
-            )?;
+        Command::TreasuryProposeSetSigners { rpc, keypair, signers, threshold, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
+            let mut parsed = Vec::with_capacity(signers.len());
+            for s in &signers {
+                parsed.push(s.parse::<qchain_crypto::Pubkey>().map_err(|e| anyhow::anyhow!("invalid --signer '{s}': {e}"))?);
+            }
+            let n = parsed.len();
+            let m = if threshold == 0 { (n / 2 + 1) as u8 } else { threshold };
+            let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: parsed, threshold: m } })?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("rotated the treasury authority to {new_auth}");
+            println!("proposed rotating the signer set to {m}-of-{n} — other signers approve, then execute after the timelock.");
+        }
+        Command::TreasuryProposeSetPolicy { rpc, keypair, timelock_rounds, max_per_release_qch, max_per_window_qch, window_rounds, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
+            let op = TreasuryOp::SetPolicy {
+                timelock_rounds,
+                max_per_release: max_per_release_qch.saturating_mul(1_000_000_000),
+                max_per_window: max_per_window_qch.saturating_mul(1_000_000_000),
+                window_rounds,
+            };
+            let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op })?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("proposed a policy change (timelock {timelock_rounds}, per-op {max_per_release_qch} QCH, per-window {max_per_window_qch} QCH/{window_rounds} rounds).");
+        }
+        Command::TreasuryApprove { rpc, keypair, op_id, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::TreasuryV7Instruction;
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&TreasuryV7Instruction::Approve { op_id })?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("approved treasury op {op_id}.");
+        }
+        Command::TreasuryExecute { rpc, keypair, op_id, to, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::TreasuryV7Instruction;
+            let executor = qchain_crypto::read_keypair_file(&keypair)?;
+            let mut accounts = vec![executor.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID];
+            if let Some(to) = &to {
+                let dest: qchain_crypto::Pubkey = to.parse().map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
+                accounts.push(dest);
+            }
+            let data = borsh::to_vec(&TreasuryV7Instruction::Execute { op_id })?;
+            let body = submit_instruction(&rpc, &executor, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, accounts, data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("executed treasury op {op_id}.");
+        }
+        Command::TreasuryCancel { rpc, keypair, op_id, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::TreasuryV7Instruction;
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&TreasuryV7Instruction::Cancel { op_id })?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("cancelled treasury op {op_id}.");
+        }
+        Command::TreasuryStatus { rpc } => {
+            let body = reqwest::blocking::get(format!("{}/treasury", rpc.trim_end_matches('/')))?.text()?;
+            println!("{body}");
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;

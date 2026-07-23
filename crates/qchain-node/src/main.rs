@@ -364,6 +364,13 @@ async fn main() -> anyhow::Result<()> {
             config.emission_reserve_atoms() / qchain_core::UNITS_PER_QCH,
         );
     }
+    // Administrative-fee wallet (task #222): a GENESIS-configured address (folded
+    // into chain_id) overrides the compiled-in constant, so the 10% admin fee
+    // destination is not a hidden constant and can be a multisig.
+    if let Some(admin) = config.admin_fee_wallet_pubkey()? {
+        ledger.set_admin_fee_wallet(admin);
+        tracing::info!("admin fee wallet: {admin} (genesis-configured — the 10% admin fee is credited here)");
+    }
     // Register the standard native programs (chosen by economics_v7). Shared
     // with `Ledger::simulate` so a dry-run dispatches exactly like the live node.
     qchain_execution::register_standard_programs(&mut ledger, config.economics_v7);
@@ -559,7 +566,25 @@ async fn main() -> anyhow::Result<()> {
             // authority (SPEC: v7 treasury). Deterministic (same authority+amount on
             // every node → identical genesis root). Absent when no treasury is
             // configured, so a v7 network without one is unchanged.
-            if let (Some(auth_b58), Some(amount)) = (config.treasury_authority.as_deref(), config.treasury_amount) {
+            // MULTISIG treasury (task #222) takes precedence: if signers are
+            // configured, seed the M-of-N multisig; otherwise fall back to a single
+            // authority (1-of-1, backward-compatible). Both require an amount.
+            if let (Some(state), Some(amount)) = (config.treasury_multisig_state()?, config.treasury_amount) {
+                let n = state.signers.len();
+                let m = state.threshold;
+                ledger.seed_account(
+                    qchain_execution::ids::TREASURY_ACCOUNT_ID,
+                    qchain_execution::treasury_v7::genesis_treasury_account_multisig(state, amount),
+                );
+                tracing::info!(
+                    "treasury: seeded {} QCH LOCKED under a {m}-of-{n} MULTISIG (timelock {} rounds, per-op {} QCH, per-window {} QCH/{} rounds) — no single key can release funds",
+                    amount / 1_000_000_000,
+                    config.treasury_timelock_rounds,
+                    config.treasury_max_per_release_qch,
+                    config.treasury_max_per_window_qch,
+                    config.treasury_window_rounds,
+                );
+            } else if let (Some(auth_b58), Some(amount)) = (config.treasury_authority.as_deref(), config.treasury_amount) {
                 let authority = auth_b58
                     .parse::<qchain_crypto::Pubkey>()
                     .map_err(|e| anyhow::anyhow!("treasury_authority is not a valid address: {e}"))?;
@@ -568,7 +593,7 @@ async fn main() -> anyhow::Result<()> {
                     qchain_execution::treasury_v7::genesis_treasury_account(authority, amount),
                 );
                 tracing::info!(
-                    "treasury: seeded {} units ({} QCH) LOCKED, release authority {}",
+                    "treasury: seeded {} units ({} QCH) LOCKED, single authority {} (1-of-1) — consider a multisig (treasury_signers)",
                     amount,
                     amount / 1_000_000_000,
                     auth_b58
