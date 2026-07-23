@@ -18,6 +18,97 @@ use qchain_execution::validator_v7::ValidatorV7Instruction;
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
 
+/// The canonical, portable representation of an UNSIGNED transaction for the
+/// air-gapped flow (roadmap #11). Produced ONLINE by `transfer-prepare` (which
+/// only needs the payer's public address), reviewed + signed OFFLINE by
+/// `tx-sign`, then broadcast ONLINE by `tx-broadcast`. It carries everything the
+/// offline signer needs to reconstruct the EXACT `Message` — but no key. The
+/// `payer_keys` field of the real `Message` is filled from the keypair at sign
+/// time, so this request stays watch-only (address only).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UnsignedTx {
+    /// Format tag; `tx-sign` refuses anything it doesn't recognize.
+    kind: String,
+    /// Payer PUBLIC address (base58). `tx-sign` asserts the keypair matches this.
+    payer: String,
+    nonce: u64,
+    /// Network genesis hash (hex) — binds the tx to one network (anti cross-replay).
+    chain_id: String,
+    fee_limit: u64,
+    priority_fee: u64,
+    /// Absolute expiry: the node rejects the tx once current_round passes this.
+    valid_until_round: u64,
+    /// The single instruction, portably: program id + accounts (base58) + data (hex).
+    program_id: String,
+    accounts: Vec<String>,
+    data_hex: String,
+    /// Human-readable summary of what this authorizes, shown for offline review.
+    summary: String,
+}
+
+const UNSIGNED_TX_KIND: &str = "qchain-unsigned-tx-v1";
+
+/// Render a one-line human summary of a prepared instruction for offline review.
+/// Decodes a known System `Transfer` into "Transfer X QCH to <addr>"; anything
+/// else is shown as its raw program/accounts/data so the signer still sees it.
+fn summarize_instruction(program_id: &Pubkey, accounts: &[Pubkey], data: &[u8]) -> String {
+    if *program_id == Pubkey::system_program_id() {
+        if let Ok(SystemInstruction::Transfer { amount }) = borsh::from_slice::<SystemInstruction>(data) {
+            if let Some(to) = accounts.get(1) {
+                return format!("Transfer {} ({} QCH) to {to}", amount, fmt_qch(amount));
+            }
+        }
+    }
+    format!(
+        "program {program_id}, {} account(s), {} data byte(s)",
+        accounts.len(),
+        data.len()
+    )
+}
+
+/// Format base units as QCH (1 QCH = 1e9 units) for display only.
+fn fmt_qch(units: u64) -> String {
+    format!("{}.{:09}", units / 1_000_000_000, units % 1_000_000_000)
+}
+
+/// Reconstruct the exact `Message` from an `UnsignedTx` and sign it with `kp`,
+/// returning the signed `Transaction` (roadmap #11). Pure: NO I/O, NO network,
+/// NO prompt — the offline `tx-sign` command wraps this with review + confirm.
+/// Refuses if the keypair is not the request's payer, or the freshly-made
+/// signature does not verify.
+fn sign_unsigned_tx(kp: &Keypair, req: &UnsignedTx) -> anyhow::Result<Transaction> {
+    if req.kind != UNSIGNED_TX_KIND {
+        anyhow::bail!("unexpected request kind {:?} (expected {UNSIGNED_TX_KIND})", req.kind);
+    }
+    let program_id: Pubkey = req.program_id.parse().map_err(|_| anyhow::anyhow!("bad program_id"))?;
+    let accounts: Vec<Pubkey> = req
+        .accounts
+        .iter()
+        .map(|a| a.parse().map_err(|_| anyhow::anyhow!("bad account address {a}")))
+        .collect::<anyhow::Result<_>>()?;
+    let data = hex::decode(&req.data_hex).map_err(|_| anyhow::anyhow!("bad data hex"))?;
+    let chain_id: [u8; 32] = hex::decode(&req.chain_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("chain_id must be 32 bytes of hex"))?;
+    // SAFETY: you can only sign a tx FROM your own account.
+    let payer_pk: Pubkey = req.payer.parse().map_err(|_| anyhow::anyhow!("bad payer"))?;
+    if kp.pubkey() != payer_pk {
+        anyhow::bail!(
+            "this keypair ({}) is NOT the payer of the request ({}) — refusing to sign",
+            kp.pubkey(),
+            payer_pk
+        );
+    }
+    let ix = Instruction { program_id, accounts, data };
+    let tx = Transaction::new_signed_full(kp, req.nonce, chain_id, req.fee_limit, req.priority_fee, req.valid_until_round, vec![ix])?;
+    // Defense in depth: the signature we just made must verify.
+    if !tx.verify_signature() {
+        anyhow::bail!("internal error: freshly-signed transaction does not verify");
+    }
+    Ok(tx)
+}
+
 #[derive(Parser)]
 #[command(about = "qchain testnet wallet: transfers, delegated staking, and governance")]
 struct Cli {
@@ -83,6 +174,67 @@ enum Command {
         /// and execution) once that round passes. Default: unset = never expires.
         #[arg(long)]
         valid_for_rounds: Option<u64>,
+    },
+    /// AIR-GAPPED step 1/3 (ONLINE, watch-only): build an UNSIGNED transfer
+    /// request from a public address. Fetches chain_id + nonce + current round
+    /// and writes a small JSON the offline signer will sign. NO private key is
+    /// read or needed here - this runs on the internet-connected machine, which
+    /// never sees the key. See `docs/OFFLINE-WALLET.md`.
+    TransferPrepare {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The payer's PUBLIC address (base58). The key stays on the offline machine.
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+        #[arg(long, default_value_t = 0)]
+        priority_fee: u64,
+        /// Validity window in rounds. Air-gapped moves take time, so the default
+        /// is generous (the node rejects the tx once current_round passes
+        /// current_round + this).
+        #[arg(long, default_value_t = 3600)]
+        valid_for_rounds: u64,
+        /// Optional explicit nonce (default: fetched from the address's account).
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Where to write the unsigned request JSON.
+        #[arg(long, default_value = "unsigned-tx.json")]
+        out: PathBuf,
+    },
+    /// AIR-GAPPED step 2/3 (OFFLINE, NO network): sign an unsigned request with
+    /// the private key. Reads the request + keypair, shows EXACTLY what will be
+    /// signed (from/to/amount/fee/chain_id/nonce/expiry) for review on the
+    /// air-gapped machine, verifies the keypair is the request's payer, then
+    /// writes the signed transaction. This command makes ZERO network calls.
+    TxSign {
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The unsigned request JSON produced by `transfer-prepare`.
+        #[arg(long)]
+        request: PathBuf,
+        /// Where to write the signed transaction JSON.
+        #[arg(long, default_value = "signed-tx.json")]
+        out: PathBuf,
+        /// Skip the interactive "type yes to sign" confirmation (for scripting).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// AIR-GAPPED step 3/3 (ONLINE): broadcast a signed transaction to a node.
+    /// Re-verifies the signature LOCALLY before sending (unless --no-verify).
+    TxBroadcast {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The signed transaction JSON produced by `tx-sign`.
+        #[arg(long)]
+        tx: PathBuf,
+        /// Skip the local signature re-verification before broadcasting.
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Bond funds to a validator, opening a new stake account (prints its
     /// address - save it, it's needed for `stake-undelegate` and `vote`).
@@ -1348,6 +1500,94 @@ fn main() -> anyhow::Result<()> {
             };
             let body = submit_instruction_p(&rpc, &payer, Pubkey::system_program_id(), vec![payer.pubkey(), to_pk], data, nonce, fee_limit, priority_fee, valid_until_round)?;
             println!("submitted: {body}");
+        }
+        // ===== AIR-GAPPED FLOW (roadmap #11) =====
+        Command::TransferPrepare { rpc, from, to, amount, fee_limit, priority_fee, valid_for_rounds, nonce, out } => {
+            // ONLINE, watch-only: we only have the payer's PUBLIC address.
+            let from_pk: Pubkey = from.parse().map_err(|_| anyhow::anyhow!("bad --from address"))?;
+            let to_pk: Pubkey = to.parse().map_err(|_| anyhow::anyhow!("bad --to address"))?;
+            let chain_id = fetch_chain_id(&rpc)?;
+            let nonce = match nonce {
+                Some(n) => n,
+                None => fetch_account(&rpc, &from_pk)?.map(|a| a.nonce).unwrap_or(0),
+            };
+            let valid_until_round = fetch_current_round(&rpc)?.saturating_add(valid_for_rounds);
+            let data = borsh::to_vec(&SystemInstruction::Transfer { amount })?;
+            let accounts = vec![from_pk, to_pk];
+            let summary = summarize_instruction(&Pubkey::system_program_id(), &accounts, &data);
+            let req = UnsignedTx {
+                kind: UNSIGNED_TX_KIND.to_string(),
+                payer: from_pk.to_string(),
+                nonce,
+                chain_id: hex::encode(chain_id),
+                fee_limit,
+                priority_fee,
+                valid_until_round,
+                program_id: Pubkey::system_program_id().to_string(),
+                accounts: accounts.iter().map(|a| a.to_string()).collect(),
+                data_hex: hex::encode(&data),
+                summary: summary.clone(),
+            };
+            std::fs::write(&out, serde_json::to_vec_pretty(&req)?)?;
+            println!("unsigned request written to {}", out.display());
+            println!("  {summary}");
+            println!("  nonce {nonce}, fee_limit {fee_limit}, valid_until_round {valid_until_round}");
+            println!("Move this file to the OFFLINE machine and run: qchain tx-sign --keypair <key> --request {}", out.display());
+        }
+        Command::TxSign { keypair, request, out, yes } => {
+            // OFFLINE: reads files only, makes ZERO network calls.
+            let kp = qchain_crypto::read_keypair_file(&keypair)?;
+            let req: UnsignedTx = serde_json::from_slice(&std::fs::read(&request)?)
+                .map_err(|e| anyhow::anyhow!("unreadable request: {e}"))?;
+            if req.kind != UNSIGNED_TX_KIND {
+                anyhow::bail!("unexpected request kind {:?} (expected {UNSIGNED_TX_KIND})", req.kind);
+            }
+            // Decode the instruction fields once for the review display; the
+            // actual reconstruction + payer check + signing happens in
+            // `sign_unsigned_tx` (shared, testable, no I/O).
+            let program_id: Pubkey = req.program_id.parse().map_err(|_| anyhow::anyhow!("bad program_id"))?;
+            let accounts: Vec<Pubkey> = req
+                .accounts
+                .iter()
+                .map(|a| a.parse().map_err(|_| anyhow::anyhow!("bad account address {a}")))
+                .collect::<anyhow::Result<_>>()?;
+            let data = hex::decode(&req.data_hex).map_err(|_| anyhow::anyhow!("bad data hex"))?;
+            // Show EXACTLY what will be signed, for review on the air-gapped box.
+            println!("== you are about to SIGN (offline) ==");
+            println!("  {}", summarize_instruction(&program_id, &accounts, &data));
+            println!("  payer:             {}", req.payer);
+            println!("  nonce:             {}", req.nonce);
+            println!("  chain_id:          {}", req.chain_id);
+            println!("  fee_limit:         {} ({} QCH)", req.fee_limit, fmt_qch(req.fee_limit));
+            println!("  priority_fee:      {}", req.priority_fee);
+            println!("  valid_until_round: {}", req.valid_until_round);
+            if !yes {
+                use std::io::Write as _;
+                print!("Type 'yes' to sign: ");
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim() != "yes" {
+                    anyhow::bail!("aborted (no signature written)");
+                }
+            }
+            let tx = sign_unsigned_tx(&kp, &req)?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&tx)?)?;
+            println!("signed transaction written to {}", out.display());
+            println!("Move this file to an ONLINE machine and run: qchain tx-broadcast --tx {}", out.display());
+        }
+        Command::TxBroadcast { rpc, tx, no_verify } => {
+            // ONLINE: read the signed tx and POST it.
+            let signed: Transaction = serde_json::from_slice(&std::fs::read(&tx)?)
+                .map_err(|e| anyhow::anyhow!("unreadable signed tx: {e}"))?;
+            if !no_verify && !signed.verify_signature() {
+                anyhow::bail!("signature does NOT verify — refusing to broadcast a bad transaction");
+            }
+            let resp = reqwest::blocking::Client::new().post(format!("{rpc}/tx")).json(&signed).send()?;
+            if !resp.status().is_success() {
+                anyhow::bail!("node rejected transaction: {}", resp.text()?);
+            }
+            println!("broadcast ok: {}", resp.text()?);
         }
         Command::StakeDelegate { rpc, keypair, validator, amount, nonce, fee_limit } => {
             let staker = qchain_crypto::read_keypair_file(&keypair)?;
@@ -2792,4 +3032,74 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod air_gapped_tests {
+    use super::*;
+    use qchain_crypto::Keypair;
+
+    /// Build an unsigned transfer request the way `transfer-prepare` does, but
+    /// without any node (fixed nonce/chain_id/round), so the offline signer can
+    /// be tested purely.
+    fn sample_request(payer: &Pubkey, to: &Pubkey) -> UnsignedTx {
+        let data = borsh::to_vec(&SystemInstruction::Transfer { amount: 5_000_000_000 }).unwrap();
+        let accounts = vec![*payer, *to];
+        UnsignedTx {
+            kind: UNSIGNED_TX_KIND.to_string(),
+            payer: payer.to_string(),
+            nonce: 7,
+            chain_id: hex::encode([9u8; 32]),
+            fee_limit: 10_000_000,
+            priority_fee: 0,
+            valid_until_round: 12_345,
+            program_id: Pubkey::system_program_id().to_string(),
+            accounts: accounts.iter().map(|a| a.to_string()).collect(),
+            data_hex: hex::encode(&data),
+            summary: summarize_instruction(&Pubkey::system_program_id(), &accounts, &data),
+        }
+    }
+
+    #[test]
+    fn offline_sign_reconstructs_a_verifiable_tx_with_the_exact_prepared_fields() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let req = sample_request(&payer.pubkey(), &to);
+
+        // Sign offline (no I/O, no network).
+        let tx = sign_unsigned_tx(&payer, &req).unwrap();
+
+        // The signature verifies, and every signed field matches the request
+        // EXACTLY — the offline signer cannot silently change what was reviewed.
+        assert!(tx.verify_signature());
+        assert_eq!(tx.message.payer, payer.pubkey());
+        assert_eq!(tx.message.nonce, 7);
+        assert_eq!(tx.message.chain_id, [9u8; 32]);
+        assert_eq!(tx.message.fee_limit, 10_000_000);
+        assert_eq!(tx.message.valid_until_round, 12_345);
+        assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.instructions[0].accounts, vec![payer.pubkey(), to]);
+    }
+
+    #[test]
+    fn offline_sign_refuses_a_keypair_that_is_not_the_payer() {
+        let payer = Keypair::generate().unwrap();
+        let attacker = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let req = sample_request(&payer.pubkey(), &to);
+
+        // A different key cannot sign a request whose payer is someone else —
+        // you can only spend from your own account.
+        let err = sign_unsigned_tx(&attacker, &req).unwrap_err().to_string();
+        assert!(err.contains("NOT the payer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn offline_sign_rejects_an_unknown_request_kind() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+        let mut req = sample_request(&payer.pubkey(), &to);
+        req.kind = "some-other-format".to_string();
+        assert!(sign_unsigned_tx(&payer, &req).is_err());
+    }
 }
