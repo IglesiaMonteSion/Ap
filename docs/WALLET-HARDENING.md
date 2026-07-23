@@ -102,8 +102,11 @@ perdería precisión sobre 2^53). Las rondas usadas sólo para mostrar quedan co
 
 ## Recomendación
 
-- Uso normal: contraseña fuerte (PBKDF2 600k) + biométrico WebAuthn-PRF +
-  respaldo Shamir. Verificá la huella en Ajustes contra el release firmado tras
-  cada actualización.
-- Fondos importantes: firmá con el CLI en una máquina air-gapped y difundí desde
-  otra; o esperá soporte de hardware wallet PQC (diferido).
+- Uso normal: contraseña fuerte (la semilla se cifra con **Argon2id** memory-hard,
+  roadmap #12 — 19 MiB/2 pasadas, el mismo argon2 vetteado que la wallet custodial
+  usa server-side, compilado a wasm; un blob viejo PBKDF2-600k se sigue descifrando,
+  nadie queda afuera) + biométrico WebAuthn-PRF + respaldo Shamir. Verificá la
+  huella en Ajustes contra el release firmado tras cada actualización.
+- Fondos importantes: firmá con el CLI en una máquina air-gapped (roadmap #11,
+  `transfer-prepare`/`tx-sign`/`tx-broadcast`, ver `docs/OFFLINE-WALLET.md`) y
+  difundí desde otra; o esperá soporte de hardware wallet PQC (diferido).

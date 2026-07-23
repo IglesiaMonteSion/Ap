@@ -21,6 +21,32 @@
 use qchain_core::{Instruction, Transaction};
 use qchain_crypto::{Keypair, Pubkey};
 
+/// Argon2id key derivation (roadmap #12) — memory-hard, GPU/ASIC-resistant.
+///
+/// Derives `out_len` bytes from `password`+`salt` with Argon2id (v0x13), the
+/// same vetted RustCrypto implementation the custodial wallet uses server-side.
+/// The browser calls this (compiled to wasm) to derive the AES-256-GCM key that
+/// encrypts the seed at rest, replacing PBKDF2-SHA256. `mem_kib` is the memory
+/// cost in KiB, `iters` the time cost (passes), `parallelism` the lanes.
+/// Backend-agnostic and testable natively.
+pub fn argon2id_raw(
+    password: &[u8],
+    salt: &[u8],
+    mem_kib: u32,
+    iters: u32,
+    parallelism: u32,
+    out_len: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(mem_kib, iters, parallelism, Some(out_len))
+        .map_err(|e| anyhow::anyhow!("bad argon2 params: {e}"))?;
+    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = vec![0u8; out_len];
+    a2.hash_password_into(password, salt, &mut out)
+        .map_err(|e| anyhow::anyhow!("argon2id derivation failed: {e}"))?;
+    Ok(out)
+}
+
 /// SystemInstruction::Transfer { amount } is variant 1 in
 /// `qchain-execution::native`; its Borsh encoding is `[1u8]` followed by the
 /// amount as 8 little-endian bytes. Replicated here (rather than depending on
@@ -539,6 +565,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn argon2id_matches_the_vetted_default_and_is_deterministic_salt_sensitive() {
+        // The browser's Argon2id (roadmap #12) at the OWASP-default params
+        // (m=19456 KiB, t=2, p=1, 32-byte output) must produce EXACTLY what the
+        // vetted `Argon2::default()` produces — the same KDF the custodial wallet
+        // uses server-side. This proves the wasm KDF is the real, standard
+        // Argon2id, not a look-alike.
+        let pw = b"correct horse battery staple";
+        let salt = [0x11u8; 16];
+        let ours = argon2id_raw(pw, &salt, 19456, 2, 1, 32).unwrap();
+        let mut reference = [0u8; 32];
+        argon2::Argon2::default()
+            .hash_password_into(pw, &salt, &mut reference)
+            .unwrap();
+        assert_eq!(ours.as_slice(), &reference[..], "must equal Argon2::default()");
+        assert_eq!(ours.len(), 32);
+        // Deterministic for the same inputs; a different salt yields a different key.
+        assert_eq!(ours, argon2id_raw(pw, &salt, 19456, 2, 1, 32).unwrap());
+        let other = argon2id_raw(pw, &[0x22u8; 16], 19456, 2, 1, 32).unwrap();
+        assert_ne!(ours, other);
+        // A wrong password yields a different key (obviously, but assert it).
+        assert_ne!(ours, argon2id_raw(b"wrong", &salt, 19456, 2, 1, 32).unwrap());
+    }
+
+    #[test]
     fn account_zero_is_the_master_and_higher_accounts_are_distinct_and_recoverable() {
         let master = [7u8; 32];
         // Account 0 MUST equal the master seed unchanged - existing wallets
@@ -644,6 +694,24 @@ mod wasm {
     #[wasm_bindgen(js_name = addressFromSeed)]
     pub fn address_from_seed(seed: &[u8]) -> Result<String, JsValue> {
         super::address_from_seed(&as32(seed, "seed")?).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `argon2idRaw(password, salt, memKiB, iters, parallelism, outLen) -> Uint8Array`
+    /// Memory-hard KDF (roadmap #12): the browser derives the seed-encryption
+    /// key with Argon2id instead of PBKDF2. Returns `outLen` raw bytes to import
+    /// as an AES-GCM key. `password` is the UTF-8 bytes of the passphrase.
+    #[wasm_bindgen(js_name = argon2idRaw)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn argon2id_raw(
+        password: &[u8],
+        salt: &[u8],
+        mem_kib: u32,
+        iters: u32,
+        parallelism: u32,
+        out_len: u32,
+    ) -> Result<Vec<u8>, JsValue> {
+        super::argon2id_raw(password, salt, mem_kib, iters, parallelism, out_len as usize)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signTransfer(seed, to, amount, nonce, chainId, feeLimit) -> string`

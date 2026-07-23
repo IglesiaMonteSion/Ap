@@ -11,6 +11,12 @@ crate-type = ["cdylib", "rlib"]
 # The pure backend: no liboqs (C), compiles to wasm32. Byte-compatible with the
 # node's liboqs (proven in qchain-crypto/tests/wasm_feasibility.rs).
 qchain-core = { path = "../qchain-core", default-features = false, features = ["pure"] }
+# Argon2id (roadmap #12): the SAME vetted RustCrypto argon2 the custodial wallet
+# uses server-side (crates/qchain-wallet/src/keystore.rs), compiled to wasm32 so
+# the browser can derive the seed-encryption key with a memory-hard KDF. Pure
+# Rust (no std needed beyond alloc), so it targets wasm cleanly; `hash_password_into`
+# takes an explicit salt so we don't need the `rand`/`password-hash` features.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 qchain-crypto = { path = "../qchain-crypto", default-features = false, features = ["pure"] }
 serde_json = "1"
 hex = "0.4"

@@ -1,4 +1,4 @@
-import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded, programAddressFromSeed, signDeployProgram, signCallProgram } from '/wasm/qchain_wasm.js';
+import init, { addressFromSeed, signTransfer, addressFromBytes, signDelegate, signUndelegate, signClaimReward, signVote, signFinalize, signExecute, stakeAddressFromSeed, deriveAccountSeed, signV7Stake, signV7BeginUnstake, signV7WithdrawUnbonded, programAddressFromSeed, signDeployProgram, signCallProgram, argon2idRaw } from '/wasm/qchain_wasm.js';
 
 const $ = id => document.getElementById(id);
 const LS_KEY = "qchain_wasm_wallet_v1";
@@ -108,27 +108,56 @@ function qchDisp(u){ const q=unitsToQch(u); const [i,f]=q.split("."); return fmt
 
 async function api(path, opts){ const r=await fetch(path,opts); const b=await r.json().catch(()=>({})); if(!r.ok) throw new Error(b.error||("error "+r.status)); return b; }
 
-// ---- WebCrypto: cifrar/descifrar la semilla con la contraseña ----
-// PBKDF2-HMAC-SHA256 iteration count. Raised to OWASP's 2023 recommendation
-// (600k) from the original 250k - a brute-forcer now pays ~2.4x more per guess.
-// The count is stored IN each blob (`iter`) so blobs written at the old 250k
-// still decrypt (fallback below), and a future raise stays backward-compatible.
+// ---- WebCrypto + Argon2id: cifrar/descifrar la semilla con la contraseña ----
+// Roadmap #12: la KDF por defecto pasó de PBKDF2-SHA256 a ARGON2ID (memory-hard).
+// PBKDF2 sólo es cómputo, así que una GPU/ASIC prueba millones de contraseñas por
+// segundo; Argon2id además EXIGE ~19 MiB de RAM por intento, lo que arruina el
+// paralelismo masivo — el estándar moderno (ganador del Password Hashing
+// Competition, recomendado por OWASP). Se usa el MISMO argon2 vetteado (RustCrypto)
+// que la wallet custodial usa server-side, compilado a wasm (verificado que
+// coincide byte a byte con `Argon2::default()`). WebCrypto no implementa Argon2,
+// por eso viene del wasm.
+//
+// Parámetros Argon2id (OWASP 2023): 19 MiB de memoria, 2 pasadas, 1 lane. Se
+// GUARDAN en cada blob (`m`/`t`/`p`) para que subirlos en el futuro siga
+// descifrando los blobs viejos.
+const ARGON2_MEM_KIB = 19456, ARGON2_ITERS = 2, ARGON2_PARALLELISM = 1;
+async function argon2Key(password, salt){
+  // 32 bytes de Argon2id -> clave AES-256-GCM (no extraíble).
+  const raw = argon2idRaw(new TextEncoder().encode(password), salt, ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLELISM, 32);
+  return crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
+// PBKDF2 se conserva SÓLO para descifrar blobs viejos (compatibilidad hacia
+// atrás — nadie queda afuera). Ya no se cifra nada nuevo con él.
 const PBKDF2_ITERS = 600000;
-async function deriveKey(password, salt, iters){
+async function pbkdf2Key(password, salt, iters){
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:iters, hash:'SHA-256'}, base,
     {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
 }
 async function encryptSeed(seed, password){
+  // NUEVO: siempre Argon2id. El blob v2 se auto-describe (kdf + params) para que
+  // decryptSeed sepa cómo derivar la clave.
   const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
-  const key=await deriveKey(password, salt, PBKDF2_ITERS);
+  const key=await argon2Key(password, salt);
   const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, seed));
-  return { v:1, iter:PBKDF2_ITERS, salt:b64(salt), iv:b64(iv), ct:b64(ct) };
+  return { v:2, kdf:"argon2id", m:ARGON2_MEM_KIB, t:ARGON2_ITERS, p:ARGON2_PARALLELISM, salt:b64(salt), iv:b64(iv), ct:b64(ct) };
 }
 async function decryptSeed(store, password){
-  // Old blobs (v1, pre-hardening) carry no `iter`: they were derived at 250k.
-  const iters=Number(store.iter)||250000;
-  const key=await deriveKey(password, ub64(store.salt), iters);
+  // Elige la KDF por lo que dice el blob: los nuevos (v2) llevan kdf:"argon2id";
+  // los viejos (PBKDF2, con o sin `iter`) se siguen descifrando igual → un usuario
+  // existente NUNCA queda bloqueado por la migración.
+  let key;
+  if(store.kdf==="argon2id"){
+    const salt=ub64(store.salt);
+    const m=Number(store.m)||ARGON2_MEM_KIB, t=Number(store.t)||ARGON2_ITERS, p=Number(store.p)||ARGON2_PARALLELISM;
+    const raw=argon2idRaw(new TextEncoder().encode(password), salt, m, t, p, 32);
+    key=await crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+  } else {
+    // Blob PBKDF2 legacy. Los pre-hardening (v1 sin `iter`) eran 250k.
+    const iters=Number(store.iter)||250000;
+    key=await pbkdf2Key(password, ub64(store.salt), iters);
+  }
   const pt=await crypto.subtle.decrypt({name:'AES-GCM', iv:ub64(store.iv)}, key, ub64(store.ct));
   return new Uint8Array(pt);
 }
@@ -161,8 +190,8 @@ function isWeakSeed(seed){
 
 // Lockout anti fuerza-bruta del desbloqueo local: tras varios intentos fallidos
 // de contraseña se impone una espera creciente antes del próximo intento. El
-// atacante que ya tiene el blob cifrado igual paga el PBKDF2 de 600k por cada
-// intento, pero esto frena además un ataque interactivo en el propio navegador.
+// atacante que ya tiene el blob cifrado igual paga el Argon2id (memory-hard) por
+// cada intento, pero esto frena además un ataque interactivo en el propio navegador.
 const LOCK_KEY="qchain_unlock_lock_v1", LOCK_FREE=4; // 4 intentos libres, luego backoff
 function unlockLockState(){ try{ return JSON.parse(localStorage.getItem(LOCK_KEY))||{fails:0,until:0}; }catch(e){ return {fails:0,until:0}; } }
 function unlockLockedMs(){ const s=unlockLockState(); return Math.max(0, (s.until||0)-Date.now()); }
@@ -786,7 +815,7 @@ async function renderSettings(){
 
 // ---- descargar semilla como archivo ----
 // Respaldo CIFRADO: la semilla nunca se guarda ni descarga en claro. El .json
-// lleva solo el ciphertext (PBKDF2-SHA256 + AES-256-GCM, mismo esquema que ya
+// lleva solo el ciphertext (Argon2id + AES-256-GCM, mismo esquema que ya
 // usa la wallet para guardar la semilla en el navegador). Un archivo robado no
 // sirve sin la contraseña. Se restaura en la wallet tipeando esa contraseña.
 async function downloadEncryptedBackup(){
@@ -795,8 +824,9 @@ async function downloadEncryptedBackup(){
   if(!pw){ pw=prompt("Contraseña para cifrar el respaldo (mínimo 8):")||""; if(pw.length<8){ toast("contraseña muy corta"); return; } }
   const addr=master0Addr();   // identidad de la wallet (cuenta 0)
   const store=await encryptSeedConfirmed(MASTER, pw);   // re-descifra para confirmar el round-trip (#197) — nunca entrega un respaldo irrecuperable
+  // `...store` ya trae kdf:"argon2id" + params (#12); cipher es informativo.
   const data=JSON.stringify({ type:"qchain-wallet-encrypted-backup", version:2, address:addr,
-    kdf:"PBKDF2-SHA256", cipher:"AES-256-GCM", ...store,
+    cipher:"AES-256-GCM", ...store,
     note:"Respaldo CIFRADO de una wallet QCHAIN no-custodial. Restauralo en la wallet (Restaurar) tipeando tu contraseña. Sin la contraseña, este archivo no revela nada." }, null, 2);
   const blob=new Blob([data],{type:"application/json"}), url=URL.createObjectURL(blob), a=document.createElement("a");
   a.href=url; a.download="qchain-wallet-backup.json"; a.click(); URL.revokeObjectURL(url);
