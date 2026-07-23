@@ -110,9 +110,17 @@ fn main() -> anyhow::Result<()> {
         Some(a) => {
             match qchain_execution::validator_v7::decode_registry(&a.data) {
                 Some(reg) => {
-                    // Distinguish V2 (decodes as current) from migratable V1.
-                    let is_v2 = qchain_execution::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).is_ok();
-                    let fmt = if is_v2 { "V2 (current)" } else { "V1 legacy -> MIGRATES to V2 on read" };
+                    // Report the EXPLICIT schema_version (pre-mainnet #3). A V1
+                    // registry migrates to V2 on read; `qchain-migrate-registry`
+                    // persists that migration offline.
+                    let schema = qchain_execution::validator_v7::detect_registry_schema(&a.data);
+                    let fmt = match schema {
+                        Some(s) if s == qchain_execution::validator_v7::RegistrySchema::V1Legacy => {
+                            format!("schema_version {} — {s} — MIGRATES to V2 on read (persist with qchain-migrate-registry)", s.version())
+                        }
+                        Some(s) => format!("schema_version {} — {s}", s.version()),
+                        None => "schema_version UNKNOWN".to_string(),
+                    };
                     println!("  format: {fmt} ({} bytes, {} validators)", a.data.len(), reg.validators.len());
                     for v in reg.validators.iter().take(20) {
                         println!("    - {} moniker={:?} state={:?} bond={}", v.address, v.moniker, v.state, v.bond);

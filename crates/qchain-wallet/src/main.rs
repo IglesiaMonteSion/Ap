@@ -1420,6 +1420,7 @@ mod tests {
             faucet: None,
             connect_origin: None,
             sim_limiter: Some(rl),
+            tx_limiter: None,
         });
         let app = super::Router::new()
             .route("/api/simulate", super::post(super::simulate_tx).layer(axum::middleware::from_fn_with_state(st.clone(), super::simulate_rate_limit_mw)))

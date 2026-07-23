@@ -379,11 +379,108 @@ pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
     None
 }
 
-/// Test-only: encode a legacy (pre-role-separation V1) registry holding one
-/// entry, so other modules' tests (e.g. the ledger startup gate) can exercise
-/// the migration path with genuinely old-format bytes.
-#[cfg(test)]
-pub(crate) fn legacy_v1_registry_bytes_for_test(
+/// The EXPLICIT on-disk schema of the validator registry — the "schema_version"
+/// (pre-mainnet #3). Detection is still structural (Borsh layout), but the
+/// result is a first-class, named, reportable value rather than a silent probe
+/// buried in `decode_registry`: `qchain-inspect-state` and
+/// `qchain-migrate-registry` report it, so an operator always knows exactly
+/// which version is on disk before touching a live network.
+///
+/// Honest note on why the schema tag isn't (yet) a byte stored INSIDE the
+/// account: a leading version byte would change the registry account's on-disk
+/// bytes for every already-V2 network, which changes that account's Merkle leaf
+/// and therefore the state root — a coordinated / fresh-genesis change. That
+/// explicit-tag-for-every-singleton work is roadmap #19 (done uniformly across
+/// all singletons at one cutover); here the schema is detected+reported, and the
+/// persisted bytes stay the plain V2 form the running node already understands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegistrySchema {
+    /// Pre-role-separation layout (v6.3.x .. v6.19.0) — migratable to V2.
+    V1Legacy,
+    /// Current layout, with the role-separated cold keys (v6.19.0+).
+    V2Current,
+}
+
+impl RegistrySchema {
+    /// The explicit numeric schema version (1 or 2).
+    pub fn version(&self) -> u16 {
+        match self {
+            RegistrySchema::V1Legacy => 1,
+            RegistrySchema::V2Current => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for RegistrySchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistrySchema::V1Legacy => write!(f, "V1 (legacy, pre-role-separation)"),
+            RegistrySchema::V2Current => write!(f, "V2 (current)"),
+        }
+    }
+}
+
+/// Report the EXPLICIT schema of a registry's on-disk `data`, or `None` if the
+/// bytes match no known version (genuinely corrupt — the caller must fail-loud,
+/// never guess). Same structural detection `decode_registry` uses, surfaced as a
+/// named value (see [`RegistrySchema`]).
+pub fn detect_registry_schema(data: &[u8]) -> Option<RegistrySchema> {
+    if ValidatorV7Registry::try_from_slice(data).is_ok() {
+        return Some(RegistrySchema::V2Current);
+    }
+    if ValidatorV7RegistryV1::try_from_slice(data).is_ok() {
+        return Some(RegistrySchema::V1Legacy);
+    }
+    None
+}
+
+/// The canonical (current V2) Borsh encoding of a registry — what a migration
+/// persists and what the running node writes on its first registry mutation.
+pub fn encode_registry(reg: &ValidatorV7Registry) -> Vec<u8> {
+    borsh::to_vec(reg).expect("registry serialization is infallible")
+}
+
+/// The plan for migrating a registry's on-disk bytes forward to the current
+/// (V2) format — computed WITHOUT touching disk, so `qchain-migrate-registry`
+/// can preview it (`--dry-run`) exactly as it would apply it. Deterministic and
+/// lossless: a V1 registry migrates to the byte-for-byte V2 `decode_registry`
+/// already yields on read (operator = withdrawal = the consensus address).
+pub enum RegistryMigration {
+    /// Already the current V2 format — migrating is a no-op.
+    AlreadyCurrent { validators: usize },
+    /// A legacy V1 registry — `new_bytes` is the V2 encoding to persist.
+    Migrated { validators: usize, new_bytes: Vec<u8> },
+    /// Bytes match no known version — genuinely corrupt; refuse to migrate.
+    Corrupt,
+}
+
+/// Compute the migration plan for a registry's on-disk `data`. Pure (no I/O).
+/// Idempotent by construction: re-planning the `new_bytes` of a `Migrated`
+/// result yields `AlreadyCurrent` (migrating twice is a no-op).
+pub fn plan_registry_migration(data: &[u8]) -> RegistryMigration {
+    match detect_registry_schema(data) {
+        Some(RegistrySchema::V2Current) => {
+            let reg = ValidatorV7Registry::try_from_slice(data).expect("just detected as V2");
+            RegistryMigration::AlreadyCurrent { validators: reg.validators.len() }
+        }
+        Some(RegistrySchema::V1Legacy) => {
+            // `decode_registry` migrates V1 -> V2 in memory; encode that as the
+            // bytes to persist.
+            let reg = decode_registry(data).expect("V1 detected, so it decodes+migrates");
+            let new_bytes = encode_registry(&reg);
+            RegistryMigration::Migrated { validators: reg.validators.len(), new_bytes }
+        }
+        None => RegistryMigration::Corrupt,
+    }
+}
+
+/// Rehearsal helper: encode a legacy (pre-role-separation V1) registry holding
+/// one entry, so tests AND operators can produce genuinely old-format bytes to
+/// rehearse the V1→V2 migration (`qchain-migrate-registry`) and the node's
+/// fail-loud/migrate behavior on a throwaway testnet. Never used on a
+/// production path (nothing writes V1 — the current node only ever writes V2).
+#[doc(hidden)]
+pub fn legacy_v1_registry_bytes(
     address: Pubkey,
     moniker: &str,
     pubkey_bundle: PublicKeyBundle,
@@ -1148,5 +1245,50 @@ mod tests {
         assert!(decode_registry(&borsh::to_vec(&ValidatorV7Registry::default()).unwrap()).is_some());
         // Genuinely-corrupt bytes → None: the caller halts, never uses empty.
         assert!(decode_registry(&[0xFFu8; 7]).is_none(), "garbage must be rejected, not silently emptied");
+    }
+
+    /// The offline persistent-migration primitives (pre-mainnet #3): explicit
+    /// schema detection, and a pure migration plan that `qchain-migrate-registry`
+    /// previews (`--dry-run`) and applies identically — V1 -> byte-exact V2,
+    /// idempotent, corrupt refused.
+    #[test]
+    fn registry_migration_plan_is_explicit_lossless_and_idempotent() {
+        let v = Keypair::generate().unwrap();
+        let addr = v.pubkey();
+
+        // A legacy V1 registry: schema detected as V1, plan says "Migrated".
+        let v1_bytes = legacy_v1_registry_bytes(addr, "legacy", v.public_key_bundle(), "1.2.3.4:9000");
+        assert_eq!(detect_registry_schema(&v1_bytes), Some(RegistrySchema::V1Legacy));
+        assert_eq!(RegistrySchema::V1Legacy.version(), 1);
+        let new_bytes = match plan_registry_migration(&v1_bytes) {
+            RegistryMigration::Migrated { validators, new_bytes } => {
+                assert_eq!(validators, 1);
+                new_bytes
+            }
+            _ => panic!("a V1 registry must plan as Migrated"),
+        };
+        // The persisted bytes are the exact V2 form the running node reads: they
+        // detect as V2, decode losslessly, and match `decode_registry` of the V1.
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V2Current));
+        assert_eq!(RegistrySchema::V2Current.version(), 2);
+        let migrated = ValidatorV7Registry::try_from_slice(&new_bytes).expect("new bytes are valid V2");
+        assert_eq!(encode_registry(&decode_registry(&v1_bytes).unwrap()), new_bytes, "persist == decode_registry's V2");
+        assert_eq!(migrated.validators[0].operator_address, addr);
+        assert_eq!(migrated.validators[0].withdrawal_address, addr);
+
+        // Idempotent: re-planning the migrated V2 bytes is a no-op.
+        match plan_registry_migration(&new_bytes) {
+            RegistryMigration::AlreadyCurrent { validators } => assert_eq!(validators, 1),
+            _ => panic!("re-migrating V2 must be AlreadyCurrent (no-op)"),
+        }
+
+        // An empty V2 registry is AlreadyCurrent (0 validators), not V1.
+        let empty = encode_registry(&ValidatorV7Registry::default());
+        assert_eq!(detect_registry_schema(&empty), Some(RegistrySchema::V2Current));
+        assert!(matches!(plan_registry_migration(&empty), RegistryMigration::AlreadyCurrent { validators: 0 }));
+
+        // Genuinely corrupt bytes: no schema, plan refuses (Corrupt).
+        assert_eq!(detect_registry_schema(&[0xFFu8; 9]), None);
+        assert!(matches!(plan_registry_migration(&[0xFFu8; 9]), RegistryMigration::Corrupt));
     }
 }

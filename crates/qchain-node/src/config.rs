@@ -1245,7 +1245,8 @@ mod tests {
         assert!(typo.validate_network_profile().is_err(), "an unknown profile string must fail loud");
 
         // Knock out each protection individually — every one must fail-stop.
-        let knockouts: Vec<(&str, Box<dyn Fn(&mut NodeConfig)>)> = vec![
+        type Knockout = (&'static str, Box<dyn Fn(&mut NodeConfig)>);
+        let knockouts: Vec<Knockout> = vec![
             ("data_dir", Box::new(|c: &mut NodeConfig| c.data_dir = None)),
             ("storage_engine", Box::new(|c: &mut NodeConfig| c.storage_engine = "sled".into())),
             ("authenticated_transport", Box::new(|c: &mut NodeConfig| c.authenticated_transport = false)),

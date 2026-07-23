@@ -79,6 +79,63 @@ un par sano a la misma ronda ejecutada.
 
 ---
 
+## 1-bis. Migrar el registro de validadores a la versión actual (V1 → V2)
+
+**Contexto**: una red arrancada antes de la separación de roles de clave (v6.19.0)
+tiene el `VALIDATOR_REGISTRY` en el formato **V1 legacy**. El nodo lo **migra a V2
+en LECTURA** (`decode_registry`) — arranca sin problema y deriva el comité correcto
+—, y sólo **persiste** el V2 cuando la próxima instrucción que muta el registro
+(bond/exit/…) hace commit. Una red **sin rotación de registro** (p.ej. un solo
+validador) por eso re-migra en cada lectura para siempre y nunca limpia sus bytes
+en disco. `qchain-migrate-registry` persiste esa migración de forma **offline,
+atómica y reversible** (dry-run + backup + rollback). **No es obligatorio** — el
+nodo funciona igual —, es higiene de estado.
+
+**Primero inspeccioná (READ-ONLY, no toca nada)**:
+
+```bash
+# ¿Qué formato tiene el registro? (schema_version 1 = V1 legacy, 2 = V2 actual)
+qchain-inspect-state --config /opt/qchain/config.json
+# → "-- validator registry (versioned) -- format: schema_version 1 … MIGRATES to V2 on read"
+```
+
+**Dry-run (por defecto, no escribe nada)**:
+
+```bash
+qchain-migrate-registry --config /opt/qchain/config.json
+# → schema_version + plan (V1 -> V2, N validadores) o "ALREADY CURRENT (V2)".
+```
+
+**Aplicar** (el nodo DEBE estar detenido — el store necesita acceso exclusivo):
+
+```bash
+sudo systemctl stop qchain-validator
+qchain-migrate-registry --config /opt/qchain/config.json --apply --yes
+#   backea el Account viejo → migra a V2 → reabre y VERIFICA (data + decode)
+#   si la verificación falla, restaura solo desde el backup (no deja estado a medias)
+sudo systemctl start qchain-validator
+```
+
+**Rollback** (si algo salió mal, restaura el registro V1 exacto del backup):
+
+```bash
+qchain-migrate-registry --config /opt/qchain/config.json --rollback <backup.bak>
+```
+
+> **⚠ FORK SAFETY — leer antes de aplicar.** Reescribir el registro V1→V2 cambia
+> los bytes del account → su hoja Merkle → el **state root**. En una red de **un
+> solo validador** es seguro en cualquier momento (no hay par del que divergir).
+> En una red **multi-nodo** es un **cutover COORDINADO**: parar TODOS los nodos,
+> `--apply` en TODOS, reiniciar TODOS — o un nodo migrado forkea de sus pares. La
+> migración es determinista (todo nodo escribe el mismo V2), así que un cutover
+> coordinado converge.
+
+Un registro **genuinamente corrupto** (no matchea V1 ni V2) hace que la herramienta
+**se niegue a migrar** (fail-loud, exit 2) — nunca adivina. Ese caso es corrupción
+de estado real → sección 1 (restaurar de backup / re-sync).
+
+---
+
 ## 2. Pérdida de un nodo (VPS muerta / disco perdido)
 
 El validador es su **clave**, no su máquina.

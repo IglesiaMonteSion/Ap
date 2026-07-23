@@ -2837,7 +2837,7 @@ mod tests {
         // (a) A LEGACY (pre-role-separation V1) registry with a real entry → the
         // gate MIGRATES + ACCEPTS it (no brick on a routine update of a live net).
         let kp = qchain_crypto::Keypair::generate().unwrap();
-        let v1 = crate::validator_v7::legacy_v1_registry_bytes_for_test(
+        let v1 = crate::validator_v7::legacy_v1_registry_bytes(
             kp.pubkey(), "founder", kp.public_key_bundle(), "1.2.3.4:9000",
         );
         // Sanity: this is genuinely the OLD layout — it does NOT decode as current V2.
