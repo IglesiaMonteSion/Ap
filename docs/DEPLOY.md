@@ -1006,6 +1006,57 @@ Para cortar una versión nueva (cuando hagas mejoras): subí `version` en el
 `Cargo.toml` raíz, actualizá `version.json`, commiteá, y cada operador corre
 `update-node.sh`.
 
+## Gobernanza endurecida y pausa de emergencia (multisig) — task #213
+
+Desde v8.0.0 la gobernanza económica (base_fee, dust, gas, comisión, emisión) es
+tier **`Economic`**: exige **supermayoría 2/3**, **30% de participación mínima**,
+y una **ventana de revisión (timelock) real de ~120 rondas** antes de ejecutar —
+ya no se aplica al instante con poca participación. Además, **el poder de voto se
+congela al crear la propuesta** (snapshot del `total_staked`), y **cada parámetro
+sólo puede moverse un máximo por propuesta** (≤2× para base_fee/dust/gas, ≤2000 bps
+comisión, ≤500 bps emisión) — un cambio grande se reparte en varias propuestas.
+
+**Pausa de emergencia por multisig (opcional, decisión de génesis).** Un conjunto
+de *guardianes* con umbral M‑de‑N puede **pausar la ejecución de cualquier cambio
+de gobernanza** mientras investiga — un freno de emergencia. La pausa **sólo
+voltea una bandera y bloquea `execute-proposal`; nunca toca un balance**, así que
+es estructuralmente incapaz de confiscar o mover fondos.
+
+Se configura **al crear la red** (se pliega en el `chain_id`, así que una red ya
+lanzada la activa relanzando con génesis nuevo; los otros 6 endurecimientos toman
+efecto con sólo actualizar el binario):
+
+```bash
+# al armar la config compartida:
+qchain-genesis-build ... \
+  --guardian <PUBKEY_GUARDIAN_1_base58> \
+  --guardian <PUBKEY_GUARDIAN_2_base58> \
+  --guardian <PUBKEY_GUARDIAN_3_base58> \
+  --guardian-threshold 2          # 2 de 3 aprobaciones para pausar/despausar
+```
+
+o directo en el `config.json` de TODOS los nodos (el mismo set en todos, o
+computan un `chain_id` distinto y se rechazan entre sí):
+
+```json
+  "governance_guardians": ["<b58_1>", "<b58_2>", "<b58_3>"],
+  "governance_guardian_threshold": 2
+```
+
+Pausar/despausar (cada guardián firma con su clave; al alcanzar el umbral, se
+voltea la bandera):
+
+```bash
+qchain emergency-pause   --rpc http://127.0.0.1:8080 --keypair guardian1.json
+qchain emergency-pause   --rpc http://127.0.0.1:8080 --keypair guardian2.json   # umbral alcanzado → pausado
+# ... investigar ...
+qchain emergency-unpause --rpc http://127.0.0.1:8080 --keypair guardian1.json
+qchain emergency-unpause --rpc http://127.0.0.1:8080 --keypair guardian2.json   # → despausado
+```
+
+Sin `governance_guardians` configurados (el default), la pausa queda **inerte**
+(nadie puede pausar) y la red conserva su `chain_id` exacto.
+
 ## Ajustar el TPS: `round_interval_ms`
 
 El techo de TPS de qchain está **medido** (no estimado): un `apply_transaction`

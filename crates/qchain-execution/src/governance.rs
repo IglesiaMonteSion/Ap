@@ -24,22 +24,58 @@ use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
 use qchain_governance::{quorum_rule, Proposal, ProposalAction, ProposalId, ProposalStatus, VoteChoice};
 use std::collections::HashMap;
 
+/// Emergency governance state, stored in `EMERGENCY_ACCOUNT_ID`. A set of
+/// guardian keys with an M-of-N threshold can flip `paused`, which blocks
+/// governance `Execute` for ALL proposals — an emergency brake on any pending
+/// or rushed change while the guardians investigate. **It only ever flips a
+/// boolean and gates execution; it never reads or writes a balance, so it is
+/// structurally incapable of confiscating or moving funds** (task #213's
+/// "pausa de emergencia ... sin permitir confiscación de fondos"). Approvals
+/// accumulate across separate guardian transactions in committed order, so the
+/// threshold is reached deterministically and identically on every node.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmergencyState {
+    pub guardians: Vec<Pubkey>,
+    pub threshold: u8,
+    pub paused: bool,
+    /// Distinct guardians who have approved pausing since the last state flip.
+    pub pause_approvals: Vec<Pubkey>,
+    /// Distinct guardians who have approved unpausing since the last flip.
+    pub unpause_approvals: Vec<Pubkey>,
+}
+
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum GovernanceInstruction {
     /// accounts[0] = proposer wallet (must equal the transaction payer),
-    /// accounts[1] = a fresh pubkey for the new proposal account.
+    /// accounts[1] = a fresh pubkey for the new proposal account,
+    /// accounts[2] = the canonical staking-stats singleton (read-only) —
+    /// the bonded supply here is SNAPSHOTTED into the proposal as the frozen
+    /// quorum denominator (task #213).
     CreateProposal { id: ProposalId, action: ProposalAction },
     /// accounts[0] = proposal account, accounts[1] = the voter's stake
     /// account (its stored `owner` must equal the transaction payer).
     Vote { choice: VoteChoice },
     /// accounts[0] = proposal account, accounts[1] = the staking-stats
-    /// singleton (read-only, for the participation-quorum check).
+    /// singleton (pinned; the quorum denominator now comes from the
+    /// proposal's creation-time snapshot, so its live value is unused).
     /// Permissionless once the voting period has ended.
     Finalize,
-    /// accounts[0] = proposal account, accounts[1] = the algorithm
-    /// registry singleton. Permissionless once the post-passage timelock
-    /// has elapsed.
+    /// accounts[0] = proposal account, accounts[1] = the target singleton
+    /// (algorithm registry / economic params), accounts[2] = the emergency
+    /// singleton (`EMERGENCY_ACCOUNT_ID`, pinned so the pause can't be
+    /// bypassed by omitting it). Permissionless once the post-passage
+    /// timelock has elapsed AND governance is not under an emergency pause.
     Execute,
+    /// accounts[0] = the emergency singleton. The transaction payer must be a
+    /// configured guardian. Records one guardian's approval to PAUSE; once
+    /// `threshold` distinct guardians have approved, `paused` becomes true.
+    /// Appended (discriminant 4) so the wallet's Vote/Finalize/Execute
+    /// encodings (0..3) stay byte-identical.
+    EmergencyPause,
+    /// accounts[0] = the emergency singleton. Mirror of `EmergencyPause`:
+    /// records a guardian's approval to UNPAUSE; once `threshold` distinct
+    /// guardians approve, `paused` becomes false. Discriminant 5.
+    EmergencyUnpause,
 }
 
 fn borsh_err(e: impl std::fmt::Display) -> ExecError {
@@ -67,13 +103,25 @@ impl NativeProgram for GovernanceProgram {
                     *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[0]".into()))?;
                 let proposal_pk =
                     *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[1]".into()))?;
+                // accounts[2] = the canonical staking-stats singleton. The bonded
+                // supply here is SNAPSHOTTED into the proposal as the frozen quorum
+                // denominator (task #213), so a later shrink of total_staked can't
+                // lower the participation bar. Pinned to the canonical id for the
+                // same reason Finalize/Execute pin theirs — a caller must not be
+                // able to name a look-alike account with a tiny total.
+                let stats_pk =
+                    *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[2] = the staking-stats singleton (voting-power snapshot)".into()))?;
+                if stats_pk != crate::ids::STAKING_STATS_ID {
+                    return Err(ExecError::ProgramError("CreateProposal accounts[2] must be the canonical staking-stats account".into()));
+                }
                 if proposer != *payer {
                     return Err(ExecError::Unauthorized("CreateProposal's proposer account must be the transaction payer".into()));
                 }
                 if accounts.contains_key(&proposal_pk) {
                     return Err(ExecError::ProgramError("proposal account already exists".into()));
                 }
-                let proposal = Proposal::new(id, proposer, action, current_round);
+                let snapshot_total_staked = u64::try_from_slice(&accounts.get(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?.data).map_err(borsh_err)?;
+                let proposal = Proposal::new(id, proposer, action, current_round, snapshot_total_staked);
                 let mut account = Account::new_wallet(GOVERNANCE_PROGRAM_ID);
                 account.data = borsh::to_vec(&proposal).map_err(borsh_err)?;
                 accounts.insert(proposal_pk, account);
@@ -136,21 +184,17 @@ impl NativeProgram for GovernanceProgram {
                 let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[0]".into()))?;
                 let stats_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[1]".into()))?;
 
-                // The quorum a proposal is judged against is a fraction of
-                // `total_staked`, read from this account's data. It MUST be
-                // the canonical staking-stats singleton - otherwise a caller
-                // could name a different account they control whose bytes
-                // deserialize to a tiny `total_staked`, shrinking the quorum
-                // and passing a proposal with far less than real support. The
-                // legitimate CLI always passes `STAKING_STATS_ID` here.
+                // The stats singleton is still PINNED here (CLI/wallet unchanged),
+                // but the quorum denominator now comes from the proposal's
+                // creation-time snapshot (task #213), not this account's live
+                // value — so a validator can't shrink `total_staked` after a
+                // proposal opens to lower the bar. The pin keeps the account shape
+                // canonical for callers; its current value is intentionally unused.
                 if stats_pk != crate::ids::STAKING_STATS_ID {
                     return Err(ExecError::ProgramError(
                         "Finalize accounts[1] must be the canonical staking-stats account".into(),
                     ));
                 }
-
-                let total_staked = u64::try_from_slice(&accounts.get(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?.data)
-                    .map_err(borsh_err)?;
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Voting {
@@ -160,7 +204,7 @@ impl NativeProgram for GovernanceProgram {
                     return Err(ExecError::ProgramError("voting period has not ended yet".into()));
                 }
 
-                let outcome = proposal.evaluate(total_staked);
+                let outcome = proposal.evaluate();
                 proposal.status = outcome;
                 if outcome == ProposalStatus::Passed {
                     proposal.passed_round = Some(current_round);
@@ -178,6 +222,29 @@ impl NativeProgram for GovernanceProgram {
                 // program just applies whichever variant `proposal.action`
                 // turns out to be against whatever it's handed.
                 let target_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[1]".into()))?;
+                // accounts[2] MUST be the emergency singleton (task #213). Pinning
+                // it means a caller can't bypass an active pause by simply omitting
+                // the account: Execute refuses to run without it declared. The read
+                // itself is TOLERANT — on a network whose genesis predates this
+                // feature the account is absent (or undecodable), which is treated
+                // as "no guardians, not paused", so a legacy chain's governance
+                // keeps working unchanged. On a guarded network the account exists
+                // and a `paused` state blocks every Execute until the guardians
+                // unpause. The pause only gates execution here — it never reads or
+                // writes any balance, so it cannot move or confiscate funds.
+                let emergency_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[2] = the emergency governance singleton".into()))?;
+                if emergency_pk != crate::ids::EMERGENCY_ACCOUNT_ID {
+                    return Err(ExecError::ProgramError("Execute accounts[2] must be the canonical emergency governance account".into()));
+                }
+                if let Some(acc) = accounts.get(&crate::ids::EMERGENCY_ACCOUNT_ID) {
+                    if let Ok(state) = EmergencyState::try_from_slice(&acc.data) {
+                        if state.paused {
+                            return Err(ExecError::ProgramError(
+                                "governance is under an emergency pause — Execute is blocked until the guardian multisig unpauses".into(),
+                            ));
+                        }
+                    }
+                }
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Passed {
@@ -230,9 +297,67 @@ impl NativeProgram for GovernanceProgram {
                 proposal.status = ProposalStatus::Executed;
                 write_proposal(accounts, &proposal_pk, &proposal)?;
             }
+
+            GovernanceInstruction::EmergencyPause => apply_emergency_approval(accounts, instruction, payer, true)?,
+            GovernanceInstruction::EmergencyUnpause => apply_emergency_approval(accounts, instruction, payer, false)?,
         }
         Ok(())
     }
+}
+
+/// One guardian's approval to pause (`want_paused = true`) or unpause
+/// (`false`). accounts[0] must be the emergency singleton. The payer must be a
+/// configured guardian; approvals accumulate (deduplicated) across separate
+/// transactions until `threshold` distinct guardians agree, at which point
+/// `paused` flips and both approval lists are cleared to start the next round
+/// clean. This handler ONLY mutates the emergency flag/approval lists — it
+/// never touches a balance, so it is structurally unable to move funds.
+fn apply_emergency_approval(
+    accounts: &mut HashMap<Pubkey, Account>,
+    instruction: &Instruction,
+    payer: &Pubkey,
+    want_paused: bool,
+) -> Result<(), ExecError> {
+    let em_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Emergency instruction requires accounts[0] = the emergency singleton".into()))?;
+    if em_pk != crate::ids::EMERGENCY_ACCOUNT_ID {
+        return Err(ExecError::ProgramError("Emergency accounts[0] must be the canonical emergency governance account".into()));
+    }
+    let account = accounts.get(&em_pk).ok_or(ExecError::AccountNotFound(em_pk))?;
+    let mut state = EmergencyState::try_from_slice(&account.data).map_err(borsh_err)?;
+
+    if state.guardians.is_empty() || state.threshold == 0 {
+        return Err(ExecError::ProgramError("no emergency guardians are configured on this network".into()));
+    }
+    if !state.guardians.contains(payer) {
+        return Err(ExecError::Unauthorized("only a configured guardian can approve an emergency pause/unpause".into()));
+    }
+    if state.paused == want_paused {
+        return Err(ExecError::ProgramError(if want_paused { "governance is already paused" } else { "governance is not paused" }.into()));
+    }
+
+    // A new pause round supersedes any stale unpause approvals and vice versa.
+    if want_paused {
+        state.unpause_approvals.clear();
+        if !state.pause_approvals.contains(payer) {
+            state.pause_approvals.push(*payer);
+        }
+        if state.pause_approvals.len() as u32 >= state.threshold as u32 {
+            state.paused = true;
+            state.pause_approvals.clear();
+        }
+    } else {
+        state.pause_approvals.clear();
+        if !state.unpause_approvals.contains(payer) {
+            state.unpause_approvals.push(*payer);
+        }
+        if state.unpause_approvals.len() as u32 >= state.threshold as u32 {
+            state.paused = false;
+            state.unpause_approvals.clear();
+        }
+    }
+
+    accounts.get_mut(&em_pk).unwrap().data = borsh::to_vec(&state).map_err(borsh_err)?;
+    Ok(())
 }
 
 fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAction, current_round: Round) -> Result<(), ExecError> {
@@ -281,6 +406,35 @@ fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAct
 /// `apply_economic_action`).
 const MAX_DUST_THRESHOLD: u64 = 1_000_000_000;
 
+/// Per-proposal change limit (task #213): a single passed proposal may move a
+/// multiplicative economic parameter (base fee, dust threshold, gas price) by
+/// at most this factor up or down. Combined with the Economic tier's mandatory
+/// review time-lock, this makes a hostile-but-passing proposal unable to swing
+/// a parameter to an extreme in one shot — any large move must proceed in
+/// several proposals, each with its own supermajority + review window.
+const MAX_ECON_CHANGE_FACTOR: u64 = 2;
+/// Absolute step allowances so a parameter sitting at a tiny value can still
+/// move by a sensible amount (a strict 2× of `1` would only reach `2`). A
+/// change is accepted if it is within the multiplicative factor OR within the
+/// absolute step — whichever is more permissive.
+const BASE_FEE_ABS_STEP: u64 = crate::params::FEE_MIN_BASE_FEE_PER_BYTE;
+const DUST_ABS_STEP: u64 = 100_000;
+const GAS_ABS_STEP: u64 = 10;
+/// Additive per-proposal caps for the basis-point parameters.
+const COMMISSION_STEP_BPS: u16 = 2_000;
+const EMISSION_STEP_BPS: u16 = 500;
+
+/// True if `new` is within `factor`× (up or down) of `current`, OR within
+/// `abs_step` of it (the small-value escape hatch). All math in u128 so it
+/// never overflows or divides by zero.
+fn within_change_limit(current: u64, new: u64, factor: u64, abs_step: u64) -> bool {
+    let (cur, nw, f) = (current as u128, new as u128, factor as u128);
+    if nw <= cur.saturating_mul(f) && nw.saturating_mul(f) >= cur {
+        return true;
+    }
+    new.abs_diff(current) <= abs_step
+}
+
 /// Only ever called with a `Low`-tier action (the `Execute` match arm routes
 /// accordingly) - the other variants are unreachable here. Enforces sanity
 /// bounds on each economic parameter: a passed `Low`-tier proposal executes
@@ -313,6 +467,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     crate::params::MAX_BASE_FEE_PER_BYTE
                 )));
             }
+            if !within_change_limit(params.base_fee_per_byte, *v, MAX_ECON_CHANGE_FACTOR, BASE_FEE_ABS_STEP) {
+                return Err(ExecError::ProgramError(format!(
+                    "base_fee_per_byte {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {BASE_FEE_ABS_STEP}) from the current {} in one proposal - split a large change across several proposals",
+                    params.base_fee_per_byte
+                )));
+            }
             params.base_fee_per_byte = *v;
         }
         // Hard cap: `dust_threshold` is the balance BELOW which a system-owned
@@ -327,6 +487,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
             if *v > MAX_DUST_THRESHOLD {
                 return Err(ExecError::ProgramError(format!(
                     "dust_threshold {v} exceeds the safety cap {MAX_DUST_THRESHOLD} - a higher value would sweep-and-burn ordinary balances"
+                )));
+            }
+            if !within_change_limit(params.dust_threshold, *v, MAX_ECON_CHANGE_FACTOR, DUST_ABS_STEP) {
+                return Err(ExecError::ProgramError(format!(
+                    "dust_threshold {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {DUST_ABS_STEP}) from the current {} in one proposal",
+                    params.dust_threshold
                 )));
             }
             params.dust_threshold = *v;
@@ -347,11 +513,23 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     crate::params::MAX_GAS_PRICE_PER_FUEL
                 )));
             }
+            if !within_change_limit(params.gas_price_per_fuel, *v, MAX_ECON_CHANGE_FACTOR, GAS_ABS_STEP) {
+                return Err(ExecError::ProgramError(format!(
+                    "gas_price_per_fuel {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {GAS_ABS_STEP}) from the current {} in one proposal",
+                    params.gas_price_per_fuel
+                )));
+            }
             params.gas_price_per_fuel = *v;
         }
         ProposalAction::SetStakingCommissionBps(v) => {
             if *v > 10_000 {
                 return Err(ExecError::ProgramError("staking commission cannot exceed 10,000 bps (100%)".into()));
+            }
+            if v.abs_diff(params.staking_commission_bps) > COMMISSION_STEP_BPS {
+                return Err(ExecError::ProgramError(format!(
+                    "staking commission {v} bps moves more than {COMMISSION_STEP_BPS} bps from the current {} in one proposal",
+                    params.staking_commission_bps
+                )));
             }
             params.staking_commission_bps = *v;
         }
@@ -364,6 +542,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                 return Err(ExecError::ProgramError(format!(
                     "emission APR {v} bps exceeds the safety cap {} bps",
                     crate::params::MAX_EMISSION_APR_BPS
+                )));
+            }
+            if v.abs_diff(params.emission_apr_bps) > EMISSION_STEP_BPS {
+                return Err(ExecError::ProgramError(format!(
+                    "emission APR {v} bps moves more than {EMISSION_STEP_BPS} bps from the current {} in one proposal",
+                    params.emission_apr_bps
                 )));
             }
             params.emission_apr_bps = *v;
@@ -385,6 +569,18 @@ pub fn genesis_registry_account_data() -> Vec<u8> {
 /// startup) write this into `PARAMS_ACCOUNT_ID` once, at genesis.
 pub fn genesis_params_account_data() -> Vec<u8> {
     borsh::to_vec(&crate::params::EconomicParams::default()).expect("default economic params always serialize")
+}
+
+/// Builds the genesis emergency-governance account contents (task #213) —
+/// callers (node startup) write this into `EMERGENCY_ACCOUNT_ID` once, at
+/// genesis. `threshold` is clamped to `1..=guardians.len()` so a
+/// mis-configured genesis can never require more approvals than there are
+/// guardians (which would make the pause un-triggerable). An empty guardian
+/// set leaves the feature inert (no one can pause), which is the safe default.
+pub fn genesis_emergency_account_data(guardians: Vec<Pubkey>, threshold: u8) -> Vec<u8> {
+    let threshold = if guardians.is_empty() { 0 } else { threshold.clamp(1, guardians.len().min(u8::MAX as usize) as u8) };
+    let state = EmergencyState { guardians, threshold, paused: false, pause_approvals: Vec::new(), unpause_approvals: Vec::new() };
+    borsh::to_vec(&state).expect("emergency state always serializes")
 }
 
 #[cfg(test)]
@@ -446,7 +642,7 @@ mod tests {
     fn create_proposal(accounts: &mut HashMap<Pubkey, Account>, proposer: Pubkey, action: ProposalAction, round: Round) {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![proposer, PROPOSAL_PK],
+            accounts: vec![proposer, PROPOSAL_PK, STAKING_STATS_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 1, action }).unwrap(),
         };
         GovernanceProgram.process(accounts, &ix, &proposer, round).unwrap();
@@ -473,7 +669,7 @@ mod tests {
     fn execute(accounts: &mut HashMap<Pubkey, Account>, caller: Pubkey, round: Round) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, REGISTRY_ACCOUNT_ID],
+            accounts: vec![PROPOSAL_PK, REGISTRY_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
         GovernanceProgram.process(accounts, &ix, &caller, round)
@@ -575,7 +771,7 @@ mod tests {
         let retire_proposal_pk = Pubkey::new([40u8; 32]);
         let retire_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![proposer, retire_proposal_pk],
+            accounts: vec![proposer, retire_proposal_pk, STAKING_STATS_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 2, action: ProposalAction::RetireAlgorithm { id: ALGORITHM_ED25519 } }).unwrap(),
         };
         GovernanceProgram.process(&mut accounts, &retire_ix, &proposer, full_cycle).unwrap();
@@ -594,7 +790,7 @@ mod tests {
 
         let execute_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![retire_proposal_pk, REGISTRY_ACCOUNT_ID],
+            accounts: vec![retire_proposal_pk, REGISTRY_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
         // The retire proposal's own governance timelock has elapsed here,
@@ -718,53 +914,147 @@ mod tests {
         assert_eq!(accounts[&STAKE_PK].balance, 0, "once voting period + time-lock have genuinely elapsed, the same position can undelegate normally");
     }
 
-    /// The `Low` tier's whole point is to be cheap to move: no
-    /// supermajority, no time-lock. This proves `Execute` succeeds the
-    /// instant a `Low`-tier proposal is finalized, unlike the multi-round
-    /// wait `Registry`-tier actions require (see
-    /// `full_registry_activation_lifecycle_passes_and_executes`).
+    /// A monetary change now runs on the `Economic` tier (task #213): it needs
+    /// a 2/3 supermajority AND must wait out a mandatory review time-lock
+    /// before `Execute` — a bare simple majority no longer flips the fee
+    /// instantly. Also proves the per-proposal step limit lets a small,
+    /// legitimate recalibration through (a big jump is rejected — see
+    /// `a_single_proposal_cannot_move_a_parameter_past_the_step_limit`).
     #[test]
-    fn low_tier_economic_parameter_change_passes_on_simple_majority_and_executes_immediately() {
+    fn economic_parameter_change_needs_supermajority_and_waits_out_the_timelock() {
         let proposer = Pubkey::new([1u8; 32]);
         let voter_a = Pubkey::new([2u8; 32]);
         let voter_b = Pubkey::new([3u8; 32]);
         let mut accounts = HashMap::from([
             (proposer, wallet(0)),
-            (STAKE_PK, stake_account(voter_a, 510)),
-            (OTHER_STAKE_PK, stake_account(voter_b, 490)),
+            (STAKE_PK, stake_account(voter_a, 700)),
+            (OTHER_STAKE_PK, stake_account(voter_b, 300)),
             (STAKING_STATS_ID, stats_account(1_000)),
             (PARAMS_ACCOUNT_ID, params_account()),
         ]);
 
-        // A valid recalibration: at or above the anti-spam floor (a value below
-        // it is now rejected - see `apply_economic_action`'s bounds).
+        // A small in-step recalibration from the default (180): well within the
+        // 2× / abs-step per-proposal limit.
         let new_fee = crate::params::FEE_MIN_BASE_FEE_PER_BYTE + 20;
         create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(new_fee), 0);
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
 
-        let rule = quorum_rule(qchain_governance::RiskTier::Low);
+        let rule = quorum_rule(qchain_governance::RiskTier::Economic);
+        assert!(rule.timelock_rounds > 0, "a monetary change must carry a real review time-lock");
         let finalize_round = rule.voting_period_rounds;
         finalize(&mut accounts, proposer, finalize_round).unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Passed, "51% is a strict simple majority");
+        assert_eq!(proposal.status, ProposalStatus::Passed, "70% yes clears the 2/3 supermajority");
 
-        // Zero time-lock: the very same round Finalize passed it, Execute
-        // must already succeed.
-        assert_eq!(rule.timelock_rounds, 0);
         let execute_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID],
+            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
-        GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round).unwrap();
+        // Too early: the review time-lock has NOT elapsed — a monetary change
+        // can no longer execute the instant it's finalized.
+        assert!(GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round).is_err(), "an economic change must wait out its review time-lock");
+
+        GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round + rule.timelock_rounds).unwrap();
 
         let params = crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap();
         assert_eq!(params.base_fee_per_byte, new_fee);
         assert_eq!(params.dust_threshold, crate::params::EconomicParams::default().dust_threshold, "unrelated params must be untouched");
+        assert_eq!(read_proposal(&accounts, &PROPOSAL_PK).unwrap().status, ProposalStatus::Executed);
+    }
 
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Executed);
+    /// The emergency guardian multisig (task #213): a threshold of guardians
+    /// can PAUSE governance, which blocks `Execute` for a passed proposal,
+    /// and can UNPAUSE to let it through — all without ever touching a balance.
+    #[test]
+    fn emergency_multisig_pauses_execution_and_can_never_touch_funds() {
+        let proposer = Pubkey::new([1u8; 32]);
+        let voter = Pubkey::new([2u8; 32]);
+        let g1 = Pubkey::new([71u8; 32]);
+        let g2 = Pubkey::new([72u8; 32]);
+        let g3 = Pubkey::new([73u8; 32]);
+        let outsider = Pubkey::new([99u8; 32]);
+        let emergency = Account {
+            data: genesis_emergency_account_data(vec![g1, g2, g3], 2),
+            ..Account::new_wallet(GOVERNANCE_PROGRAM_ID)
+        };
+        let mut accounts = HashMap::from([
+            (proposer, wallet(0)),
+            (STAKE_PK, stake_account(voter, 1_000)),
+            (STAKING_STATS_ID, stats_account(1_000)),
+            (PARAMS_ACCOUNT_ID, params_account()),
+            (crate::ids::EMERGENCY_ACCOUNT_ID, emergency),
+        ]);
+
+        let new_fee = crate::params::FEE_MIN_BASE_FEE_PER_BYTE + 10;
+        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(new_fee), 0);
+        vote(&mut accounts, voter, STAKE_PK, VoteChoice::Yes, 1).unwrap();
+        let rule = quorum_rule(qchain_governance::RiskTier::Economic);
+        finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
+        let ready_round = rule.voting_period_rounds + rule.timelock_rounds;
+
+        let pause = || Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![crate::ids::EMERGENCY_ACCOUNT_ID],
+            data: borsh::to_vec(&GovernanceInstruction::EmergencyPause).unwrap(),
+        };
+        let unpause = || Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![crate::ids::EMERGENCY_ACCOUNT_ID],
+            data: borsh::to_vec(&GovernanceInstruction::EmergencyUnpause).unwrap(),
+        };
+        let exec = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
+            data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
+        };
+
+        // An outsider cannot pause.
+        assert!(GovernanceProgram.process(&mut accounts, &pause(), &outsider, 1).is_err());
+        // One guardian is below the threshold of 2 → not paused yet.
+        GovernanceProgram.process(&mut accounts, &pause(), &g1, 1).unwrap();
+        // A second DISTINCT guardian reaches the threshold → paused.
+        GovernanceProgram.process(&mut accounts, &pause(), &g2, 2).unwrap();
+        let em: EmergencyState = borsh::from_slice(&accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].data).unwrap();
+        assert!(em.paused, "two of three guardians reached the pause threshold");
+
+        // Now Execute is blocked even though the proposal passed and the
+        // timelock elapsed.
+        assert!(GovernanceProgram.process(&mut accounts, &exec, &proposer, ready_round).is_err(), "a paused chain must block Execute");
+        assert_eq!(
+            crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap().base_fee_per_byte,
+            crate::params::EconomicParams::default().base_fee_per_byte,
+            "the paused change must NOT have taken effect"
+        );
+
+        // Two guardians unpause → Execute proceeds.
+        GovernanceProgram.process(&mut accounts, &unpause(), &g1, ready_round).unwrap();
+        GovernanceProgram.process(&mut accounts, &unpause(), &g3, ready_round).unwrap();
+        GovernanceProgram.process(&mut accounts, &exec, &proposer, ready_round).unwrap();
+        assert_eq!(crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap().base_fee_per_byte, new_fee);
+
+        // The guardians never held or moved any balance: the emergency account
+        // balance stayed zero throughout (it only ever carried the flag).
+        assert_eq!(accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].balance, 0, "the pause mechanism must never touch funds");
+    }
+
+    #[test]
+    fn a_single_proposal_cannot_move_a_parameter_past_the_step_limit() {
+        use crate::params::EconomicParams;
+        let mut p = EconomicParams::default(); // base_fee default = 180
+                                               // Doubling (180 -> 360) is within the 2× per-proposal factor.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(360)).is_ok());
+        assert_eq!(p.base_fee_per_byte, 360);
+        // Tripling in one shot (360 -> 1080) exceeds both the 2× factor and the
+        // absolute step — rejected. A big move must span several proposals.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(1080)).is_err());
+        assert_eq!(p.base_fee_per_byte, 360, "a rejected step must not mutate the parameter");
+        // Emission APR: default 1200 bps. A move within the additive cap (500)
+        // is fine; a larger jump is rejected.
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(1_600)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(2_200)).is_err());
+        assert_eq!(p.emission_apr_bps, 1_600);
     }
 
     #[test]
@@ -789,22 +1079,24 @@ mod tests {
         assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
         // gas_price ABOVE the ceiling is rejected too (symmetric bound).
         assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(u64::MAX)).is_err());
-        // Legitimate in-range recalibrations still apply.
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(MAX_DUST_THRESHOLD)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::FEE_MIN_BASE_FEE_PER_BYTE)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(1)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(crate::params::MAX_EMISSION_APR_BPS)).is_ok());
-        // A base fee / gas price exactly AT the ceiling is a legitimate value.
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(crate::params::MAX_BASE_FEE_PER_BYTE)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(crate::params::MAX_GAS_PRICE_PER_FUEL)).is_ok());
-        assert_eq!(p.dust_threshold, MAX_DUST_THRESHOLD);
-        assert_eq!(p.emission_apr_bps, crate::params::MAX_EMISSION_APR_BPS);
-        assert_eq!(p.base_fee_per_byte, crate::params::MAX_BASE_FEE_PER_BYTE);
-        assert_eq!(p.gas_price_per_fuel, crate::params::MAX_GAS_PRICE_PER_FUEL);
+        // Legitimate SMALL in-step recalibrations still apply (a big single jump
+        // is separately rejected by the per-proposal step limit — see
+        // `a_single_proposal_cannot_move_a_parameter_past_the_step_limit`). `p`
+        // is still at defaults here (all prior calls were rejections that never
+        // mutated), so a 2× / within-cap move is in-step and applies.
+        let d = EconomicParams::default();
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(d.base_fee_per_byte * 2)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(2)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(d.dust_threshold * 2)).is_ok());
+        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(d.emission_apr_bps + 400)).is_ok());
+        assert_eq!(p.base_fee_per_byte, d.base_fee_per_byte * 2);
+        assert_eq!(p.gas_price_per_fuel, 2);
+        assert_eq!(p.dust_threshold, d.dust_threshold * 2);
+        assert_eq!(p.emission_apr_bps, d.emission_apr_bps + 400);
     }
 
     #[test]
-    fn low_tier_tie_is_rejected_and_registry_actions_reject_a_params_target_mismatch() {
+    fn an_economic_tie_fails_the_supermajority() {
         let proposer = Pubkey::new([1u8; 32]);
         let voter_a = Pubkey::new([2u8; 32]);
         let voter_b = Pubkey::new([3u8; 32]);
@@ -819,9 +1111,9 @@ mod tests {
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
 
-        let rule = quorum_rule(qchain_governance::RiskTier::Low);
+        let rule = quorum_rule(qchain_governance::RiskTier::Economic);
         finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Rejected, "a 500/500 tie is not a strict majority");
+        assert_eq!(proposal.status, ProposalStatus::Rejected, "a 500/500 tie is nowhere near the 2/3 supermajority a monetary change needs");
     }
 }

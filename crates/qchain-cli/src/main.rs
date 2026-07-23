@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use qchain_core::{Account, Instruction, Transaction};
 use qchain_crypto::{AlgorithmId, AlgorithmStatus, Keypair, Pubkey, RegistryEntry};
 use qchain_execution::{
-    EconomicParams, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
+    EconomicParams, EMERGENCY_ACCOUNT_ID, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
 use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
@@ -480,6 +480,31 @@ enum Command {
         keypair: PathBuf,
         #[arg(long)]
         proposal: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// Guardian approval to PAUSE governance (emergency brake). Blocks
+    /// `execute-proposal` for every proposal once a threshold of guardians
+    /// approve. Only ever flips a flag — it can never move funds.
+    EmergencyPause {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// A guardian keypair (must be in the genesis guardian set).
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// Guardian approval to UNPAUSE governance (lift the emergency brake).
+    EmergencyUnpause {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -1483,7 +1508,7 @@ fn main() -> anyhow::Result<()> {
             };
             let action = ProposalAction::ActivateAlgorithm(entry);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1492,7 +1517,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::DeprecateAlgorithm { id: AlgorithmId(algorithm_id), retirement_round };
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1501,7 +1526,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::RetireAlgorithm { id: AlgorithmId(algorithm_id) };
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1510,7 +1535,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::SetBaseFeePerByte(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1519,7 +1544,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::SetDustThreshold(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1528,7 +1553,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::SetGasPricePerFuel(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1537,7 +1562,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::SetStakingCommissionBps(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1546,7 +1571,7 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk = Keypair::generate()?.pubkey();
             let action = ProposalAction::SetEmissionApr(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
-            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("proposal account: {proposal_pk}");
         }
@@ -1564,6 +1589,18 @@ fn main() -> anyhow::Result<()> {
             let proposal_pk: Pubkey = proposal.parse()?;
             let data = borsh::to_vec(&GovernanceInstruction::Finalize)?;
             let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+        }
+        Command::EmergencyPause { rpc, keypair, nonce, fee_limit } => {
+            let guardian = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&GovernanceInstruction::EmergencyPause)?;
+            let body = submit_instruction(&rpc, &guardian, GOVERNANCE_PROGRAM_ID, vec![EMERGENCY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+        }
+        Command::EmergencyUnpause { rpc, keypair, nonce, fee_limit } => {
+            let guardian = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&GovernanceInstruction::EmergencyUnpause)?;
+            let body = submit_instruction(&rpc, &guardian, GOVERNANCE_PROGRAM_ID, vec![EMERGENCY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::ExecuteProposal { rpc, keypair, proposal, nonce, fee_limit } => {
@@ -1586,7 +1623,7 @@ fn main() -> anyhow::Result<()> {
                 | ProposalAction::SetEmissionApr(_) => PARAMS_ACCOUNT_ID,
             };
             let data = borsh::to_vec(&GovernanceInstruction::Execute)?;
-            let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, target], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &caller, GOVERNANCE_PROGRAM_ID, vec![proposal_pk, target, EMERGENCY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::Registry { rpc } => {

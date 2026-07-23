@@ -120,6 +120,18 @@ pub const TREASURY_V7_PROGRAM_ID: Pubkey = Pubkey::new([17u8; 32]);
 /// authority. Absent on a v6 network or a v7 network with no treasury configured.
 pub const TREASURY_ACCOUNT_ID: Pubkey = Pubkey::new([18u8; 32]);
 
+/// Emergency governance multisig singleton (owned by `GOVERNANCE_PROGRAM_ID`).
+/// Its `data` is a borsh-encoded `governance::EmergencyState` naming a set of
+/// guardian pubkeys, an approval threshold, and a `paused` flag (task #213).
+/// When `paused`, governance `Execute` is blocked for ALL proposals — the
+/// guardians' emergency brake on any pending/rushed change. The pause flips a
+/// flag and gates execution only; it can NEVER touch a balance, so it is
+/// structurally incapable of confiscating funds. Seeded at genesis (empty
+/// guardian set = the feature is inert). Absent on a network whose genesis
+/// predates this feature (a legacy already-seeded chain), which `Execute`
+/// tolerates as "not paused".
+pub const EMERGENCY_ACCOUNT_ID: Pubkey = Pubkey::new([19u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;
@@ -142,6 +154,7 @@ mod wasm_id_contract_tests {
         assert_eq!(REGISTRY_ACCOUNT_ID, Pubkey::new([4u8; 32]), "wasm REGISTRY_ACCOUNT_ID");
         assert_eq!(PARAMS_ACCOUNT_ID, Pubkey::new([5u8; 32]), "wasm PARAMS_ACCOUNT_ID");
         assert_eq!(STAKING_REWARDS_POOL_ID, Pubkey::new([6u8; 32]), "wasm STAKING_REWARDS_POOL_ID");
+        assert_eq!(EMERGENCY_ACCOUNT_ID, Pubkey::new([19u8; 32]), "wasm EMERGENCY_ACCOUNT_ID");
         assert_eq!(STAKING_RESERVE_ID, Pubkey::new([11u8; 32]), "wasm STAKING_RESERVE_ID");
         assert_eq!(STAKING_UNBONDING_POOL_ID, Pubkey::new([13u8; 32]), "wasm STAKING_UNBONDING_POOL_ID");
         assert_eq!(STAKING_GLOBAL_ID, Pubkey::new([15u8; 32]), "wasm STAKING_GLOBAL_ID");

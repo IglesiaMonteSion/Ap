@@ -379,9 +379,36 @@ pub struct NodeConfig {
     /// malicioso no basta; varios independientes deben coincidir.
     #[serde(default)]
     pub state_sync_min_confirmations: Option<u32>,
+
+    /// **Emergency governance guardian set** (task #213). Base58 pubkeys that
+    /// can, at `governance_guardian_threshold`-of-N, pause/unpause governance
+    /// `Execute` on-chain — an emergency brake on any rushed economic change,
+    /// structurally unable to move funds. Seeded into `EMERGENCY_ACCOUNT_ID` at
+    /// genesis. Empty (default) = the feature is inert. Because it is genesis
+    /// STATE that varies by operator config, it is folded into `chain_id` when
+    /// set (a network with guardians is a distinct, deliberately-chosen
+    /// network) — so an existing network without it keeps its `chain_id`
+    /// exactly, and every node of a guarded network must configure the SAME set
+    /// or compute a different chain_id.
+    #[serde(default)]
+    pub governance_guardians: Vec<String>,
+    /// Approvals required to flip the emergency pause. Clamped to
+    /// `1..=guardians.len()` at genesis; ignored when there are no guardians.
+    #[serde(default)]
+    pub governance_guardian_threshold: u8,
 }
 
 impl NodeConfig {
+    /// Parses `governance_guardians` (base58) into pubkeys. Invalid entries are
+    /// a hard genesis error — a mis-typed guardian must fail loudly, not be
+    /// silently dropped (which could weaken the multisig).
+    pub fn guardian_pubkeys(&self) -> anyhow::Result<Vec<Pubkey>> {
+        self.governance_guardians
+            .iter()
+            .map(|s| s.trim().parse::<Pubkey>().map_err(|e| anyhow::anyhow!("invalid governance guardian pubkey {s:?}: {e}")))
+            .collect()
+    }
+
     /// Whether to serve/produce quorum-signable state checkpoints (#212): the
     /// explicit flag, OR forced on by the mainnet profile.
     pub fn state_checkpoints(&self) -> bool {
@@ -469,6 +496,21 @@ impl NodeConfig {
                 bytes.extend_from_slice(auth.as_bytes());
                 bytes.extend_from_slice(&amt.to_le_bytes());
             }
+        }
+        // Emergency governance guardians (task #213) are genesis STATE that
+        // varies by operator config, so they fold into the network identity —
+        // but ONLY when configured, so a network without guardians keeps its
+        // chain_id byte-identical to before this feature. Fold the (already
+        // parsed & ordered) raw base58 strings + threshold; a mismatched
+        // guardian set on any node yields a different chain_id (rejected txs),
+        // never a silent divergence in who can pause.
+        if !self.governance_guardians.is_empty() {
+            bytes.extend_from_slice(b"governance-guardians-v1");
+            for g in &self.governance_guardians {
+                bytes.extend_from_slice(g.trim().as_bytes());
+                bytes.push(0);
+            }
+            bytes.push(self.governance_guardian_threshold);
         }
         Sha3_256::digest(bytes).into()
     }
@@ -712,6 +754,8 @@ mod tests {
             network_profile: None,
             state_checkpoints: false,
             state_sync_min_confirmations: None,
+            governance_guardians: Vec::new(),
+            governance_guardian_threshold: 0,
         }
     }
 

@@ -60,6 +60,9 @@ const GOVERNANCE_PROGRAM_ID: [u8; 32] = [3u8; 32];
 const REGISTRY_ACCOUNT_ID: [u8; 32] = [4u8; 32];
 const PARAMS_ACCOUNT_ID: [u8; 32] = [5u8; 32];
 const STAKING_REWARDS_POOL_ID: [u8; 32] = [6u8; 32];
+/// Emergency governance singleton (task #213). Execute must declare it so an
+/// active pause can't be bypassed (see qchain-execution `governance.rs`).
+const EMERGENCY_ACCOUNT_ID: [u8; 32] = [19u8; 32];
 // v7 staking singletons (economics_v7 networks). On a v7 network STAKING_PROGRAM_ID
 // dispatches to StakingV7Program, whose instructions (Stake/IncreaseStake/
 // BeginUnstake/WithdrawUnbonded) use the shares+index reserve model - a different
@@ -352,7 +355,10 @@ pub fn sign_execute_json(
     let target = if registry { REGISTRY_ACCOUNT_ID } else { PARAMS_ACCOUNT_ID };
     let ix = Instruction {
         program_id: Pubkey::new(GOVERNANCE_PROGRAM_ID),
-        accounts: vec![proposal_pk, Pubkey::new(target)],
+        // accounts[2] = the emergency singleton (task #213): the node requires
+        // it declared so an active pause blocks Execute rather than being
+        // silently bypassed.
+        accounts: vec![proposal_pk, Pubkey::new(target), Pubkey::new(EMERGENCY_ACCOUNT_ID)],
         data: vec![3u8],
     };
     let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;

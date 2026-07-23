@@ -25,11 +25,20 @@ pub type ProposalId = u64;
 
 #[derive(Clone, Copy, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum RiskTier {
-    /// Economic parameters (fee curve constants, gas pricing table):
-    /// simple majority of participating stake, no mandatory time-lock -
-    /// `ARCHITECTURE.md` §6 doesn't require one for this tier, unlike
-    /// `Registry`.
+    /// Reserved for genuinely low-risk, non-monetary future parameters:
+    /// simple majority, low participation floor, no time-lock. Nothing
+    /// routes here today — every economic/monetary action was promoted to
+    /// the `Economic` tier (governance-hardening task #213), which the
+    /// audit requires to demand a supermajority + a real review time-lock
+    /// rather than an instant simple-majority flip.
     Low,
+    /// Monetary/economic parameters (base fee, dust threshold, gas price,
+    /// staking commission, emission APR): **supermajority + a mandatory
+    /// review time-lock** and a raised participation floor. Money supply and
+    /// fee policy must never change instantly on a thin simple majority
+    /// (task #213 — "los cambios de emisión, gas, fees, dust y comisiones no
+    /// deberían ejecutarse inmediatamente con poca participación").
+    Economic,
     /// Algorithm registry changes: supermajority + mandatory time-lock
     /// review window (`ARCHITECTURE.md` §6, `blockchain-security-audit`
     /// #7 - never instant activation or instant invalidation).
@@ -63,20 +72,25 @@ pub struct QuorumRule {
 
 pub fn quorum_rule(tier: RiskTier) -> QuorumRule {
     match tier {
-        // Strict simple majority (5_001, not 5_000 - a 50/50 tie must not
-        // pass) of participating stake, per ARCHITECTURE.md §6 ("bajo
-        // riesgo ... mayoría simple del stake participante"). Lower
-        // participation floor and no time-lock, reflecting that this
-        // tier is deliberately meant to be easier to move than a
-        // registry change. All values are placeholders pending real
-        // testnet operating data, same as the Registry tier below.
+        // Reserved tier (nothing routes here today). Simple majority
+        // (5_001, not 5_000 — a 50/50 tie must not pass), a low turnout
+        // floor and no time-lock — the profile a genuinely low-risk,
+        // non-monetary parameter would use. Kept for API/future stability.
         RiskTier::Low => QuorumRule { min_participation_bps: 1_000, approval_threshold_bps: 5_001, voting_period_rounds: 100, timelock_rounds: 0 },
+        // Monetary/economic changes (task #213). A supermajority (2/3), a
+        // raised 30% turnout floor, and a real post-passage review
+        // time-lock (120 rounds) so a fee/gas/dust/commission/emission
+        // change can never take effect instantly on thin participation —
+        // there is always a review window during which the emergency
+        // multisig can pause it (see `qchain-execution`'s EmergencyState).
+        RiskTier::Economic => {
+            QuorumRule { min_participation_bps: 3_000, approval_threshold_bps: 6_667, voting_period_rounds: 150, timelock_rounds: 120 }
+        }
         // 2/3 supermajority per ARCHITECTURE.md §6 ("Cambios al registro
         // de algoritmos ... supermayoría (2/3) + ventana de revisión con
-        // time-lock obligatorio"). Participation floor and round counts
-        // are placeholders pending real testnet operating data.
+        // time-lock obligatorio"). Turnout floor raised to 25% (task #213).
         RiskTier::Registry => {
-            QuorumRule { min_participation_bps: 2_000, approval_threshold_bps: 6_667, voting_period_rounds: 200, timelock_rounds: 100 }
+            QuorumRule { min_participation_bps: 2_500, approval_threshold_bps: 6_667, voting_period_rounds: 200, timelock_rounds: 100 }
         }
     }
 }
@@ -118,7 +132,7 @@ impl ProposalAction {
             | ProposalAction::SetDustThreshold(_)
             | ProposalAction::SetGasPricePerFuel(_)
             | ProposalAction::SetStakingCommissionBps(_)
-            | ProposalAction::SetEmissionApr(_) => RiskTier::Low,
+            | ProposalAction::SetEmissionApr(_) => RiskTier::Economic,
         }
     }
 }
@@ -145,6 +159,15 @@ pub struct Proposal {
     pub action: ProposalAction,
     pub created_round: Round,
     pub voting_ends_round: Round,
+    /// The total bonded supply captured at proposal CREATION (task #213),
+    /// read from the canonical staking-stats singleton by `CreateProposal`.
+    /// This — not the live value at finalize time — is the quorum
+    /// denominator, so a validator can't shrink `total_staked` after a
+    /// proposal opens to lower the participation bar and pass a change with
+    /// far less than real support ("tomar snapshot del poder de voto al
+    /// crear la propuesta"). Standard snapshot-governance discipline
+    /// (Compound/OZ Governor). Frozen for the whole life of the proposal.
+    pub snapshot_total_staked: u64,
     pub yes_stake: u64,
     pub no_stake: u64,
     pub abstain_stake: u64,
@@ -158,7 +181,7 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    pub fn new(id: ProposalId, proposer: Pubkey, action: ProposalAction, created_round: Round) -> Self {
+    pub fn new(id: ProposalId, proposer: Pubkey, action: ProposalAction, created_round: Round, snapshot_total_staked: u64) -> Self {
         let rule = quorum_rule(action.risk_tier());
         Proposal {
             id,
@@ -166,6 +189,7 @@ impl Proposal {
             voting_ends_round: created_round + rule.voting_period_rounds,
             action,
             created_round,
+            snapshot_total_staked,
             yes_stake: 0,
             no_stake: 0,
             abstain_stake: 0,
@@ -198,14 +222,24 @@ impl Proposal {
         true
     }
 
-    /// Decides pass/fail against `total_staked` (the bonded supply at
-    /// finalization time), per this proposal's risk tier's `QuorumRule`.
-    /// Pure function of the vote tallies - no side effects, callers
-    /// (the `qchain-execution` native program) apply the resulting
-    /// status transition.
-    pub fn evaluate(&self, total_staked: u64) -> ProposalStatus {
+    /// Decides pass/fail against the CREATION-time `snapshot_total_staked`
+    /// (task #213), per this proposal's risk tier's `QuorumRule`. Using the
+    /// frozen snapshot as the denominator — rather than the live value at
+    /// finalize — means post-creation manipulation of `total_staked` can't
+    /// move the participation bar. Pure function of the proposal — no side
+    /// effects; callers (the `qchain-execution` native program) apply the
+    /// resulting status transition.
+    pub fn evaluate(&self) -> ProposalStatus {
         let rule = quorum_rule(self.action.risk_tier());
-        let participating = self.yes_stake.saturating_add(self.no_stake).saturating_add(self.abstain_stake);
+        let total_staked = self.snapshot_total_staked;
+        // Clamp participating to the frozen denominator so a voter who bonded
+        // AFTER the snapshot (live vote weight can exceed the snapshot supply)
+        // can never push participation past 100% — the frozen snapshot is the
+        // authority for the turnout bar. The main gaming vector (shrinking the
+        // denominator to pass on thin support) is closed by the snapshot; a
+        // flash-staker still can't LOWER the bar, and their capital is locked
+        // through the whole window by the vote-lock + min-bonding rules.
+        let participating = self.yes_stake.saturating_add(self.no_stake).saturating_add(self.abstain_stake).min(total_staked);
 
         if total_staked == 0 {
             return ProposalStatus::Rejected;
@@ -236,53 +270,52 @@ mod tests {
         ProposalAction::DeprecateAlgorithm { id: AlgorithmId(2), retirement_round: 1_000 }
     }
 
-    fn low_risk_action() -> ProposalAction {
+    fn economic_action() -> ProposalAction {
         ProposalAction::SetBaseFeePerByte(5)
     }
 
     #[test]
     fn below_participation_floor_is_rejected_even_with_unanimous_yes() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
+        // snapshot_total_staked = 100_000; 100 yes = 0.1% turnout, far under
+        // the Registry floor, even though every vote cast was Yes.
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100_000);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 100);
-        // 100 out of a 100_000 total supply is 0.1% - far under the 20%
-        // participation floor for the Registry tier, even though every
-        // vote cast was Yes.
-        assert_eq!(p.evaluate(100_000), ProposalStatus::Rejected);
+        assert_eq!(p.evaluate(), ProposalStatus::Rejected);
     }
 
     #[test]
     fn supermajority_threshold_is_enforced_not_simple_majority() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
         // 60% yes, 40% no, full participation - fails the 2/3 (66.67%)
         // supermajority bar for a Registry-tier proposal even though it
         // would pass a simple-majority rule.
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 60);
         p.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 40);
-        assert_eq!(p.evaluate(100), ProposalStatus::Rejected);
+        assert_eq!(p.evaluate(), ProposalStatus::Rejected);
     }
 
     #[test]
     fn meeting_both_participation_and_supermajority_passes() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 70);
         p.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 30);
-        assert_eq!(p.evaluate(100), ProposalStatus::Passed);
+        assert_eq!(p.evaluate(), ProposalStatus::Passed);
     }
 
     #[test]
     fn abstain_votes_count_toward_participation_but_not_approval() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 20);
         p.record_vote(Pubkey::new([2u8; 32]), VoteChoice::Abstain, 60);
         // Participation = 80/100 (way past the floor), but of *decided*
         // votes (yes+no = 20), 100% are Yes - still passes on approval,
         // proving abstains don't drag down the approval ratio.
-        assert_eq!(p.evaluate(100), ProposalStatus::Passed);
+        assert_eq!(p.evaluate(), ProposalStatus::Passed);
     }
 
     #[test]
     fn the_same_stake_account_cannot_vote_twice() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
         let stake_account = Pubkey::new([1u8; 32]);
         assert!(p.record_vote(stake_account, VoteChoice::Yes, 50));
         assert!(!p.record_vote(stake_account, VoteChoice::No, 50), "a second vote from the same stake account must be rejected");
@@ -292,42 +325,72 @@ mod tests {
 
     #[test]
     fn zero_total_staked_never_passes() {
-        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0);
-        assert_eq!(p.evaluate(0), ProposalStatus::Rejected, "an empty staking pool must never be able to pass a proposal");
+        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 0);
+        assert_eq!(p.evaluate(), ProposalStatus::Rejected, "an empty staking pool (snapshot 0) must never be able to pass a proposal");
+    }
+
+    #[test]
+    fn a_snapshot_denominator_cannot_be_shrunk_after_creation_to_lower_the_bar() {
+        // The proposal snapshots a large bonded supply at creation. Even if
+        // total_staked later collapses, the frozen snapshot is the quorum
+        // denominator, so 100 yes out of a 100_000 snapshot stays below the
+        // floor — a shrink-the-denominator attack can't pass it (task #213).
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100_000);
+        p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 100);
+        assert_eq!(p.evaluate(), ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn participation_is_clamped_to_the_snapshot_denominator() {
+        // A voter who bonded after the snapshot votes with live weight far
+        // exceeding the snapshot supply; participation clamps to 100%, it
+        // never overflows the ratio.
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100);
+        p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 10_000);
+        assert_eq!(p.evaluate(), ProposalStatus::Passed, "clamped to the snapshot, a lone huge Yes is 100% participation and 100% approval");
     }
 
     #[test]
     fn voting_period_and_timelock_are_derived_from_risk_tier() {
-        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 500);
+        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 500, 0);
         let rule = quorum_rule(RiskTier::Registry);
         assert_eq!(p.voting_ends_round, 500 + rule.voting_period_rounds);
     }
 
     #[test]
-    fn low_tier_passes_on_a_strict_simple_majority_not_a_tie() {
-        let mut tied = Proposal::new(1, Pubkey::system_program_id(), low_risk_action(), 0);
-        tied.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 50);
-        tied.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 50);
-        assert_eq!(tied.evaluate(100), ProposalStatus::Rejected, "a 50/50 tie must not pass a simple-majority vote");
+    fn economic_tier_requires_a_supermajority_and_a_real_timelock() {
+        // 51/49 (a bare simple majority) must NOT pass an economic change —
+        // monetary policy now demands a 2/3 supermajority (task #213).
+        let mut simple = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100);
+        simple.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 51);
+        simple.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 49);
+        assert_eq!(simple.evaluate(), ProposalStatus::Rejected, "a bare simple majority must not pass a monetary change");
 
-        let mut clear = Proposal::new(2, Pubkey::system_program_id(), low_risk_action(), 0);
-        clear.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 51);
-        clear.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 49);
-        assert_eq!(clear.evaluate(100), ProposalStatus::Passed);
+        // 70/30 clears the 2/3 bar.
+        let mut super_maj = Proposal::new(2, Pubkey::system_program_id(), economic_action(), 0, 100);
+        super_maj.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 70);
+        super_maj.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 30);
+        assert_eq!(super_maj.evaluate(), ProposalStatus::Passed);
+
+        // And an economic change now carries a real, mandatory review window.
+        assert!(quorum_rule(RiskTier::Economic).timelock_rounds > 0, "monetary changes must have a real review time-lock");
     }
 
     #[test]
-    fn low_tier_has_a_lower_participation_floor_and_no_timelock_than_registry() {
-        let low_rule = quorum_rule(RiskTier::Low);
-        let registry_rule = quorum_rule(RiskTier::Registry);
-        assert!(low_rule.min_participation_bps < registry_rule.min_participation_bps);
-        assert_eq!(low_rule.timelock_rounds, 0, "ARCHITECTURE.md §6 doesn't require a time-lock for low-risk parameters");
-        assert!(registry_rule.timelock_rounds > 0);
+    fn economic_and_registry_tiers_have_raised_floors_over_the_reserved_low_tier() {
+        let low = quorum_rule(RiskTier::Low);
+        let economic = quorum_rule(RiskTier::Economic);
+        let registry = quorum_rule(RiskTier::Registry);
+        assert!(economic.min_participation_bps > low.min_participation_bps, "economic floor raised");
+        assert!(registry.min_participation_bps > low.min_participation_bps, "registry floor raised");
+        assert_eq!(economic.approval_threshold_bps, 6_667, "economic needs a 2/3 supermajority");
+        assert!(economic.timelock_rounds > 0 && registry.timelock_rounds > 0);
     }
 
     #[test]
-    fn set_base_fee_action_is_low_risk_tier() {
-        assert_eq!(low_risk_action().risk_tier(), RiskTier::Low);
+    fn set_base_fee_action_is_economic_tier() {
+        assert_eq!(economic_action().risk_tier(), RiskTier::Economic);
+        assert_eq!(ProposalAction::SetEmissionApr(1).risk_tier(), RiskTier::Economic);
         assert_eq!(sample_action().risk_tier(), RiskTier::Registry);
     }
 }

@@ -380,6 +380,21 @@ async fn main() -> anyhow::Result<()> {
             PARAMS_ACCOUNT_ID,
             qchain_core::Account { data: genesis_params_account_data(), ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
         );
+        // Emergency governance guardian multisig (task #213). Seeded with the
+        // configured guardian set (empty by default = the pause feature is
+        // inert). Folded into `chain_id` only when set (see `NodeConfig::
+        // chain_id`), so a network without guardians is byte-identical.
+        {
+            let guardians = config.guardian_pubkeys()?;
+            let threshold = config.governance_guardian_threshold;
+            ledger.seed_account(
+                qchain_execution::EMERGENCY_ACCOUNT_ID,
+                qchain_core::Account {
+                    data: qchain_execution::genesis_emergency_account_data(guardians, threshold),
+                    ..qchain_core::Account::new_wallet(GOVERNANCE_PROGRAM_ID)
+                },
+            );
+        }
         // Shared delegator staking-reward pool (`ARCHITECTURE.md` §5's
         // staking-rewards paragraph, `qchain-execution::staking`'s module
         // docs for the reward-per-share accrual mechanism): starts empty,

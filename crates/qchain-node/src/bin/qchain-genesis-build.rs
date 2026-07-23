@@ -125,6 +125,17 @@ struct Cli {
     /// no profile (a testnet).
     #[arg(long)]
     network_profile: Option<String>,
+
+    /// Emergency governance guardian (base58 pubkey), repeatable (task #213). A
+    /// threshold of these can pause/unpause governance Execute — an emergency
+    /// brake on any rushed economic change, structurally unable to move funds.
+    /// Folded into `chain_id` when any is set. Baked into every output config.
+    #[arg(long = "guardian")]
+    guardians: Vec<String>,
+    /// Approvals required to flip the emergency pause (default 1). Clamped to
+    /// 1..=guardians at genesis.
+    #[arg(long, default_value_t = 1)]
+    guardian_threshold: u8,
 }
 
 #[derive(Deserialize)]
@@ -304,6 +315,8 @@ fn main() -> anyhow::Result<()> {
             network_profile: cli.network_profile.clone(),
             state_checkpoints: cli.network_profile.as_deref()==Some("mainnet"),
             state_sync_min_confirmations: None,
+            governance_guardians: cli.guardians.clone(),
+            governance_guardian_threshold: cli.guardian_threshold,
         };
         // Every output config shares the same validators+genesis (+ folded genesis
         // flags), so they all resolve to the identical chain_id — the network's
