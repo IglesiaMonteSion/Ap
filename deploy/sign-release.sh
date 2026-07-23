@@ -14,12 +14,14 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-KEY=""; TAG=""
+KEY=""; TAG=""; IMAGE=""; BIN_DIR="target/release"
 while [ $# -gt 0 ]; do
   case "$1" in
     --key) KEY="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
-    -h|--help) echo "uso: $0 [--key <GPG_KEY_ID>] [--tag vX.Y.Z]"; exit 0 ;;
+    --image) IMAGE="$2"; shift 2 ;;
+    --bin-dir) BIN_DIR="$2"; shift 2 ;;
+    -h|--help) echo "uso: $0 [--key <GPG_KEY_ID>] [--tag vX.Y.Z] [--image <ref>] [--bin-dir <dir>]"; exit 0 ;;
     *) echo "argumento desconocido: $1" >&2; exit 1 ;;
   esac
 done
@@ -33,17 +35,29 @@ mkdir -p "$OUTDIR"
 echo "== SBOM =="
 bash deploy/gen-sbom.sh -o "$OUTDIR/sbom.cdx.json"
 
+echo "== Provenance (commit -> version -> binarios -> imagen -> wasm de la wallet) =="
+PROVARGS=(--bin-dir "$BIN_DIR" -o "$OUTDIR/provenance.json")
+[ -n "$IMAGE" ] && PROVARGS+=(--image "$IMAGE")
+bash deploy/gen-provenance.sh "${PROVARGS[@]}"
+cat "$OUTDIR/provenance.json"
+
 echo "== Manifiesto de release =="
 MAN="$OUTDIR/RELEASE-MANIFEST.txt"
 {
   echo "qchain release manifest"
   echo "version: $VERSION"
   echo "git_commit: $COMMIT"
-  echo "toolchain: $(grep -m1 channel rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+  echo "toolchain: $(grep -m1 '^channel = ' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')"
   echo
   echo "# sha256 de los artefactos que se firman con esta release:"
-  # El Cargo.lock (deps pinneadas), el Dockerfile (receta de build), y el SBOM.
-  sha256sum Cargo.lock Dockerfile rust-toolchain.toml "$OUTDIR/sbom.cdx.json" 2>/dev/null || true
+  # El Cargo.lock (deps pinneadas), el Dockerfile (receta de build), el SBOM y
+  # la PROVENANCE (que ata commit -> version -> binarios -> imagen -> wasm).
+  sha256sum Cargo.lock Dockerfile rust-toolchain.toml "$OUTDIR/sbom.cdx.json" "$OUTDIR/provenance.json" 2>/dev/null || true
+  echo
+  echo "# sha256 de los BINARIOS de release ($BIN_DIR):"
+  for b in qchain-node qchain-genesis-build qchain qchain-faucet qchain-wallet qchain-indexer qchain-remote-signer; do
+    [ -f "$BIN_DIR/$b" ] && sha256sum "$BIN_DIR/$b" || echo "(falta) $b"
+  done
   echo
   echo "# huellas de los assets de la WALLET WEB (lo que el navegador ejecuta;"
   echo "# compará contra Ajustes -> 'huella del código' / GET /api/version):"
@@ -57,6 +71,11 @@ GPGARGS=(--armor --detach-sign)
 gpg "${GPGARGS[@]}" --output "$MAN.asc" "$MAN"
 echo "firma escrita en $MAN.asc"
 echo "verificá con: gpg --verify $MAN.asc $MAN"
+
+echo "== Firma GPG de la provenance =="
+gpg "${GPGARGS[@]}" --output "$OUTDIR/provenance.json.asc" "$OUTDIR/provenance.json"
+echo "firma escrita en $OUTDIR/provenance.json.asc"
+echo "verificá con: gpg --verify $OUTDIR/provenance.json.asc $OUTDIR/provenance.json"
 
 if [ -n "$TAG" ]; then
   echo "== Tag firmada $TAG =="

@@ -1,0 +1,166 @@
+name: Release verificable
+
+# CADENA DE CONSTRUCCIÓN VERIFICABLE (tarea de release-verify). Se dispara al
+# pushear una tag `vX.Y.Z`. La regla dura: los ARTEFACTOS FIRMADOS de un release
+# sólo se producen si el GATE COMPLETO está VERDE sobre EL MISMO COMMIT tagueado
+# (tests + clippy -D + cargo-audit), y la PROVENANCE ata ese commit a la versión,
+# a los binarios, a la imagen de despliegue y al WASM de la wallet — todo en un
+# único archivo firmable. Un verificador reconstruye la cadena sin confiar en el
+# servidor: commit -> version -> binario -> imagen -> wasm.
+#
+# La firma GPG de los artefactos requiere el secret `GPG_PRIVATE_KEY` (la clave
+# del maintainer). SIN el secret el workflow igual corre y publica la provenance
+# + los hashes SIN firmar (útil para verificar la cadena de hashes); la firma es
+# el paso humano que sólo el dueño de la clave puede dar (ver docs/RELEASE-VERIFY.md).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # crea el GitHub Release y sube los artefactos de esta tag
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 1) GATE: el release NO avanza si esto no está verde sobre el commit tagueado.
+  gate:
+    name: Gate (build --locked + clippy -D + tests + audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Toolchain de Rust (pinneado por rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          components: clippy
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build (--locked)
+        run: cargo build --workspace --locked
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests del workspace (incl. DST y ataques WASM)
+        run: cargo test --workspace --locked
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      # La tag DEBE coincidir con la versión del Cargo.toml (no publicar un binario
+      # cuya versión no calce con la tag firmada).
+      - name: La tag coincide con la versión del workspace
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAGV="${GITHUB_REF_NAME#v}"
+          WSV="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          echo "tag=$TAGV workspace=$WSV"
+          [ "$TAGV" = "$WSV" ] || { echo "FALLO: la tag ($TAGV) no coincide con Cargo.toml ($WSV)"; exit 1; }
+
+  # 2) ARTEFACTOS + PROVENANCE: sólo tras el gate verde, sobre el mismo commit.
+  provenance:
+    name: Binarios + imagen + provenance (+ firma si hay clave)
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Toolchain de Rust (pinneado)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Build de release reproducible (mismo SOURCE_DATE_EPOCH que el job
+      # `reproducible` del CI, para que los hashes de la provenance sean estables).
+      - name: Build release (--locked)
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          cargo build --locked --release \
+            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+
+      # Imagen de despliegue: se construye para atar su digest a la provenance.
+      - name: Build de la imagen de despliegue
+        run: |
+          DOCKER_BUILDKIT=1 docker build -t "qchain:${GITHUB_REF_NAME}" .
+
+      - name: SBOM
+        run: bash deploy/gen-sbom.sh -o sbom.cdx.json
+
+      # LA PIEZA CENTRAL: provenance que relaciona commit -> version -> binarios
+      # -> imagen de despliegue -> wasm de la wallet.
+      - name: Generar provenance
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          bash deploy/gen-provenance.sh --bin-dir target/release --image "qchain:${GITHUB_REF_NAME}" -o provenance.json
+          cat provenance.json
+
+      - name: Hashes de los binarios (SHA256SUMS)
+        run: |
+          cd target/release
+          sha256sum qchain-node qchain qchain-genesis-build qchain-faucet qchain-wallet qchain-indexer qchain-remote-signer > ../../SHA256SUMS
+          cd ../..
+          cat SHA256SUMS
+
+      # Firma GPG: SÓLO si el secret está presente (la firma es del maintainer).
+      # Sin secret el paso se salta y se publican los artefactos SIN firma.
+      - name: Firmar provenance + hashes (si hay GPG_PRIVATE_KEY)
+        id: sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "sin GPG_PRIVATE_KEY -> se publican artefactos SIN firma (agregá el secret para firmar)"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          SIGN=(gpg --batch --yes --local-user "$KEYID" --armor --detach-sign)
+          [ -n "${GPG_PASSPHRASE:-}" ] && SIGN=(gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$KEYID" --armor --detach-sign)
+          "${SIGN[@]}" --output provenance.json.asc provenance.json
+          "${SIGN[@]}" --output SHA256SUMS.asc SHA256SUMS
+          gpg --armor --export "$KEYID" > qchain-release-pubkey.asc
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar en el GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            provenance.json
+            provenance.json.asc
+            SHA256SUMS
+            SHA256SUMS.asc
+            sbom.cdx.json
+            qchain-release-pubkey.asc
+            target/release/qchain-node
+            target/release/qchain
+            target/release/qchain-genesis-build
+            target/release/qchain-faucet
+            target/release/qchain-wallet
+            target/release/qchain-indexer
+            target/release/qchain-remote-signer
+          fail_on_unmatched_files: false
+          body: |
+            Release verificable de qchain ${{ github.ref_name }}.
+
+            La `provenance.json` relaciona commit -> version -> binarios -> imagen
+            de despliegue -> wasm de la wallet, todo sobre el commit `${{ github.sha }}`.
+            Verificación: `docs/RELEASE-VERIFY.md`.
+
+            Artefactos firmados: **${{ steps.sign.outputs.signed }}** (si es `false`,
+            falta el secret `GPG_PRIVATE_KEY` — la cadena de hashes igual es verificable).

@@ -11,6 +11,12 @@ name: CI de seguridad
 on:
   push:
   pull_request:
+  # Los jobs PESADOS (fuzzing, sanitizers) corren de noche y a demanda, NO en
+  # cada push — son caros y lentos. El gate rápido (build/clippy/tests/audit/sbom)
+  # sigue corriendo en cada push/PR.
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC todos los días
+  workflow_dispatch:
 
 # Menor privilegio para el GITHUB_TOKEN: estos jobs sólo compilan/testean, no
 # escriben nada al repo ni usan secrets. (QCH-CI: defensa-en-profundidad contra
@@ -150,3 +156,114 @@ jobs:
         with:
           name: qchain-sbom-cyclonedx
           path: sbom.cdx.json
+
+  fuzz:
+    name: Fuzzing (cargo-fuzz, nightly/manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Sólo de noche o a demanda: coverage-guided fuzzing es caro. Ejercita los
+    # deserializadores del wire (transaction/message) — ningún byte arbitrario
+    # debe panicar/OOM el nodo. El crate `fuzz/` está EXCLUIDO del workspace y
+    # necesita nightly + cargo-fuzz.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Toolchain nightly (cargo-fuzz requiere nightly)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          toolchain: nightly
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Instalar cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # Cada target corre un tiempo ACOTADO (120s). Un crash deja un artefacto
+      # reproducible que tumba el job. Para una campaña larga, subir el tiempo.
+      - name: Fuzz transaction_deserialize (120s)
+        run: cargo +nightly fuzz run transaction_deserialize -- -max_total_time=120
+      - name: Fuzz message_deserialize (120s)
+        run: cargo +nightly fuzz run message_deserialize -- -max_total_time=120
+
+  sanitizers:
+    name: Sanitizers (ASan/UBSan sobre los deserializadores, nightly/manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Sólo de noche o a demanda. AddressSanitizer + UndefinedBehaviorSanitizer
+    # sobre los tests de los crates de wire PUROS-Rust (core/storage/stark) —
+    # los que deserializan bytes no confiables. LÍMITE HONESTO: un sanitizer
+    # sobre el workspace COMPLETO tropieza con el liboqs en C (firmas PQC), cuyo
+    # análisis de canal lateral/memory-safety es un proceso externo aparte (#185);
+    # por eso se acota a los crates que no linkean liboqs en su test path.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Toolchain nightly + rust-src (sanitizers requieren nightly)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Caché de cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Tests bajo AddressSanitizer (core/storage/stark)
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+        run: |
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p qchain-core -p qchain-storage -p qchain-stark
+      - name: Tests bajo UndefinedBehaviorSanitizer (core/storage/stark)
+        env:
+          RUSTFLAGS: "-Zsanitizer=undefined"
+          RUSTDOCFLAGS: "-Zsanitizer=undefined"
+        run: |
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p qchain-core -p qchain-storage -p qchain-stark
+
+  reproducible:
+    name: Build reproducible (dos builds -> hashes idénticos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Sólo de noche o a demanda (compila release dos veces). Con el toolchain
+    # pinneado + Cargo.lock + --locked + SOURCE_DATE_EPOCH, dos builds del MISMO
+    # commit deben producir binarios con el MISMO sha256. Si difieren, el build
+    # no es reproducible y el job falla (así el hash de la provenance es una
+    # promesa verificable, no una foto de una sola corrida).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Toolchain de Rust (pinneado por rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+      - name: Build A (release, --locked, SOURCE_DATE_EPOCH fijo)
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          cargo build --locked --release \
+            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+          mkdir -p /tmp/buildA
+          cp target/release/qchain-node target/release/qchain target/release/qchain-genesis-build \
+             target/release/qchain-faucet target/release/qchain-wallet target/release/qchain-indexer \
+             target/release/qchain-remote-signer /tmp/buildA/
+          (cd /tmp/buildA && sha256sum * > SHA256SUMS)
+          cat /tmp/buildA/SHA256SUMS
+      - name: Build B (limpio, mismo SOURCE_DATE_EPOCH)
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          cargo clean
+          cargo build --locked --release \
+            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+          mkdir -p /tmp/buildB
+          cp target/release/qchain-node target/release/qchain target/release/qchain-genesis-build \
+             target/release/qchain-faucet target/release/qchain-wallet target/release/qchain-indexer \
+             target/release/qchain-remote-signer /tmp/buildB/
+          (cd /tmp/buildB && sha256sum * > SHA256SUMS)
+      - name: Comparar hashes A vs B
+        run: |
+          echo "== A =="; cat /tmp/buildA/SHA256SUMS
+          echo "== B =="; cat /tmp/buildB/SHA256SUMS
+          diff /tmp/buildA/SHA256SUMS /tmp/buildB/SHA256SUMS \
+            && echo "OK: build reproducible (hashes idénticos en dos corridas)" \
+            || { echo "FALLO: los binarios NO son bit-idénticos entre dos builds"; exit 1; }

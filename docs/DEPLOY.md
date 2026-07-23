@@ -535,12 +535,28 @@ salió el binario:
   deploy exige la revisión del maintainer (necesita branch protection con "Require
   review from Code Owners"). Reemplazá `@owner` por tu handle real de GitHub.
 - **Firmas GPG** (`deploy/sign-release.sh`): firma un manifiesto (hashes del
-  `Cargo.lock` + `Dockerfile` + SBOM) y, opcional, la tag. **Requiere tu clave GPG**
-  (la firma es humana). Activá también `git config --global commit.gpgsign true`.
+  `Cargo.lock` + `Dockerfile` + SBOM + **provenance** + los binarios) y, opcional,
+  la tag. **Requiere tu clave GPG** (la firma es humana). Activá también
+  `git config --global commit.gpgsign true`.
+- **Provenance verificable** (`deploy/gen-provenance.sh` → `provenance.json`): UN
+  archivo determinista que RELACIONA `commit → version → binarios → imagen de
+  despliegue → wasm de la wallet`. Un verificador corre
+  `deploy/verify-provenance.sh --provenance provenance.json` para confirmar, sin
+  confiar en el servidor, que todo salió del commit firmado.
+- **CI de release** (`.github/workflows/release.yml`): al pushear una tag `vX.Y.Z`
+  re-corre el gate completo (build+clippy+tests+audit) SOBRE ESE commit y sólo
+  entonces produce+firma los artefactos → **CI verde sobre el mismo commit antes
+  del release**. Los jobs pesados (fuzz/sanitizers/reproducible) corren nightly.
 
-**Pendiente honesto:** la reproducibilidad **bit-for-bit** completa necesita además
-`SOURCE_DATE_EPOCH` + un entorno de build determinista; y la auditoría externa +
-bug bounty (tarea #203) es un proceso humano con terceros.
+Ver **`docs/RELEASE-VERIFY.md`** para el flujo completo (cortar un release firmado,
+verificar la cadena, y activar protección de rama + revisión obligatoria — que son
+settings del repo en GitHub, no código).
+
+**Pendiente honesto:** la reproducibilidad **bit-for-bit** entre máquinas distintas
+necesita un entorno de build hermético (el `SOURCE_DATE_EPOCH` + toolchain pinneado
++ el job `reproducible` cubren el mismo-entorno); firmar la IMAGEN en un registro
+(cosign) es un follow-up cuando se publique a uno; y la auditoría externa + bug
+bounty (tarea #203) es un proceso humano con terceros.
 
 ## Respaldos automáticos (`deploy/backup-node.sh`)
 
