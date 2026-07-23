@@ -257,6 +257,30 @@ pub struct NodeConfig {
     /// `economics_v7` + `treasury_authority`; part of the network config hash.
     #[serde(default)]
     pub treasury_amount: Option<u64>,
+
+    /// **HARD-CAP supply model** (SPEC §5, task #221 — the "definitive supply"
+    /// decision). When `true` (only meaningful with `economics_v7`), staking
+    /// emission is DRAWN from the pre-minted `emission_reserve_qch` instead of
+    /// minted, so total supply can NEVER exceed the genesis total (the ≤100M cap).
+    /// The node ALSO refuses to start if the genesis supply exceeds the cap. Default
+    /// `false` = the inflationary v7 model (emission minted, no absolute max). Folded
+    /// into `chain_id` when enabled — a fresh-genesis, network-wide decision every
+    /// node must set identically. See `docs/ECONOMIC-REDESIGN.md`.
+    #[serde(default)]
+    pub hard_cap_supply: bool,
+    /// The hard cap in whole QCH (default `economics_v7::MAX_SUPPLY_QCH` = 100M when
+    /// `hard_cap_supply` is on). The genesis gate enforces `Σ genesis balances ≤`
+    /// this. Only meaningful with `hard_cap_supply`; part of the network config hash.
+    #[serde(default)]
+    pub supply_cap_qch: Option<u64>,
+    /// Pre-minted **emission reserve** in whole QCH (default 0), seeded LOCKED into
+    /// `EMISSION_RESERVE_ID` at genesis under the hard-cap model. This funds staking
+    /// yield: each quanto's emission is drawn from here (a transfer, never a mint).
+    /// It is part of the ≤ cap split (treasury + reserve + bonds + allocations ≤
+    /// cap). When it empties, staking yield falls to fee income only. Only meaningful
+    /// with `economics_v7` + `hard_cap_supply`; part of the network config hash.
+    #[serde(default)]
+    pub emission_reserve_qch: Option<u64>,
     /// Per-IP RPC rate limit (task #196, QCH-S6): max requests any single client
     /// IP may make in a 10-second window before it's temporarily banned (60 s).
     /// `None`/`0` (the default, and what every existing config resolves to)
@@ -496,6 +520,15 @@ impl NodeConfig {
                 bytes.extend_from_slice(auth.as_bytes());
                 bytes.extend_from_slice(&amt.to_le_bytes());
             }
+            // Hard-cap supply (§5, #221): the cap + the pre-minted emission reserve
+            // are part of the genesis economics identity, so a hard-cap network is a
+            // distinct chain. Only folded when enabled, so an inflationary v7 network
+            // keeps its chain_id unchanged.
+            if self.hard_cap_supply {
+                bytes.extend_from_slice(b"hard-cap-supply-v1");
+                bytes.extend_from_slice(&self.supply_cap_atoms().to_le_bytes());
+                bytes.extend_from_slice(&self.emission_reserve_atoms().to_le_bytes());
+            }
         }
         // Emergency governance guardians (task #213) are genesis STATE that
         // varies by operator config, so they fold into the network identity —
@@ -532,6 +565,25 @@ impl NodeConfig {
     /// Only meaningful when `economics_v7` is on.
     pub fn rounds_per_quanto(&self) -> u64 {
         self.rounds_per_quanto.unwrap_or(qchain_execution::economics_v7::DEFAULT_ROUNDS_PER_QUANTO)
+    }
+
+    /// The resolved hard supply cap in ATOMS (config `supply_cap_qch` × 1e9, or the
+    /// canonical 100M default). Only meaningful when `hard_cap_supply` is on; the
+    /// genesis gate enforces `Σ genesis balances ≤` this. `u128` because the total
+    /// economy is summed in `u128`; the value itself stays well below `u64::MAX`.
+    pub fn supply_cap_atoms(&self) -> u128 {
+        match self.supply_cap_qch {
+            Some(qch) => qch as u128 * qchain_core::UNITS_PER_QCH as u128,
+            None => qchain_execution::economics_v7::MAX_SUPPLY_ATOMS,
+        }
+    }
+
+    /// The resolved pre-minted emission reserve in ATOMS (config
+    /// `emission_reserve_qch` × 1e9, or 0). Seeded into `EMISSION_RESERVE_ID` at
+    /// genesis under the hard-cap model. Saturating so a nonsensical huge config
+    /// can't wrap; the genesis gate then rejects it for exceeding the cap.
+    pub fn emission_reserve_atoms(&self) -> u64 {
+        self.emission_reserve_qch.unwrap_or(0).saturating_mul(qchain_core::UNITS_PER_QCH)
     }
 
     /// Rounds per epoch for validator rotation (the config override, or the
@@ -721,6 +773,13 @@ mod tests {
     use super::*;
     use qchain_crypto::Keypair;
 
+    /// A v7-economics config (for the hard-cap folding test), from cloned inputs.
+    fn config_with_v7(validators: &[ValidatorConfig], genesis: &[GenesisAllocation]) -> NodeConfig {
+        let mut c = config_with(validators.to_vec(), genesis.to_vec());
+        c.economics_v7 = true;
+        c
+    }
+
     fn config_with(validators: Vec<ValidatorConfig>, genesis: Vec<GenesisAllocation>) -> NodeConfig {
         NodeConfig {
             keypair_path: PathBuf::from("keypair.json"),
@@ -745,6 +804,9 @@ mod tests {
             rounds_per_quanto: None,
             treasury_authority: None,
             treasury_amount: None,
+            hard_cap_supply: false,
+            supply_cap_qch: None,
+            emission_reserve_qch: None,
             rpc_rate_limit_per_10s: None,
             simulate_rate_limit_per_10s: None,
             tx_rate_limit_per_10s: None,
@@ -803,6 +865,43 @@ mod tests {
         v7_fast.economics_v7 = true;
         v7_fast.rounds_per_quanto = Some(8);
         assert_ne!(v7.chain_id(), v7_fast.chain_id(), "economic params are part of the config hash");
+    }
+
+    /// The HARD-CAP supply model (#221) folds into `chain_id` ONLY when enabled, so
+    /// an inflationary v7 network keeps its chain_id unchanged, while a hard-cap
+    /// network (and one with a different cap or reserve) is a genuinely distinct
+    /// chain. Also confirms the resolvers default the cap to 100M and reserve to 0.
+    #[test]
+    fn hard_cap_supply_folds_into_chain_id_only_when_enabled() {
+        let bundle = Keypair::generate().unwrap().public_key_bundle();
+        let validators = vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }];
+        let genesis = vec![GenesisAllocation { address: Keypair::generate().unwrap().pubkey(), balance: 5_000_000 }];
+
+        let mut v7 = config_with(validators.clone(), genesis.clone());
+        v7.economics_v7 = true;
+        // An inflationary v7 config is byte-identical to before this field existed.
+        assert_eq!(v7.chain_id(), config_with_v7(&validators, &genesis).chain_id(), "inflationary v7 chain_id unchanged");
+
+        let mut cap = config_with_v7(&validators, &genesis);
+        cap.hard_cap_supply = true;
+        assert_ne!(v7.chain_id(), cap.chain_id(), "a hard-cap network is a distinct chain");
+        // Defaults: 100M cap, 0 reserve.
+        assert_eq!(cap.supply_cap_atoms(), qchain_execution::economics_v7::MAX_SUPPLY_ATOMS);
+        assert_eq!(cap.emission_reserve_atoms(), 0);
+
+        // A different cap → a different chain.
+        let mut cap2 = config_with_v7(&validators, &genesis);
+        cap2.hard_cap_supply = true;
+        cap2.supply_cap_qch = Some(50_000_000);
+        assert_ne!(cap.chain_id(), cap2.chain_id(), "the cap value is part of the config hash");
+        assert_eq!(cap2.supply_cap_atoms(), 50_000_000u128 * qchain_core::UNITS_PER_QCH as u128);
+
+        // A different pre-minted reserve → a different chain.
+        let mut cap3 = config_with_v7(&validators, &genesis);
+        cap3.hard_cap_supply = true;
+        cap3.emission_reserve_qch = Some(40_000_000);
+        assert_ne!(cap.chain_id(), cap3.chain_id(), "the emission reserve is part of the config hash");
+        assert_eq!(cap3.emission_reserve_atoms(), 40_000_000u64 * qchain_core::UNITS_PER_QCH);
     }
 
     /// The real, live-confirmed gap this closes (see

@@ -4,7 +4,7 @@
 //! sweep per `ARCHITECTURE.md` §5.
 
 use crate::error::ExecError;
-use crate::ids::{ADMIN_FEE_WALLET, FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_FEE_POOL_ID};
+use crate::ids::{ADMIN_FEE_WALLET, EMISSION_RESERVE_ID, FEE_STATE_ACCOUNT_ID, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_FEE_POOL_ID};
 use crate::params::{FeeState, FEE_TARGET_BYTES_PER_ROUND};
 use crate::native::{NativeProgram, SystemInstruction};
 use crate::params::EconomicParams;
@@ -305,6 +305,7 @@ pub struct SimSnapshot {
     economics_v7: bool,
     quanto_rate_fp: u128,
     rounds_per_quanto: u64,
+    hard_cap_supply: bool,
 }
 
 /// Persistable snapshot of a `Ledger`'s running economic counters. Written to
@@ -401,6 +402,13 @@ pub struct Ledger {
     /// Rounds per reward quanto (`economics_v7::DEFAULT_ROUNDS_PER_QUANTO`). Only
     /// read when `economics_v7` is on; 0 disables the quanto close.
     rounds_per_quanto: u64,
+    /// HARD-CAP supply model (SPEC §5, task #221). When true (only meaningful with
+    /// `economics_v7`), staking emission is DRAWN from the pre-minted
+    /// `EMISSION_RESERVE_ID` instead of minted, so total supply can never exceed
+    /// the genesis total (the ≤100M cap). Default `false` = the inflationary v7
+    /// model (emission minted). A fresh-genesis, chain_id-folded decision — never
+    /// toggled on a live chain.
+    hard_cap_supply: bool,
     /// v7 participation (§21.2): per-quanto `(validator, credits, opportunities)`
     /// tallies the NODE feeds in from the committed order (which validators had a
     /// committed certificate in each of the quanto's rounds vs which were in the
@@ -476,6 +484,7 @@ impl Ledger {
             economics_v7: false,
             quanto_rate_fp: 0,
             rounds_per_quanto: 0,
+            hard_cap_supply: false,
             participation_by_quanto: std::collections::HashMap::new(),
         })
     }
@@ -491,6 +500,46 @@ impl Ledger {
         l.quanto_rate_fp = quanto_rate_fp;
         l.rounds_per_quanto = rounds_per_quanto;
         Ok(l)
+    }
+
+    /// Enable the HARD-CAP supply model (task #221): staking emission is drawn
+    /// from the pre-minted `EMISSION_RESERVE` instead of minted, so total supply
+    /// never exceeds the genesis total (the ≤100M cap). Only meaningful with
+    /// `economics_v7`; a genesis-level, chain_id-folded decision the node sets from
+    /// config. Default off = the inflationary v7 model.
+    pub fn set_hard_cap_supply(&mut self, on: bool) {
+        self.hard_cap_supply = on;
+    }
+
+    /// Whether this ledger enforces the hard-cap supply model (emission drawn from
+    /// a reserve, never minted).
+    pub fn is_hard_cap_supply(&self) -> bool {
+        self.hard_cap_supply
+    }
+
+    /// Total QCH supply currently in existence: the sum of EVERY account balance in
+    /// the store (`u128`, since the economy spans many pools and can exceed `u64`).
+    /// Under the hard cap this is constant at the genesis total; the node checks it
+    /// against the cap at startup (`assert_supply_cap`).
+    pub fn total_supply(&self) -> u128 {
+        self.store.iter().fold(0u128, |acc, (_, a)| acc.saturating_add(a.balance as u128))
+    }
+
+    /// Genesis gate for the HARD-CAP model (§5, #221): refuse to start if the
+    /// seeded supply exceeds `cap_atoms`. Fail-loud — a genesis whose treasury +
+    /// emission reserve + bonds + allocations sum above the cap would break the
+    /// "never exceed 100M" promise, so the operator must fix the split before the
+    /// network launches (it is folded into `chain_id`, so it can't be changed live).
+    pub fn assert_supply_cap(&self, cap_atoms: u128) -> Result<(), String> {
+        let total = self.total_supply();
+        crate::invariants_v7::check_supply_cap(total, cap_atoms).map_err(|_| {
+            format!(
+                "FATAL: genesis supply {total} atoms ({} QCH) exceeds the hard cap {cap_atoms} atoms ({} QCH) — \
+                 reduce treasury/emission-reserve/allocations so their sum ≤ the cap. The hard cap guarantees supply never exceeds this.",
+                total / qchain_core::UNITS_PER_QCH as u128,
+                cap_atoms / qchain_core::UNITS_PER_QCH as u128,
+            )
+        })
     }
 
     /// Whether this ledger runs the v7 economics (shares+index staking + quanto
@@ -550,7 +599,7 @@ impl Ledger {
         // payer, the fee collector, EVERY protocol singleton, and each
         // instruction's program account + declared accounts. A missed read only
         // dents preview accuracy, never safety.
-        let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, crate::ids::TREASURY_ACCOUNT_ID];
+        let mut want: Vec<Pubkey> = vec![tx.message.payer, *fee_collector, crate::ids::ADMIN_FEE_WALLET, crate::ids::TREASURY_ACCOUNT_ID, crate::ids::EMISSION_RESERVE_ID];
         for i in 1u8..=15u8 {
             want.push(Pubkey::new([i; 32]));
         }
@@ -580,6 +629,7 @@ impl Ledger {
             economics_v7: self.is_economics_v7(),
             quanto_rate_fp: self.quanto_rate_fp(),
             rounds_per_quanto: self.rounds_per_quanto(),
+            hard_cap_supply: self.is_hard_cap_supply(),
         }
     }
 
@@ -588,7 +638,7 @@ impl Ledger {
     /// [`SimSnapshot`] — so a slow WASM compile/exec never touches consensus.
     pub fn run_simulation(snapshot: SimSnapshot, tx: &Transaction, fee_collector: &Pubkey, round: Round) -> SimOutcome {
         use qchain_storage::InMemoryStore;
-        let SimSnapshot { accounts, before, payer_before, compressed, economics_v7, quanto_rate_fp, rounds_per_quanto } = snapshot;
+        let SimSnapshot { accounts, before, payer_before, compressed, economics_v7, quanto_rate_fp, rounds_per_quanto, hard_cap_supply } = snapshot;
         let mut scratch = InMemoryStore::new();
         for (pk, a) in accounts {
             scratch.set(pk, a);
@@ -601,7 +651,10 @@ impl Ledger {
             quanto_rate_fp,
             rounds_per_quanto,
         ) {
-            Ok(l) => l,
+            Ok(mut l) => {
+                l.set_hard_cap_supply(hard_cap_supply);
+                l
+            }
             Err(e) => {
                 return SimOutcome {
                     ok: false,
@@ -698,6 +751,13 @@ impl Ledger {
         if let Some(r) = self.store.get(&crate::ids::STAKING_RESERVE_ID) {
             map.insert(crate::ids::STAKING_RESERVE_ID, r);
         }
+        // Hard-cap model (§5, #221): emission is DRAWN from the pre-minted
+        // emission reserve, so it must be in the working set to be debited.
+        if self.hard_cap_supply {
+            if let Some(er) = self.store.get(&crate::ids::EMISSION_RESERVE_ID) {
+                map.insert(crate::ids::EMISSION_RESERVE_ID, er);
+            }
+        }
         let mut settled_any = false;
         let mut guard = 0u64;
         loop {
@@ -705,7 +765,7 @@ impl Ledger {
             if cur >= target_quanto {
                 break;
             }
-            match crate::staking_v7::settle_quanto(&mut map, cur) {
+            match crate::staking_v7::settle_quanto_ex(&mut map, cur, self.hard_cap_supply) {
                 Ok(minted) => {
                     self.total_emitted = self.total_emitted.saturating_add(minted);
                     settled_any = true;
@@ -732,6 +792,12 @@ impl Ledger {
             }
             if let Some(r) = map.remove(&crate::ids::STAKING_RESERVE_ID) {
                 self.write_account(crate::ids::STAKING_RESERVE_ID, r);
+            }
+            // Persist the debited emission reserve (hard-cap model). `settle_quanto_ex`
+            // may have inserted it via `or_insert_with` even when it started absent,
+            // so write whatever is present.
+            if let Some(er) = map.remove(&crate::ids::EMISSION_RESERVE_ID) {
+                self.write_account(crate::ids::EMISSION_RESERVE_ID, er);
             }
         }
     }
@@ -1367,8 +1433,21 @@ impl Ledger {
     /// pool, not a per-proposer credit). Mirrors `fees_v7::route_fee` exactly.
     fn route_fee_v7(&mut self, mut working: Option<&mut HashMap<Pubkey, Account>>, fee: u64) {
         let split = crate::fees_v7::fee_split(fee);
-        self.total_burned = self.total_burned.saturating_add(split.burn);
-        self.fee_burned = self.fee_burned.saturating_add(split.burn);
+        // The "burn" 45%: under the INFLATIONARY model it is destroyed (deflationary).
+        // Under the HARD-CAP model (§5, #221) it is instead credited to the pre-minted
+        // EMISSION_RESERVE — so "fees fund staking" is literally true and, when the
+        // reserve depletes, yield continues from fee income (the model the user chose).
+        // Redirecting a would-be burn to a program-owned pool keeps supply CONSTANT
+        // (never grows past the cap, never shrinks below it): a hard-cap network's
+        // total supply is exactly its genesis total forever.
+        if split.burn > 0 {
+            if self.hard_cap_supply {
+                self.credit_fee_target(working.as_deref_mut(), EMISSION_RESERVE_ID, split.burn);
+            } else {
+                self.total_burned = self.total_burned.saturating_add(split.burn);
+                self.fee_burned = self.fee_burned.saturating_add(split.burn);
+            }
+        }
         // Credit through `credit_fee_target` (into `working` when the singleton is
         // present there, else the store) — so a contract that names
         // VALIDATOR_FEE_POOL_ID / ADMIN_FEE_WALLET in `ix.accounts` cannot have the
@@ -3203,6 +3282,74 @@ mod tests {
         assert!(reserve1 <= reserve0 + amount * 12 / 100 + 2, "growth never exceeds 12% APY");
         assert!(reserve1 >= reserve0 + amount * 119 / 1000, "growth is close to 12% (>=11.9%)");
         assert_eq!(l.total_emitted, reserve1 - reserve0, "total_emitted tracks the reserve growth");
+    }
+
+    /// A HARD-CAP v7 ledger (#221): like `new_test_ledger_v7` but emission is drawn
+    /// from a pre-minted `EMISSION_RESERVE` (seeded with `reserve_atoms`) instead of
+    /// minted. Total supply never exceeds the genesis total.
+    fn new_test_ledger_v7_hardcap(rounds_per_quanto: u64, reserve_atoms: u64) -> Ledger {
+        let mut l = new_test_ledger_v7(rounds_per_quanto);
+        l.set_hard_cap_supply(true);
+        l.write_account(
+            crate::ids::EMISSION_RESERVE_ID,
+            qchain_core::Account { balance: reserve_atoms, ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
+        );
+        l
+    }
+
+    #[test]
+    fn hard_cap_ledger_conserves_supply_across_a_year_and_a_transfer() {
+        let rpq = 4;
+        let reserve0 = 50 * qchain_core::UNITS_PER_QCH;
+        let mut l = new_test_ledger_v7_hardcap(rpq, reserve0);
+        let validator = Keypair::generate().unwrap().pubkey();
+        let staker = Keypair::generate().unwrap();
+        let position = Keypair::generate().unwrap().pubkey();
+        l.credit(staker.pubkey(), 300 * qchain_core::UNITS_PER_QCH);
+        let supply_before = l.total_supply();
+
+        // Stake (transfer wallet → staking reserve; conserves supply).
+        let amount = 100 * qchain_core::UNITS_PER_QCH;
+        l.apply_transaction(&v7_stake_tx(&staker, 0, position, amount), &validator, 0).unwrap();
+        assert_eq!(l.total_supply(), supply_before, "staking is a transfer — supply unchanged");
+
+        // Cross a full protocol year: emission is DRAWN from the reserve.
+        let round_one_year = rpq * crate::economics_v7::DEFAULT_QUANTOS_PER_YEAR;
+        let bob = Keypair::generate().unwrap().pubkey();
+        let transfer = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![staker.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 * qchain_core::UNITS_PER_QCH }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&staker, 1, [0u8; 32], 50_000_000, vec![transfer]).unwrap();
+        l.apply_transaction(&tx, &validator, round_one_year).unwrap();
+
+        // NOTHING was minted: total supply is exactly the genesis total, still ≤ cap.
+        assert_eq!(l.total_supply(), supply_before, "hard-cap: emission and fees mint NOTHING — supply is constant");
+        assert!(l.assert_supply_cap(crate::economics_v7::MAX_SUPPLY_ATOMS).is_ok(), "supply stays within the 100M cap");
+        // Under the hard cap NOTHING is burned (the 45% would-be burn refills the reserve).
+        assert_eq!(l.fee_burned, 0, "hard-cap burns nothing — the burn slice funds staking");
+        // The emission reserve was drawn down to fund the year's yield, and the
+        // transfer's fee (its would-be burn) refilled it — net it shrank by the
+        // yield paid, never below the amount actually paid out.
+        let reserve_now = l.store.get(&crate::ids::EMISSION_RESERVE_ID).unwrap().balance;
+        let staking_reserve = l.store.get(&crate::ids::STAKING_RESERVE_ID).unwrap().balance;
+        assert!(staking_reserve > amount, "staking reserve grew by the emission it received");
+        assert!(reserve_now < reserve0, "emission reserve funded real yield");
+    }
+
+    #[test]
+    fn hard_cap_startup_gate_rejects_a_genesis_over_the_cap() {
+        // A ledger whose seeded supply exceeds the cap must be refused at startup.
+        let mut l = new_test_ledger_v7_hardcap(4, 0);
+        // Seed a wallet just over the cap.
+        l.credit(Keypair::generate().unwrap().pubkey(), crate::economics_v7::MAX_SUPPLY_QCH.saturating_mul(qchain_core::UNITS_PER_QCH));
+        l.credit(Keypair::generate().unwrap().pubkey(), qchain_core::UNITS_PER_QCH); // +1 QCH over
+        assert!(l.assert_supply_cap(crate::economics_v7::MAX_SUPPLY_ATOMS).is_err(), "a genesis over the cap is rejected");
+        // Exactly at the cap is fine.
+        let mut ok = new_test_ledger_v7_hardcap(4, 0);
+        ok.credit(Keypair::generate().unwrap().pubkey(), crate::economics_v7::MAX_SUPPLY_QCH.saturating_mul(qchain_core::UNITS_PER_QCH));
+        assert!(ok.assert_supply_cap(crate::economics_v7::MAX_SUPPLY_ATOMS).is_ok(), "a genesis at the cap is allowed");
     }
 
     #[test]

@@ -353,6 +353,17 @@ async fn main() -> anyhow::Result<()> {
             config.rounds_per_quanto()
         );
     }
+    // HARD-CAP supply model (§5, #221): emission is DRAWN from a pre-minted reserve
+    // instead of minted, so total supply never exceeds the cap. Genesis-level,
+    // folded into chain_id; only meaningful with economics_v7.
+    if config.economics_v7 && config.hard_cap_supply {
+        ledger.set_hard_cap_supply(true);
+        tracing::info!(
+            "supply: HARD CAP ENABLED — max {} QCH, emission drawn from a pre-minted reserve of {} QCH (never minted). When the reserve empties, staking yield = fee income only.",
+            config.supply_cap_atoms() / qchain_core::UNITS_PER_QCH as u128,
+            config.emission_reserve_atoms() / qchain_core::UNITS_PER_QCH,
+        );
+    }
     // Register the standard native programs (chosen by economics_v7). Shared
     // with `Ledger::simulate` so a dry-run dispatches exactly like the live node.
     qchain_execution::register_standard_programs(&mut ledger, config.economics_v7);
@@ -461,6 +472,19 @@ async fn main() -> anyhow::Result<()> {
             // bond escrow is seeded below with the founder validators' bonds.
             for pool in [STAKING_RESERVE_ID, VALIDATOR_FEE_POOL_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID] {
                 ledger.seed_account(pool, qchain_core::Account::new_wallet(STAKING_PROGRAM_ID));
+            }
+            // HARD-CAP model (§5, #221): pre-mint the emission reserve. Staking
+            // emission is DRAWN from here each quanto (a transfer to the staking
+            // reserve), never minted — so total supply is fixed at the genesis
+            // total and can never exceed the cap. Program-owned so the dust sweep
+            // never touches it. Seeded only under `hard_cap_supply`, so an
+            // inflationary v7 network's genesis root is unchanged.
+            if config.hard_cap_supply {
+                use qchain_execution::ids::EMISSION_RESERVE_ID;
+                ledger.seed_account(
+                    EMISSION_RESERVE_ID,
+                    qchain_core::Account { balance: config.emission_reserve_atoms(), ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID) },
+                );
             }
             // Admin-fee wallet: a REAL system-owned wallet (the operator spends it
             // with a normal signed transfer). Seeded empty; the 10% admin share
@@ -866,6 +890,24 @@ async fn main() -> anyhow::Result<()> {
     // (EMERGENCY / v7 set on a v6 network) are tolerated.
     if let Err(e) = ledger.validate_critical_singletons(config.economics_v7) {
         anyhow::bail!("FATAL: {e}. Restore from a good backup / re-sync a fresh data_dir before restarting.");
+    }
+
+    // HARD-CAP GATE (§5, #221): under the hard cap, refuse to start if the total
+    // supply exceeds the absolute cap. This is a genesis-config check (nothing
+    // mints post-genesis under the hard cap, so total supply is constant) — a
+    // misconfigured split (treasury + emission reserve + bonds + allocations >
+    // cap) would break the "never exceed 100M" promise, and it is folded into
+    // chain_id so it can't be changed live. Fail-loud rather than launch a
+    // network that violates its own supply invariant.
+    if config.economics_v7 && config.hard_cap_supply {
+        if let Err(e) = ledger.assert_supply_cap(config.supply_cap_atoms()) {
+            anyhow::bail!("{e}");
+        }
+        tracing::info!(
+            "supply cap OK: genesis supply {} QCH ≤ cap {} QCH",
+            ledger.total_supply() / qchain_core::UNITS_PER_QCH as u128,
+            config.supply_cap_atoms() / qchain_core::UNITS_PER_QCH as u128,
+        );
     }
 
     // The committee schedule was built (and, for a rotation node, reloaded from

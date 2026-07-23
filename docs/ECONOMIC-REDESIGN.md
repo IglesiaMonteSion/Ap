@@ -274,10 +274,60 @@ comunes.
 
 ---
 
+## 12-bis. Suministro definitivo — CAP DURO de 100M (decisión #221)
+
+**Decisión firme del proyecto (elegida por el usuario, severidad Alta):** el
+suministro máximo real es **100.000.000 QCH y NUNCA se supera**. Esto es un
+**invariante de consenso**, no una promesa de marketing.
+
+**Cómo se garantiza — por CONSTRUCCIÓN, no por vigilancia:**
+- El staking **NO acuña** monedas nuevas. Toda la emisión sale de una **reserva
+  pre-acuñada en génesis** (`EMISSION_RESERVE`, id `[20;32]`), parte del reparto de
+  los 100M. Cada cierre de cuanto **transfiere** (no acuña) de `EMISSION_RESERVE` a
+  `STAKING_RESERVE`; el índice avanza sólo por el monto **respaldado** por esa
+  transferencia (`economics_v7::index_for_backed_emission`). Como nada se acuña
+  después de génesis, **`Σ balances` es constante** al total de génesis para siempre.
+- **Los fees financian el staking:** bajo el cap duro, el 45% del fee que en el
+  modelo inflacionario se **quemaba** se **acredita a `EMISSION_RESERVE`** en vez de
+  destruirse (`route_fee_v7`). Así la reserva se **recarga con los ingresos reales**,
+  y `Σ balances` se mantiene EXACTAMENTE en el total de génesis (ni crece ni encoge).
+- **Cuando la reserva se agota, el rendimiento depende sólo de los ingresos reales
+  (fees):** si `EMISSION_RESERVE` cae por debajo del paso de emisión de un cuanto, la
+  emisión de ese cuanto floorea a 0 y el índice se congela — el yield efectivo baja a
+  lo que los fees vuelvan a aportar a la reserva. No hay "yield garantizado" sin
+  respaldo: el 12% APY es un **techo** que sólo se alcanza mientras la reserva (o los
+  fees) lo respalden.
+
+**Invariantes automáticos (obligatorios):**
+- **GÉNESIS (fail-loud):** el nodo **se niega a arrancar** si el suministro sembrado
+  (asignaciones + tesorería + reserva de emisión + bonos 500×N) **excede el cap**
+  (`Ledger::assert_supply_cap` → `invariants_v7::check_supply_cap`). `qchain-genesis-build`
+  lo verifica ANTES de escribir los configs.
+- **RUNTIME:** `total_supply ≤ cap` en todo momento — se cumple **estructuralmente**
+  (nada acuña bajo el cap duro), verificado como defensa-en-profundidad y por el
+  monitor de soak (`soak-canary.py`, invariante SUPPLY).
+
+**Config (plegado en `chain_id`, decisión de génesis):** `hard_cap_supply: bool`
+(default `false` = modelo inflacionario, compatible con la red viva), `supply_cap_qch`
+(default 100M), `emission_reserve_qch` (pre-acuñado). `qchain-genesis-build
+--hard-cap-supply [--supply-cap-qch N] [--emission-reserve-qch N]`.
+
+**Despliegue:** el cap duro cambia la semántica económica y se pliega en el
+`chain_id` → **NO es un update en caliente** de la red inflacionaria viva; requiere
+**relanzamiento con génesis nuevo** (mismo procedimiento que §15). El reparto de los
+100M (circulante + tesorería + reserva de emisión + bonos) lo decide el operador al
+crear la red, y debe sumar ≤ 100M o el nodo no arranca.
+
+---
+
 ## 13. Invariantes económicas obligatorias (todo bloque)
 
-- **Oferta:** `Δoferta = emisión_staking − fees_quemados − bonos_slasheados`. Las
+- **Oferta (modelo inflacionario, `hard_cap_supply` off):**
+  `Δoferta = emisión_staking − fees_quemados − bonos_slasheados`. Las
   transferencias entre pools NO cambian la oferta.
+- **Oferta (CAP DURO, `hard_cap_supply` on — §12-bis):** `Σ balances` es
+  **CONSTANTE** al total de génesis (la emisión es transferencia reserva→reserva, el
+  fee no se quema sino que recarga la reserva), y **≤ 100M** siempre.
 - **Staking:** `total_active_stake = total_shares × staking_index / INDEX_SCALE`.
   Los bonos no forman parte de `total_active_stake`. Las posiciones en unbonding no
   reciben emisión.

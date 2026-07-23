@@ -132,6 +132,18 @@ pub const TREASURY_ACCOUNT_ID: Pubkey = Pubkey::new([18u8; 32]);
 /// tolerates as "not paused".
 pub const EMERGENCY_ACCOUNT_ID: Pubkey = Pubkey::new([19u8; 32]);
 
+/// Pre-minted **emission reserve** for the HARD-CAP supply model (SPEC §5, task
+/// #221). Under `hard_cap_supply`, each quanto's staking emission is DRAWN from
+/// this account (debited here, credited to `STAKING_RESERVE_ID`) instead of
+/// minted — so total supply can NEVER grow past what genesis minted. Seeded at
+/// genesis with the operator's chosen reserve (part of the ≤100M split); fee
+/// income routed here refills it. When it empties, staking yield falls to
+/// whatever real income provides ("fees only"). Owned by `STAKING_PROGRAM_ID`
+/// so the dust sweep never touches it. Absent on an inflationary v7 network
+/// (`hard_cap_supply` off) or any v6 network, so their genesis roots are
+/// unchanged — this is a fresh-genesis, chain_id-folded decision.
+pub const EMISSION_RESERVE_ID: Pubkey = Pubkey::new([20u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

@@ -31,7 +31,7 @@ use crate::economics_v7::{
     position_value, shares_for_deposit, INITIAL_STAKING_INDEX, STAKING_UNBONDING_QUANTOS,
 };
 use crate::error::ExecError;
-use crate::ids::{STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID};
+use crate::ids::{EMISSION_RESERVE_ID, STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID};
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, Instruction};
 use qchain_crypto::Pubkey;
@@ -563,6 +563,30 @@ impl StakingV7Program {
 /// caller-supplied parameter risked a divergence where a deposit could collect a
 /// join-quanto reward unbacked by emission (auditor finding, closed here).
 pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u64) -> Result<u64, ExecError> {
+    settle_quanto_ex(accounts, closing_quanto, false)
+}
+
+/// Like [`settle_quanto`], but with the emission source selected by `hard_cap`:
+///
+/// - `hard_cap == false` (the INFLATIONARY v7 model): the emission is **MINTED**
+///   into `STAKING_RESERVE` and the index advances by the full compounding rate.
+///   Total supply grows by `emission` each quanto. This is the byte-identical
+///   original behavior (the live v7 chain).
+///
+/// - `hard_cap == true` (the **HARD-CAP** model, task #221): the emission is
+///   **DRAWN** from a finite pre-minted `EMISSION_RESERVE` — debited there,
+///   credited to `STAKING_RESERVE` — so **nothing is minted** and total supply is
+///   constant at the genesis total (structurally ≤ the 100M cap). The index
+///   advances only by the amount the reserve can back (`index_for_backed_emission`):
+///   while the reserve is funded the yield hits the target rate; as it depletes
+///   the yield throttles smoothly down toward "fees only" (SPEC §5). The
+///   `EMISSION_RESERVE` account MUST be present in `accounts` (the caller seeds it
+///   into the working set); if it is absent it is treated as empty (budget 0), so
+///   yield safely stops rather than minting.
+///
+/// Returns the emission amount (minted, or drawn from the reserve). Deterministic
+/// over committed state in both modes → every node settles identically, no fork.
+pub fn settle_quanto_ex(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u64, hard_cap: bool) -> Result<u64, ExecError> {
     let mut g = read_global(accounts);
     // Idempotency + ordering: only the currently-accruing quanto can close. Once
     // it does, `current_quanto` advances, so a repeat call with the same
@@ -573,11 +597,20 @@ pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u6
         return Ok(0);
     }
     let old_index = g.index;
-    let new_index = crate::economics_v7::advance_staking_index(old_index, g.rate_fp);
+    let target_index = crate::economics_v7::advance_staking_index(old_index, g.rate_fp);
     // Emission for the CLOSING quanto is computed on the shares that were EARNING
     // during it — i.e. BEFORE folding in this quanto's pending deposits, so a
     // deposit made during the closing quanto never collects its reward.
-    let minted = crate::economics_v7::emission_for_quanto(g.total_shares, old_index, new_index);
+    let (new_index, emission) = if hard_cap {
+        // Draw from the pre-minted reserve; the index advances only by the backed
+        // amount, so `reserve == total value` stays an exact invariant with NO
+        // mint. Budget = the emission reserve's current balance (0 if absent).
+        let budget = accounts.get(&EMISSION_RESERVE_ID).map(|a| a.balance as u128).unwrap_or(0);
+        crate::economics_v7::index_for_backed_emission(g.total_shares, old_index, target_index, budget)
+    } else {
+        // Inflationary: advance to the full-rate target and mint the delta.
+        (target_index, crate::economics_v7::emission_for_quanto(g.total_shares, old_index, target_index))
+    };
     g.index = new_index;
     g.last_settled_quanto = closing_quanto;
     g.current_quanto = closing_quanto.saturating_add(1);
@@ -587,12 +620,22 @@ pub fn settle_quanto(accounts: &mut HashMap<Pubkey, Account>, closing_quanto: u6
     // each is worth exactly its principal, and they compound from here.
     g.total_shares = g.total_shares.saturating_add(g.pending_shares);
     g.pending_shares = 0;
-    let minted_u64 = minted.min(u64::MAX as u128) as u64;
-    if minted_u64 > 0 {
-        credit(accounts, &STAKING_RESERVE_ID, STAKING_PROGRAM_ID, minted_u64);
+    let emission_u64 = emission.min(u64::MAX as u128) as u64;
+    if emission_u64 > 0 {
+        if hard_cap {
+            // Move (not mint): debit the emission reserve by exactly what we credit
+            // the staking reserve. `index_for_backed_emission` guarantees
+            // `emission <= budget`, so the debit never underflows.
+            let er = accounts.entry(EMISSION_RESERVE_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
+            er.balance = er
+                .balance
+                .checked_sub(emission_u64)
+                .expect("hard-cap emission exceeded the reserve budget — index_for_backed_emission invariant violated");
+        }
+        credit(accounts, &STAKING_RESERVE_ID, STAKING_PROGRAM_ID, emission_u64);
     }
     write_global(accounts, &g)?;
-    Ok(minted_u64)
+    Ok(emission_u64)
 }
 
 #[cfg(test)]
@@ -738,6 +781,83 @@ mod tests {
         // The reserve backs the grown value (modulo a sub-unit floor residue).
         let reserve = accounts.get(&STAKING_RESERVE_ID).unwrap().balance;
         assert!(reserve >= value && reserve - value < 1000, "reserve backs the value: {reserve} vs {value}");
+    }
+
+    #[test]
+    fn hard_cap_emission_is_drawn_from_the_reserve_never_minted_and_conserves_supply() {
+        let staker = pk(50);
+        let position = pk(60);
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        accounts.insert(staker, wallet(100 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
+        // Pre-mint an emission reserve (the hard-cap model). Total supply now = the
+        // staker wallet + this reserve; NOTHING must ever be minted on top of it.
+        let reserve0 = 50 * UNITS_PER_QCH;
+        accounts.insert(EMISSION_RESERVE_ID, wallet(reserve0));
+        let supply_before: u128 = accounts.values().map(|a| a.balance as u128).sum();
+
+        let amount = 100 * UNITS_PER_QCH;
+        StakingV7Program::execute(&mut accounts, &ix(&StakingV7Instruction::Stake { amount }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]), &staker).unwrap();
+        // Close the join quanto (activates the deposit, 0 emission), then an earning one.
+        settle_quanto_ex(&mut accounts, 0, true).unwrap();
+        let drawn = settle_quanto_ex(&mut accounts, 1, true).unwrap();
+        assert!(drawn > 0, "an earning quanto draws real emission");
+
+        // The emission came OUT of the emission reserve, INTO the staking reserve —
+        // a transfer, not a mint. Total supply is UNCHANGED.
+        let supply_after: u128 = accounts.values().map(|a| a.balance as u128).sum();
+        assert_eq!(supply_after, supply_before, "hard-cap emission MINTS NOTHING: total supply is constant");
+        assert_eq!(accounts.get(&EMISSION_RESERVE_ID).unwrap().balance, reserve0 - drawn, "reserve debited by exactly the emission");
+        // The staking reserve backs the position value (the 1b invariant still holds).
+        reserve_value_invariant(&accounts);
+    }
+
+    #[test]
+    fn hard_cap_yield_stops_when_the_reserve_empties() {
+        let staker = pk(50);
+        let position = pk(60);
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        accounts.insert(staker, wallet(1_000_000 * UNITS_PER_QCH));
+        seed_global(&mut accounts, rate);
+        // A TINY reserve relative to the stake, so it empties within a few quantos.
+        accounts.insert(EMISSION_RESERVE_ID, wallet(3 * UNITS_PER_QCH));
+        StakingV7Program::execute(
+            &mut accounts,
+            &ix(&StakingV7Instruction::Stake { amount: 1_000_000 * UNITS_PER_QCH }, vec![staker, position, STAKING_GLOBAL_ID, STAKING_RESERVE_ID]),
+            &staker,
+        )
+        .unwrap();
+        settle_quanto_ex(&mut accounts, 0, true).unwrap(); // activate
+        // Draw quanto after quanto; the reserve must never go negative, emission must
+        // never exceed the reserve, and once it is spent down the yield → 0 (the
+        // index freezes) — "fees only". A sub-per-quanto-step residue may stay in the
+        // reserve (the same floor-residue behavior the staking reserve has), never a
+        // shortfall and never a mint.
+        let mut total_drawn = 0u64;
+        let mut yield_stopped = false;
+        for q in 1..40u64 {
+            let idx_before = read_global(&accounts).index;
+            let reserve_before = accounts.get(&EMISSION_RESERVE_ID).unwrap().balance;
+            let drawn = settle_quanto_ex(&mut accounts, q, true).unwrap();
+            total_drawn += drawn;
+            assert!(drawn <= reserve_before, "never draws more than the reserve holds");
+            assert_eq!(accounts.get(&EMISSION_RESERVE_ID).unwrap().balance, reserve_before - drawn, "reserve debited by exactly the draw, never negative");
+            if drawn == 0 {
+                // Once the per-quanto emission floors to zero, the index must freeze.
+                assert_eq!(read_global(&accounts).index, idx_before, "yield stops once the reserve is spent (fees-only)");
+                yield_stopped = true;
+            }
+        }
+        assert!(yield_stopped, "a tiny reserve must run out and stop the yield within the window");
+        // The reserve funded real yield and was spent down to a tiny sub-unit residue
+        // (< the per-quanto floor), never a mint.
+        assert!(total_drawn > 0, "the reserve paid out real yield");
+        assert!(total_drawn <= 3 * UNITS_PER_QCH, "never pays out more than the reserve held");
+        let residue = accounts.get(&EMISSION_RESERVE_ID).unwrap().balance;
+        assert_eq!(total_drawn + residue, 3 * UNITS_PER_QCH, "every atom either paid yield or is the tiny residue — none minted, none lost");
+        assert!(residue < 1_000, "only a sub-unit floor residue remains: {residue}");
     }
 
     #[test]

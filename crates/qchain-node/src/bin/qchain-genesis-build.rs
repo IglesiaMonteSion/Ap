@@ -117,6 +117,22 @@ struct Cli {
     /// 1 QCH = 1e9). Requires `--treasury-authority`. Max 9223372036 QCH.
     #[arg(long)]
     treasury_qch: Option<u64>,
+    /// (v7) enable the **HARD-CAP supply model** (task #221): total supply can
+    /// NEVER exceed the cap because staking emission is DRAWN from a pre-minted
+    /// reserve instead of minted. The node also refuses to start if the genesis
+    /// supply exceeds the cap. Requires `--economics-v7`. Folded into `chain_id`.
+    #[arg(long)]
+    hard_cap_supply: bool,
+    /// (v7 hard-cap) the maximum total supply in whole QCH (default 100000000 =
+    /// 100M). Only meaningful with `--hard-cap-supply`.
+    #[arg(long)]
+    supply_cap_qch: Option<u64>,
+    /// (v7 hard-cap) whole QCH to pre-mint into the emission reserve at genesis;
+    /// staking yield is drawn from here (a transfer, never a mint). Part of the ≤
+    /// cap split (treasury + reserve + bonds + allocations ≤ cap). Only meaningful
+    /// with `--hard-cap-supply`. Max 9223372036 QCH.
+    #[arg(long)]
+    emission_reserve_qch: Option<u64>,
     /// Bake the network profile (`mainnet` / `testnet`, task #211) into every
     /// generated config. With `--network-profile mainnet`, each node REFUSES TO
     /// START until the operator fills in the per-node mainnet protections
@@ -279,6 +295,57 @@ fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("--treasury-authority and --treasury-qch must be given together"),
     };
 
+    // Resolve the HARD-CAP supply model (v7, #221). Validate ranges, then check the
+    // genesis split FITS the cap here (the node re-checks at startup) so the
+    // operator sees a misconfiguration before launching a network that would
+    // violate its own "never exceed the cap" promise.
+    let (supply_cap_qch, emission_reserve_qch): (Option<u64>, Option<u64>) = if cli.hard_cap_supply {
+        if !cli.economics_v7 {
+            anyhow::bail!("--hard-cap-supply requires --economics-v7");
+        }
+        let cap_qch = cli.supply_cap_qch.unwrap_or(qchain_execution::economics_v7::MAX_SUPPLY_QCH);
+        if cap_qch == 0 || cap_qch > 9_223_372_036 {
+            anyhow::bail!("--supply-cap-qch out of range (1..=9223372036 QCH)");
+        }
+        let reserve_qch = cli.emission_reserve_qch.unwrap_or(0);
+        if reserve_qch > 9_223_372_036 {
+            anyhow::bail!("--emission-reserve-qch too large (max 9223372036 QCH)");
+        }
+        // Sum the genesis supply the same way the node seeds it: allocations +
+        // treasury + emission reserve + founder bonds (500 QCH each). Everything in
+        // atoms (u128) so a large split can't wrap. Must be ≤ the cap.
+        let units = qchain_core::UNITS_PER_QCH as u128;
+        let cap_atoms = cap_qch as u128 * units;
+        let alloc_atoms: u128 = genesis.iter().fold(0u128, |a, g| a + g.balance as u128);
+        let treasury_atoms = treasury_amount.unwrap_or(0) as u128;
+        let reserve_atoms = reserve_qch as u128 * units;
+        let bond_atoms = qchain_execution::economics_v7::VALIDATOR_BOND_ATOMS as u128 * validators.len() as u128;
+        let total_atoms = alloc_atoms + treasury_atoms + reserve_atoms + bond_atoms;
+        if total_atoms > cap_atoms {
+            anyhow::bail!(
+                "hard-cap violated: genesis supply {} QCH (allocations {} + treasury {} + emission reserve {} + bonds {}×500) exceeds the cap {} QCH. Reduce the split so it fits.",
+                total_atoms / units,
+                alloc_atoms / units,
+                treasury_atoms / units,
+                reserve_atoms / units,
+                validators.len(),
+                cap_qch,
+            );
+        }
+        println!(
+            "hard cap: {cap_qch} QCH max — genesis supply {} QCH (alloc {} + treasury {} + emission reserve {} + {} bonds), {} QCH of cap headroom.",
+            total_atoms / units,
+            alloc_atoms / units,
+            treasury_atoms / units,
+            reserve_atoms / units,
+            validators.len(),
+            (cap_atoms - total_atoms) / units,
+        );
+        (Some(cap_qch), Some(reserve_qch))
+    } else {
+        (None, None)
+    };
+
     std::fs::create_dir_all(&cli.out_dir)?;
     let mut shared_chain_id: Option<[u8; 32]> = None;
     for (i, manifest) in manifests.iter().enumerate() {
@@ -306,6 +373,9 @@ fn main() -> anyhow::Result<()> {
             rounds_per_quanto: cli.rounds_per_quanto,
             treasury_authority: treasury_authority.clone(),
             treasury_amount,
+            hard_cap_supply: cli.hard_cap_supply,
+            supply_cap_qch,
+            emission_reserve_qch,
             rpc_rate_limit_per_10s: None,
             simulate_rate_limit_per_10s: None,
             tx_rate_limit_per_10s: None,
@@ -350,6 +420,13 @@ fn main() -> anyhow::Result<()> {
         println!("quanto_rate_fp: {} (BAKED into every config — identical on every platform, no f64 re-derivation)", baked_rate_fp.unwrap_or(0));
         if let (Some(auth), Some(units)) = (&treasury_authority, treasury_amount) {
             println!("treasury: {} QCH ({units} units) LOCKED in genesis, release authority {auth} (only a signed Release moves it) — folded into the chain_id.", units / 1_000_000_000);
+        }
+        if cli.hard_cap_supply {
+            println!(
+                "supply: HARD CAP {} QCH — emission drawn from a pre-minted reserve of {} QCH (never minted); total supply can never exceed the cap. Folded into the chain_id.",
+                supply_cap_qch.unwrap_or(qchain_execution::economics_v7::MAX_SUPPLY_QCH),
+                emission_reserve_qch.unwrap_or(0),
+            );
         }
     }
     if cli.compressed_state_tree {

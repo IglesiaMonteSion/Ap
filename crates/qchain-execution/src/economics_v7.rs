@@ -134,6 +134,60 @@ pub fn emission_for_quanto(total_shares: u128, old_index: u128, new_index: u128)
 }
 
 // ---------------------------------------------------------------------------
+// Hard-cap supply (SPEC §5 — the "definitive supply" decision, task #221)
+// ---------------------------------------------------------------------------
+
+/// The canonical maximum total supply of QCH: **100 million**, in whole QCH.
+/// This is the HARD-CAP model the project publishes: total supply is guaranteed
+/// NEVER to exceed this, because under `hard_cap_supply` staking emission is
+/// DRAWN from a pre-minted reserve (a transfer) instead of minted — so nothing is
+/// created after genesis and `Σ balances` is constant at the genesis total, which
+/// the genesis gate forces to be ≤ this cap. A network may bake a different cap;
+/// this is the default and the value the tokenomics advertises.
+pub const MAX_SUPPLY_QCH: u64 = 100_000_000;
+
+/// The canonical maximum total supply in atoms (100M × 1e9 = 1e17). Stays far
+/// below `u64::MAX` (~1.8e19), so a genesis supply at the cap fits a single u64.
+pub const MAX_SUPPLY_ATOMS: u128 = MAX_SUPPLY_QCH as u128 * UNITS_PER_QCH as u128;
+
+/// Hard-cap emission: given the target index (the full compounding rate) and a
+/// finite `budget` of atoms available in the emission reserve, return
+/// `(new_index, emission)` such that:
+/// - `emission == emission_for_quanto(total_shares, old_index, new_index) ≤ budget`
+///   (never draws more than the reserve holds),
+/// - `new_index ≤ target_new_index` (never overshoots the target yield),
+/// - if the desired emission fits the budget it is used exactly (fully backed at
+///   the target rate),
+/// - otherwise the index advances only by the largest floor-safe step the budget
+///   backs, so the effective yield throttles smoothly down toward "fees only" as
+///   the reserve depletes (budget 0 → no advance, no emission).
+///
+/// Crediting `STAKING_RESERVE` by exactly `emission` while advancing the index by
+/// the corresponding amount keeps `reserve ≥ total position value` (the 1b
+/// invariant) with **NO mint** — the emission is a transfer OUT of the emission
+/// reserve. Deterministic integer math; no f64, no overflow (products stay far
+/// below `u128::MAX` at any real supply — see `no_overflow_at_extreme_bounds`).
+pub fn index_for_backed_emission(total_shares: u128, old_index: u128, target_new_index: u128, budget: u128) -> (u128, u128) {
+    if total_shares == 0 {
+        // No positions → advancing the index is harmless and mints nothing; match
+        // the mint path (which advances to target with 0 emission).
+        return (target_new_index, 0);
+    }
+    let desired = emission_for_quanto(total_shares, old_index, target_new_index);
+    if desired <= budget {
+        return (target_new_index, desired);
+    }
+    // Budget-bound. The largest index step whose value-delta is provably ≤ budget:
+    // `total_shares · delta / SCALE ≤ budget` ⟺ `delta = floor(budget · SCALE / total_shares)`.
+    // Then `emission = floor(total_shares·(old+delta)/SCALE) − floor(total_shares·old/SCALE)`
+    //   `< budget + 1` (floor(a+b) − floor(a) < ⌈b⌉ ≤ b+1) ⟹ ≤ budget (integer).
+    let delta = budget.saturating_mul(INDEX_SCALE) / total_shares;
+    let new_index = old_index.saturating_add(delta);
+    let emission = emission_for_quanto(total_shares, old_index, new_index);
+    (new_index, emission)
+}
+
+// ---------------------------------------------------------------------------
 // Validator bond
 // ---------------------------------------------------------------------------
 
@@ -289,6 +343,71 @@ mod tests {
         // And the saturating guards mean even the impossible extreme can't panic.
         let _ = position_value(u128::MAX, idx);
         let _ = advance_staking_index(u128::MAX, fp);
+    }
+
+    #[test]
+    fn backed_emission_matches_the_full_rate_when_the_reserve_can_cover_it() {
+        let fp = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let total_shares = 10_000_000u128 * UNITS_PER_QCH as u128; // 10M QCH staked
+        let old = INITIAL_STAKING_INDEX;
+        let target = advance_staking_index(old, fp);
+        let desired = emission_for_quanto(total_shares, old, target);
+        // A budget larger than the desired emission → identical to the mint path:
+        // full-rate index + exactly `desired` drawn.
+        let (new_index, emission) = index_for_backed_emission(total_shares, old, target, desired + 1_000_000);
+        assert_eq!(new_index, target, "fully-funded quanto advances to the full-rate index");
+        assert_eq!(emission, desired, "fully-funded quanto emits exactly the target amount");
+    }
+
+    #[test]
+    fn backed_emission_never_exceeds_the_budget_and_throttles_the_index() {
+        let fp = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let total_shares = 10_000_000u128 * UNITS_PER_QCH as u128;
+        let old = INITIAL_STAKING_INDEX;
+        let target = advance_staking_index(old, fp);
+        let desired = emission_for_quanto(total_shares, old, target);
+        // A budget SMALLER than desired → emission clamped to ≤ budget, index below
+        // the full-rate target (yield throttled), and the reserve invariant still
+        // holds (emission == the exact value-delta of the chosen index step).
+        let budget = desired / 3;
+        let (new_index, emission) = index_for_backed_emission(total_shares, old, target, budget);
+        assert!(emission <= budget, "never draws more than the reserve holds: {emission} > {budget}");
+        assert!(new_index <= target, "throttled index never overshoots the target");
+        assert!(new_index >= old, "index never goes backwards");
+        assert_eq!(emission, emission_for_quanto(total_shares, old, new_index), "emission is the exact value-delta of the chosen index (reserve invariant)");
+        // And it uses as much of the budget as floor-arithmetic allows (tight).
+        assert!(emission + 1 >= budget || budget == 0, "throttle is tight to the budget");
+    }
+
+    #[test]
+    fn a_depleted_reserve_stops_yield_without_advancing_the_index() {
+        let fp = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let total_shares = 5_000_000u128 * UNITS_PER_QCH as u128;
+        let old = INITIAL_STAKING_INDEX;
+        let target = advance_staking_index(old, fp);
+        // Budget 0 (reserve empty) → no advance, no emission = "fees only".
+        let (new_index, emission) = index_for_backed_emission(total_shares, old, target, 0);
+        assert_eq!(new_index, old, "empty reserve → index frozen");
+        assert_eq!(emission, 0, "empty reserve → no emission");
+    }
+
+    #[test]
+    fn backed_emission_with_no_shares_advances_and_emits_nothing() {
+        let fp = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, DEFAULT_QUANTOS_PER_YEAR);
+        let old = INITIAL_STAKING_INDEX;
+        let target = advance_staking_index(old, fp);
+        // No positions → matches the mint path: advance to target, emit 0 (and never
+        // divides by zero).
+        let (new_index, emission) = index_for_backed_emission(0, old, target, 1_000_000);
+        assert_eq!(new_index, target);
+        assert_eq!(emission, 0);
+    }
+
+    #[test]
+    fn max_supply_is_100_million_qch() {
+        assert_eq!(MAX_SUPPLY_QCH, 100_000_000);
+        assert_eq!(MAX_SUPPLY_ATOMS, 100_000_000u128 * UNITS_PER_QCH as u128);
+        assert_eq!(MAX_SUPPLY_ATOMS, 100_000_000_000_000_000); // 1e17
     }
 
     #[test]

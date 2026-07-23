@@ -59,6 +59,11 @@ pub enum InvariantViolation {
     /// A quanto close did not conserve the pool: `pool_before + fees_new !=
     /// distributed + remainder_new`.
     FeePoolNotConserved { pool_before: u64, fees_new: u64, distributed: u64, remainder_new: u64 },
+    /// HARD-CAP model (§5, #221): total supply exceeds the absolute cap. Under the
+    /// hard cap nothing is minted after genesis (emission is drawn from a reserve),
+    /// so this can only fire on a misconfigured genesis whose seeded balances sum
+    /// above the cap — the node refuses to start.
+    SupplyCapExceeded { total: u128, cap: u128 },
 }
 
 /// Running supply accounting for the whole economy. Genesis mints the founder
@@ -99,6 +104,18 @@ pub fn check_supply(accounts: &HashMap<Pubkey, Account>, tally: &SupplyTally) ->
         Ok(())
     } else {
         Err(InvariantViolation::Supply { expected, actual })
+    }
+}
+
+/// HARD-CAP invariant (§5, #221): total supply must never exceed the absolute
+/// `cap`. Under the hard-cap model this holds by construction at runtime (staking
+/// emission is a transfer out of a pre-minted reserve, never a mint), so this is
+/// the genesis gate + a defense-in-depth assertion: `Σ balances ≤ cap`.
+pub fn check_supply_cap(total: u128, cap: u128) -> Result<(), InvariantViolation> {
+    if total <= cap {
+        Ok(())
+    } else {
+        Err(InvariantViolation::SupplyCapExceeded { total, cap })
     }
 }
 
@@ -461,6 +478,59 @@ mod tests {
         // A single changed balance changes the root.
         b.get_mut(&pk(5)).unwrap().balance += 1;
         assert_ne!(economic_state_root(&a), economic_state_root(&b));
+    }
+
+    #[test]
+    fn supply_cap_gate_accepts_at_or_below_and_rejects_above() {
+        use crate::economics_v7::MAX_SUPPLY_ATOMS;
+        // Exactly at the cap is OK (100M), below is OK, above fails.
+        assert!(check_supply_cap(MAX_SUPPLY_ATOMS, MAX_SUPPLY_ATOMS).is_ok(), "at the cap is allowed");
+        assert!(check_supply_cap(MAX_SUPPLY_ATOMS - 1, MAX_SUPPLY_ATOMS).is_ok(), "below the cap is allowed");
+        assert!(
+            matches!(check_supply_cap(MAX_SUPPLY_ATOMS + 1, MAX_SUPPLY_ATOMS), Err(InvariantViolation::SupplyCapExceeded { .. })),
+            "one atom over the cap is rejected"
+        );
+    }
+
+    #[test]
+    fn hard_cap_supply_stays_constant_across_emission_transfers() {
+        // Model the hard-cap emission as a pure transfer emission-reserve →
+        // staking-reserve: total supply must not change (never exceeds the cap).
+        use crate::economics_v7::{index_for_backed_emission, advance_staking_index, derive_quanto_rate_fp, shares_for_deposit, INDEX_SCALE, STAKING_TARGET_APY_BPS};
+        use crate::ids::{EMISSION_RESERVE_ID, STAKING_RESERVE_ID};
+        let mut accounts: HashMap<Pubkey, Account> = HashMap::new();
+        // Genesis split entirely within a 100M cap: some circulating, a reserve.
+        accounts.insert(pk(1), wallet(60_000_000u64.saturating_mul(UNITS_PER_QCH)));
+        accounts.insert(EMISSION_RESERVE_ID, wallet(40_000_000u64.saturating_mul(UNITS_PER_QCH)));
+        let cap = crate::economics_v7::MAX_SUPPLY_ATOMS;
+        let genesis_total = total_supply(&accounts);
+        assert!(check_supply_cap(genesis_total, cap).is_ok());
+
+        // Stake some (transfer wallet → staking reserve; mints shares).
+        let stake = 10_000_000u64.saturating_mul(UNITS_PER_QCH);
+        accounts.get_mut(&pk(1)).unwrap().balance -= stake;
+        accounts.entry(STAKING_RESERVE_ID).or_insert_with(|| wallet(0)).balance += stake;
+        let mut index = INDEX_SCALE;
+        let mut total_shares = shares_for_deposit(stake, index);
+        let rate = derive_quanto_rate_fp(STAKING_TARGET_APY_BPS, 365);
+
+        // A year of hard-cap quanto closes: draw from the reserve, credit staking.
+        for _ in 0..365 {
+            let budget = accounts.get(&EMISSION_RESERVE_ID).unwrap().balance as u128;
+            let target = advance_staking_index(index, rate);
+            let (new_index, emission) = index_for_backed_emission(total_shares, index, target, budget);
+            index = new_index;
+            let e = emission.min(u64::MAX as u128) as u64;
+            accounts.get_mut(&EMISSION_RESERVE_ID).unwrap().balance -= e;
+            accounts.get_mut(&STAKING_RESERVE_ID).unwrap().balance += e;
+            let _ = &mut total_shares; // shares unchanged (no new deposits)
+            // Supply is CONSTANT every step and always ≤ cap.
+            assert_eq!(total_supply(&accounts), genesis_total, "hard-cap emission conserves supply");
+            check_supply_cap(total_supply(&accounts), cap).unwrap();
+        }
+        // Real yield was paid (the reserve shrank), but supply never grew.
+        assert!(accounts.get(&EMISSION_RESERVE_ID).unwrap().balance < 40_000_000u64.saturating_mul(UNITS_PER_QCH), "reserve funded real yield");
+        assert_eq!(total_supply(&accounts), genesis_total);
     }
 
     #[test]
