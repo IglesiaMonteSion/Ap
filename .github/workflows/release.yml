@@ -81,14 +81,17 @@ jobs:
       - name: Caché de cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # Build de release reproducible (mismo SOURCE_DATE_EPOCH que el job
-      # `reproducible` del CI, para que los hashes de la provenance sean estables).
-      - name: Build release (--locked)
-        env:
-          SOURCE_DATE_EPOCH: "1700000000"
+      # Build de release reproducible (roadmap #9): se sourcea
+      # deploy/reproducible-env.sh, que setea SOURCE_DATE_EPOCH y — la pieza
+      # nueva — remapea con --remap-path-prefix los paths absolutos del registry
+      # y del workspace a placeholders canónicos. Así los binarios PUBLICADOS son
+      # exactamente los que reproduce el job `reproducible` del CI y cualquier
+      # builder independiente (deploy/verify-reproducible.sh), no una foto atada a
+      # este runner. Los hashes de la provenance quedan cross-builder-verificables.
+      - name: Build release (--locked, reproducible cross-builder)
         run: |
-          cargo build --locked --release \
-            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+          . deploy/reproducible-env.sh
+          cargo build --locked --release $QCHAIN_RELEASE_PKGS
 
       # Imagen de despliegue: se construye para atar su digest a la provenance.
       - name: Build de la imagen de despliegue

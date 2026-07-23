@@ -221,14 +221,20 @@ jobs:
             -p qchain-core -p qchain-storage -p qchain-stark
 
   reproducible:
-    name: Build reproducible (dos builds -> hashes idénticos)
+    name: Build reproducible cross-builder (dos builders -> hashes idénticos)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    # Sólo de noche o a demanda (compila release dos veces). Con el toolchain
-    # pinneado + Cargo.lock + --locked + SOURCE_DATE_EPOCH, dos builds del MISMO
-    # commit deben producir binarios con el MISMO sha256. Si difieren, el build
-    # no es reproducible y el job falla (así el hash de la provenance es una
-    # promesa verificable, no una foto de una sola corrida).
+    timeout-minutes: 120
+    # Sólo de noche o a demanda (compila release dos veces). Roadmap #9: NO
+    # basta con dos builds en el MISMO path (eso sólo prueba determinismo del
+    # compilador). El artefacto es reproducible CROSS-BUILDER sólo si dos
+    # builders en PATHS y CARGO_HOME DISTINTOS producen el MISMO sha256 — porque
+    # cargo embebe ~4400 paths absolutos (registry + workspace) en el binario.
+    # deploy/reproducible-env.sh los REMAPEA a placeholders canónicos
+    # (/cargo-registry, /qchain-src) con --remap-path-prefix, así el path deja de
+    # ser un input. Este job construye el builder A en el checkout y el builder B
+    # en OTRO directorio con OTRO CARGO_HOME, y exige hashes idénticos. Si
+    # difieren, el build no es reproducible y el job falla (así el hash de la
+    # provenance es una promesa verificable, no una foto de una sola corrida).
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -236,34 +242,42 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
       - name: Toolchain de Rust (pinneado por rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
-      - name: Build A (release, --locked, SOURCE_DATE_EPOCH fijo)
-        env:
-          SOURCE_DATE_EPOCH: "1700000000"
+      - name: Builder A (checkout path, CARGO_HOME del runner, remap)
         run: |
-          cargo build --locked --release \
-            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+          # Source del env reproducible (remap + SOURCE_DATE_EPOCH). Se computa
+          # desde el path del propio script, así el remap "from" es el del runner.
+          . deploy/reproducible-env.sh
+          cargo build --locked --release $QCHAIN_RELEASE_PKGS
           mkdir -p /tmp/buildA
           cp target/release/qchain-node target/release/qchain target/release/qchain-genesis-build \
              target/release/qchain-faucet target/release/qchain-wallet target/release/qchain-indexer \
              target/release/qchain-remote-signer /tmp/buildA/
           (cd /tmp/buildA && sha256sum * > SHA256SUMS)
           cat /tmp/buildA/SHA256SUMS
-      - name: Build B (limpio, mismo SOURCE_DATE_EPOCH)
-        env:
-          SOURCE_DATE_EPOCH: "1700000000"
+      - name: Builder B (OTRO path + OTRO CARGO_HOME, mismos placeholders)
         run: |
-          cargo clean
-          cargo build --locked --release \
-            -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer
+          # Copiar el repo a un directorio DISTINTO y usar un CARGO_HOME DISTINTO
+          # — simula un segundo builder independiente. reproducible-env.sh remapea
+          # los paths de ESTE entorno a los MISMOS placeholders, así el binario
+          # debe salir byte-idéntico al de A pese a haberse construido en otro lado.
+          SRCB="$RUNNER_TEMP/builderB-src"
+          rm -rf "$SRCB"; cp -a "$GITHUB_WORKSPACE" "$SRCB"
+          cd "$SRCB"
+          export CARGO_HOME="$RUNNER_TEMP/cargohomeB"
+          . "$SRCB/deploy/reproducible-env.sh"
+          cargo build --locked --release $QCHAIN_RELEASE_PKGS
           mkdir -p /tmp/buildB
           cp target/release/qchain-node target/release/qchain target/release/qchain-genesis-build \
              target/release/qchain-faucet target/release/qchain-wallet target/release/qchain-indexer \
              target/release/qchain-remote-signer /tmp/buildB/
           (cd /tmp/buildB && sha256sum * > SHA256SUMS)
-      - name: Comparar hashes A vs B
+      - name: Comparar hashes A (path 1) vs B (path 2, cargo-home 2)
         run: |
-          echo "== A =="; cat /tmp/buildA/SHA256SUMS
-          echo "== B =="; cat /tmp/buildB/SHA256SUMS
-          diff /tmp/buildA/SHA256SUMS /tmp/buildB/SHA256SUMS \
-            && echo "OK: build reproducible (hashes idénticos en dos corridas)" \
-            || { echo "FALLO: los binarios NO son bit-idénticos entre dos builds"; exit 1; }
+          echo "== A (checkout) =="; cat /tmp/buildA/SHA256SUMS
+          echo "== B (otro path + cargo-home) =="; cat /tmp/buildB/SHA256SUMS
+          if diff <(awk '{print $1"  "$2}' /tmp/buildA/SHA256SUMS) \
+                  <(awk '{print $1"  "$2}' /tmp/buildB/SHA256SUMS); then
+            echo "OK: build reproducible CROSS-BUILDER (hashes idénticos desde dos paths/cargo-homes distintos)"
+          else
+            echo "FALLO: los binarios NO son bit-idénticos entre dos builders distintos (path leak?)"; exit 1
+          fi

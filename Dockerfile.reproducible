@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.reproducible — the HERMETIC, CANONICAL builder for reproducible
+# release artifacts (roadmap #9). Unlike the regular Dockerfile (optimized for
+# fast incremental updates with BuildKit cache mounts), this one fixes EVERY
+# build input so two DIFFERENT machines produce BYTE-IDENTICAL binaries:
+#
+#   * base image        — pinned by DIGEST (ARG BASE_DIGEST below), not a
+#                         floating tag, so the bundled glibc + the clang/cmake
+#                         that compile liboqs's C are identical everywhere.
+#   * Rust toolchain    — pinned by rust-toolchain.toml (1.94.1) on top of the base.
+#   * dependencies      — pinned by the committed Cargo.lock + `--locked`.
+#   * embedded paths    — erased with `--remap-path-prefix` (the last input that
+#                         otherwise differs per builder: cargo embeds ~4400
+#                         absolute registry/workspace paths into the binary).
+#   * timestamps        — SOURCE_DATE_EPOCH fixed.
+#   * build location    — fixed CARGO_HOME=/usr/local/cargo and WORKDIR=/build,
+#                         so the remap "from" prefixes are constants here.
+#
+# Because those constants match the placeholders in deploy/reproducible-env.sh
+# (/cargo-registry and /qchain-src), a `--host` build (CI runner / laptop) that
+# sources that script produces the SAME hashes as this container. That is
+# cross-builder reproducibility.
+#
+# HOW TO PIN THE BASE DIGEST (operator, one time per toolchain bump):
+#   docker pull rust:1.94.1-bookworm
+#   docker inspect --format='{{index .RepoDigests 0}}' rust:1.94.1-bookworm
+#   # -> rust@sha256:XXXX ; pass it: --build-arg BASE_DIGEST=sha256:XXXX
+# Until pinned, the version tag below is used (reproducible on a given day, but
+# a base rebuild by upstream could shift the C-compiled liboqs bytes; the digest
+# closes that. This is the one operator action #9 leaves — documented, honest).
+ARG BASE_DIGEST=
+FROM rust:1.94.1-bookworm${BASE_DIGEST:+@${BASE_DIGEST}} AS builder
+
+# liboqs (vendored C) needs cmake + a C/C++ compiler; oqs-sys/bindgen need libclang.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake clang libclang-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fixed, canonical build location so the remap "from" prefixes are constants
+# that match deploy/reproducible-env.sh's placeholders.
+ENV CARGO_HOME=/usr/local/cargo
+WORKDIR /build
+COPY . .
+
+# The two reproducibility levers, baked with the container's fixed paths:
+#  - SOURCE_DATE_EPOCH: any embedded timestamp is fixed.
+#  - RUSTFLAGS remap:   erase the absolute registry + workspace paths so the
+#                       output does not depend on where it was built.
+ENV SOURCE_DATE_EPOCH=1700000000
+ENV RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry=/cargo-registry --remap-path-prefix=/build=/qchain-src"
+
+# Clean, deterministic `--locked --release` build of the 7 release binaries.
+# No BuildKit cache mount here on purpose: the canonical artifact is built from
+# a clean tree so its provenance is unambiguous.
+RUN cargo build --locked --release \
+        -p qchain-node -p qchain-cli -p qchain-faucet -p qchain-wallet -p qchain-indexer -p qchain-remote-signer \
+ && mkdir -p /out \
+ && cp target/release/qchain-node \
+       target/release/qchain-genesis-build \
+       target/release/qchain \
+       target/release/qchain-faucet \
+       target/release/qchain-wallet \
+       target/release/qchain-indexer \
+       target/release/qchain-remote-signer /out/ \
+ && cd /out \
+ && sha256sum qchain-node qchain-genesis-build qchain qchain-faucet qchain-wallet qchain-indexer qchain-remote-signer > SHA256SUMS \
+ && cat SHA256SUMS
+
+# Minimal final stage that just carries /out, so `docker create` + `docker cp`
+# can extract the reproducible binaries + SHA256SUMS (see reproducible-build.sh --docker).
+FROM scratch AS artifacts
+COPY --from=builder /out/ /out/
