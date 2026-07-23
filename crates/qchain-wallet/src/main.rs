@@ -716,7 +716,7 @@ async fn proposal_ep(State(st): State<Arc<AppState>>, Path(address): Path<String
         "id": p.id,
         "proposer": p.proposer.to_string(),
         "action": action_label,
-        "tier": match tier { RiskTier::Low => "low", RiskTier::Registry => "registry" },
+        "tier": match tier { RiskTier::Low => "low", RiskTier::Economic => "economic", RiskTier::Registry => "registry" },
         "registry": matches!(tier, RiskTier::Registry),
         "status": format!("{:?}", p.status),
         "created_round": p.created_round,
