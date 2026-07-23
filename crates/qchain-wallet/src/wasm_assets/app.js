@@ -17,6 +17,32 @@ let lastActivitySig = "";
 let activityExpanded = false;   // el historial muestra 5 filas; "Ver más" lo expande
 let nodeTimer = null, balTimer = null;
 
+// ---- ZEROIZE de secretos (roadmap #13) ----
+// El material de clave que vive en memoria del navegador se SOBREESCRIBE con ceros
+// apenas deja de usarse, en vez de sólo soltar la referencia y esperar al GC — así
+// un volcado de heap tras bloquear/cerrar la wallet no lo puede recuperar. Cubre la
+// semilla maestra (MASTER), la semilla de la cuenta activa (SEED) y el material de
+// clave transitorio de la KDF (los 32 bytes crudos de Argon2id antes de importarlos
+// como CryptoKey no-extraíble). `.fill(0)` garantiza el borrado inmediato sin
+// depender del GC. Un no-Uint8Array (o null) es un no-op seguro.
+// LÍMITES HONESTOS (documentados, no ocultos): (1) las STRINGS de JS son inmutables
+// y no se pueden sobreescribir — la contraseña `PW` y los `.value` de los inputs
+// sólo se pueden soltar (referencia a null), no borrar; `PW` es además un secreto de
+// MENOR valor (inútil sin el blob cifrado, que igual vive en disco) y es el tradeoff
+// deliberado de la UX de respaldo. (2) los fragmentos Shamir se muestran/descargan
+// como palabras (strings) → se sueltan, no se borran. (3) al firmar, wasm-bindgen
+// COPIA los bytes de la semilla a la memoria lineal del WASM y la libera (sin borrar)
+// al terminar la llamada; el `Keypair` híbrido DERIVADO de esos bytes SÍ se zeroiza
+// en su Drop (tarea #188), así que las CLAVES PRIVADAS no quedan — sólo una copia
+// transitoria de los 32 bytes de semilla en heap WASM ya liberado (exposición menor
+// que la de MASTER/SEED, que viven toda la sesión desbloqueada).
+function zeroize(a){ try{ if(a && typeof a.fill === "function") a.fill(0); }catch(e){} }
+// Reemplaza la semilla maestra sobreescribiendo la anterior primero.
+function setMaster(m){ if(MASTER!==m) zeroize(MASTER); MASTER=m; }
+// Borra TODO el material secreto de memoria (bloqueo / cierre de pestaña).
+function wipeSecrets(){ zeroize(MASTER); zeroize(SEED); MASTER=null; SEED=null; PW=null; shamirShares=[]; }
+
+
 // ---- helpers ----
 function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); setTimeout(()=>e.classList.remove("show"),1300); }
 function short(s){ return (s&&s.length>18)? s.slice(0,10)+"…"+s.slice(-6) : (s||""); }
@@ -125,7 +151,9 @@ const ARGON2_MEM_KIB = 19456, ARGON2_ITERS = 2, ARGON2_PARALLELISM = 1;
 async function argon2Key(password, salt){
   // 32 bytes de Argon2id -> clave AES-256-GCM (no extraíble).
   const raw = argon2idRaw(new TextEncoder().encode(password), salt, ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLELISM, 32);
-  return crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+  const key = await crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+  zeroize(raw);   // #13: la clave ya vive dentro del CryptoKey no-extraíble; borrá los bytes crudos
+  return key;
 }
 // PBKDF2 se conserva SÓLO para descifrar blobs viejos (compatibilidad hacia
 // atrás — nadie queda afuera). Ya no se cifra nada nuevo con él.
@@ -153,6 +181,7 @@ async function decryptSeed(store, password){
     const m=Number(store.m)||ARGON2_MEM_KIB, t=Number(store.t)||ARGON2_ITERS, p=Number(store.p)||ARGON2_PARALLELISM;
     const raw=argon2idRaw(new TextEncoder().encode(password), salt, m, t, p, 32);
     key=await crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+    zeroize(raw);   // #13: borrá los bytes crudos de la KDF tras importarlos
   } else {
     // Blob PBKDF2 legacy. Los pre-hardening (v1 sin `iter`) eran 250k.
     const iters=Number(store.iter)||250000;
@@ -452,7 +481,7 @@ function isHidden(i,o){ return acctHidden(o).includes(i); }
 function visibleAccounts(o){ o=o||myAccounts(); const h=acctHidden(o); const v=[]; for(let i=0;i<o.count;i++) if(!h.includes(i)) v.push(i); return v; }
 // Cambia la cuenta activa: re-deriva SEED, persiste la elección y refresca la vista.
 function setAccount(i){
-  ACCT=i; SEED=acctSeed(i);
+  ACCT=i; zeroize(SEED); SEED=acctSeed(i);   // #13: borrá la semilla de la cuenta anterior antes de re-derivar
   const o=myAccounts(); o.active=i; if(i+1>o.count) o.count=i+1; saveAccounts(o);
   lastActivitySig=""; activityExpanded=false;  // re-render de la actividad (colapsada) para la cuenta nueva
 }
@@ -849,7 +878,7 @@ $("c-btn").onclick=async()=>{
     const store=await encryptSeedConfirmed(seed, p);             // re-descifra para confirmar el round-trip (#197)
     localStorage.setItem(LS_KEY, JSON.stringify(store));
     clearUnlockFails();
-    MASTER=seed; PW=p; disableBiometric(); bootAccounts();
+    setMaster(seed); PW=p; disableBiometric(); bootAccounts();
     showView("backup");
   }catch(e){ msg.className="msg err"; msg.textContent="no se pudo crear: "+e.message; }
   $("c-btn").disabled=false;
@@ -922,7 +951,7 @@ $("i-btn").onclick=async()=>{
     const store=await encryptSeedConfirmed(seed, p);   // re-descifra para confirmar el round-trip
     localStorage.setItem(LS_KEY, JSON.stringify(store));
     clearUnlockFails();
-    MASTER=seed; PW=p; disableBiometric(); bootAccounts();
+    setMaster(seed); PW=p; disableBiometric(); bootAccounts();
     toast("wallet restaurada"); showView("home");
   }catch(e){ if(e.message!=="__handled__"){ msg.className="msg err"; msg.textContent="no se pudo restaurar: "+e.message; } }
   $("i-btn").disabled=false;
@@ -976,7 +1005,7 @@ $("u-btn").onclick=async()=>{
   $("u-btn").disabled=true;
   try{
     const store=JSON.parse(localStorage.getItem(LS_KEY));
-    MASTER=await decryptSeed(store, p);
+    setMaster(await decryptSeed(store, p));
     PW=p;
     clearUnlockFails();
     bootAccounts();
@@ -999,7 +1028,7 @@ $("u-bio").onclick=async()=>{
   const msg=$("u-msg"); msg.className="msg"; msg.style.display="block"; msg.textContent="esperando Face ID / huella…";
   $("u-bio").disabled=true;
   try{
-    MASTER=await unlockWithBiometric();
+    setMaster(await unlockWithBiometric());
     bootAccounts();
     msg.textContent=""; $("u-pass").value="";
     showView("home");
@@ -1819,7 +1848,10 @@ async function stakeAction(kind, pos){
 
 // configuración
 $("set-download").onclick=()=>downloadEncryptedBackup();
-$("set-lock").onclick=()=>{ MASTER=null; SEED=null; ACCT=0; PW=null; $("u-pass").value=""; showView("unlock"); };
+$("set-lock").onclick=()=>{ wipeSecrets(); ACCT=0; $("u-pass").value=""; showView("unlock"); };
+// #13: al cerrar/ocultar la pestaña, borrá el material secreto de memoria (best-effort).
+// `pagehide` cubre cerrar la pestaña y navegar fuera; no re-renderiza (la página se va).
+window.addEventListener("pagehide", ()=>{ try{ wipeSecrets(); }catch(e){} });
 $("set-remove").onclick=()=>{
   if(confirm("Esto borra la wallet cifrada de ESTE navegador. Solo vas a poder recuperarla con tu respaldo. ¿Seguir?")){
     localStorage.removeItem(LS_KEY); localStorage.removeItem(BIO_KEY); location.reload();

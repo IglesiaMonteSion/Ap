@@ -1,7 +1,7 @@
 qchain wallet asset manifest v1
 # name  sha256(hex)  sri(sha384-b64)
 wasm_wallet.html         83daada39abb57ca6c517392d46a37a54dc8d4fb8703d491fe1a9e3e2d3bc344  sha384-WQdgP430INh0N093KBx/0HNtrpldipLugFBlhaJPoU791P9snpih8cXk9Sd+B2H8
-app.js                   d75f1f67aa188d1a2a8c29279961cc01c1ae80a52578fbeef259739685c49035  sha384-/9a3eRDeacgdRyd+JvHdLJ+Rvx9HxU8eVcZ6wJSQY7KywJgW4Ah0D9iITY/uQ8Ub
+app.js                   b47285689012ab896fecbcf45018a63b6cd838ea50329f226cc92e7fd30496ad  sha384-UAcFcGLilBHNfimTfhKQ9/AaYnMCq8r+mQecmoLraTb0Mb/et56JoeVkSbS87smI
 custodial.js             d3182ee32f60c256d22655bd0279591c81fddf34cf324ff375fcc1768471250b  sha384-H/8243stFiUhbBSSr0Rx4cD01lLq+9DqlRG2ssareTpzUtzCh4fO3etjkRYgMpQU
 qchain_wasm.js           4495dedeeb6d864cdf23882a75d7993e140985a6ffb8a9760f925bb9a84f7df7  sha384-Sw6NM4zuyfZIHqyLGnKnwmUYCsa+nSotDvCQTiJRU10w32azN9oOsXoSl4Dk9KF8
 qchain_wasm_bg.wasm      9bf99d1269560ac77a707eb14936693f99b6f48c5abe363f3815858ef861c5a9  sha384-P5qqgTYhPrLITrW4HbUnhBmhKwLD9MKTlGLhdOMNfhX6N0M+Ph8Rho9DSWXgBCWa
