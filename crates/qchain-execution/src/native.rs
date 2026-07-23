@@ -99,12 +99,13 @@ impl SystemProgram {
         if from_balance < amount {
             return Err(ExecError::InsufficientFunds);
         }
-        accounts.get_mut(from).unwrap().balance = from_balance - amount;
-        // saturating_add: overflow-safety discipline (see qchain-governance::record_vote).
-        // Unreachable at realistic supply, but a plain `+` overflow would panic-halt
-        // every node in release (overflow-checks=true). Byte-identical for real values.
+        // #218: money uses checked_*; on over/underflow the whole transfer is
+        // rejected, never silently saturated. The debit is already guarded above,
+        // the credit could only overflow on an impossible supply — either way,
+        // reject rather than corrupt value.
+        accounts.get_mut(from).unwrap().balance = crate::arith::sub_u64(from_balance, amount)?;
         let to_acct = accounts.entry(*to).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-        to_acct.balance = to_acct.balance.saturating_add(amount);
+        to_acct.balance = crate::arith::add_u64(to_acct.balance, amount)?;
         Ok(())
     }
 }
@@ -313,6 +314,31 @@ mod tests {
         SystemProgram.process(&mut accounts, &ix, &from, 0).unwrap();
         assert_eq!(accounts[&from].balance, 600);
         assert_eq!(accounts[&to].balance, 400);
+    }
+
+    #[test]
+    fn a_credit_that_would_overflow_the_recipient_is_rejected_not_saturated() {
+        // #218: money uses checked_add — a transfer that would overflow the
+        // recipient's u64 balance is REJECTED (the whole transition), never
+        // silently saturated to u64::MAX (which would create value). Both
+        // balances stay untouched.
+        let from = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let to = qchain_crypto::Keypair::generate().unwrap().pubkey();
+        let mut accounts = HashMap::new();
+        accounts.insert(from, Account { balance: 10, ..Account::new_wallet(Pubkey::system_program_id()) });
+        accounts.insert(to, Account { balance: u64::MAX, ..Account::new_wallet(Pubkey::system_program_id()) });
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![from, to],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: 5 }).unwrap(),
+        };
+        let r = SystemProgram.process(&mut accounts, &ix, &from, 0);
+        assert!(matches!(r, Err(ExecError::ArithmeticOverflow)), "credit overflow must reject, got {r:?}");
+        // The credit is never applied (checked_add returns Err before the write),
+        // so the recipient is NOT saturated to u64::MAX+something. On the real
+        // apply path the whole working set is discarded on this Err, so the
+        // sender's partial debit here is rolled back too (Ledger-level guarantee).
+        assert_eq!(accounts[&to].balance, u64::MAX, "recipient not saturated — credit rejected, not capped");
     }
 
     #[test]

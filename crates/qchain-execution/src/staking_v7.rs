@@ -181,7 +181,9 @@ fn write_position(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, p: &Stak
 
 fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, owner_if_new: Pubkey, amount: u64) {
     let acct = accounts.entry(*pk).or_insert_with(|| Account::new_wallet(owner_if_new));
-    acct.balance = acct.balance.saturating_add(amount);
+    // #218: checked money (a bounded pool/wallet credit that cannot overflow at
+    // realistic supply); fail loud rather than silently saturate-and-lose value.
+    acct.balance = acct.balance.checked_add(amount).expect("v7 staking credit overflow — corrupt/attacked state");
 }
 
 /// Read the global staking state from a working set (or `genesis()` if absent).
@@ -311,7 +313,7 @@ impl StakingV7Program {
             // (it starts earning next quanto — the added principal doesn't collect
             // the partial join quanto's reward either).
             settle_position(&mut pos, &g);
-            accounts.get_mut(&staker).unwrap().balance -= amount;
+            { let a = accounts.get_mut(&staker).unwrap(); a.balance = crate::arith::sub_u64(a.balance, amount)?; }
             let added = add_pending_deposit(&mut pos, &g, amount);
             g.pending_shares = g.pending_shares.saturating_add(added);
             pos.last_modified_quanto = g.current_quanto;
@@ -387,7 +389,7 @@ impl StakingV7Program {
             if staker_balance < amount {
                 return Err(ExecError::InsufficientFunds);
             }
-            accounts.get_mut(&staker).unwrap().balance -= amount;
+            { let a = accounts.get_mut(&staker).unwrap(); a.balance = crate::arith::sub_u64(a.balance, amount)?; }
             let mut pos = StakePositionV7 {
                 owner: staker,
                 active_shares: 0,
@@ -486,7 +488,7 @@ impl StakingV7Program {
         if reserve_bal < value_removed {
             return Err(ExecError::ProgramError("staking reserve underfunded (invariant violation)".into()));
         }
-        accounts.get_mut(&reserve_pk).unwrap().balance -= value_removed;
+        { let a = accounts.get_mut(&reserve_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, value_removed)?; }
         credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, value_removed);
 
         write_global(accounts, &g)?;
@@ -533,7 +535,7 @@ impl StakingV7Program {
         if pool_bal < amount {
             return Err(ExecError::ProgramError("unbonding pool underfunded (invariant violation)".into()));
         }
-        accounts.get_mut(&unbonding_pk).unwrap().balance -= amount;
+        { let a = accounts.get_mut(&unbonding_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, amount)?; }
         credit(accounts, &staker, qchain_crypto::Pubkey::system_program_id(), amount);
 
         pos.unbonding_amount = 0;

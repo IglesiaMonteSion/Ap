@@ -859,6 +859,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // STARTUP GATE (#217): after genesis-seeding (fresh) or loading persisted
+    // state, the critical singletons must be valid. Refuse to start on a corrupt
+    // (present-but-undecodable) or missing-required one — never run degraded on
+    // silent defaults. Brick-safe: absent optional/version-dependent accounts
+    // (EMERGENCY / v7 set on a v6 network) are tolerated.
+    if let Err(e) = ledger.validate_critical_singletons(config.economics_v7) {
+        anyhow::bail!("FATAL: {e}. Restore from a good backup / re-sync a fresh data_dir before restarting.");
+    }
+
     // The committee schedule was built (and, for a rotation node, reloaded from
     // disk) above, before the consensus-resume decision. `current_committee` is
     // the set in effect for the resume round; the schedule carries the full

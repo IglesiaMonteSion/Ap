@@ -56,9 +56,15 @@ pub enum TreasuryV7Instruction {
 pub struct TreasuryV7Program;
 
 fn read_state(accounts: &HashMap<Pubkey, Account>) -> Option<TreasuryState> {
-    accounts
-        .get(&TREASURY_ACCOUNT_ID)
-        .and_then(|a| TreasuryState::try_from_slice(&a.data).ok())
+    // FAIL-LOUD (#217): absent = no treasury on this network (None). But PRESENT
+    // and undecodable is corruption of the account that guards the locked supply
+    // → refuse to run rather than returning None (which a caller reads as "no
+    // treasury / not authorized", silently changing who controls locked funds).
+    accounts.get(&TREASURY_ACCOUNT_ID).map(|a| {
+        TreasuryState::try_from_slice(&a.data).unwrap_or_else(|e| {
+            panic!("TREASURY_ACCOUNT is present but does not decode as TreasuryState ({e}); refusing to run on corrupt treasury state")
+        })
+    })
 }
 
 impl TreasuryV7Program {
@@ -135,11 +141,15 @@ impl TreasuryV7Program {
         // Move (never mint): debit the treasury, credit the destination. Supply is
         // conserved. The destination is created as a normal system-owned wallet if
         // it does not exist yet, so released funds are immediately spendable.
-        accounts.get_mut(&TREASURY_ACCOUNT_ID).unwrap().balance -= amount;
+        // #218: checked money — debit/credit reject the release on over/underflow.
+        {
+            let t = accounts.get_mut(&TREASURY_ACCOUNT_ID).unwrap();
+            t.balance = crate::arith::sub_u64(t.balance, amount)?;
+        }
         let dest = accounts
             .entry(dest_pk)
             .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-        dest.balance = dest.balance.saturating_add(amount);
+        dest.balance = crate::arith::add_u64(dest.balance, amount)?;
         Ok(())
     }
 

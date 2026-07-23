@@ -236,13 +236,18 @@ impl NativeProgram for GovernanceProgram {
                 if emergency_pk != crate::ids::EMERGENCY_ACCOUNT_ID {
                     return Err(ExecError::ProgramError("Execute accounts[2] must be the canonical emergency governance account".into()));
                 }
+                // FAIL-LOUD (#217): absent EMERGENCY account = legacy network without
+                // guardians (pause inert, tolerated). But PRESENT-but-undecodable must
+                // NOT be silently ignored — that would disable the pause gate on a
+                // corrupt singleton and let a rushed Execute through. Refuse to run.
                 if let Some(acc) = accounts.get(&crate::ids::EMERGENCY_ACCOUNT_ID) {
-                    if let Ok(state) = EmergencyState::try_from_slice(&acc.data) {
-                        if state.paused {
-                            return Err(ExecError::ProgramError(
-                                "governance is under an emergency pause — Execute is blocked until the guardian multisig unpauses".into(),
-                            ));
-                        }
+                    let state = EmergencyState::try_from_slice(&acc.data).unwrap_or_else(|e| {
+                        panic!("EMERGENCY_ACCOUNT is present but does not decode as EmergencyState ({e}); refusing to run on corrupt emergency-governance state")
+                    });
+                    if state.paused {
+                        return Err(ExecError::ProgramError(
+                            "governance is under an emergency pause — Execute is blocked until the guardian multisig unpauses".into(),
+                        ));
                     }
                 }
 

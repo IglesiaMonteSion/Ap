@@ -46,4 +46,15 @@ pub enum ExecError {
     /// committed round), so every validator rejects it identically — no fork.
     #[error("transaction expired: valid until round {valid_until}, current round is {current}")]
     Expired { valid_until: u64, current: u64 },
+    /// A MONEY arithmetic operation on a balance/pool/aggregate overflowed or
+    /// underflowed (#218). Per the hardening rule, `checked_add`/`checked_sub`/
+    /// `checked_mul` are used for funds; on `None` the WHOLE state transition is
+    /// rejected (this error propagates, the working set is discarded) rather than
+    /// silently saturating to a wrong value. Deterministic (a pure function of
+    /// the committed state), so every validator rejects identically — no fork.
+    /// Unreachable in normal operation (total supply is far below `u64::MAX`); it
+    /// fires only on an attack or corrupt state, exactly when saturating would
+    /// have quietly created or destroyed value.
+    #[error("arithmetic overflow/underflow on a balance or pool — transaction rejected")]
+    ArithmeticOverflow,
 }

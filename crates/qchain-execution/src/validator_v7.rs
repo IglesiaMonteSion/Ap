@@ -288,10 +288,16 @@ pub enum ValidatorV7Instruction {
 pub struct ValidatorV7Program;
 
 fn read_registry(accounts: &HashMap<Pubkey, Account>) -> ValidatorV7Registry {
-    accounts
-        .get(&VALIDATOR_REGISTRY_ACCOUNT_ID)
-        .and_then(|a| ValidatorV7Registry::try_from_slice(&a.data).ok())
-        .unwrap_or_default()
+    // FAIL-LOUD (#217): absent = empty registry (not yet seeded); present but
+    // undecodable = corrupt/version-skewed validator registry → refuse to run,
+    // never silently treat it as EMPTY (which would drop every registered
+    // validator from the committee and the fee split).
+    match accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID) {
+        None => ValidatorV7Registry::default(),
+        Some(a) => ValidatorV7Registry::try_from_slice(&a.data).unwrap_or_else(|e| {
+            panic!("VALIDATOR_REGISTRY_ACCOUNT is present but does not decode as the v7 registry ({e}); refusing to run on corrupt validator registry")
+        }),
+    }
 }
 
 fn write_registry(accounts: &mut HashMap<Pubkey, Account>, r: &ValidatorV7Registry) -> Result<(), ExecError> {
@@ -304,9 +310,10 @@ fn current_quanto(accounts: &HashMap<Pubkey, Account>) -> u64 {
     crate::staking_v7::global_state(accounts).current_quanto
 }
 
-fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, owner_if_new: Pubkey, amount: u64) {
+fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, owner_if_new: Pubkey, amount: u64) -> Result<(), ExecError> {
     let acct = accounts.entry(*pk).or_insert_with(|| Account::new_wallet(owner_if_new));
-    acct.balance = acct.balance.saturating_add(amount);
+    acct.balance = crate::arith::add_u64(acct.balance, amount)?; // #218 checked money
+    Ok(())
 }
 
 impl crate::native::NativeProgram for ValidatorV7Program {
@@ -420,8 +427,8 @@ impl ValidatorV7Program {
         if bal < VALIDATOR_BOND_ATOMS {
             return Err(ExecError::InsufficientFunds);
         }
-        accounts.get_mut(&operator).unwrap().balance -= VALIDATOR_BOND_ATOMS;
-        credit(accounts, &escrow_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS);
+        { let a = accounts.get_mut(&operator).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
+        credit(accounts, &escrow_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS)?;
 
         let q = current_quanto(accounts);
         let entry = ValidatorV7Entry {
@@ -471,8 +478,8 @@ impl ValidatorV7Program {
         if escrow_bal < VALIDATOR_BOND_ATOMS {
             return Err(ExecError::ProgramError("bond escrow underfunded (invariant violation)".into()));
         }
-        accounts.get_mut(&escrow_pk).unwrap().balance -= VALIDATOR_BOND_ATOMS;
-        credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS);
+        { let a = accounts.get_mut(&escrow_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
+        credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS)?;
 
         let q = current_quanto(accounts);
         let e = &mut reg.validators[idx];
@@ -520,8 +527,8 @@ impl ValidatorV7Program {
         if pool_bal < VALIDATOR_BOND_ATOMS {
             return Err(ExecError::ProgramError("validator unbonding pool underfunded (invariant violation)".into()));
         }
-        accounts.get_mut(&unbonding_pk).unwrap().balance -= VALIDATOR_BOND_ATOMS;
-        credit(accounts, &dest, Pubkey::system_program_id(), VALIDATOR_BOND_ATOMS);
+        { let a = accounts.get_mut(&unbonding_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
+        credit(accounts, &dest, Pubkey::system_program_id(), VALIDATOR_BOND_ATOMS)?;
         reg.validators[idx].state = ValidatorV7State::Removed;
         reg.validators[idx].bond = 0;
         write_registry(accounts, &reg)?;
@@ -580,7 +587,8 @@ impl ValidatorV7Program {
         if bal < VALIDATOR_BOND_ATOMS {
             return Err(ExecError::ProgramError("nothing to slash".into()));
         }
-        accounts.get_mut(&pool_pk).unwrap().balance -= VALIDATOR_BOND_ATOMS; // burned
+        // burned: the full bond leaves circulation (slash for equivocation)
+        { let a = accounts.get_mut(&pool_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
         let e = &mut reg.validators[idx];
         e.state = ValidatorV7State::Slashed;
         e.bond = 0;

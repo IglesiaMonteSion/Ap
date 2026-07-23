@@ -277,9 +277,9 @@ pub fn accrue_reward_pool(accounts: &mut HashMap<Pubkey, Account>, pool_pk: Pubk
         .entry(pool_pk)
         .or_insert_with(|| Account { data: borsh::to_vec(&RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
     let mut pool = read_pool(pool_account)?;
-    pool.acc_reward_per_share = pool.acc_reward_per_share.saturating_add((pool_share as u128).saturating_mul(PRECISION) / total_staked as u128);
+    pool.acc_reward_per_share = crate::arith::add_u128(pool.acc_reward_per_share, crate::arith::mul_u128(pool_share as u128, PRECISION)? / total_staked as u128)?;
     pool_account.data = borsh::to_vec(&pool).map_err(|e| ExecError::ProgramError(e.to_string()))?;
-    pool_account.balance = pool_account.balance.saturating_add(pool_share);
+    pool_account.balance = crate::arith::add_u64(pool_account.balance, pool_share)?;
     Ok(true)
 }
 
@@ -335,7 +335,7 @@ impl NativeProgram for StakingProgram {
                 if staker_balance < amount {
                     return Err(ExecError::InsufficientFunds);
                 }
-                accounts.get_mut(&staker).unwrap().balance -= amount;
+                { let a = accounts.get_mut(&staker).unwrap(); a.balance = crate::arith::sub_u64(a.balance, amount)?; }
 
                 let pool_acc = match accounts.get(&pool_pk) {
                     Some(pool) => read_pool(pool)?.acc_reward_per_share,
@@ -358,7 +358,7 @@ impl NativeProgram for StakingProgram {
                 let stats = accounts
                     .entry(stats_pk)
                     .or_insert_with(|| Account { data: borsh::to_vec(&0u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
-                let total = read_stats(stats)?.saturating_add(amount);
+                let total = crate::arith::add_u64(read_stats(stats)?, amount)?;
                 stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
             }
             StakingInstruction::Undelegate => {
@@ -447,14 +447,14 @@ impl NativeProgram for StakingProgram {
 
                 if reward > 0 {
                     let pool_account = accounts.get_mut(&pool_pk).ok_or(ExecError::AccountNotFound(pool_pk))?;
-                    pool_account.balance = pool_account.balance.saturating_sub(reward);
+                    pool_account.balance = crate::arith::sub_u64(pool_account.balance, reward)?;
                 }
-                let credit = amount.saturating_add(reward);
+                let credit = crate::arith::add_u64(amount, reward)?;
                 let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-                acct.balance = acct.balance.saturating_add(credit);
+                acct.balance = crate::arith::add_u64(acct.balance, credit)?;
 
                 let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
-                let total = read_stats(stats)?.saturating_sub(amount);
+                let total = crate::arith::sub_u64(read_stats(stats)?, amount)?;
                 stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
             }
             StakingInstruction::ClaimReward => {
@@ -483,9 +483,9 @@ impl NativeProgram for StakingProgram {
 
                 if reward > 0 {
                     let pool_account = accounts.get_mut(&pool_pk).unwrap();
-                    pool_account.balance = pool_account.balance.saturating_sub(reward);
+                    pool_account.balance = crate::arith::sub_u64(pool_account.balance, reward)?;
                     let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-                    acct.balance = acct.balance.saturating_add(reward);
+                    acct.balance = crate::arith::add_u64(acct.balance, reward)?;
                 }
             }
             StakingInstruction::ReportEquivocation { evidence } => {
@@ -572,7 +572,7 @@ impl NativeProgram for StakingProgram {
                 // underflowing.
                 if let Some(stats_pk) = stats_pk {
                     let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
-                    let total = read_stats(stats)?.saturating_sub(slashed);
+                    let total = crate::arith::sub_u64(read_stats(stats)?, slashed)?;
                     stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 }
             }
@@ -1263,7 +1263,10 @@ mod tests {
                     ..Account::new_wallet(STAKING_PROGRAM_ID)
                 },
             ),
-            (STAKING_STATS_ID, stats_account()),
+            // total_staked reflects this position (the real invariant: Delegate
+            // keeps total_staked >= Σ staked amounts). #218 checked_sub relies on
+            // that invariant, so seed the stats consistently rather than at 0.
+            (STAKING_STATS_ID, Account { data: borsh::to_vec(&5_000_000u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }),
             (STAKING_REWARDS_POOL_ID, pool_account()),
         ]);
         let undelegate_ix = Instruction {

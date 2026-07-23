@@ -72,7 +72,11 @@ pub fn eligible_addresses(registry: &ValidatorV7Registry, quanto: u64) -> Vec<Pu
 
 fn credit(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, amount: u64) {
     let acct = accounts.entry(*pk).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
-    acct.balance = acct.balance.saturating_add(amount);
+    // #218: checked money, NOT saturating. This is fee-routing plumbing with a
+    // tiny bounded amount (a share of one tx's fee) that cannot overflow at any
+    // realistic supply; on the impossible overflow, fail loud rather than
+    // silently cap (which would lose value).
+    acct.balance = acct.balance.checked_add(amount).expect("v7 fee credit overflow — corrupt/attacked state");
 }
 
 /// Distribute the current `VALIDATOR_FEE_POOL_ID` balance 1/N among the eligible
@@ -92,7 +96,7 @@ pub fn distribute_fee_pool(accounts: &mut HashMap<Pubkey, Account>, registry: &V
     let paid = reward * n;
     if reward > 0 {
         // Debit the pool by exactly what's paid; the remainder stays.
-        accounts.get_mut(&VALIDATOR_FEE_POOL_ID).unwrap().balance -= paid;
+        { let a = accounts.get_mut(&VALIDATOR_FEE_POOL_ID).unwrap(); a.balance = a.balance.checked_sub(paid).expect("v7 fee-pool debit underflow — corrupt state"); }
         for addr in &eligible {
             credit(accounts, addr, reward);
         }
@@ -113,7 +117,7 @@ pub fn route_fee(accounts: &mut HashMap<Pubkey, Account>, fee: u64) -> FeeSplit 
     let split = fee_split(fee);
     if split.validator > 0 {
         let acct = accounts.entry(VALIDATOR_FEE_POOL_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
-        acct.balance = acct.balance.saturating_add(split.validator);
+        acct.balance = acct.balance.checked_add(split.validator).expect("v7 fee-pool credit overflow — corrupt state");
     }
     if split.admin > 0 {
         credit(accounts, &ADMIN_FEE_WALLET, split.admin);

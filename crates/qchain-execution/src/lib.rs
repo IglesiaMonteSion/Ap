@@ -1,3 +1,4 @@
+pub(crate) mod arith;
 pub mod economics_v7;
 pub mod error;
 pub mod fees_v7;

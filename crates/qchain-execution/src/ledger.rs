@@ -1143,13 +1143,84 @@ impl Ledger {
         self.write_account(pubkey, account);
     }
 
+    /// STARTUP GATE (#217): post-genesis, the critical singletons must be valid.
+    /// Called by the node once at boot (after loading persisted state, before
+    /// serving) so corruption is caught EARLY with a clear message instead of
+    /// on the first transaction. BRICK-SAFE: it never REQUIRES an absent account
+    /// (an upgraded-without-fresh-genesis network legitimately lacks EMERGENCY /
+    /// v7 accounts) — it only fails on a PRESENT-but-undecodable one, plus
+    /// requires the two universal always-seeded singletons (PARAMS + crypto
+    /// registry) and, on a v7 network, the v7 set that a v7 genesis always seeds.
+    pub fn validate_critical_singletons(&self, economics_v7: bool) -> Result<(), String> {
+        use crate::ids::{STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID};
+        // Present-but-must-decode (tolerate absent): halt if the account exists
+        // but its bytes are garbage.
+        let decodes_if_present = |id: Pubkey, name: &str, ok: &dyn Fn(&[u8]) -> bool| -> Result<(), String> {
+            match self.store.get(&id) {
+                None => Ok(()),
+                Some(a) if ok(&a.data) => Ok(()),
+                Some(_) => Err(format!("critical singleton {name} is present but does not decode — refusing to start on corrupt state")),
+            }
+        };
+        // Required present + decodable.
+        let required = |id: Pubkey, name: &str, ok: &dyn Fn(&[u8]) -> bool| -> Result<(), String> {
+            match self.store.get(&id) {
+                Some(a) if ok(&a.data) => Ok(()),
+                Some(_) => Err(format!("critical singleton {name} is present but does not decode — refusing to start on corrupt state")),
+                None => Err(format!("critical singleton {name} is MISSING post-genesis — refusing to start")),
+            }
+        };
+        let params_ok = |d: &[u8]| EconomicParams::read_or_legacy(d).is_some();
+        let regv = |d: &[u8]| Vec::<RegistryEntry>::try_from_slice(d).is_ok();
+        let feestate = |d: &[u8]| FeeState::read_or_legacy(d).is_some();
+        let u64ok = |d: &[u8]| u64::try_from_slice(d).is_ok();
+        let poolok = |d: &[u8]| crate::staking::RewardPoolData::try_from_slice(d).is_ok();
+        let emok = |d: &[u8]| crate::governance::EmergencyState::try_from_slice(d).is_ok();
+
+        // Universal (seeded since phase 2 — every network the operator runs has these):
+        required(PARAMS_ACCOUNT_ID, "PARAMS (economic params)", &params_ok)?;
+        required(REGISTRY_ACCOUNT_ID, "REGISTRY (crypto registry)", &regv)?;
+        // Present-but-must-decode (may be absent on an upgraded/legacy network):
+        decodes_if_present(FEE_STATE_ACCOUNT_ID, "FEE_STATE", &feestate)?;
+        decodes_if_present(STAKING_STATS_ID, "STAKING_STATS", &u64ok)?;
+        decodes_if_present(STAKING_REWARDS_POOL_ID, "REWARD_POOL", &poolok)?;
+        decodes_if_present(crate::ids::EMERGENCY_ACCOUNT_ID, "EMERGENCY", &emok)?;
+
+        if economics_v7 {
+            // A v7 network is always freshly genesis'd, so the v7 set is present.
+            let globalok = |d: &[u8]| crate::staking_v7::GlobalStakingState::try_from_slice(d).is_ok();
+            let vregok = |d: &[u8]| crate::validator_v7::ValidatorV7Registry::try_from_slice(d).is_ok();
+            required(STAKING_GLOBAL_ID, "STAKING_GLOBAL", &globalok)?;
+            required(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, "VALIDATOR_REGISTRY (v7)", &vregok)?;
+            // Economic pools are plain balances (no decode) — just require presence.
+            for (id, name) in [
+                (STAKING_RESERVE_ID, "STAKING_RESERVE"),
+                (VALIDATOR_FEE_POOL_ID, "VALIDATOR_FEE_POOL"),
+                (STAKING_UNBONDING_POOL_ID, "STAKING_UNBONDING_POOL"),
+                (VALIDATOR_UNBONDING_POOL_ID, "VALIDATOR_UNBONDING_POOL"),
+                (VALIDATOR_BOND_ESCROW_ID, "VALIDATOR_BOND_ESCROW"),
+                (ADMIN_FEE_WALLET, "ADMIN_FEE_WALLET"),
+            ] {
+                if self.store.get(&id).is_none() {
+                    return Err(format!("v7 economic pool {name} is MISSING post-genesis — refusing to start"));
+                }
+            }
+            // Treasury: optional (only if the network configured one) — decode if present.
+            let treasok = |d: &[u8]| crate::treasury_v7::TreasuryState::try_from_slice(d).is_ok();
+            decodes_if_present(crate::ids::TREASURY_ACCOUNT_ID, "TREASURY", &treasok)?;
+        }
+        Ok(())
+    }
+
     pub fn get_balance(&self, pk: &Pubkey) -> u64 {
         self.store.get(pk).map(|a| a.balance).unwrap_or(0)
     }
 
     pub fn credit(&mut self, pk: Pubkey, amount: u64) {
         let mut account = self.store.get(&pk).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id()));
-        account.balance = account.balance.saturating_add(amount);
+        // #218: checked money, not saturating (used by genesis seeding + fee
+        // credits; a bounded amount that cannot overflow at realistic supply).
+        account.balance = account.balance.checked_add(amount).expect("balance credit overflow — corrupt/attacked state");
         self.write_account(pk, account);
     }
 
@@ -1180,7 +1251,7 @@ impl Ledger {
         }
         if let Some(w) = working {
             if let Some(acc) = w.get_mut(&pk) {
-                acc.balance = acc.balance.saturating_add(amount);
+                acc.balance = acc.balance.checked_add(amount).expect("fee credit overflow — corrupt/attacked state"); // #218
                 return;
             }
         }
@@ -1307,19 +1378,31 @@ impl Ledger {
     /// cached, so a passed-and-executed governance proposal takes effect
     /// on the very next transaction, not after a restart.
     pub fn current_params(&self) -> EconomicParams {
-        self.store
-            .get(&PARAMS_ACCOUNT_ID)
-            .and_then(|a| EconomicParams::read_or_legacy(&a.data))
-            .unwrap_or_default()
+        // FAIL-LOUD (#217): an ABSENT account defaults (bare test Ledger / not yet
+        // seeded), but a PRESENT-but-undecodable account is NOT silently replaced
+        // by defaults — that would swap the network's real base_fee/dust/gas/
+        // commission/emission for the compiled defaults on corrupt/version-skewed
+        // bytes. Refuse to run instead (same discipline as `read_global`).
+        match self.store.get(&PARAMS_ACCOUNT_ID) {
+            None => EconomicParams::default(),
+            Some(a) => EconomicParams::read_or_legacy(&a.data).unwrap_or_else(|| {
+                panic!("PARAMS_ACCOUNT is present but does not decode as EconomicParams; refusing to run on corrupt/version-skewed economic parameters")
+            }),
+        }
     }
 
     /// The dynamic-fee accumulator (see `params::FeeState`), or a fresh default
     /// if `FEE_STATE_ACCOUNT_ID` hasn't been created yet.
     pub fn current_fee_state(&self) -> FeeState {
-        self.store
-            .get(&FEE_STATE_ACCOUNT_ID)
-            .and_then(|a| FeeState::try_from_slice(&a.data).ok())
-            .unwrap_or_default()
+        // FAIL-LOUD (#217): absent = lazily-not-yet-created (default); present but
+        // undecodable = corrupt fee-epoch state → refuse to run, never silently
+        // default (a wrong epoch anchor would misprice the dynamic fee).
+        match self.store.get(&FEE_STATE_ACCOUNT_ID) {
+            None => FeeState::default(),
+            Some(a) => FeeState::read_or_legacy(&a.data).unwrap_or_else(|| {
+                panic!("FEE_STATE_ACCOUNT is present but does not decode as FeeState; refusing to run on corrupt dynamic-fee state")
+            }),
+        }
     }
 
     /// The base fee a transaction committed at `current_round` should actually
@@ -1338,9 +1421,14 @@ impl Ledger {
     /// `existing.is_none()` branch.
     pub fn effective_base_fee_at(&self, current_round: Round) -> u64 {
         let base = self.current_params().base_fee_per_byte;
-        match self.store.get(&FEE_STATE_ACCOUNT_ID).and_then(|a| FeeState::read_or_legacy(&a.data)) {
-            Some(fs) => crate::params::rolled_base_fee(base, fs.epoch_round, fs.epoch_bytes, current_round, FEE_TARGET_BYTES_PER_ROUND),
+        // FAIL-LOUD (#217): absent = no epoch yet (return base); present-but-corrupt
+        // → halt via current_fee_state() rather than silently pricing off `base`.
+        match self.store.get(&FEE_STATE_ACCOUNT_ID) {
             None => base,
+            Some(_) => {
+                let fs = self.current_fee_state();
+                crate::params::rolled_base_fee(base, fs.epoch_round, fs.epoch_bytes, current_round, FEE_TARGET_BYTES_PER_ROUND)
+            }
         }
     }
 
@@ -1362,10 +1450,14 @@ impl Ledger {
     /// capture on purpose.
     fn advance_dynamic_fee(&mut self, current_round: Round, tx_bytes: u64) {
         let existing = self.store.get(&FEE_STATE_ACCOUNT_ID);
-        let mut fs = existing
-            .as_ref()
-            .and_then(|a| FeeState::read_or_legacy(&a.data))
-            .unwrap_or(FeeState { epoch_round: current_round, epoch_bytes: 0, emission_carry: 0 });
+        // FAIL-LOUD (#217): absent = fresh epoch; present-but-corrupt → halt, never
+        // reset the fee epoch silently (that would reprice/miscarry emission).
+        let mut fs = match existing.as_ref() {
+            None => FeeState { epoch_round: current_round, epoch_bytes: 0, emission_carry: 0 },
+            Some(a) => FeeState::read_or_legacy(&a.data).unwrap_or_else(|| {
+                panic!("FEE_STATE_ACCOUNT is present but does not decode as FeeState; refusing to run on corrupt dynamic-fee state")
+            }),
+        };
 
         if existing.is_some() && current_round > fs.epoch_round {
             // Close the previous epoch AND roll the fee through every empty
@@ -1480,10 +1572,16 @@ impl Ledger {
     /// a passed `ActivateAlgorithm`/`DeprecateAlgorithm`/`RetireAlgorithm`
     /// proposal takes effect on the very next transaction.
     fn current_registry(&self) -> Vec<RegistryEntry> {
-        self.store
-            .get(&REGISTRY_ACCOUNT_ID)
-            .and_then(|a| Vec::<RegistryEntry>::try_from_slice(&a.data).ok())
-            .unwrap_or_else(qchain_crypto::registry::genesis_registry)
+        // FAIL-LOUD (#217): absent = genesis registry (bare test Ledger); present
+        // but undecodable = corrupt crypto registry → halt, never silently fall
+        // back to the genesis set (which could re-enable a governance-retired
+        // scheme or hide an activation).
+        match self.store.get(&REGISTRY_ACCOUNT_ID) {
+            None => qchain_crypto::registry::genesis_registry(),
+            Some(a) => Vec::<RegistryEntry>::try_from_slice(&a.data).unwrap_or_else(|e| {
+                panic!("REGISTRY_ACCOUNT is present but does not decode as the algorithm registry ({e}); refusing to run on corrupt crypto registry")
+            }),
+        }
     }
 
     /// The real closure of the "the registry is bookkeeping only" gap (see
@@ -1805,7 +1903,7 @@ impl Ledger {
             None
         };
 
-        payer_account.balance -= upfront_fee;
+        payer_account.balance = crate::arith::sub_u64(payer_account.balance, upfront_fee)?; // #218
         payer_account.nonce += 1;
         self.write_account(tx.message.payer, payer_account.clone());
 
@@ -2178,7 +2276,7 @@ impl Ledger {
             if payer_after.balance < total_gas_fee {
                 return Err(ExecError::InsufficientFunds);
             }
-            payer_after.balance -= total_gas_fee;
+            payer_after.balance = crate::arith::sub_u64(payer_after.balance, total_gas_fee)?; // #218
             if self.economics_v7 {
                 // v7: same 45/45/10 route as the byte fee. Pass the `working`
                 // overlay so that if a contract named VALIDATOR_FEE_POOL_ID /
@@ -2215,7 +2313,7 @@ impl Ledger {
                 .entry(*fee_collector)
                 .or_insert_with(|| self.store.get(fee_collector).unwrap_or_else(|| Account::new_wallet(Pubkey::system_program_id())));
             // saturating_add: overflow-safety discipline (see governance::record_vote).
-            fc.balance = fc.balance.saturating_add(gas_validator_share);
+            fc.balance = crate::arith::add_u64(fc.balance, gas_validator_share)?; // #218
             }
         }
 
@@ -2308,7 +2406,7 @@ impl Ledger {
                 // no leaked instruction effects.
                 if let Some(mut payer_account) = self.store.get(payer) {
                     let charge = trap_fee.min(payer_account.balance);
-                    payer_account.balance -= charge;
+                    payer_account.balance = payer_account.balance.checked_sub(charge).expect("trap fee debit underflow — corrupt state"); // #218
                     self.write_account(*payer, payer_account);
                     if self.economics_v7 {
                         // v7: 45/45/10 route (same as the byte/gas paths). `None`
@@ -2556,6 +2654,27 @@ mod tests {
         let mut ledger = Ledger::new(Box::new(InMemoryStore::new())).unwrap();
         ledger.register_program(Pubkey::system_program_id(), Program::Native(Box::new(SystemProgram)));
         ledger
+    }
+
+    /// #217: a PRESENT-but-undecodable critical singleton must HALT (fail-loud),
+    /// never silently fall back to defaults on corrupt bytes.
+    #[test]
+    #[should_panic(expected = "does not decode as EconomicParams")]
+    fn a_corrupt_params_account_halts_instead_of_silently_defaulting() {
+        let mut ledger = new_test_ledger();
+        ledger.seed_account(
+            crate::ids::PARAMS_ACCOUNT_ID,
+            Account { data: vec![0xFF; 3], ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) },
+        );
+        let _ = ledger.current_params(); // must panic, not return default
+    }
+
+    /// #217: an ABSENT critical singleton is tolerated (default) — a bare test
+    /// Ledger / feature-off network is not corruption.
+    #[test]
+    fn an_absent_params_account_defaults_without_halting() {
+        let ledger = new_test_ledger();
+        assert_eq!(ledger.current_params(), EconomicParams::default());
     }
 
     fn new_test_ledger_compressed() -> Ledger {
