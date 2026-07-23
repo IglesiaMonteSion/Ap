@@ -287,21 +287,148 @@ pub enum ValidatorV7Instruction {
 
 pub struct ValidatorV7Program;
 
+// ─── Versioned registry migration (pre-mainnet #1) ────────────────────────────
+//
+// The validator registry singleton has had layout evolutions across versions. A
+// node must NEVER silently fall back to an EMPTY registry on a present-but-old
+// one — that would drop the committee to the genesis fallback and can diverge a
+// multi-validator network. Instead it MIGRATES a known old layout to the current
+// one, and treats a genuinely unrecognizable one as CORRUPT (fail-loud / halt),
+// never as empty.
+//
+// Known layouts at `VALIDATOR_REGISTRY_ACCOUNT_ID`:
+//   V2 (current) — `ValidatorV7Entry` with the role-separated cold keys
+//                  (`operator_address` / `withdrawal_address`), since v6.19.0.
+//   V1 (legacy)  — the pre-role-separation `ValidatorV7Entry` (v6.3.x .. v6.19.0):
+//                  byte-identical to V2 except it lacks the two cold-key fields
+//                  inserted after `address`. `ValidatorV7State` is byte-identical
+//                  between V1 and V2, so migration is exact and lossless:
+//                  operator = withdrawal = the consensus address (the pre-#193-B
+//                  behavior, where one key held every role).
+
+/// The pre-role-separation (V1) validator entry layout. Kept ONLY to decode a
+/// legacy on-disk registry and migrate it forward — never written.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7EntryV1 {
+    pub(crate) address: Pubkey,
+    pub(crate) moniker: String,
+    pub(crate) pubkey_bundle: PublicKeyBundle,
+    pub(crate) p2p_address: String,
+    pub(crate) bond: u64,
+    pub(crate) state: ValidatorV7State,
+    pub(crate) registered_quanto: u64,
+    pub(crate) activation_quanto: u64,
+    pub(crate) exit_requested_quanto: u64,
+    pub(crate) bond_release_quanto: u64,
+    pub(crate) participation_credits: u64,
+    pub(crate) participation_opportunities: u64,
+}
+
+/// The legacy (V1) registry container — a `Vec` of the pre-role-separation entry.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7RegistryV1 {
+    pub(crate) validators: Vec<ValidatorV7EntryV1>,
+}
+
+impl ValidatorV7EntryV1 {
+    fn migrate(self) -> ValidatorV7Entry {
+        ValidatorV7Entry {
+            // pre-#193-B: one key held consensus + operator + withdrawal roles.
+            operator_address: self.address,
+            withdrawal_address: self.address,
+            address: self.address,
+            moniker: self.moniker,
+            pubkey_bundle: self.pubkey_bundle,
+            p2p_address: self.p2p_address,
+            bond: self.bond,
+            state: self.state,
+            registered_quanto: self.registered_quanto,
+            activation_quanto: self.activation_quanto,
+            exit_requested_quanto: self.exit_requested_quanto,
+            bond_release_quanto: self.bond_release_quanto,
+            participation_credits: self.participation_credits,
+            participation_opportunities: self.participation_opportunities,
+        }
+    }
+}
+
+/// Decode the validator registry from its on-disk `data`, MIGRATING a known
+/// legacy layout forward. Returns `None` ONLY when the bytes are neither the
+/// current format nor a recognized older one — i.e. GENUINELY CORRUPT, which the
+/// caller must treat as fail-loud (halt), never as an empty registry.
+///
+/// Deterministic and side-effect-free: every node decodes/migrates the same
+/// bytes to the same `ValidatorV7Registry`, so reading a V1 registry as its
+/// migrated V2 form never diverges a network. The migration is applied on READ
+/// only (the stored bytes are NOT rewritten here), so it introduces no
+/// state-root change; the first real registry write persists the V2 form.
+pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
+    // Current format first: a real V2 registry always decodes here. A non-empty
+    // V1 one won't (V2 entries carry two extra Pubkey fields, so the byte lengths
+    // differ and borsh — which rejects trailing bytes — fails cleanly). An empty
+    // registry (`[0,0,0,0]`) is a valid empty V2 and decodes here directly.
+    if let Ok(v2) = ValidatorV7Registry::try_from_slice(data) {
+        return Some(v2);
+    }
+    // Legacy pre-role-separation layout → migrate each entry forward.
+    if let Ok(v1) = ValidatorV7RegistryV1::try_from_slice(data) {
+        return Some(ValidatorV7Registry {
+            validators: v1.validators.into_iter().map(|e| e.migrate()).collect(),
+        });
+    }
+    None
+}
+
+/// Test-only: encode a legacy (pre-role-separation V1) registry holding one
+/// entry, so other modules' tests (e.g. the ledger startup gate) can exercise
+/// the migration path with genuinely old-format bytes.
+#[cfg(test)]
+pub(crate) fn legacy_v1_registry_bytes_for_test(
+    address: Pubkey,
+    moniker: &str,
+    pubkey_bundle: PublicKeyBundle,
+    p2p_address: &str,
+) -> Vec<u8> {
+    let reg = ValidatorV7RegistryV1 {
+        validators: vec![ValidatorV7EntryV1 {
+            address,
+            moniker: moniker.to_string(),
+            pubkey_bundle,
+            p2p_address: p2p_address.to_string(),
+            bond: VALIDATOR_BOND_ATOMS,
+            state: ValidatorV7State::Active,
+            registered_quanto: 0,
+            activation_quanto: 0,
+            exit_requested_quanto: 0,
+            bond_release_quanto: 0,
+            participation_credits: 0,
+            participation_opportunities: 0,
+        }],
+    };
+    borsh::to_vec(&reg).unwrap()
+}
+
 fn read_registry(accounts: &HashMap<Pubkey, Account>) -> ValidatorV7Registry {
-    // #217 honest scope: the validator registry is NOT a money/authority
-    // singleton — a non-decode has a SAFE, deterministic fallback (empty →
-    // genesis committee, exactly what the epoch ratchet already does), it never
-    // touches funds, and it is re-derivable. A Borsh layout evolution across
-    // versions can legitimately leave an old-format-but-present registry on a
-    // LIVE network that the node has been safely tolerating; panicking here would
-    // brick that network on the next v7 registry op for a non-fund-safety reason.
-    // So: absent OR undecodable → empty registry, matching the engine's tolerant
-    // read (`try_from_slice(..).ok().unwrap_or_default()`). Fail-loud stays on
-    // the singletons where a silent default is dangerous (params/crypto registry/
-    // staking global/pools/treasury).
+    // Pre-mainnet #1: MIGRATE a known legacy layout forward; NEVER fall back to
+    // an empty registry on a present-but-undecodable one (that would silently
+    // drop to the genesis committee and can diverge a multi-validator network).
+    // A truly unrecognizable registry is CORRUPT → fail-loud (halt), matching the
+    // money/authority singletons. The startup gate
+    // (`Ledger::validate_critical_singletons`) already halts on a corrupt
+    // registry before the node runs, so this read-time panic is defense-in-depth
+    // for runtime disk corruption — deterministic in the committed-state sense
+    // (a per-node disk fault stops that node, it never forks).
     match accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID) {
+        // Absent = a network with no v7 registry (a v6 chain / not-yet-seeded) →
+        // legitimately empty. Presence is separately required by the startup gate.
         None => ValidatorV7Registry::default(),
-        Some(a) => ValidatorV7Registry::try_from_slice(&a.data).unwrap_or_default(),
+        Some(a) => decode_registry(&a.data).unwrap_or_else(|| {
+            panic!(
+                "VALIDATOR_REGISTRY (v7) is present but decodes as neither the current \
+                 nor a known legacy format — refusing to run on a corrupt validator \
+                 registry (restore from a good backup / re-sync a fresh data_dir)"
+            )
+        }),
     }
 }
 
@@ -965,5 +1092,61 @@ mod tests {
         assert!(r.is_err(), "a domain-less (raw) signature must not verify as vote evidence");
         assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "the bond must be untouched when the evidence is rejected");
         assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::BondedPending, "state unchanged");
+    }
+
+    /// Pre-mainnet #1: a legacy (pre-role-separation V1) validator registry is
+    /// MIGRATED forward by `decode_registry` — operator = withdrawal = the
+    /// consensus address, every other field carried over — and a genuinely-
+    /// unrecognizable one returns `None` so the caller can fail loud instead of
+    /// silently using an empty registry (which would drop to the genesis
+    /// committee and can diverge a multi-validator network).
+    #[test]
+    fn decode_registry_migrates_a_legacy_v1_registry_and_rejects_garbage() {
+        let v = Keypair::generate().unwrap();
+        let addr = v.pubkey();
+        let v1 = ValidatorV7RegistryV1 {
+            validators: vec![ValidatorV7EntryV1 {
+                address: addr,
+                moniker: "legacy".to_string(),
+                pubkey_bundle: v.public_key_bundle(),
+                p2p_address: "1.2.3.4:9000".to_string(),
+                bond: VALIDATOR_BOND_ATOMS,
+                state: ValidatorV7State::Active,
+                registered_quanto: 3,
+                activation_quanto: 4,
+                exit_requested_quanto: 0,
+                bond_release_quanto: 0,
+                participation_credits: 7,
+                participation_opportunities: 9,
+            }],
+        };
+        let bytes = borsh::to_vec(&v1).unwrap();
+        // A real (non-empty) V1 registry must NOT clean-decode as the current V2
+        // layout — V2 entries carry two extra Pubkey fields, so the lengths differ.
+        assert!(
+            ValidatorV7Registry::try_from_slice(&bytes).is_err(),
+            "a non-empty V1 registry must not decode as V2"
+        );
+        // ...but `decode_registry` migrates it forward.
+        let migrated = decode_registry(&bytes).expect("a legacy V1 registry migrates, never None");
+        assert_eq!(migrated.validators.len(), 1);
+        let e = &migrated.validators[0];
+        assert_eq!(e.address, addr);
+        assert_eq!(e.operator_address, addr, "pre-#193-B: operator == consensus address");
+        assert_eq!(e.withdrawal_address, addr, "pre-#193-B: withdrawal == consensus address");
+        assert_eq!(e.moniker, "legacy");
+        assert_eq!(e.bond, VALIDATOR_BOND_ATOMS);
+        assert_eq!(e.state, ValidatorV7State::Active);
+        assert_eq!(e.registered_quanto, 3);
+        assert_eq!(e.activation_quanto, 4);
+        assert_eq!(e.participation_credits, 7);
+        assert_eq!(e.participation_opportunities, 9);
+        // The migrated registry round-trips as the current V2 format.
+        let v2_bytes = borsh::to_vec(&migrated).unwrap();
+        assert_eq!(decode_registry(&v2_bytes).unwrap().validators.len(), 1);
+        // A current empty registry decodes directly (no migration path).
+        assert!(decode_registry(&borsh::to_vec(&ValidatorV7Registry::default()).unwrap()).is_some());
+        // Genuinely-corrupt bytes → None: the caller halts, never uses empty.
+        assert!(decode_registry(&[0xFFu8; 7]).is_none(), "garbage must be rejected, not silently emptied");
     }
 }

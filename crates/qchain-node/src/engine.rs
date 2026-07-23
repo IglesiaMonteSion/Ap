@@ -4550,12 +4550,29 @@ impl Engine {
                     let mut v7_members: Option<Vec<qchain_execution::validator_v7::ActiveV7Member>> = None;
                     let mut phase3_registry: Option<qchain_execution::validator_registry::ValidatorRegistryData> = None;
                     if state.ledger.is_economics_v7() {
-                        let registry = state
+                        // Pre-mainnet #1: MIGRATE a known legacy layout forward
+                        // instead of falling back to an EMPTY registry on a
+                        // present-but-old one (which would drop to the inherited/
+                        // genesis committee and can diverge a multi-validator
+                        // network). Absent = legitimately empty; present-but-
+                        // corrupt = fail-loud halt (the startup gate already
+                        // rejects it, so this is defense-in-depth for runtime
+                        // disk corruption).
+                        let registry = match state
                             .ledger
                             .store()
                             .get(&qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
-                            .and_then(|a| <qchain_execution::validator_v7::ValidatorV7Registry as borsh::BorshDeserialize>::try_from_slice(&a.data).ok())
-                            .unwrap_or_default();
+                        {
+                            None => qchain_execution::validator_v7::ValidatorV7Registry::default(),
+                            Some(a) => qchain_execution::validator_v7::decode_registry(&a.data)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "VALIDATOR_REGISTRY (v7) present but corrupt at the epoch \
+                                         ratchet — halting (restore from a good backup / re-sync a \
+                                         fresh data_dir)"
+                                    )
+                                }),
+                        };
                         // Activation is synced to the epoch via the quanto clock:
                         // `active_committee` only seats a validator whose
                         // `activation_quanto <= current_quanto`, and `jail_inactive`
