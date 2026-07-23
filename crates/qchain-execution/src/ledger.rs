@@ -1189,9 +1189,23 @@ impl Ledger {
         if economics_v7 {
             // A v7 network is always freshly genesis'd, so the v7 set is present.
             let globalok = |d: &[u8]| crate::staking_v7::GlobalStakingState::try_from_slice(d).is_ok();
-            let vregok = |d: &[u8]| crate::validator_v7::ValidatorV7Registry::try_from_slice(d).is_ok();
             required(STAKING_GLOBAL_ID, "STAKING_GLOBAL", &globalok)?;
-            required(crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID, "VALIDATOR_REGISTRY (v7)", &vregok)?;
+            // VALIDATOR_REGISTRY (v7): require PRESENCE but TOLERATE a non-decode.
+            // Unlike the money/authority singletons (params, crypto registry,
+            // staking global, pools, treasury) — where a silent default changes
+            // fund control or security — the validator registry has a SAFE,
+            // deterministic fallback: if it doesn't decode, the epoch ratchet
+            // reads it as EMPTY and falls back to the genesis committee (already
+            // the engine's behavior). It touches WHO is in the committee, never
+            // funds, and it is re-derivable. A Borsh layout evolution across
+            // versions can legitimately leave an old-format-but-present registry
+            // on a live network that the node has been safely tolerating; halting
+            // on it would brick that network for a non-fund-safety reason. So we
+            // check presence (seeded at genesis) and let the safe fallback handle
+            // an undecodable one.
+            if self.store.get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID).is_none() {
+                return Err("critical singleton VALIDATOR_REGISTRY (v7) is MISSING post-genesis — refusing to start".to_string());
+            }
             // Economic pools are plain balances (no decode) — just require presence.
             for (id, name) in [
                 (STAKING_RESERVE_ID, "STAKING_RESERVE"),
@@ -2675,6 +2689,40 @@ mod tests {
     fn an_absent_params_account_defaults_without_halting() {
         let ledger = new_test_ledger();
         assert_eq!(ledger.current_params(), EconomicParams::default());
+    }
+
+    /// #217 honest scope: the v7 VALIDATOR_REGISTRY is NOT a money/authority
+    /// singleton — a present-but-undecodable one (a Borsh layout evolution across
+    /// versions on a LIVE network) must be TOLERATED by the startup gate (it has
+    /// a safe genesis-committee fallback), never a hard halt. This is the exact
+    /// scenario that bricked a live v7 network: an old-format validator registry
+    /// the node had been safely falling back on for months.
+    #[test]
+    fn a_corrupt_v7_validator_registry_is_tolerated_not_a_startup_halt() {
+        use crate::ids::{
+            STAKING_GLOBAL_ID, STAKING_RESERVE_ID, STAKING_UNBONDING_POOL_ID,
+            VALIDATOR_BOND_ESCROW_ID, VALIDATOR_FEE_POOL_ID, VALIDATOR_UNBONDING_POOL_ID,
+            ADMIN_FEE_WALLET, PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID,
+            VALIDATOR_REGISTRY_ACCOUNT_ID,
+        };
+        let mut l = new_test_ledger();
+        // Seed the universal + v7 required set with VALID bytes...
+        l.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&EconomicParams::default()).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+        l.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&Vec::<qchain_crypto::RegistryEntry>::new()).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+        l.seed_account(STAKING_GLOBAL_ID, Account { data: borsh::to_vec(&crate::staking_v7::GlobalStakingState::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
+        for id in [STAKING_RESERVE_ID, VALIDATOR_FEE_POOL_ID, STAKING_UNBONDING_POOL_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_BOND_ESCROW_ID, ADMIN_FEE_WALLET] {
+            l.seed_account(id, Account::new_wallet(STAKING_PROGRAM_ID));
+        }
+        // ...but the validator registry is PRESENT-but-CORRUPT (old/garbage layout).
+        l.seed_account(VALIDATOR_REGISTRY_ACCOUNT_ID, Account { data: vec![0xFF; 7], ..Account::new_wallet(STAKING_PROGRAM_ID) });
+        // The gate must NOT halt — the corrupt validator registry is tolerated.
+        assert!(l.validate_critical_singletons(true).is_ok(), "a corrupt v7 validator registry must be tolerated by the startup gate, not halt");
+        // But an ABSENT one still fails (it must be present post-genesis).
+        let mut l2 = new_test_ledger();
+        l2.seed_account(PARAMS_ACCOUNT_ID, Account { data: borsh::to_vec(&EconomicParams::default()).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+        l2.seed_account(REGISTRY_ACCOUNT_ID, Account { data: borsh::to_vec(&Vec::<qchain_crypto::RegistryEntry>::new()).unwrap(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) });
+        l2.seed_account(STAKING_GLOBAL_ID, Account { data: borsh::to_vec(&crate::staking_v7::GlobalStakingState::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
+        assert!(l2.validate_critical_singletons(true).is_err(), "an absent v7 validator registry still fails the gate");
     }
 
     fn new_test_ledger_compressed() -> Ledger {

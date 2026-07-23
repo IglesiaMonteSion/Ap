@@ -288,15 +288,20 @@ pub enum ValidatorV7Instruction {
 pub struct ValidatorV7Program;
 
 fn read_registry(accounts: &HashMap<Pubkey, Account>) -> ValidatorV7Registry {
-    // FAIL-LOUD (#217): absent = empty registry (not yet seeded); present but
-    // undecodable = corrupt/version-skewed validator registry → refuse to run,
-    // never silently treat it as EMPTY (which would drop every registered
-    // validator from the committee and the fee split).
+    // #217 honest scope: the validator registry is NOT a money/authority
+    // singleton — a non-decode has a SAFE, deterministic fallback (empty →
+    // genesis committee, exactly what the epoch ratchet already does), it never
+    // touches funds, and it is re-derivable. A Borsh layout evolution across
+    // versions can legitimately leave an old-format-but-present registry on a
+    // LIVE network that the node has been safely tolerating; panicking here would
+    // brick that network on the next v7 registry op for a non-fund-safety reason.
+    // So: absent OR undecodable → empty registry, matching the engine's tolerant
+    // read (`try_from_slice(..).ok().unwrap_or_default()`). Fail-loud stays on
+    // the singletons where a silent default is dangerous (params/crypto registry/
+    // staking global/pools/treasury).
     match accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID) {
         None => ValidatorV7Registry::default(),
-        Some(a) => ValidatorV7Registry::try_from_slice(&a.data).unwrap_or_else(|e| {
-            panic!("VALIDATOR_REGISTRY_ACCOUNT is present but does not decode as the v7 registry ({e}); refusing to run on corrupt validator registry")
-        }),
+        Some(a) => ValidatorV7Registry::try_from_slice(&a.data).unwrap_or_default(),
     }
 }
 
