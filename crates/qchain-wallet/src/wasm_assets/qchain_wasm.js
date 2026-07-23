@@ -184,9 +184,10 @@ export function signCallProgram(seed, program_id, accounts_csv, args_csv, nonce,
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signClaimReward(seed, stake_account, nonce, chain_id, fee_limit) {
+export function signClaimReward(seed, stake_account, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -197,7 +198,7 @@ export function signClaimReward(seed, stake_account, nonce, chain_id, fee_limit)
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signClaimReward(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit);
+        wasm.signClaimReward(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -226,9 +227,10 @@ export function signClaimReward(seed, stake_account, nonce, chain_id, fee_limit)
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signDelegate(seed, validator, amount, stake_account, nonce, chain_id, fee_limit) {
+export function signDelegate(seed, validator, amount, stake_account, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred6_0;
     let deferred6_1;
     try {
@@ -241,7 +243,7 @@ export function signDelegate(seed, validator, amount, stake_account, nonce, chai
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len3 = WASM_VECTOR_LEN;
-        wasm.signDelegate(retptr, ptr0, len0, ptr1, len1, amount, ptr2, len2, nonce, ptr3, len3, fee_limit);
+        wasm.signDelegate(retptr, ptr0, len0, ptr1, len1, amount, ptr2, len2, nonce, ptr3, len3, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -320,9 +322,10 @@ export function signDeployProgram(seed, index, module_bytes, entry_point, nonce,
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signExecute(seed, proposal, registry, nonce, chain_id, fee_limit) {
+export function signExecute(seed, proposal, registry, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -333,7 +336,7 @@ export function signExecute(seed, proposal, registry, nonce, chain_id, fee_limit
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signExecute(retptr, ptr0, len0, ptr1, len1, registry, nonce, ptr2, len2, fee_limit);
+        wasm.signExecute(retptr, ptr0, len0, ptr1, len1, registry, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -360,9 +363,10 @@ export function signExecute(seed, proposal, registry, nonce, chain_id, fee_limit
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signFinalize(seed, proposal, nonce, chain_id, fee_limit) {
+export function signFinalize(seed, proposal, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -373,7 +377,7 @@ export function signFinalize(seed, proposal, nonce, chain_id, fee_limit) {
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signFinalize(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit);
+        wasm.signFinalize(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -402,9 +406,10 @@ export function signFinalize(seed, proposal, nonce, chain_id, fee_limit) {
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signTransfer(seed, to, amount, nonce, chain_id, fee_limit) {
+export function signTransfer(seed, to, amount, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -415,7 +420,7 @@ export function signTransfer(seed, to, amount, nonce, chain_id, fee_limit) {
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signTransfer(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        wasm.signTransfer(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -442,9 +447,10 @@ export function signTransfer(seed, to, amount, nonce, chain_id, fee_limit) {
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signUndelegate(seed, stake_account, nonce, chain_id, fee_limit) {
+export function signUndelegate(seed, stake_account, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -455,7 +461,7 @@ export function signUndelegate(seed, stake_account, nonce, chain_id, fee_limit) 
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signUndelegate(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit);
+        wasm.signUndelegate(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -483,9 +489,10 @@ export function signUndelegate(seed, stake_account, nonce, chain_id, fee_limit) 
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signV7BeginUnstake(seed, position, amount, nonce, chain_id, fee_limit) {
+export function signV7BeginUnstake(seed, position, amount, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -496,7 +503,7 @@ export function signV7BeginUnstake(seed, position, amount, nonce, chain_id, fee_
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signV7BeginUnstake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        wasm.signV7BeginUnstake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -524,9 +531,10 @@ export function signV7BeginUnstake(seed, position, amount, nonce, chain_id, fee_
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signV7IncreaseStake(seed, position, amount, nonce, chain_id, fee_limit) {
+export function signV7IncreaseStake(seed, position, amount, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -537,7 +545,7 @@ export function signV7IncreaseStake(seed, position, amount, nonce, chain_id, fee
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signV7IncreaseStake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        wasm.signV7IncreaseStake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -566,9 +574,10 @@ export function signV7IncreaseStake(seed, position, amount, nonce, chain_id, fee
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signV7Stake(seed, position, amount, nonce, chain_id, fee_limit) {
+export function signV7Stake(seed, position, amount, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -579,7 +588,7 @@ export function signV7Stake(seed, position, amount, nonce, chain_id, fee_limit) 
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signV7Stake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit);
+        wasm.signV7Stake(retptr, ptr0, len0, ptr1, len1, amount, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -606,9 +615,10 @@ export function signV7Stake(seed, position, amount, nonce, chain_id, fee_limit) 
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signV7WithdrawUnbonded(seed, position, nonce, chain_id, fee_limit) {
+export function signV7WithdrawUnbonded(seed, position, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -619,7 +629,7 @@ export function signV7WithdrawUnbonded(seed, position, nonce, chain_id, fee_limi
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len2 = WASM_VECTOR_LEN;
-        wasm.signV7WithdrawUnbonded(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit);
+        wasm.signV7WithdrawUnbonded(retptr, ptr0, len0, ptr1, len1, nonce, ptr2, len2, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -649,9 +659,10 @@ export function signV7WithdrawUnbonded(seed, position, nonce, chain_id, fee_limi
  * @param {bigint} nonce
  * @param {Uint8Array} chain_id
  * @param {bigint} fee_limit
+ * @param {bigint} valid_until_round
  * @returns {string}
  */
-export function signVote(seed, proposal, stake_account, choice, nonce, chain_id, fee_limit) {
+export function signVote(seed, proposal, stake_account, choice, nonce, chain_id, fee_limit, valid_until_round) {
     let deferred6_0;
     let deferred6_1;
     try {
@@ -664,7 +675,7 @@ export function signVote(seed, proposal, stake_account, choice, nonce, chain_id,
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passArray8ToWasm0(chain_id, wasm.__wbindgen_export);
         const len3 = WASM_VECTOR_LEN;
-        wasm.signVote(retptr, ptr0, len0, ptr1, len1, ptr2, len2, choice, nonce, ptr3, len3, fee_limit);
+        wasm.signVote(retptr, ptr0, len0, ptr1, len1, ptr2, len2, choice, nonce, ptr3, len3, fee_limit, valid_until_round);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);

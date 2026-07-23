@@ -44,6 +44,10 @@ MAN="$OUTDIR/RELEASE-MANIFEST.txt"
   echo "# sha256 de los artefactos que se firman con esta release:"
   # El Cargo.lock (deps pinneadas), el Dockerfile (receta de build), y el SBOM.
   sha256sum Cargo.lock Dockerfile rust-toolchain.toml "$OUTDIR/sbom.cdx.json" 2>/dev/null || true
+  echo
+  echo "# huellas de los assets de la WALLET WEB (lo que el navegador ejecuta;"
+  echo "# compará contra Ajustes -> 'huella del código' / GET /api/version):"
+  bash deploy/wallet-asset-manifest.sh 2>/dev/null || echo "(no se pudo generar el manifiesto de la wallet)"
 } > "$MAN"
 cat "$MAN"
 

@@ -1165,6 +1165,14 @@ fn blast_txs_async(rpc: &str, txs: Vec<Transaction>, baseline_executed: u64) -> 
     })
 }
 
+/// Ventana de validez por defecto para TODA tx mutadora del CLI (endurecimiento
+/// #213): staking, gobernanza, tesorería, registro de validadores, contratos y
+/// pausa de emergencia caducan `DEFAULT_CLI_TTL_ROUNDS` rondas después de la
+/// ronda actual — nunca `0` (sin caducidad). Acota el replay de una tx firmada
+/// que quede atascada/capturada. Generosa (~operación de operador con revisión),
+/// ajustable en `transfer` con `--valid-for-rounds`.
+const DEFAULT_CLI_TTL_ROUNDS: u64 = 3600;
+
 fn submit_instruction(
     rpc: &str,
     payer: &Keypair,
@@ -1174,7 +1182,10 @@ fn submit_instruction(
     nonce: Option<u64>,
     fee_limit: u64,
 ) -> anyhow::Result<serde_json::Value> {
-    submit_instruction_p(rpc, payer, program_id, accounts, data, nonce, fee_limit, 0, 0)
+    // TTL obligatorio: se lee la ronda actual (fail-closed — si el nodo no
+    // responde, `?` aborta y no se firma una tx sin caducidad).
+    let valid_until_round = fetch_current_round(rpc)?.saturating_add(DEFAULT_CLI_TTL_ROUNDS);
+    submit_instruction_p(rpc, payer, program_id, accounts, data, nonce, fee_limit, 0, valid_until_round)
 }
 
 /// Current committed round (`next_round`) from the node's `/status` — used to
@@ -1255,10 +1266,11 @@ fn main() -> anyhow::Result<()> {
             let to_pk: Pubkey = to.parse()?;
             let data = borsh::to_vec(&SystemInstruction::Transfer { amount })?;
             // Relative expiry (#191): turn `--valid-for-rounds N` into an absolute
-            // `valid_until_round = current_round + N`. Unset = 0 = never expires.
+            // `valid_until_round = current_round + N`. TTL obligatorio (#213): sin
+            // el flag usa la ventana por defecto (NO 0/sin caducidad).
             let valid_until_round = match valid_for_rounds {
+                None => fetch_current_round(&rpc)?.saturating_add(DEFAULT_CLI_TTL_ROUNDS),
                 Some(n) => fetch_current_round(&rpc)?.saturating_add(n),
-                None => 0,
             };
             let body = submit_instruction_p(&rpc, &payer, Pubkey::system_program_id(), vec![payer.pubkey(), to_pk], data, nonce, fee_limit, priority_fee, valid_until_round)?;
             println!("submitted: {body}");

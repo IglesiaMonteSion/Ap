@@ -150,6 +150,7 @@ pub fn derive_account_seed(master_seed: &[u8; 32], index: u32) -> [u8; 32] {
 /// Sign a `Delegate` (stake `amount` to `validator`). `stake_account` is the
 /// fresh address the browser generated for this position. accounts order matches
 /// the CLI: [payer, stake_account, stats, reward_pool].
+#[allow(clippy::too_many_arguments)]
 pub fn sign_delegate_json(
     seed: &[u8; 32],
     validator: &str,
@@ -158,6 +159,7 @@ pub fn sign_delegate_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let validator_pk: Pubkey = validator.trim().parse().map_err(|e| anyhow::anyhow!("validator address invalid: {e}"))?;
@@ -167,7 +169,7 @@ pub fn sign_delegate_json(
         accounts: vec![payer.pubkey(), stake_pk, Pubkey::new(STAKING_STATS_ID), Pubkey::new(STAKING_REWARDS_POOL_ID)],
         data: delegate_instruction_data(&validator_pk.to_bytes(), amount),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -179,6 +181,7 @@ pub fn sign_undelegate_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let stake_pk: Pubkey = stake_account.trim().parse().map_err(|e| anyhow::anyhow!("stake account address invalid: {e}"))?;
@@ -187,7 +190,7 @@ pub fn sign_undelegate_json(
         accounts: vec![stake_pk, Pubkey::new(STAKING_STATS_ID), Pubkey::new(STAKING_REWARDS_POOL_ID)],
         data: vec![1u8],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -199,6 +202,7 @@ pub fn sign_claim_reward_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let stake_pk: Pubkey = stake_account.trim().parse().map_err(|e| anyhow::anyhow!("stake account address invalid: {e}"))?;
@@ -207,7 +211,7 @@ pub fn sign_claim_reward_json(
         accounts: vec![stake_pk, Pubkey::new(STAKING_REWARDS_POOL_ID)],
         data: vec![2u8],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -228,7 +232,7 @@ fn v7_amount_instruction_data(disc: u8, amount: u64) -> Vec<u8> {
 /// staking reserve and the position accrues via the index. `position` is the
 /// fresh, seed-derived address the browser picked for this position. accounts =
 /// [payer, position, STAKING_GLOBAL, STAKING_RESERVE].
-pub fn sign_v7_stake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+pub fn sign_v7_stake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64, valid_until_round: u64) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
     let ix = Instruction {
@@ -236,13 +240,13 @@ pub fn sign_v7_stake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u
         accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID)],
         data: v7_amount_instruction_data(0, amount),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
 /// v7 `IncreaseStake` (`[1]`): add `amount` to an EXISTING position you own.
 /// accounts = [payer, position, STAKING_GLOBAL, STAKING_RESERVE].
-pub fn sign_v7_increase_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+pub fn sign_v7_increase_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64, valid_until_round: u64) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
     let ix = Instruction {
@@ -250,14 +254,14 @@ pub fn sign_v7_increase_json(seed: &[u8; 32], position: &str, amount: u64, nonce
         accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID)],
         data: v7_amount_instruction_data(1, amount),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
 /// v7 `BeginUnstake` (`[2]`): move `amount` atoms of value into unbonding
 /// (withdrawing rewards = a partial unstake of the accrued value). accounts =
 /// [payer, position, STAKING_GLOBAL, STAKING_RESERVE, STAKING_UNBONDING_POOL].
-pub fn sign_v7_begin_unstake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+pub fn sign_v7_begin_unstake_json(seed: &[u8; 32], position: &str, amount: u64, nonce: u64, chain_id: &[u8; 32], fee_limit: u64, valid_until_round: u64) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
     let ix = Instruction {
@@ -265,14 +269,14 @@ pub fn sign_v7_begin_unstake_json(seed: &[u8; 32], position: &str, amount: u64, 
         accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_GLOBAL_ID), Pubkey::new(STAKING_RESERVE_ID), Pubkey::new(STAKING_UNBONDING_POOL_ID)],
         data: v7_amount_instruction_data(2, amount),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
 /// v7 `WithdrawUnbonded` (`[3]`): pay out the matured unbonding chunk. accounts =
 /// [payer, position, STAKING_UNBONDING_POOL, STAKING_GLOBAL]. The global account
 /// is required so the maturity check reads the real current quanto (audit fix).
-pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u64, chain_id: &[u8; 32], fee_limit: u64) -> anyhow::Result<String> {
+pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u64, chain_id: &[u8; 32], fee_limit: u64, valid_until_round: u64) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let pos_pk: Pubkey = position.trim().parse().map_err(|e| anyhow::anyhow!("position address invalid: {e}"))?;
     let ix = Instruction {
@@ -280,7 +284,7 @@ pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u6
         accounts: vec![payer.pubkey(), pos_pk, Pubkey::new(STAKING_UNBONDING_POOL_ID), Pubkey::new(STAKING_GLOBAL_ID)],
         data: vec![3u8],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -290,6 +294,7 @@ pub fn sign_v7_withdraw_unbonded_json(seed: &[u8; 32], position: &str, nonce: u6
 /// `governance_instruction_encoding_is_stable` in qchain-execution). The stake
 /// account's stored `owner` must equal this payer, so only positions you
 /// control can vote.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_vote_json(
     seed: &[u8; 32],
     proposal: &str,
@@ -298,6 +303,7 @@ pub fn sign_vote_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     if choice > 2 {
         anyhow::bail!("vote choice must be 0=Yes, 1=No, or 2=Abstain");
@@ -310,7 +316,7 @@ pub fn sign_vote_json(
         accounts: vec![proposal_pk, stake_pk],
         data: vec![1u8, choice],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -323,6 +329,7 @@ pub fn sign_finalize_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let proposal_pk: Pubkey = proposal.trim().parse().map_err(|e| anyhow::anyhow!("proposal address invalid: {e}"))?;
@@ -331,7 +338,7 @@ pub fn sign_finalize_json(
         accounts: vec![proposal_pk, Pubkey::new(STAKING_STATS_ID)],
         data: vec![2u8],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -349,6 +356,7 @@ pub fn sign_execute_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let proposal_pk: Pubkey = proposal.trim().parse().map_err(|e| anyhow::anyhow!("proposal address invalid: {e}"))?;
@@ -361,7 +369,7 @@ pub fn sign_execute_json(
         accounts: vec![proposal_pk, Pubkey::new(target), Pubkey::new(EMERGENCY_ACCOUNT_ID)],
         data: vec![3u8],
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -375,6 +383,7 @@ pub fn sign_transfer_json(
     nonce: u64,
     chain_id: &[u8; 32],
     fee_limit: u64,
+    valid_until_round: u64,
 ) -> anyhow::Result<String> {
     let payer = Keypair::generate_from_seed(seed)?;
     let to_pk: Pubkey = to.trim().parse().map_err(|e| anyhow::anyhow!("destination address invalid: {e}"))?;
@@ -383,7 +392,7 @@ pub fn sign_transfer_json(
         accounts: vec![payer.pubkey(), to_pk],
         data: transfer_instruction_data(amount),
     };
-    let tx = Transaction::new_signed(&payer, nonce, *chain_id, fee_limit, vec![ix])?;
+    let tx = Transaction::new_signed_full(&payer, nonce, *chain_id, fee_limit, 0, valid_until_round, vec![ix])?;
     Ok(serde_json::to_string(&tx)?)
 }
 
@@ -449,6 +458,7 @@ const MAX_CALL_ARGS: usize = 32;
 /// value makes the tx expire at that committed round. Contract deploy/call txs
 /// should carry a SHORT window (re-audit #4) so a signed-but-not-broadcast tx
 /// can't be replayed much later against a changed on-chain state.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_deploy_program_json(
     seed: &[u8; 32],
     index: u32,
@@ -490,6 +500,7 @@ pub fn sign_deploy_program_json(
 /// each as little-endian `i64` in `ix.data`). program_id = the contract's
 /// address (the ledger dispatches loader-owned accounts to WASM). The payer
 /// (seed) signs; `host_is_signer` sees the payer as the authenticated signer.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_call_program_json(
     seed: &[u8; 32],
     program_id: &str,
@@ -646,8 +657,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_transfer_json(&as32(seed, "seed")?, to, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_transfer_json(&as32(seed, "seed")?, to, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -688,8 +700,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_delegate_json(&as32(seed, "seed")?, validator, amount, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_delegate_json(&as32(seed, "seed")?, validator, amount, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -701,8 +714,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_undelegate_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_undelegate_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -714,34 +728,35 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_claim_reward_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_claim_reward_json(&as32(seed, "seed")?, stake_account, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signV7Stake(seed, position, amount, nonce, chainId, feeLimit) -> string`
     /// v7 networks only: open a new staking position (no validator target).
     #[wasm_bindgen(js_name = signV7Stake)]
-    pub fn sign_v7_stake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
-        super::sign_v7_stake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    pub fn sign_v7_stake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64, valid_until_round: u64) -> Result<String, JsValue> {
+        super::sign_v7_stake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signV7IncreaseStake(seed, position, amount, nonce, chainId, feeLimit) -> string`
     #[wasm_bindgen(js_name = signV7IncreaseStake)]
-    pub fn sign_v7_increase(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
-        super::sign_v7_increase_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    pub fn sign_v7_increase(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64, valid_until_round: u64) -> Result<String, JsValue> {
+        super::sign_v7_increase_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signV7BeginUnstake(seed, position, amount, nonce, chainId, feeLimit) -> string`
     #[wasm_bindgen(js_name = signV7BeginUnstake)]
-    pub fn sign_v7_begin_unstake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
-        super::sign_v7_begin_unstake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    pub fn sign_v7_begin_unstake(seed: &[u8], position: &str, amount: u64, nonce: u64, chain_id: &[u8], fee_limit: u64, valid_until_round: u64) -> Result<String, JsValue> {
+        super::sign_v7_begin_unstake_json(&as32(seed, "seed")?, position, amount, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signV7WithdrawUnbonded(seed, position, nonce, chainId, feeLimit) -> string`
     #[wasm_bindgen(js_name = signV7WithdrawUnbonded)]
-    pub fn sign_v7_withdraw_unbonded(seed: &[u8], position: &str, nonce: u64, chain_id: &[u8], fee_limit: u64) -> Result<String, JsValue> {
-        super::sign_v7_withdraw_unbonded_json(&as32(seed, "seed")?, position, nonce, &as32(chain_id, "chain_id")?, fee_limit).map_err(|e| JsValue::from_str(&e.to_string()))
+    pub fn sign_v7_withdraw_unbonded(seed: &[u8], position: &str, nonce: u64, chain_id: &[u8], fee_limit: u64, valid_until_round: u64) -> Result<String, JsValue> {
+        super::sign_v7_withdraw_unbonded_json(&as32(seed, "seed")?, position, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// `signVote(seed, proposal, stakeAccount, choice, nonce, chainId, feeLimit) -> string`
@@ -756,8 +771,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_vote_json(&as32(seed, "seed")?, proposal, stake_account, choice, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_vote_json(&as32(seed, "seed")?, proposal, stake_account, choice, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -769,8 +785,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_finalize_json(&as32(seed, "seed")?, proposal, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_finalize_json(&as32(seed, "seed")?, proposal, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -786,8 +803,9 @@ mod wasm {
         nonce: u64,
         chain_id: &[u8],
         fee_limit: u64,
+        valid_until_round: u64,
     ) -> Result<String, JsValue> {
-        super::sign_execute_json(&as32(seed, "seed")?, proposal, registry, nonce, &as32(chain_id, "chain_id")?, fee_limit)
+        super::sign_execute_json(&as32(seed, "seed")?, proposal, registry, nonce, &as32(chain_id, "chain_id")?, fee_limit, valid_until_round)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

@@ -277,6 +277,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/wasm", get(wasm_page))
         .route("/wasm/qchain_wasm.js", get(wasm_js))
         .route("/wasm/qchain_wasm_bg.wasm", get(wasm_bg))
+        // App JS externalizado + versionado por content-hash + SRI (#214).
+        .route("/app/:name", get(app_js))
+        // Provenance del build (versión + hashes) para verificar en la app.
+        .route("/api/version", get(wallet_version))
         .route("/vendor/jsQR.min.js", get(jsqr_js))
         // brand / PWA assets (favicon, home-screen icons, manifest)
         .route("/icon.svg", get(icon_svg))
@@ -392,10 +396,12 @@ async fn main() -> anyhow::Result<()> {
 /// seed in browser memory + an encrypted blob in localStorage and is often
 /// exposed publicly (Cloudflare tunnel), so the only barrier between any future
 /// injection and total seed theft is the hand-rolled `esc()` - CSP is the
-/// backstop if one were ever missed. `'unsafe-inline'` + `'wasm-unsafe-eval'`
-/// are required (the whole app is inline JS/CSS + a WASM signer), so the CSP is
-/// weaker than ideal, but `object-src 'none'`/`base-uri 'none'`/`frame-ancestors
-/// 'none'` still cut the main injection-escalation and framing vectors. The
+/// backstop if one were ever missed. Tras #214 el `script-src` YA NO lleva
+/// `'unsafe-inline'` (el JS de la app va externo con SRI), así un `<script>`
+/// inyectado por un XSS no corre; sólo queda `'wasm-unsafe-eval'` (instanciar el
+/// firmante WASM). `style-src 'unsafe-inline'` se conserva (los `style=` inline
+/// no exfiltran la semilla con connect-src/img-src acotados). Más
+/// `object-src`/`base-uri`/`frame-ancestors 'none'`. The
 /// three simple headers are unconditionally safe: every handler sets an explicit
 /// Content-Type (nosniff), the wallet is never meant to be framed (clickjacking
 /// the send/confirm flow), and the URL/path shouldn't leak outward (no-referrer).
@@ -405,7 +411,15 @@ async fn security_headers(req: Request, next: Next) -> Response {
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+            // script-src SIN 'unsafe-inline' (#214): todo el JS de la app se sirve
+            // como un archivo externo con SRI (`/app/app-<hash>.js`), así un
+            // <script> inline inyectado por un XSS NO se ejecuta. 'wasm-unsafe-eval'
+            // sigue (el firmante WASM lo necesita para instanciar el módulo; no es
+            // 'unsafe-inline'). style-src conserva 'unsafe-inline' a propósito: la
+            // UI usa ~155 `style=` inline (no hasheables por atributo) y una
+            // inyección de CSS NO puede exfiltrar la semilla con connect-src 'self'
+            // + img-src acotado (un `url(https://evil/…)` de CSS lo bloquea img-src).
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
              style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; \
              object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         ),
@@ -508,7 +522,9 @@ fn ct_password_eq(a: &str, b: &str) -> bool {
 }
 
 async fn index() -> Html<&'static str> {
-    Html(include_str!("wallet.html"))
+    // Custodial wallet HTML with its external-JS src/SRI placeholders filled in
+    // (#214): its inline <script> was externalized so the strict CSP applies here too.
+    Html(asset_hashes().custodial_html.as_str())
 }
 
 async fn config(State(st): State<Arc<AppState>>) -> Json<Value> {
@@ -577,8 +593,108 @@ async fn faucet_request(
 
 // ---- non-custodial WASM wallet (keys live in the browser) ----------------
 
+// ---- Endurecimiento de assets (#214) --------------------------------------
+// El JS de la wallet (la superficie que toca la semilla) se sirve como un
+// ARCHIVO EXTERNO versionado por content-hash (`/app/app-<hash>.js`) con
+// integridad SRI, en vez de inline — así la CSP puede quitar `'unsafe-inline'`
+// del `script-src` (un `<script>` inyectado por un XSS ya no se ejecuta). El
+// hash SRI (SHA-384) y la URL versionada (SHA-256[:12]) se computan EN RUST a
+// partir de los mismos bytes embebidos, así el `integrity=` del HTML NUNCA
+// puede driftear de lo que se sirve (una sola fuente de verdad, sin build step).
+//
+// LÍMITE HONESTO (documentado): SRI servido por el MISMO origen NO defiende
+// contra un SERVIDOR malicioso (que reescribe el `integrity` para que calce con
+// su JS malicioso). Sí frena un XSS/inyección (CSP) y una manipulación de UN
+// recurso en tránsito. La defensa real contra un servidor malicioso es que el
+// usuario compare el hash mostrado en la app (`/api/version`) contra un release
+// FIRMADO publicado fuera de banda (o use una extensión/hardware wallet). El
+// hash visible + el manifiesto firmado + el build reproducible existen para
+// ESO: detectabilidad de bytes servidos != release firmado.
+const APP_JS: &str = include_str!("wasm_assets/app.js");
+const CUSTODIAL_JS: &str = include_str!("wasm_assets/custodial.js");
+const WALLET_HTML: &str = include_str!("wasm_wallet.html");
+const CUSTODIAL_HTML: &str = include_str!("wallet.html");
+const WASM_GLUE_JS: &str = include_str!("wasm_assets/qchain_wasm.js");
+const WASM_BG_BYTES: &[u8] = include_bytes!("wasm_assets/qchain_wasm_bg.wasm");
+
+struct AssetHashes {
+    app_js_url: String,        // "/app/app-<sha256hex12>.js"
+    app_js_sri: String,        // "sha384-<b64>"
+    app_js_sha256: String,     // hex, full
+    glue_sha256: String,       // hex
+    wasm_sha256: String,       // hex
+    html: String,              // non-custodial HTML with placeholders filled
+    custodial_html: String,    // custodial HTML with placeholders filled
+}
+
+fn asset_hashes() -> &'static AssetHashes {
+    use base64::engine::general_purpose::STANDARD;
+    use sha2::{Digest, Sha256, Sha384};
+    static H: std::sync::OnceLock<AssetHashes> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let sri = |b: &[u8]| format!("sha384-{}", STANDARD.encode(Sha384::digest(b)));
+        let s256 = |b: &[u8]| hex::encode(Sha256::digest(b));
+        let app_sha256 = s256(APP_JS.as_bytes());
+        let app_url = format!("/app/app-{}.js", &app_sha256[..12]);
+        let cust_sha256 = s256(CUSTODIAL_JS.as_bytes());
+        let cust_url = format!("/app/custodial-{}.js", &cust_sha256[..12]);
+        let html = WALLET_HTML
+            .replace("__APP_JS_SRC__", &app_url)
+            .replace("__APP_JS_SRI__", &sri(APP_JS.as_bytes()));
+        let custodial_html = CUSTODIAL_HTML
+            .replace("__CUSTODIAL_JS_SRC__", &cust_url)
+            .replace("__CUSTODIAL_JS_SRI__", &sri(CUSTODIAL_JS.as_bytes()));
+        AssetHashes {
+            app_js_url: app_url,
+            app_js_sri: sri(APP_JS.as_bytes()),
+            app_js_sha256: app_sha256,
+            glue_sha256: s256(WASM_GLUE_JS.as_bytes()),
+            wasm_sha256: s256(WASM_BG_BYTES),
+            html,
+            custodial_html,
+        }
+    })
+}
+
 async fn wasm_page() -> Html<&'static str> {
-    Html(include_str!("wasm_wallet.html"))
+    Html(asset_hashes().html.as_str())
+}
+
+/// Serves the external, SRI-pinned wallet JS. Content-addressed URL
+/// (`/app/app-<hash>.js` for the non-custodial wallet, `/app/custodial-<hash>.js`
+/// for the custodial one) + immutable cache. The freshly-served HTML always
+/// carries the matching `integrity=`. A name we don't mint → 404 (avoids
+/// serving mismatched-hash bytes under a stale SRI).
+async fn app_js(Path(name): Path<String>) -> Response {
+    let js: &'static str = if name.starts_with("custodial-") {
+        CUSTODIAL_JS
+    } else if name.starts_with("app-") {
+        APP_JS
+    } else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/javascript; charset=utf-8")
+        .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+        .body(Body::from(js))
+        .expect("static js response always builds")
+}
+
+/// Build/version provenance: the wallet version + SHA-256 of every served
+/// script/wasm asset + the SRI of the app JS. Shown IN-APP (Settings) so a user
+/// can compare against a signed release note (see docs/WALLET-HARDENING.md) —
+/// the real defense against a malicious server, which same-origin SRI cannot
+/// provide. Read-only, safe to expose.
+async fn wallet_version() -> Json<serde_json::Value> {
+    let h = asset_hashes();
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "app_js_url": h.app_js_url,
+        "app_js_sri": h.app_js_sri,
+        "app_js_sha256": h.app_js_sha256,
+        "wasm_glue_sha256": h.glue_sha256,
+        "wasm_bg_sha256": h.wasm_sha256,
+    }))
 }
 
 async fn wasm_js() -> Response {

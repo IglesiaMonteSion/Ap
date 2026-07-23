@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
             let nonce: u64 = args[5].parse()?;
             let chain_id = seed(&args[6])?;
             let fee_limit: u64 = args[7].parse()?;
-            print!("{}", qchain_wasm::sign_transfer_json(&s, to, amount, nonce, &chain_id, fee_limit)?);
+            print!("{}", qchain_wasm::sign_transfer_json(&s, to, amount, nonce, &chain_id, fee_limit, args.get(8).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         // sign-expiring <seed> <to> <amount> <nonce> <chain_id_hex> <fee_limit> <valid_until_round>
         // Signs a transfer with an explicit `valid_until_round` (task #191) — used
@@ -59,41 +59,41 @@ fn main() -> anyhow::Result<()> {
         Some("delegate") => {
             // delegate <seed> <validator> <amount> <stake_account> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_delegate_json(&s, &args[3], args[4].parse()?, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+            print!("{}", qchain_wasm::sign_delegate_json(&s, &args[3], args[4].parse()?, &args[5], args[6].parse()?, &seed(&args[7])?, args[8].parse()?, args.get(9).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("vote") => {
             // vote <seed> <proposal> <stake_account> <choice 0|1|2> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_vote_json(&s, &args[3], &args[4], args[5].parse()?, args[6].parse()?, &seed(&args[7])?, args[8].parse()?)?);
+            print!("{}", qchain_wasm::sign_vote_json(&s, &args[3], &args[4], args[5].parse()?, args[6].parse()?, &seed(&args[7])?, args[8].parse()?, args.get(9).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("finalize") => {
             // finalize <seed> <proposal> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_finalize_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
+            print!("{}", qchain_wasm::sign_finalize_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?, args.get(7).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("execute") => {
             // execute <seed> <proposal> <registry 0|1> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_execute_json(&s, &args[3], args[4] != "0", args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+            print!("{}", qchain_wasm::sign_execute_json(&s, &args[3], args[4] != "0", args[5].parse()?, &seed(&args[6])?, args[7].parse()?, args.get(8).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         // v7 staking-path helpers, exercising the exact browser signing code.
         Some("v7-stake") => {
             // v7-stake <seed> <position> <amount> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_v7_stake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+            print!("{}", qchain_wasm::sign_v7_stake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?, args.get(8).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("v7-increase") => {
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_v7_increase_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+            print!("{}", qchain_wasm::sign_v7_increase_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?, args.get(8).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("v7-begin-unstake") => {
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_v7_begin_unstake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?)?);
+            print!("{}", qchain_wasm::sign_v7_begin_unstake_json(&s, &args[3], args[4].parse()?, args[5].parse()?, &seed(&args[6])?, args[7].parse()?, args.get(8).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("v7-withdraw") => {
             // v7-withdraw <seed> <position> <nonce> <chain_id_hex> <fee_limit>
             let s = seed(&args[2])?;
-            print!("{}", qchain_wasm::sign_v7_withdraw_unbonded_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?)?);
+            print!("{}", qchain_wasm::sign_v7_withdraw_unbonded_json(&s, &args[3], args[4].parse()?, &seed(&args[5])?, args[6].parse()?, args.get(7).map(|a| a.parse()).transpose()?.unwrap_or(0))?);
         }
         Some("program-addr") => {
             // program-addr <seed> <index>

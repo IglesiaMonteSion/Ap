@@ -41,4 +41,10 @@ DEST="$ROOT/crates/qchain-wallet/src/wasm_assets"
 mkdir -p "$DEST"
 cp pkg/qchain_wasm.js "$DEST/"
 cp "$WASM" "$DEST/qchain_wasm_bg.wasm"
+
+# Refrescar el manifiesto de assets (#216): hashes SHA-256 + SRI de todo lo que
+# el navegador ejecuta. Se committea y se firma con la release (sign-release.sh)
+# para que un usuario pueda verificar los bytes servidos contra el release firmado.
+bash "$ROOT/deploy/wallet-asset-manifest.sh" -o "$ROOT/crates/qchain-wallet/wallet-assets.manifest.txt" || true
+
 echo "Assets del wallet WASM actualizados en $DEST. Ahora recompilá qchain-wallet."
