@@ -21,7 +21,9 @@ use crate::staking::StakeAccountData;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, Instruction, Round};
 use qchain_crypto::{AlgorithmStatus, Pubkey, RegistryEntry};
-use qchain_governance::{quorum_rule, Proposal, ProposalAction, ProposalId, ProposalStatus, VoteChoice};
+use qchain_governance::{
+    quorum_rule, Proposal, ProposalAction, ProposalId, ProposalStatus, VoteChoice,
+};
 use std::collections::HashMap;
 
 /// Emergency governance state, stored in `EMERGENCY_ACCOUNT_ID`. A set of
@@ -51,7 +53,10 @@ pub enum GovernanceInstruction {
     /// accounts[2] = the canonical staking-stats singleton (read-only) —
     /// the bonded supply here is SNAPSHOTTED into the proposal as the frozen
     /// quorum denominator (task #213).
-    CreateProposal { id: ProposalId, action: ProposalAction },
+    CreateProposal {
+        id: ProposalId,
+        action: ProposalAction,
+    },
     /// accounts[0] = proposal account, accounts[1] = the voter's stake
     /// account (its stored `owner` must equal the transaction payer).
     Vote { choice: VoteChoice },
@@ -87,22 +92,37 @@ fn read_proposal(accounts: &HashMap<Pubkey, Account>, pk: &Pubkey) -> Result<Pro
     Proposal::try_from_slice(&account.data).map_err(borsh_err)
 }
 
-fn write_proposal(accounts: &mut HashMap<Pubkey, Account>, pk: &Pubkey, proposal: &Proposal) -> Result<(), ExecError> {
-    accounts.get_mut(pk).ok_or(ExecError::AccountNotFound(*pk))?.data = borsh::to_vec(proposal).map_err(borsh_err)?;
+fn write_proposal(
+    accounts: &mut HashMap<Pubkey, Account>,
+    pk: &Pubkey,
+    proposal: &Proposal,
+) -> Result<(), ExecError> {
+    accounts
+        .get_mut(pk)
+        .ok_or(ExecError::AccountNotFound(*pk))?
+        .data = borsh::to_vec(proposal).map_err(borsh_err)?;
     Ok(())
 }
 
 pub struct GovernanceProgram;
 
 impl NativeProgram for GovernanceProgram {
-    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, current_round: Round) -> Result<(), ExecError> {
+    fn process(
+        &self,
+        accounts: &mut HashMap<Pubkey, Account>,
+        instruction: &Instruction,
+        payer: &Pubkey,
+        current_round: Round,
+    ) -> Result<(), ExecError> {
         let instr = GovernanceInstruction::try_from_slice(&instruction.data).map_err(borsh_err)?;
         match instr {
             GovernanceInstruction::CreateProposal { id, action } => {
-                let proposer =
-                    *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[0]".into()))?;
-                let proposal_pk =
-                    *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[1]".into()))?;
+                let proposer = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("CreateProposal requires accounts[0]".into())
+                })?;
+                let proposal_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("CreateProposal requires accounts[1]".into())
+                })?;
                 // accounts[2] = the canonical staking-stats singleton. The bonded
                 // supply here is SNAPSHOTTED into the proposal as the frozen quorum
                 // denominator (task #213), so a later shrink of total_staked can't
@@ -112,26 +132,48 @@ impl NativeProgram for GovernanceProgram {
                 let stats_pk =
                     *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("CreateProposal requires accounts[2] = the staking-stats singleton (voting-power snapshot)".into()))?;
                 if stats_pk != crate::ids::STAKING_STATS_ID {
-                    return Err(ExecError::ProgramError("CreateProposal accounts[2] must be the canonical staking-stats account".into()));
+                    return Err(ExecError::ProgramError(
+                        "CreateProposal accounts[2] must be the canonical staking-stats account"
+                            .into(),
+                    ));
                 }
                 if proposer != *payer {
-                    return Err(ExecError::Unauthorized("CreateProposal's proposer account must be the transaction payer".into()));
+                    return Err(ExecError::Unauthorized(
+                        "CreateProposal's proposer account must be the transaction payer".into(),
+                    ));
                 }
                 if accounts.contains_key(&proposal_pk) {
-                    return Err(ExecError::ProgramError("proposal account already exists".into()));
+                    return Err(ExecError::ProgramError(
+                        "proposal account already exists".into(),
+                    ));
                 }
-                let snapshot_total_staked = u64::try_from_slice(&accounts.get(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?.data).map_err(borsh_err)?;
-                let proposal = Proposal::new(id, proposer, action, current_round, snapshot_total_staked);
+                let snapshot_total_staked = u64::try_from_slice(
+                    &accounts
+                        .get(&stats_pk)
+                        .ok_or(ExecError::AccountNotFound(stats_pk))?
+                        .data,
+                )
+                .map_err(borsh_err)?;
+                let proposal =
+                    Proposal::new(id, proposer, action, current_round, snapshot_total_staked);
                 let mut account = Account::new_wallet(GOVERNANCE_PROGRAM_ID);
                 account.data = borsh::to_vec(&proposal).map_err(borsh_err)?;
                 accounts.insert(proposal_pk, account);
             }
 
             GovernanceInstruction::Vote { choice } => {
-                let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Vote requires accounts[0]".into()))?;
-                let stake_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Vote requires accounts[1]".into()))?;
+                let proposal_pk = *instruction
+                    .accounts
+                    .first()
+                    .ok_or_else(|| ExecError::ProgramError("Vote requires accounts[0]".into()))?;
+                let stake_pk = *instruction
+                    .accounts
+                    .get(1)
+                    .ok_or_else(|| ExecError::ProgramError("Vote requires accounts[1]".into()))?;
 
-                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let stake_account = accounts
+                    .get(&stake_pk)
+                    .ok_or(ExecError::AccountNotFound(stake_pk))?;
                 // Defense in depth: the vote weight is derived from bytes in
                 // this account's `data`, so it must be a genuine staking-program
                 // account, not an arbitrary account whose `data` an attacker
@@ -141,25 +183,57 @@ impl NativeProgram for GovernanceProgram {
                 // future arbitrary-data primitive unable to silently enable
                 // vote-weight forgery.
                 if stake_account.owner != crate::ids::STAKING_PROGRAM_ID {
-                    return Err(ExecError::Unauthorized("Vote's stake account must be owned by the staking program".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Vote's stake account must be owned by the staking program".into(),
+                    ));
                 }
-                let mut stake_data = StakeAccountData::try_from_slice(&stake_account.data).map_err(borsh_err)?;
+                let mut stake_data =
+                    StakeAccountData::read_or_legacy(&stake_account.data).map_err(borsh_err)?;
                 if stake_data.owner != *payer {
-                    return Err(ExecError::Unauthorized("Vote's stake account must be owned by the transaction payer".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Vote's stake account must be owned by the transaction payer".into(),
+                    ));
                 }
                 if stake_data.amount == 0 {
-                    return Err(ExecError::ProgramError("stake account has no active (undelegated) stake to vote with".into()));
+                    return Err(ExecError::ProgramError(
+                        "stake account has no active (undelegated) stake to vote with".into(),
+                    ));
                 }
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Voting {
-                    return Err(ExecError::ProgramError("proposal is not open for voting".into()));
+                    return Err(ExecError::ProgramError(
+                        "proposal is not open for voting".into(),
+                    ));
                 }
                 if current_round >= proposal.voting_ends_round {
-                    return Err(ExecError::ProgramError("voting period has ended - call Finalize instead".into()));
+                    return Err(ExecError::ProgramError(
+                        "voting period has ended - call Finalize instead".into(),
+                    ));
+                }
+                // Per-voter creation-time snapshot (roadmap #6). The position
+                // must have existed at or before the proposal was created; stake
+                // delegated AFTER a proposal opened cannot vote on it. This is
+                // sound in the access-list model because a v6 stake account's
+                // `amount` is immutable after `Delegate` (only ever zeroed by
+                // Undelegate/slash, never increased), so a position that predates
+                // the proposal held exactly this `amount` at snapshot time — the
+                // live weight IS the historical weight. It closes the residual the
+                // aggregate `snapshot_total_staked` (task #213) left open: a
+                // flash-staker could still swing a SPECIFIC proposal with capital
+                // acquired after it opened, even though they couldn't lower the
+                // participation bar. A legacy (pre-#6) position decodes with
+                // `created_round = 0` (predates everything), so an existing
+                // delegator's rights are unchanged.
+                if stake_data.created_round > proposal.created_round {
+                    return Err(ExecError::ProgramError(
+                        "this stake position was opened after the proposal was created — stake delegated after a proposal opens cannot vote on it (per-voter creation-time snapshot)".into(),
+                    ));
                 }
                 if !proposal.record_vote(stake_pk, choice, stake_data.amount) {
-                    return Err(ExecError::ProgramError("this stake account already voted on this proposal".into()));
+                    return Err(ExecError::ProgramError(
+                        "this stake account already voted on this proposal".into(),
+                    ));
                 }
                 write_proposal(accounts, &proposal_pk, &proposal)?;
 
@@ -175,14 +249,21 @@ impl NativeProgram for GovernanceProgram {
                 // ends and sit out the review window with zero exposure while
                 // their recorded vote still drives execution. Low tier has a
                 // zero time-lock, so this is unchanged there.
-                let lock_until = proposal.voting_ends_round.saturating_add(quorum_rule(proposal.action.risk_tier()).timelock_rounds);
+                let lock_until = proposal
+                    .voting_ends_round
+                    .saturating_add(quorum_rule(proposal.action.risk_tier()).timelock_rounds);
                 stake_data.locked_until_round = stake_data.locked_until_round.max(lock_until);
-                accounts.get_mut(&stake_pk).unwrap().data = borsh::to_vec(&stake_data).map_err(borsh_err)?;
+                accounts.get_mut(&stake_pk).unwrap().data =
+                    borsh::to_vec(&stake_data).map_err(borsh_err)?;
             }
 
             GovernanceInstruction::Finalize => {
-                let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[0]".into()))?;
-                let stats_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Finalize requires accounts[1]".into()))?;
+                let proposal_pk = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("Finalize requires accounts[0]".into())
+                })?;
+                let stats_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("Finalize requires accounts[1]".into())
+                })?;
 
                 // The stats singleton is still PINNED here (CLI/wallet unchanged),
                 // but the quorum denominator now comes from the proposal's
@@ -198,10 +279,14 @@ impl NativeProgram for GovernanceProgram {
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Voting {
-                    return Err(ExecError::ProgramError("proposal has already been finalized".into()));
+                    return Err(ExecError::ProgramError(
+                        "proposal has already been finalized".into(),
+                    ));
                 }
                 if current_round < proposal.voting_ends_round {
-                    return Err(ExecError::ProgramError("voting period has not ended yet".into()));
+                    return Err(ExecError::ProgramError(
+                        "voting period has not ended yet".into(),
+                    ));
                 }
 
                 let outcome = proposal.evaluate();
@@ -213,7 +298,9 @@ impl NativeProgram for GovernanceProgram {
             }
 
             GovernanceInstruction::Execute => {
-                let proposal_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Execute requires accounts[0]".into()))?;
+                let proposal_pk = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("Execute requires accounts[0]".into())
+                })?;
                 // The account this action actually mutates - the
                 // algorithm registry for a Registry-tier action, the
                 // economic-params singleton for a Low-tier one. The
@@ -221,7 +308,9 @@ impl NativeProgram for GovernanceProgram {
                 // proposal first and pass the matching target; this
                 // program just applies whichever variant `proposal.action`
                 // turns out to be against whatever it's handed.
-                let target_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[1]".into()))?;
+                let target_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("Execute requires accounts[1]".into())
+                })?;
                 // accounts[2] MUST be the emergency singleton (task #213). Pinning
                 // it means a caller can't bypass an active pause by simply omitting
                 // the account: Execute refuses to run without it declared. The read
@@ -232,9 +321,16 @@ impl NativeProgram for GovernanceProgram {
                 // and a `paused` state blocks every Execute until the guardians
                 // unpause. The pause only gates execution here — it never reads or
                 // writes any balance, so it cannot move or confiscate funds.
-                let emergency_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Execute requires accounts[2] = the emergency governance singleton".into()))?;
+                let emergency_pk = *instruction.accounts.get(2).ok_or_else(|| {
+                    ExecError::ProgramError(
+                        "Execute requires accounts[2] = the emergency governance singleton".into(),
+                    )
+                })?;
                 if emergency_pk != crate::ids::EMERGENCY_ACCOUNT_ID {
-                    return Err(ExecError::ProgramError("Execute accounts[2] must be the canonical emergency governance account".into()));
+                    return Err(ExecError::ProgramError(
+                        "Execute accounts[2] must be the canonical emergency governance account"
+                            .into(),
+                    ));
                 }
                 // FAIL-LOUD (#217): absent EMERGENCY account = legacy network without
                 // guardians (pause inert, tolerated). But PRESENT-but-undecodable must
@@ -253,12 +349,18 @@ impl NativeProgram for GovernanceProgram {
 
                 let mut proposal = read_proposal(accounts, &proposal_pk)?;
                 if proposal.status != ProposalStatus::Passed {
-                    return Err(ExecError::ProgramError("proposal has not passed - nothing to execute".into()));
+                    return Err(ExecError::ProgramError(
+                        "proposal has not passed - nothing to execute".into(),
+                    ));
                 }
                 let rule = quorum_rule(proposal.action.risk_tier());
-                let passed_round = proposal.passed_round.ok_or_else(|| ExecError::ProgramError("passed proposal is missing passed_round".into()))?;
+                let passed_round = proposal.passed_round.ok_or_else(|| {
+                    ExecError::ProgramError("passed proposal is missing passed_round".into())
+                })?;
                 if current_round < passed_round + rule.timelock_rounds {
-                    return Err(ExecError::ProgramError("the mandatory review time-lock has not elapsed yet".into()));
+                    return Err(ExecError::ProgramError(
+                        "the mandatory review time-lock has not elapsed yet".into(),
+                    ));
                 }
 
                 // Pin the mutated account to the canonical singleton for the
@@ -270,16 +372,22 @@ impl NativeProgram for GovernanceProgram {
                 // `REGISTRY_ACCOUNT_ID` (Registry tier) or `PARAMS_ACCOUNT_ID`
                 // (Low tier) as accounts[1].
                 match &proposal.action {
-                    ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+                    ProposalAction::ActivateAlgorithm(_)
+                    | ProposalAction::DeprecateAlgorithm { .. }
+                    | ProposalAction::RetireAlgorithm { .. } => {
                         if target_pk != crate::ids::REGISTRY_ACCOUNT_ID {
                             return Err(ExecError::ProgramError(
                                 "Execute accounts[1] must be the canonical registry account for a registry action".into(),
                             ));
                         }
-                        let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
-                        let mut registry: Vec<RegistryEntry> = Vec::try_from_slice(&target_account.data).map_err(borsh_err)?;
+                        let target_account = accounts
+                            .get(&target_pk)
+                            .ok_or(ExecError::AccountNotFound(target_pk))?;
+                        let mut registry: Vec<RegistryEntry> =
+                            Vec::try_from_slice(&target_account.data).map_err(borsh_err)?;
                         apply_registry_action(&mut registry, &proposal.action, current_round)?;
-                        accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&registry).map_err(borsh_err)?;
+                        accounts.get_mut(&target_pk).unwrap().data =
+                            borsh::to_vec(&registry).map_err(borsh_err)?;
                     }
                     ProposalAction::SetBaseFeePerByte(_)
                     | ProposalAction::SetDustThreshold(_)
@@ -291,11 +399,19 @@ impl NativeProgram for GovernanceProgram {
                                 "Execute accounts[1] must be the canonical economic-params account for a Low-tier action".into(),
                             ));
                         }
-                        let target_account = accounts.get(&target_pk).ok_or(ExecError::AccountNotFound(target_pk))?;
-                        let mut params = crate::params::EconomicParams::read_or_legacy(&target_account.data)
-                            .ok_or_else(|| ExecError::ProgramError("economic-params account is unreadable".into()))?;
+                        let target_account = accounts
+                            .get(&target_pk)
+                            .ok_or(ExecError::AccountNotFound(target_pk))?;
+                        let mut params =
+                            crate::params::EconomicParams::read_or_legacy(&target_account.data)
+                                .ok_or_else(|| {
+                                    ExecError::ProgramError(
+                                        "economic-params account is unreadable".into(),
+                                    )
+                                })?;
                         apply_economic_action(&mut params, &proposal.action)?;
-                        accounts.get_mut(&target_pk).unwrap().data = borsh::to_vec(&params).map_err(borsh_err)?;
+                        accounts.get_mut(&target_pk).unwrap().data =
+                            borsh::to_vec(&params).map_err(borsh_err)?;
                     }
                 }
 
@@ -303,8 +419,12 @@ impl NativeProgram for GovernanceProgram {
                 write_proposal(accounts, &proposal_pk, &proposal)?;
             }
 
-            GovernanceInstruction::EmergencyPause => apply_emergency_approval(accounts, instruction, payer, true)?,
-            GovernanceInstruction::EmergencyUnpause => apply_emergency_approval(accounts, instruction, payer, false)?,
+            GovernanceInstruction::EmergencyPause => {
+                apply_emergency_approval(accounts, instruction, payer, true)?
+            }
+            GovernanceInstruction::EmergencyUnpause => {
+                apply_emergency_approval(accounts, instruction, payer, false)?
+            }
         }
         Ok(())
     }
@@ -323,21 +443,40 @@ fn apply_emergency_approval(
     payer: &Pubkey,
     want_paused: bool,
 ) -> Result<(), ExecError> {
-    let em_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Emergency instruction requires accounts[0] = the emergency singleton".into()))?;
+    let em_pk = *instruction.accounts.first().ok_or_else(|| {
+        ExecError::ProgramError(
+            "Emergency instruction requires accounts[0] = the emergency singleton".into(),
+        )
+    })?;
     if em_pk != crate::ids::EMERGENCY_ACCOUNT_ID {
-        return Err(ExecError::ProgramError("Emergency accounts[0] must be the canonical emergency governance account".into()));
+        return Err(ExecError::ProgramError(
+            "Emergency accounts[0] must be the canonical emergency governance account".into(),
+        ));
     }
-    let account = accounts.get(&em_pk).ok_or(ExecError::AccountNotFound(em_pk))?;
+    let account = accounts
+        .get(&em_pk)
+        .ok_or(ExecError::AccountNotFound(em_pk))?;
     let mut state = EmergencyState::try_from_slice(&account.data).map_err(borsh_err)?;
 
     if state.guardians.is_empty() || state.threshold == 0 {
-        return Err(ExecError::ProgramError("no emergency guardians are configured on this network".into()));
+        return Err(ExecError::ProgramError(
+            "no emergency guardians are configured on this network".into(),
+        ));
     }
     if !state.guardians.contains(payer) {
-        return Err(ExecError::Unauthorized("only a configured guardian can approve an emergency pause/unpause".into()));
+        return Err(ExecError::Unauthorized(
+            "only a configured guardian can approve an emergency pause/unpause".into(),
+        ));
     }
     if state.paused == want_paused {
-        return Err(ExecError::ProgramError(if want_paused { "governance is already paused" } else { "governance is not paused" }.into()));
+        return Err(ExecError::ProgramError(
+            if want_paused {
+                "governance is already paused"
+            } else {
+                "governance is not paused"
+            }
+            .into(),
+        ));
     }
 
     // A new pause round supersedes any stale unpause approvals and vice versa.
@@ -365,31 +504,58 @@ fn apply_emergency_approval(
     Ok(())
 }
 
-fn apply_registry_action(registry: &mut Vec<RegistryEntry>, action: &ProposalAction, current_round: Round) -> Result<(), ExecError> {
+fn apply_registry_action(
+    registry: &mut Vec<RegistryEntry>,
+    action: &ProposalAction,
+    current_round: Round,
+) -> Result<(), ExecError> {
     match action {
         ProposalAction::ActivateAlgorithm(entry) => {
             if registry.iter().any(|e| e.id == entry.id) {
-                return Err(ExecError::ProgramError("algorithm id is already registered".into()));
+                return Err(ExecError::ProgramError(
+                    "algorithm id is already registered".into(),
+                ));
             }
             registry.push(entry.clone());
         }
-        ProposalAction::DeprecateAlgorithm { id, retirement_round } => {
-            let entry = registry.iter_mut().find(|e| e.id == *id).ok_or_else(|| ExecError::ProgramError("unknown algorithm id".into()))?;
+        ProposalAction::DeprecateAlgorithm {
+            id,
+            retirement_round,
+        } => {
+            let entry = registry
+                .iter_mut()
+                .find(|e| e.id == *id)
+                .ok_or_else(|| ExecError::ProgramError("unknown algorithm id".into()))?;
             if entry.status != AlgorithmStatus::Active {
-                return Err(ExecError::ProgramError("only an Active entry can be deprecated".into()));
+                return Err(ExecError::ProgramError(
+                    "only an Active entry can be deprecated".into(),
+                ));
             }
-            entry.status = AlgorithmStatus::Deprecated { retirement_epoch: *retirement_round };
+            entry.status = AlgorithmStatus::Deprecated {
+                retirement_epoch: *retirement_round,
+            };
         }
         ProposalAction::RetireAlgorithm { id } => {
-            let entry = registry.iter_mut().find(|e| e.id == *id).ok_or_else(|| ExecError::ProgramError("unknown algorithm id".into()))?;
+            let entry = registry
+                .iter_mut()
+                .find(|e| e.id == *id)
+                .ok_or_else(|| ExecError::ProgramError("unknown algorithm id".into()))?;
             match entry.status {
-                AlgorithmStatus::Deprecated { retirement_epoch } if current_round >= retirement_epoch => {
+                AlgorithmStatus::Deprecated { retirement_epoch }
+                    if current_round >= retirement_epoch =>
+                {
                     entry.status = AlgorithmStatus::Retired;
                 }
                 AlgorithmStatus::Deprecated { .. } => {
-                    return Err(ExecError::ProgramError("retirement round has not been reached yet".into()));
+                    return Err(ExecError::ProgramError(
+                        "retirement round has not been reached yet".into(),
+                    ));
                 }
-                _ => return Err(ExecError::ProgramError("only a Deprecated entry can be retired".into())),
+                _ => {
+                    return Err(ExecError::ProgramError(
+                        "only a Deprecated entry can be retired".into(),
+                    ))
+                }
             }
         }
         ProposalAction::SetBaseFeePerByte(_)
@@ -447,7 +613,10 @@ fn within_change_limit(current: u64, new: u64, factor: u64, abs_step: u64) -> bo
 /// u64::MAX`, `base_fee = 0`, `gas_price = 0`) would take effect immediately
 /// with no window to react - these bounds keep governance from bricking the
 /// chain even with a transient majority.
-fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &ProposalAction) -> Result<(), ExecError> {
+fn apply_economic_action(
+    params: &mut crate::params::EconomicParams,
+    action: &ProposalAction,
+) -> Result<(), ExecError> {
     match action {
         // Floor: below the anti-spam minimum the dynamic fee mechanism already
         // clamps to (`FEE_MIN_BASE_FEE_PER_BYTE`), so a governance-set value
@@ -472,7 +641,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     crate::params::MAX_BASE_FEE_PER_BYTE
                 )));
             }
-            if !within_change_limit(params.base_fee_per_byte, *v, MAX_ECON_CHANGE_FACTOR, BASE_FEE_ABS_STEP) {
+            if !within_change_limit(
+                params.base_fee_per_byte,
+                *v,
+                MAX_ECON_CHANGE_FACTOR,
+                BASE_FEE_ABS_STEP,
+            ) {
                 return Err(ExecError::ProgramError(format!(
                     "base_fee_per_byte {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {BASE_FEE_ABS_STEP}) from the current {} in one proposal - split a large change across several proposals",
                     params.base_fee_per_byte
@@ -494,7 +668,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     "dust_threshold {v} exceeds the safety cap {MAX_DUST_THRESHOLD} - a higher value would sweep-and-burn ordinary balances"
                 )));
             }
-            if !within_change_limit(params.dust_threshold, *v, MAX_ECON_CHANGE_FACTOR, DUST_ABS_STEP) {
+            if !within_change_limit(
+                params.dust_threshold,
+                *v,
+                MAX_ECON_CHANGE_FACTOR,
+                DUST_ABS_STEP,
+            ) {
                 return Err(ExecError::ProgramError(format!(
                     "dust_threshold {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {DUST_ABS_STEP}) from the current {} in one proposal",
                     params.dust_threshold
@@ -506,7 +685,9 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
         // DoS protections (trap billing, memory limiter, fuel limit).
         ProposalAction::SetGasPricePerFuel(v) => {
             if *v == 0 {
-                return Err(ExecError::ProgramError("gas_price_per_fuel cannot be zero - would make WASM compute free (DoS)".into()));
+                return Err(ExecError::ProgramError(
+                    "gas_price_per_fuel cannot be zero - would make WASM compute free (DoS)".into(),
+                ));
             }
             // Ceiling, symmetric with `base_fee`: an unbounded gas price makes
             // every WASM-consuming tx unaffordable (smaller blast radius than the
@@ -518,7 +699,12 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
                     crate::params::MAX_GAS_PRICE_PER_FUEL
                 )));
             }
-            if !within_change_limit(params.gas_price_per_fuel, *v, MAX_ECON_CHANGE_FACTOR, GAS_ABS_STEP) {
+            if !within_change_limit(
+                params.gas_price_per_fuel,
+                *v,
+                MAX_ECON_CHANGE_FACTOR,
+                GAS_ABS_STEP,
+            ) {
                 return Err(ExecError::ProgramError(format!(
                     "gas_price_per_fuel {v} moves more than {MAX_ECON_CHANGE_FACTOR}× (or {GAS_ABS_STEP}) from the current {} in one proposal",
                     params.gas_price_per_fuel
@@ -528,7 +714,9 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
         }
         ProposalAction::SetStakingCommissionBps(v) => {
             if *v > 10_000 {
-                return Err(ExecError::ProgramError("staking commission cannot exceed 10,000 bps (100%)".into()));
+                return Err(ExecError::ProgramError(
+                    "staking commission cannot exceed 10,000 bps (100%)".into(),
+                ));
             }
             if v.abs_diff(params.staking_commission_bps) > COMMISSION_STEP_BPS {
                 return Err(ExecError::ProgramError(format!(
@@ -557,7 +745,9 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
             }
             params.emission_apr_bps = *v;
         }
-        ProposalAction::ActivateAlgorithm(_) | ProposalAction::DeprecateAlgorithm { .. } | ProposalAction::RetireAlgorithm { .. } => {
+        ProposalAction::ActivateAlgorithm(_)
+        | ProposalAction::DeprecateAlgorithm { .. }
+        | ProposalAction::RetireAlgorithm { .. } => {
             unreachable!("Execute only calls apply_economic_action for Low-tier actions")
         }
     }
@@ -567,13 +757,15 @@ fn apply_economic_action(params: &mut crate::params::EconomicParams, action: &Pr
 /// Builds the genesis algorithm-registry account contents - callers (node
 /// startup) write this into `REGISTRY_ACCOUNT_ID` once, at genesis.
 pub fn genesis_registry_account_data() -> Vec<u8> {
-    borsh::to_vec(&qchain_crypto::registry::genesis_registry()).expect("genesis registry always serializes")
+    borsh::to_vec(&qchain_crypto::registry::genesis_registry())
+        .expect("genesis registry always serializes")
 }
 
 /// Builds the genesis economic-params account contents - callers (node
 /// startup) write this into `PARAMS_ACCOUNT_ID` once, at genesis.
 pub fn genesis_params_account_data() -> Vec<u8> {
-    borsh::to_vec(&crate::params::EconomicParams::default()).expect("default economic params always serialize")
+    borsh::to_vec(&crate::params::EconomicParams::default())
+        .expect("default economic params always serialize")
 }
 
 /// Builds the genesis emergency-governance account contents (task #213) —
@@ -583,15 +775,27 @@ pub fn genesis_params_account_data() -> Vec<u8> {
 /// guardians (which would make the pause un-triggerable). An empty guardian
 /// set leaves the feature inert (no one can pause), which is the safe default.
 pub fn genesis_emergency_account_data(guardians: Vec<Pubkey>, threshold: u8) -> Vec<u8> {
-    let threshold = if guardians.is_empty() { 0 } else { threshold.clamp(1, guardians.len().min(u8::MAX as usize) as u8) };
-    let state = EmergencyState { guardians, threshold, paused: false, pause_approvals: Vec::new(), unpause_approvals: Vec::new() };
+    let threshold = if guardians.is_empty() {
+        0
+    } else {
+        threshold.clamp(1, guardians.len().min(u8::MAX as usize) as u8)
+    };
+    let state = EmergencyState {
+        guardians,
+        threshold,
+        paused: false,
+        pause_approvals: Vec::new(),
+        unpause_approvals: Vec::new(),
+    };
     borsh::to_vec(&state).expect("emergency state always serializes")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
+    use crate::ids::{
+        PARAMS_ACCOUNT_ID, REGISTRY_ACCOUNT_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID,
+    };
     use crate::staking::StakingProgram;
     use qchain_crypto::{ALGORITHM_ED25519, ALGORITHM_ML_DSA_65};
 
@@ -605,37 +809,93 @@ mod tests {
         // avoid depending on this crate (which pulls wasmtime, no wasm target).
         // If GovernanceInstruction/VoteChoice ever change, this guard fails so
         // the wallet's sign_vote/finalize/execute are updated in lock-step.
-        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::Yes }).unwrap(), vec![1u8, 0], "wasm Vote(Yes) encoding out of sync");
-        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::No }).unwrap(), vec![1u8, 1], "wasm Vote(No) encoding out of sync");
-        assert_eq!(borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::Abstain }).unwrap(), vec![1u8, 2], "wasm Vote(Abstain) encoding out of sync");
-        assert_eq!(borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(), vec![2u8], "wasm Finalize encoding out of sync");
-        assert_eq!(borsh::to_vec(&GovernanceInstruction::Execute).unwrap(), vec![3u8], "wasm Execute encoding out of sync");
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::Vote {
+                choice: VoteChoice::Yes
+            })
+            .unwrap(),
+            vec![1u8, 0],
+            "wasm Vote(Yes) encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::Vote {
+                choice: VoteChoice::No
+            })
+            .unwrap(),
+            vec![1u8, 1],
+            "wasm Vote(No) encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::Vote {
+                choice: VoteChoice::Abstain
+            })
+            .unwrap(),
+            vec![1u8, 2],
+            "wasm Vote(Abstain) encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(),
+            vec![2u8],
+            "wasm Finalize encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
+            vec![3u8],
+            "wasm Execute encoding out of sync"
+        );
     }
 
     fn wallet(balance: u64) -> Account {
-        Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) }
+        Account {
+            balance,
+            ..Account::new_wallet(Pubkey::system_program_id())
+        }
     }
 
     fn stake_account(owner: Pubkey, amount: u64) -> Account {
-        let data =
-            StakeAccountData { owner, validator: Pubkey::new([99u8; 32]), amount, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None };
-        Account { balance: amount, data: borsh::to_vec(&data).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
+        let data = StakeAccountData {
+            owner,
+            validator: Pubkey::new([99u8; 32]),
+            amount,
+            reward_debt: 0,
+            locked_until_round: 0,
+            bonding_until_round: 0,
+            unbonding_requested_at_round: None,
+            created_round: 0,
+        };
+        Account {
+            balance: amount,
+            data: borsh::to_vec(&data).unwrap(),
+            ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID)
+        }
     }
 
     fn registry_account() -> Account {
-        Account { data: genesis_registry_account_data(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) }
+        Account {
+            data: genesis_registry_account_data(),
+            ..Account::new_wallet(GOVERNANCE_PROGRAM_ID)
+        }
     }
 
     fn stats_account(total: u64) -> Account {
-        Account { data: borsh::to_vec(&total).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
+        Account {
+            data: borsh::to_vec(&total).unwrap(),
+            ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID)
+        }
     }
 
     fn pool_account() -> Account {
-        Account { data: borsh::to_vec(&crate::staking::RewardPoolData::default()).unwrap(), ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID) }
+        Account {
+            data: borsh::to_vec(&crate::staking::RewardPoolData::default()).unwrap(),
+            ..Account::new_wallet(crate::ids::STAKING_PROGRAM_ID)
+        }
     }
 
     fn params_account() -> Account {
-        Account { data: genesis_params_account_data(), ..Account::new_wallet(GOVERNANCE_PROGRAM_ID) }
+        Account {
+            data: genesis_params_account_data(),
+            ..Account::new_wallet(GOVERNANCE_PROGRAM_ID)
+        }
     }
 
     fn new_slh_dsa_entry() -> RegistryEntry {
@@ -644,16 +904,29 @@ mod tests {
         qchain_crypto::slh_dsa_registry_entry(0)
     }
 
-    fn create_proposal(accounts: &mut HashMap<Pubkey, Account>, proposer: Pubkey, action: ProposalAction, round: Round) {
+    fn create_proposal(
+        accounts: &mut HashMap<Pubkey, Account>,
+        proposer: Pubkey,
+        action: ProposalAction,
+        round: Round,
+    ) {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![proposer, PROPOSAL_PK, STAKING_STATS_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 1, action }).unwrap(),
         };
-        GovernanceProgram.process(accounts, &ix, &proposer, round).unwrap();
+        GovernanceProgram
+            .process(accounts, &ix, &proposer, round)
+            .unwrap();
     }
 
-    fn vote(accounts: &mut HashMap<Pubkey, Account>, voter: Pubkey, stake_pk: Pubkey, choice: VoteChoice, round: Round) -> Result<(), ExecError> {
+    fn vote(
+        accounts: &mut HashMap<Pubkey, Account>,
+        voter: Pubkey,
+        stake_pk: Pubkey,
+        choice: VoteChoice,
+        round: Round,
+    ) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![PROPOSAL_PK, stake_pk],
@@ -662,7 +935,11 @@ mod tests {
         GovernanceProgram.process(accounts, &ix, &voter, round)
     }
 
-    fn finalize(accounts: &mut HashMap<Pubkey, Account>, caller: Pubkey, round: Round) -> Result<(), ExecError> {
+    fn finalize(
+        accounts: &mut HashMap<Pubkey, Account>,
+        caller: Pubkey,
+        round: Round,
+    ) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![PROPOSAL_PK, STAKING_STATS_ID],
@@ -671,10 +948,18 @@ mod tests {
         GovernanceProgram.process(accounts, &ix, &caller, round)
     }
 
-    fn execute(accounts: &mut HashMap<Pubkey, Account>, caller: Pubkey, round: Round) -> Result<(), ExecError> {
+    fn execute(
+        accounts: &mut HashMap<Pubkey, Account>,
+        caller: Pubkey,
+        round: Round,
+    ) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, REGISTRY_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
+            accounts: vec![
+                PROPOSAL_PK,
+                REGISTRY_ACCOUNT_ID,
+                crate::ids::EMERGENCY_ACCOUNT_ID,
+            ],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
         GovernanceProgram.process(accounts, &ix, &caller, round)
@@ -693,22 +978,49 @@ mod tests {
             (REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
 
-        create_proposal(&mut accounts, proposer, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 5).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 5).unwrap();
 
         let rule = quorum_rule(qchain_governance::RiskTier::Registry);
-        finalize(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds).unwrap();
+        finalize(
+            &mut accounts,
+            Pubkey::new([9u8; 32]),
+            rule.voting_period_rounds,
+        )
+        .unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Passed, "70% yes clears the 2/3 supermajority bar");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Passed,
+            "70% yes clears the 2/3 supermajority bar"
+        );
 
         // Too early - the review time-lock hasn't elapsed.
-        assert!(execute(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds + 1).is_err());
+        assert!(execute(
+            &mut accounts,
+            Pubkey::new([9u8; 32]),
+            rule.voting_period_rounds + 1
+        )
+        .is_err());
 
-        execute(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds + rule.timelock_rounds).unwrap();
+        execute(
+            &mut accounts,
+            Pubkey::new([9u8; 32]),
+            rule.voting_period_rounds + rule.timelock_rounds,
+        )
+        .unwrap();
 
-        let registry: Vec<RegistryEntry> = Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert!(registry.iter().any(|e| e.id == qchain_crypto::ALGORITHM_SLH_DSA && e.status == AlgorithmStatus::Active));
+        let registry: Vec<RegistryEntry> =
+            Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert!(registry.iter().any(
+            |e| e.id == qchain_crypto::ALGORITHM_SLH_DSA && e.status == AlgorithmStatus::Active
+        ));
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Executed);
     }
@@ -725,17 +1037,35 @@ mod tests {
         ]);
         let original_registry = accounts[&REGISTRY_ACCOUNT_ID].data.clone();
 
-        create_proposal(&mut accounts, proposer, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         // Only 100/1000 = 10% participates - below the 20% floor.
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 5).unwrap();
 
         let rule = quorum_rule(qchain_governance::RiskTier::Registry);
-        finalize(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds).unwrap();
+        finalize(
+            &mut accounts,
+            Pubkey::new([9u8; 32]),
+            rule.voting_period_rounds,
+        )
+        .unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Rejected);
 
-        assert!(execute(&mut accounts, Pubkey::new([9u8; 32]), rule.voting_period_rounds + rule.timelock_rounds).is_err());
-        assert_eq!(accounts[&REGISTRY_ACCOUNT_ID].data, original_registry, "a rejected proposal must never mutate the registry");
+        assert!(execute(
+            &mut accounts,
+            Pubkey::new([9u8; 32]),
+            rule.voting_period_rounds + rule.timelock_rounds
+        )
+        .is_err());
+        assert_eq!(
+            accounts[&REGISTRY_ACCOUNT_ID].data, original_registry,
+            "a rejected proposal must never mutate the registry"
+        );
     }
 
     #[test]
@@ -761,15 +1091,34 @@ mod tests {
         // entry's *migration grace period* has not.
         let retirement_round = 2 * full_cycle + 50;
 
-        create_proposal(&mut accounts, proposer, ProposalAction::DeprecateAlgorithm { id: ALGORITHM_ED25519, retirement_round }, 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::DeprecateAlgorithm {
+                id: ALGORITHM_ED25519,
+                retirement_round,
+            },
+            0,
+        );
         vote(&mut accounts, voter, STAKE_PK, VoteChoice::Yes, 5).unwrap();
         finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
         execute(&mut accounts, proposer, full_cycle).unwrap();
 
-        let registry: Vec<RegistryEntry> = Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
+        let registry: Vec<RegistryEntry> =
+            Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
         let entry = registry.iter().find(|e| e.id == ALGORITHM_ED25519).unwrap();
-        assert_eq!(entry.status, AlgorithmStatus::Deprecated { retirement_epoch: retirement_round });
-        assert!(registry.iter().any(|e| e.id == ALGORITHM_ML_DSA_65 && e.status == AlgorithmStatus::Active), "unrelated entries must be untouched");
+        assert_eq!(
+            entry.status,
+            AlgorithmStatus::Deprecated {
+                retirement_epoch: retirement_round
+            }
+        );
+        assert!(
+            registry
+                .iter()
+                .any(|e| e.id == ALGORITHM_ML_DSA_65 && e.status == AlgorithmStatus::Active),
+            "unrelated entries must be untouched"
+        );
 
         // A second proposal retires it, created right after the deprecate
         // proposal executed.
@@ -777,13 +1126,29 @@ mod tests {
         let retire_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![proposer, retire_proposal_pk, STAKING_STATS_ID],
-            data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 2, action: ProposalAction::RetireAlgorithm { id: ALGORITHM_ED25519 } }).unwrap(),
+            data: borsh::to_vec(&GovernanceInstruction::CreateProposal {
+                id: 2,
+                action: ProposalAction::RetireAlgorithm {
+                    id: ALGORITHM_ED25519,
+                },
+            })
+            .unwrap(),
         };
-        GovernanceProgram.process(&mut accounts, &retire_ix, &proposer, full_cycle).unwrap();
+        GovernanceProgram
+            .process(&mut accounts, &retire_ix, &proposer, full_cycle)
+            .unwrap();
 
-        let vote_ix =
-            Instruction { program_id: GOVERNANCE_PROGRAM_ID, accounts: vec![retire_proposal_pk, STAKE_PK], data: borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::Yes }).unwrap() };
-        GovernanceProgram.process(&mut accounts, &vote_ix, &voter, full_cycle + 1).unwrap();
+        let vote_ix = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![retire_proposal_pk, STAKE_PK],
+            data: borsh::to_vec(&GovernanceInstruction::Vote {
+                choice: VoteChoice::Yes,
+            })
+            .unwrap(),
+        };
+        GovernanceProgram
+            .process(&mut accounts, &vote_ix, &voter, full_cycle + 1)
+            .unwrap();
 
         let finalize_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
@@ -791,24 +1156,56 @@ mod tests {
             data: borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(),
         };
         let retire_finalize_round = full_cycle + rule.voting_period_rounds;
-        GovernanceProgram.process(&mut accounts, &finalize_ix, &proposer, retire_finalize_round).unwrap();
+        GovernanceProgram
+            .process(
+                &mut accounts,
+                &finalize_ix,
+                &proposer,
+                retire_finalize_round,
+            )
+            .unwrap();
 
         let execute_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![retire_proposal_pk, REGISTRY_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
+            accounts: vec![
+                retire_proposal_pk,
+                REGISTRY_ACCOUNT_ID,
+                crate::ids::EMERGENCY_ACCOUNT_ID,
+            ],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
         // The retire proposal's own governance timelock has elapsed here,
         // but `retirement_round` (the entry's migration grace period)
         // hasn't - this must still be rejected.
         let retire_execute_ready_round = retire_finalize_round + rule.timelock_rounds;
-        assert!(retire_execute_ready_round < retirement_round, "test setup assumption: still before the grace period ends");
-        let result = GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, retire_execute_ready_round);
-        assert!(result.is_err(), "retiring before the grace period elapses must be rejected");
+        assert!(
+            retire_execute_ready_round < retirement_round,
+            "test setup assumption: still before the grace period ends"
+        );
+        let result = GovernanceProgram.process(
+            &mut accounts,
+            &execute_ix,
+            &proposer,
+            retire_execute_ready_round,
+        );
+        assert!(
+            result.is_err(),
+            "retiring before the grace period elapses must be rejected"
+        );
 
-        GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, retirement_round).unwrap();
-        let registry: Vec<RegistryEntry> = Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert_eq!(registry.iter().find(|e| e.id == ALGORITHM_ED25519).unwrap().status, AlgorithmStatus::Retired);
+        GovernanceProgram
+            .process(&mut accounts, &execute_ix, &proposer, retirement_round)
+            .unwrap();
+        let registry: Vec<RegistryEntry> =
+            Vec::try_from_slice(&accounts[&REGISTRY_ACCOUNT_ID].data).unwrap();
+        assert_eq!(
+            registry
+                .iter()
+                .find(|e| e.id == ALGORITHM_ED25519)
+                .unwrap()
+                .status,
+            AlgorithmStatus::Retired
+        );
     }
 
     #[test]
@@ -821,9 +1218,21 @@ mod tests {
             (STAKING_STATS_ID, stats_account(1_000)),
             (REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
-        create_proposal(&mut accounts, proposer, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         let rule = quorum_rule(qchain_governance::RiskTier::Registry);
-        assert!(vote(&mut accounts, voter, STAKE_PK, VoteChoice::Yes, rule.voting_period_rounds).is_err());
+        assert!(vote(
+            &mut accounts,
+            voter,
+            STAKE_PK,
+            VoteChoice::Yes,
+            rule.voting_period_rounds
+        )
+        .is_err());
     }
 
     #[test]
@@ -837,7 +1246,12 @@ mod tests {
             (STAKING_STATS_ID, stats_account(1_000)),
             (REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
-        create_proposal(&mut accounts, proposer, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         let result = vote(&mut accounts, attacker, STAKE_PK, VoteChoice::Yes, 1);
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
     }
@@ -859,15 +1273,100 @@ mod tests {
         let delegate_ix = Instruction {
             program_id: crate::ids::STAKING_PROGRAM_ID,
             accounts: vec![staker, STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate { validator: Pubkey::new([50u8; 32]), amount: 5_000 }).unwrap(),
+            data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate {
+                validator: Pubkey::new([50u8; 32]),
+                amount: 5_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
-        create_proposal(&mut accounts, staker, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            staker,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         vote(&mut accounts, staker, STAKE_PK, VoteChoice::Yes, 1).unwrap();
 
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.yes_stake, 5_000, "voting power must come from the real delegated amount");
+        assert_eq!(
+            proposal.yes_stake, 5_000,
+            "voting power must come from the real delegated amount"
+        );
+    }
+
+    /// Roadmap #6 — the per-voter creation-time snapshot. Composes both real
+    /// programs exactly as a live node would: a position DELEGATED AFTER the
+    /// proposal opened cannot vote on it (the flash-stake-to-swing-a-specific-
+    /// vote residual the aggregate `snapshot_total_staked` left open), while a
+    /// position that predates the proposal votes with its full weight.
+    #[test]
+    fn stake_delegated_after_the_proposal_opened_cannot_vote_but_an_earlier_position_can() {
+        // Non-reserved pubkeys (low bytes collide with the singleton ids like
+        // STAKING_STATS_ID=[2;32]).
+        let early = Pubkey::new([61u8; 32]);
+        let latecomer = Pubkey::new([62u8; 32]);
+        let early_stake = Pubkey::new([63u8; 32]);
+        let late_stake = Pubkey::new([64u8; 32]);
+        let mut accounts = HashMap::from([
+            (early, wallet(10_000)),
+            (latecomer, wallet(10_000)),
+            (STAKING_STATS_ID, stats_account(0)),
+            (REGISTRY_ACCOUNT_ID, registry_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
+        let validator = Pubkey::new([50u8; 32]);
+        let delegate = |accounts: &mut HashMap<Pubkey, Account>,
+                        staker: Pubkey,
+                        stake_pk: Pubkey,
+                        amount: u64,
+                        round: Round| {
+            let ix = Instruction {
+                program_id: crate::ids::STAKING_PROGRAM_ID,
+                accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+                data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate {
+                    validator,
+                    amount,
+                })
+                .unwrap(),
+            };
+            StakingProgram
+                .process(accounts, &ix, &staker, round)
+                .unwrap();
+        };
+
+        // `early` delegated at round 5 — BEFORE the proposal opens at round 10.
+        delegate(&mut accounts, early, early_stake, 6_000, 5);
+
+        // Proposal created at round 10 (its per-voter snapshot boundary).
+        create_proposal(
+            &mut accounts,
+            early,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            10,
+        );
+
+        // `latecomer` delegates at round 15 — AFTER the proposal opened — and
+        // tries to vote it down. Rejected: its stake wasn't part of the
+        // creation-time picture, so it can't vote on THIS proposal.
+        delegate(&mut accounts, latecomer, late_stake, 9_000, 15);
+        let late = vote(&mut accounts, latecomer, late_stake, VoteChoice::No, 16);
+        assert!(
+            matches!(late, Err(ExecError::ProgramError(ref m)) if m.contains("after the proposal was created")),
+            "stake delegated after the proposal opened must not be able to vote on it, got {late:?}",
+        );
+
+        // The earlier position votes normally (created_round 5 <= 10).
+        vote(&mut accounts, early, early_stake, VoteChoice::Yes, 16).unwrap();
+        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        assert_eq!(
+            proposal.yes_stake, 6_000,
+            "a position that predates the proposal votes with its full weight"
+        );
+        assert_eq!(proposal.no_stake, 0, "the flash-staked No never counted");
     }
 
     /// The exact real, live-confirmed attack this closes (see
@@ -889,11 +1388,22 @@ mod tests {
         let delegate_ix = Instruction {
             program_id: crate::ids::STAKING_PROGRAM_ID,
             accounts: vec![staker, STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate { validator: Pubkey::new([50u8; 32]), amount: 5_000 }).unwrap(),
+            data: borsh::to_vec(&crate::staking::StakingInstruction::Delegate {
+                validator: Pubkey::new([50u8; 32]),
+                amount: 5_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
-        create_proposal(&mut accounts, staker, ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()), 0);
+        create_proposal(
+            &mut accounts,
+            staker,
+            ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
+            0,
+        );
         vote(&mut accounts, staker, STAKE_PK, VoteChoice::Yes, 1).unwrap();
 
         let rule = quorum_rule(qchain_governance::RiskTier::Registry);
@@ -902,20 +1412,46 @@ mod tests {
             accounts: vec![STAKE_PK, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&crate::staking::StakingInstruction::Undelegate).unwrap(),
         };
-        let too_early = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds - 1);
-        assert!(too_early.is_err(), "reclaiming the stake before the vote it cast is decided must be rejected");
-        assert_eq!(accounts[&STAKE_PK].balance, 5_000, "the position must remain fully intact while locked");
+        let too_early = StakingProgram.process(
+            &mut accounts,
+            &undelegate_ix,
+            &staker,
+            rule.voting_period_rounds - 1,
+        );
+        assert!(
+            too_early.is_err(),
+            "reclaiming the stake before the vote it cast is decided must be rejected"
+        );
+        assert_eq!(
+            accounts[&STAKE_PK].balance, 5_000,
+            "the position must remain fully intact while locked"
+        );
 
         // The lock now extends through the ENTIRE Registry window: voting period
         // PLUS the post-passage time-lock. Undelegating the instant the voting
         // period ends must still be rejected - a Yes-voter can't sit out the
         // review window with zero economic exposure while their vote drives
         // execution (audit finding C).
-        let still_locked = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds);
+        let still_locked = StakingProgram.process(
+            &mut accounts,
+            &undelegate_ix,
+            &staker,
+            rule.voting_period_rounds,
+        );
         assert!(still_locked.is_err(), "a Registry-tier voter stays locked through the time-lock window, not just the voting period");
-        assert_eq!(accounts[&STAKE_PK].balance, 5_000, "still fully intact during the time-lock");
+        assert_eq!(
+            accounts[&STAKE_PK].balance, 5_000,
+            "still fully intact during the time-lock"
+        );
 
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, rule.voting_period_rounds + rule.timelock_rounds).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &undelegate_ix,
+                &staker,
+                rule.voting_period_rounds + rule.timelock_rounds,
+            )
+            .unwrap();
         assert_eq!(accounts[&STAKE_PK].balance, 0, "once voting period + time-lock have genuinely elapsed, the same position can undelegate normally");
     }
 
@@ -941,32 +1477,69 @@ mod tests {
         // A small in-step recalibration from the default (180): well within the
         // 2× / abs-step per-proposal limit.
         let new_fee = crate::params::FEE_MIN_BASE_FEE_PER_BYTE + 20;
-        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(new_fee), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::SetBaseFeePerByte(new_fee),
+            0,
+        );
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
 
         let rule = quorum_rule(qchain_governance::RiskTier::Economic);
-        assert!(rule.timelock_rounds > 0, "a monetary change must carry a real review time-lock");
+        assert!(
+            rule.timelock_rounds > 0,
+            "a monetary change must carry a real review time-lock"
+        );
         let finalize_round = rule.voting_period_rounds;
         finalize(&mut accounts, proposer, finalize_round).unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Passed, "70% yes clears the 2/3 supermajority");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Passed,
+            "70% yes clears the 2/3 supermajority"
+        );
 
         let execute_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
+            accounts: vec![
+                PROPOSAL_PK,
+                PARAMS_ACCOUNT_ID,
+                crate::ids::EMERGENCY_ACCOUNT_ID,
+            ],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
         // Too early: the review time-lock has NOT elapsed — a monetary change
         // can no longer execute the instant it's finalized.
-        assert!(GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round).is_err(), "an economic change must wait out its review time-lock");
+        assert!(
+            GovernanceProgram
+                .process(&mut accounts, &execute_ix, &proposer, finalize_round)
+                .is_err(),
+            "an economic change must wait out its review time-lock"
+        );
 
-        GovernanceProgram.process(&mut accounts, &execute_ix, &proposer, finalize_round + rule.timelock_rounds).unwrap();
+        GovernanceProgram
+            .process(
+                &mut accounts,
+                &execute_ix,
+                &proposer,
+                finalize_round + rule.timelock_rounds,
+            )
+            .unwrap();
 
-        let params = crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap();
+        let params =
+            crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data)
+                .unwrap();
         assert_eq!(params.base_fee_per_byte, new_fee);
-        assert_eq!(params.dust_threshold, crate::params::EconomicParams::default().dust_threshold, "unrelated params must be untouched");
-        assert_eq!(read_proposal(&accounts, &PROPOSAL_PK).unwrap().status, ProposalStatus::Executed);
+        assert_eq!(
+            params.dust_threshold,
+            crate::params::EconomicParams::default().dust_threshold,
+            "unrelated params must be untouched"
+        );
+        assert_eq!(
+            read_proposal(&accounts, &PROPOSAL_PK).unwrap().status,
+            ProposalStatus::Executed
+        );
     }
 
     /// The emergency guardian multisig (task #213): a threshold of guardians
@@ -993,7 +1566,12 @@ mod tests {
         ]);
 
         let new_fee = crate::params::FEE_MIN_BASE_FEE_PER_BYTE + 10;
-        create_proposal(&mut accounts, proposer, ProposalAction::SetBaseFeePerByte(new_fee), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::SetBaseFeePerByte(new_fee),
+            0,
+        );
         vote(&mut accounts, voter, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         let rule = quorum_rule(qchain_governance::RiskTier::Economic);
         finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
@@ -1011,37 +1589,73 @@ mod tests {
         };
         let exec = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, PARAMS_ACCOUNT_ID, crate::ids::EMERGENCY_ACCOUNT_ID],
+            accounts: vec![
+                PROPOSAL_PK,
+                PARAMS_ACCOUNT_ID,
+                crate::ids::EMERGENCY_ACCOUNT_ID,
+            ],
             data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
         };
 
         // An outsider cannot pause.
-        assert!(GovernanceProgram.process(&mut accounts, &pause(), &outsider, 1).is_err());
+        assert!(GovernanceProgram
+            .process(&mut accounts, &pause(), &outsider, 1)
+            .is_err());
         // One guardian is below the threshold of 2 → not paused yet.
-        GovernanceProgram.process(&mut accounts, &pause(), &g1, 1).unwrap();
+        GovernanceProgram
+            .process(&mut accounts, &pause(), &g1, 1)
+            .unwrap();
         // A second DISTINCT guardian reaches the threshold → paused.
-        GovernanceProgram.process(&mut accounts, &pause(), &g2, 2).unwrap();
-        let em: EmergencyState = borsh::from_slice(&accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].data).unwrap();
-        assert!(em.paused, "two of three guardians reached the pause threshold");
+        GovernanceProgram
+            .process(&mut accounts, &pause(), &g2, 2)
+            .unwrap();
+        let em: EmergencyState =
+            borsh::from_slice(&accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].data).unwrap();
+        assert!(
+            em.paused,
+            "two of three guardians reached the pause threshold"
+        );
 
         // Now Execute is blocked even though the proposal passed and the
         // timelock elapsed.
-        assert!(GovernanceProgram.process(&mut accounts, &exec, &proposer, ready_round).is_err(), "a paused chain must block Execute");
+        assert!(
+            GovernanceProgram
+                .process(&mut accounts, &exec, &proposer, ready_round)
+                .is_err(),
+            "a paused chain must block Execute"
+        );
         assert_eq!(
-            crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap().base_fee_per_byte,
+            crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data)
+                .unwrap()
+                .base_fee_per_byte,
             crate::params::EconomicParams::default().base_fee_per_byte,
             "the paused change must NOT have taken effect"
         );
 
         // Two guardians unpause → Execute proceeds.
-        GovernanceProgram.process(&mut accounts, &unpause(), &g1, ready_round).unwrap();
-        GovernanceProgram.process(&mut accounts, &unpause(), &g3, ready_round).unwrap();
-        GovernanceProgram.process(&mut accounts, &exec, &proposer, ready_round).unwrap();
-        assert_eq!(crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data).unwrap().base_fee_per_byte, new_fee);
+        GovernanceProgram
+            .process(&mut accounts, &unpause(), &g1, ready_round)
+            .unwrap();
+        GovernanceProgram
+            .process(&mut accounts, &unpause(), &g3, ready_round)
+            .unwrap();
+        GovernanceProgram
+            .process(&mut accounts, &exec, &proposer, ready_round)
+            .unwrap();
+        assert_eq!(
+            crate::params::EconomicParams::try_from_slice(&accounts[&PARAMS_ACCOUNT_ID].data)
+                .unwrap()
+                .base_fee_per_byte,
+            new_fee
+        );
 
         // The guardians never held or moved any balance: the emergency account
         // balance stayed zero throughout (it only ever carried the flag).
-        assert_eq!(accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].balance, 0, "the pause mechanism must never touch funds");
+        assert_eq!(
+            accounts[&crate::ids::EMERGENCY_ACCOUNT_ID].balance,
+            0,
+            "the pause mechanism must never touch funds"
+        );
     }
 
     #[test]
@@ -1054,7 +1668,10 @@ mod tests {
         // Tripling in one shot (360 -> 1080) exceeds both the 2× factor and the
         // absolute step — rejected. A big move must span several proposals.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(1080)).is_err());
-        assert_eq!(p.base_fee_per_byte, 360, "a rejected step must not mutate the parameter");
+        assert_eq!(
+            p.base_fee_per_byte, 360,
+            "a rejected step must not mutate the parameter"
+        );
         // Emission APR: default 1200 bps. A move within the additive cap (500)
         // is fine; a larger jump is rejected.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(1_600)).is_ok());
@@ -1067,33 +1684,60 @@ mod tests {
         use crate::params::EconomicParams;
         let mut p = EconomicParams::default();
         // dust_threshold = u64::MAX would burn every account on touch - rejected.
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(u64::MAX)).is_err());
+        assert!(
+            apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(u64::MAX)).is_err()
+        );
         // base_fee below the anti-spam floor (e.g. 0 = free spam) - rejected.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(0)).is_err());
         // gas_price 0 = free WASM compute - rejected.
         assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(0)).is_err());
         // The state must be untouched after every rejection.
         assert_eq!(p.dust_threshold, EconomicParams::default().dust_threshold);
-        assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
+        assert_eq!(
+            p.base_fee_per_byte,
+            EconomicParams::default().base_fee_per_byte
+        );
         // An emission APR above the safety cap is rejected (unbounded inflation).
         assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(u16::MAX)).is_err());
-        assert_eq!(p.emission_apr_bps, EconomicParams::default().emission_apr_bps);
+        assert_eq!(
+            p.emission_apr_bps,
+            EconomicParams::default().emission_apr_bps
+        );
         // base_fee ABOVE the ceiling is rejected — the permanent-brick vector
         // (a value that makes every tx, including the recovery tx, unaffordable).
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(u64::MAX)).is_err());
-        assert_eq!(p.base_fee_per_byte, EconomicParams::default().base_fee_per_byte);
+        assert!(
+            apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(u64::MAX)).is_err()
+        );
+        assert_eq!(
+            p.base_fee_per_byte,
+            EconomicParams::default().base_fee_per_byte
+        );
         // gas_price ABOVE the ceiling is rejected too (symmetric bound).
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(u64::MAX)).is_err());
+        assert!(
+            apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(u64::MAX)).is_err()
+        );
         // Legitimate SMALL in-step recalibrations still apply (a big single jump
         // is separately rejected by the per-proposal step limit — see
         // `a_single_proposal_cannot_move_a_parameter_past_the_step_limit`). `p`
         // is still at defaults here (all prior calls were rejections that never
         // mutated), so a 2× / within-cap move is in-step and applies.
         let d = EconomicParams::default();
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetBaseFeePerByte(d.base_fee_per_byte * 2)).is_ok());
+        assert!(apply_economic_action(
+            &mut p,
+            &ProposalAction::SetBaseFeePerByte(d.base_fee_per_byte * 2)
+        )
+        .is_ok());
         assert!(apply_economic_action(&mut p, &ProposalAction::SetGasPricePerFuel(2)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetDustThreshold(d.dust_threshold * 2)).is_ok());
-        assert!(apply_economic_action(&mut p, &ProposalAction::SetEmissionApr(d.emission_apr_bps + 400)).is_ok());
+        assert!(apply_economic_action(
+            &mut p,
+            &ProposalAction::SetDustThreshold(d.dust_threshold * 2)
+        )
+        .is_ok());
+        assert!(apply_economic_action(
+            &mut p,
+            &ProposalAction::SetEmissionApr(d.emission_apr_bps + 400)
+        )
+        .is_ok());
         assert_eq!(p.base_fee_per_byte, d.base_fee_per_byte * 2);
         assert_eq!(p.gas_price_per_fuel, 2);
         assert_eq!(p.dust_threshold, d.dust_threshold * 2);
@@ -1112,13 +1756,22 @@ mod tests {
             (STAKING_STATS_ID, stats_account(1_000)),
             (PARAMS_ACCOUNT_ID, params_account()),
         ]);
-        create_proposal(&mut accounts, proposer, ProposalAction::SetDustThreshold(1), 0);
+        create_proposal(
+            &mut accounts,
+            proposer,
+            ProposalAction::SetDustThreshold(1),
+            0,
+        );
         vote(&mut accounts, voter_a, STAKE_PK, VoteChoice::Yes, 1).unwrap();
         vote(&mut accounts, voter_b, OTHER_STAKE_PK, VoteChoice::No, 1).unwrap();
 
         let rule = quorum_rule(qchain_governance::RiskTier::Economic);
         finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
         let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Rejected, "a 500/500 tie is nowhere near the 2/3 supermajority a monetary change needs");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Rejected,
+            "a 500/500 tie is nowhere near the 2/3 supermajority a monetary change needs"
+        );
     }
 }

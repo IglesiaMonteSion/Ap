@@ -156,6 +156,67 @@ pub struct StakeAccountData {
     /// unaffected and stays instant, since slashing never touches
     /// delegator stake in the first place.
     pub unbonding_requested_at_round: Option<u64>,
+    /// The DAG round this position was opened at (`Delegate`), captured so
+    /// governance can enforce a **per-voter creation-time snapshot** (roadmap
+    /// #6). `Vote` requires `created_round <= proposal.created_round`: stake
+    /// delegated AFTER a proposal opened can't vote on that proposal. This is
+    /// sound in the access-list model precisely because a v6 stake account's
+    /// `amount` is immutable after `Delegate` — it's only ever zeroed by
+    /// `Undelegate`/slash, never increased — so a position that predates the
+    /// proposal held exactly this `amount` at snapshot time, and using the
+    /// live amount IS the historical weight. Closes the residual the aggregate
+    /// `snapshot_total_staked` (task #213) left open: a flash-staker could
+    /// still swing a *specific* proposal with capital acquired after it
+    /// opened, even though they couldn't lower the participation bar. Appended
+    /// as the last field so a legacy blob is a byte-prefix of the new layout
+    /// and `read_or_legacy` can migrate it (defaulting to 0 = "predates every
+    /// proposal", the permissive interpretation that preserves an existing
+    /// delegator's voting rights unchanged).
+    pub created_round: Round,
+}
+
+/// Legacy (pre-#6) `StakeAccountData` layout, WITHOUT `created_round`. Kept
+/// only so [`StakeAccountData::read_or_legacy`] can decode an existing v6
+/// stake account written before roadmap #6: the new layout appends
+/// `created_round` after this struct's last field, so an old blob is exactly
+/// these bytes.
+#[derive(BorshDeserialize, BorshSerialize)]
+struct StakeAccountDataLegacy {
+    owner: Pubkey,
+    validator: Pubkey,
+    amount: u64,
+    reward_debt: u128,
+    locked_until_round: u64,
+    bonding_until_round: u64,
+    unbonding_requested_at_round: Option<u64>,
+}
+
+impl StakeAccountData {
+    /// Decode a stake account, migrating a legacy (pre-#6) blob that has no
+    /// `created_round` by defaulting it to 0. The try-new-then-legacy order is
+    /// unambiguous: a new blob decodes exactly as the full struct; a legacy
+    /// blob is 8 bytes short, so the full decode hits EOF and falls through to
+    /// the legacy struct (which in turn rejects a new blob's 8 trailing bytes,
+    /// so the two never cross-decode). `created_round = 0` means "existed since
+    /// genesis / predates any proposal", so an old delegator keeps voting
+    /// exactly as before; only positions opened by a post-#6 `Delegate` carry
+    /// a real creation round.
+    pub fn read_or_legacy(data: &[u8]) -> Result<Self, borsh::io::Error> {
+        if let Ok(v) = Self::try_from_slice(data) {
+            return Ok(v);
+        }
+        let l = StakeAccountDataLegacy::try_from_slice(data)?;
+        Ok(StakeAccountData {
+            owner: l.owner,
+            validator: l.validator,
+            amount: l.amount,
+            reward_debt: l.reward_debt,
+            locked_until_round: l.locked_until_round,
+            bonding_until_round: l.bonding_until_round,
+            unbonding_requested_at_round: l.unbonding_requested_at_round,
+            created_round: 0,
+        })
+    }
 }
 
 /// How long a self-stake position's principal stays slashable after
@@ -218,7 +279,10 @@ pub enum StakingInstruction {
     /// updates the existing entry (address/bundle/stake refresh) rather than
     /// duplicating it. **Inert this increment**: nothing reads the registry
     /// for consensus yet - see `validator_registry.rs`'s module docs.
-    RegisterValidator { pubkey_bundle: qchain_crypto::PublicKeyBundle, address: String },
+    RegisterValidator {
+        pubkey_bundle: qchain_crypto::PublicKeyBundle,
+        address: String,
+    },
     /// Remove the caller's own entry from the on-chain validator registry.
     /// accounts[0] = the validator wallet (must equal the transaction
     /// payer), accounts[1] = the validator registry singleton. Only removes
@@ -228,11 +292,13 @@ pub enum StakingInstruction {
 }
 
 fn read_stats(account: &Account) -> Result<u64, ExecError> {
-    u64::try_from_slice(&account.data).map_err(|e| ExecError::ProgramError(format!("corrupt staking stats: {e}")))
+    u64::try_from_slice(&account.data)
+        .map_err(|e| ExecError::ProgramError(format!("corrupt staking stats: {e}")))
 }
 
 fn read_pool(account: &Account) -> Result<RewardPoolData, ExecError> {
-    RewardPoolData::try_from_slice(&account.data).map_err(|e| ExecError::ProgramError(format!("corrupt reward pool: {e}")))
+    RewardPoolData::try_from_slice(&account.data)
+        .map_err(|e| ExecError::ProgramError(format!("corrupt reward pool: {e}")))
 }
 
 /// The reward this position has earned but not yet been paid, given its
@@ -262,7 +328,12 @@ fn settled_reward_debt(amount: u64, acc_reward_per_share: u128) -> u128 {
 /// fee share - the caller is expected to credit the validator directly
 /// with the full amount in that case, preserving pre-staking-reward
 /// behavior when there are no delegators yet to share with.
-pub fn accrue_reward_pool(accounts: &mut HashMap<Pubkey, Account>, pool_pk: Pubkey, stats_pk: Pubkey, pool_share: u64) -> Result<bool, ExecError> {
+pub fn accrue_reward_pool(
+    accounts: &mut HashMap<Pubkey, Account>,
+    pool_pk: Pubkey,
+    stats_pk: Pubkey,
+    pool_share: u64,
+) -> Result<bool, ExecError> {
     if pool_share == 0 {
         return Ok(true);
     }
@@ -273,11 +344,15 @@ pub fn accrue_reward_pool(accounts: &mut HashMap<Pubkey, Account>, pool_pk: Pubk
     if total_staked == 0 {
         return Ok(false);
     }
-    let pool_account = accounts
-        .entry(pool_pk)
-        .or_insert_with(|| Account { data: borsh::to_vec(&RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
+    let pool_account = accounts.entry(pool_pk).or_insert_with(|| Account {
+        data: borsh::to_vec(&RewardPoolData::default()).unwrap(),
+        ..Account::new_wallet(STAKING_PROGRAM_ID)
+    });
     let mut pool = read_pool(pool_account)?;
-    pool.acc_reward_per_share = crate::arith::add_u128(pool.acc_reward_per_share, crate::arith::mul_u128(pool_share as u128, PRECISION)? / total_staked as u128)?;
+    pool.acc_reward_per_share = crate::arith::add_u128(
+        pool.acc_reward_per_share,
+        crate::arith::mul_u128(pool_share as u128, PRECISION)? / total_staked as u128,
+    )?;
     pool_account.data = borsh::to_vec(&pool).map_err(|e| ExecError::ProgramError(e.to_string()))?;
     pool_account.balance = crate::arith::add_u64(pool_account.balance, pool_share)?;
     Ok(true)
@@ -286,15 +361,29 @@ pub fn accrue_reward_pool(accounts: &mut HashMap<Pubkey, Account>, pool_pk: Pubk
 pub struct StakingProgram;
 
 impl NativeProgram for StakingProgram {
-    fn process(&self, accounts: &mut HashMap<Pubkey, Account>, instruction: &Instruction, payer: &Pubkey, current_round: Round) -> Result<(), ExecError> {
+    fn process(
+        &self,
+        accounts: &mut HashMap<Pubkey, Account>,
+        instruction: &Instruction,
+        payer: &Pubkey,
+        current_round: Round,
+    ) -> Result<(), ExecError> {
         let instr = StakingInstruction::try_from_slice(&instruction.data)
             .map_err(|e| ExecError::ProgramError(format!("bad instruction data: {e}")))?;
         match instr {
             StakingInstruction::Delegate { validator, amount } => {
-                let staker = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[0]".into()))?;
-                let stake_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[1]".into()))?;
-                let stats_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[2]".into()))?;
-                let pool_pk = *instruction.accounts.get(3).ok_or_else(|| ExecError::ProgramError("Delegate requires accounts[3]".into()))?;
+                let staker = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("Delegate requires accounts[0]".into())
+                })?;
+                let stake_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("Delegate requires accounts[1]".into())
+                })?;
+                let stats_pk = *instruction.accounts.get(2).ok_or_else(|| {
+                    ExecError::ProgramError("Delegate requires accounts[2]".into())
+                })?;
+                let pool_pk = *instruction.accounts.get(3).ok_or_else(|| {
+                    ExecError::ProgramError("Delegate requires accounts[3]".into())
+                })?;
 
                 // Pin the staking-stats singleton. `total_staked` (the governance
                 // quorum denominator) is only meaningful if EVERY Delegate/
@@ -306,7 +395,9 @@ impl NativeProgram for StakingProgram {
                 // unreachable and governance freezes. The read side (`Finalize`)
                 // was already pinned; this closes the write side.
                 if stats_pk != STAKING_STATS_ID {
-                    return Err(ExecError::Unauthorized("Delegate must name the canonical staking-stats account".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Delegate must name the canonical staking-stats account".into(),
+                    ));
                 }
                 // Pin the reward-pool singleton. `reward_debt` (the "already
                 // accrued, not owed to me" watermark) is seeded from THIS
@@ -321,21 +412,34 @@ impl NativeProgram for StakingProgram {
                 // the legitimate first-ever-delegator case (pool not yet created)
                 // still correctly yields acc = 0 via the `None` branch below.
                 if pool_pk != STAKING_REWARDS_POOL_ID {
-                    return Err(ExecError::Unauthorized("Delegate must name the canonical reward pool".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Delegate must name the canonical reward pool".into(),
+                    ));
                 }
 
                 if staker != *payer {
-                    return Err(ExecError::Unauthorized("Delegate's funding account must be the transaction payer".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Delegate's funding account must be the transaction payer".into(),
+                    ));
                 }
                 if accounts.contains_key(&stake_pk) {
-                    return Err(ExecError::ProgramError("stake account already exists - Delegate always opens a fresh position".into()));
+                    return Err(ExecError::ProgramError(
+                        "stake account already exists - Delegate always opens a fresh position"
+                            .into(),
+                    ));
                 }
 
-                let staker_balance = accounts.get(&staker).ok_or(ExecError::AccountNotFound(staker))?.balance;
+                let staker_balance = accounts
+                    .get(&staker)
+                    .ok_or(ExecError::AccountNotFound(staker))?
+                    .balance;
                 if staker_balance < amount {
                     return Err(ExecError::InsufficientFunds);
                 }
-                { let a = accounts.get_mut(&staker).unwrap(); a.balance = crate::arith::sub_u64(a.balance, amount)?; }
+                {
+                    let a = accounts.get_mut(&staker).unwrap();
+                    a.balance = crate::arith::sub_u64(a.balance, amount)?;
+                }
 
                 let pool_acc = match accounts.get(&pool_pk) {
                     Some(pool) => read_pool(pool)?.acc_reward_per_share,
@@ -351,39 +455,59 @@ impl NativeProgram for StakingProgram {
                     locked_until_round: 0,
                     bonding_until_round: current_round + MINIMUM_BONDING_ROUNDS,
                     unbonding_requested_at_round: None,
+                    // Per-voter governance snapshot (roadmap #6): stamp the
+                    // creation round so `Vote` can reject stake delegated after
+                    // a proposal opened.
+                    created_round: current_round,
                 })
                 .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 accounts.insert(stake_pk, stake_account);
 
-                let stats = accounts
-                    .entry(stats_pk)
-                    .or_insert_with(|| Account { data: borsh::to_vec(&0u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) });
+                let stats = accounts.entry(stats_pk).or_insert_with(|| Account {
+                    data: borsh::to_vec(&0u64).unwrap(),
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                });
                 let total = crate::arith::add_u64(read_stats(stats)?, amount)?;
-                stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stats.data =
+                    borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
             }
             StakingInstruction::Undelegate => {
-                let stake_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[0]".into()))?;
-                let stats_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[1]".into()))?;
-                let pool_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("Undelegate requires accounts[2]".into()))?;
+                let stake_pk = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("Undelegate requires accounts[0]".into())
+                })?;
+                let stats_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("Undelegate requires accounts[1]".into())
+                })?;
+                let pool_pk = *instruction.accounts.get(2).ok_or_else(|| {
+                    ExecError::ProgramError("Undelegate requires accounts[2]".into())
+                })?;
 
                 // Pin the staking-stats singleton (see the matching check in
                 // Delegate) - the write side of the `total_staked` invariant.
                 if stats_pk != STAKING_STATS_ID {
-                    return Err(ExecError::Unauthorized("Undelegate must name the canonical staking-stats account".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Undelegate must name the canonical staking-stats account".into(),
+                    ));
                 }
                 // Pin the reward-pool singleton (defense-in-depth, matches
                 // Delegate). Not independently exploitable here (naming a
                 // bogus pool only forfeits one's own reward), but consistent
                 // with the project-wide singleton-pinning discipline.
                 if pool_pk != STAKING_REWARDS_POOL_ID {
-                    return Err(ExecError::Unauthorized("Undelegate must name the canonical reward pool".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Undelegate must name the canonical reward pool".into(),
+                    ));
                 }
 
-                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
-                let mut data = StakeAccountData::try_from_slice(&stake_account.data)
+                let stake_account = accounts
+                    .get(&stake_pk)
+                    .ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let mut data = StakeAccountData::read_or_legacy(&stake_account.data)
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if data.owner != *payer {
-                    return Err(ExecError::Unauthorized("Undelegate must be signed by the stake account's owner".into()));
+                    return Err(ExecError::Unauthorized(
+                        "Undelegate must be signed by the stake account's owner".into(),
+                    ));
                 }
                 // Real, live-confirmed governance attack this closes - see
                 // `StakeAccountData::locked_until_round`'s doc comment for
@@ -419,10 +543,13 @@ impl NativeProgram for StakingProgram {
                         None => {
                             data.unbonding_requested_at_round = Some(current_round);
                             let stake_account = accounts.get_mut(&stake_pk).unwrap();
-                            stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                            stake_account.data = borsh::to_vec(&data)
+                                .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                             return Ok(());
                         }
-                        Some(requested_round) if current_round < requested_round + SELF_STAKE_UNBONDING_ROUNDS => {
+                        Some(requested_round)
+                            if current_round < requested_round + SELF_STAKE_UNBONDING_ROUNDS =>
+                        {
                             return Err(ExecError::ProgramError(format!(
                                 "this self-stake position is still unbonding until round {} - cannot withdraw until then",
                                 requested_round + SELF_STAKE_UNBONDING_ROUNDS
@@ -443,54 +570,81 @@ impl NativeProgram for StakingProgram {
                 data.reward_debt = 0;
                 let stake_account = accounts.get_mut(&stake_pk).unwrap();
                 stake_account.balance = 0;
-                stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stake_account.data =
+                    borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
 
                 if reward > 0 {
-                    let pool_account = accounts.get_mut(&pool_pk).ok_or(ExecError::AccountNotFound(pool_pk))?;
+                    let pool_account = accounts
+                        .get_mut(&pool_pk)
+                        .ok_or(ExecError::AccountNotFound(pool_pk))?;
                     pool_account.balance = crate::arith::sub_u64(pool_account.balance, reward)?;
                 }
                 let credit = crate::arith::add_u64(amount, reward)?;
-                let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+                let acct = accounts
+                    .entry(*payer)
+                    .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
                 acct.balance = crate::arith::add_u64(acct.balance, credit)?;
 
-                let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
+                let stats = accounts
+                    .get_mut(&stats_pk)
+                    .ok_or(ExecError::AccountNotFound(stats_pk))?;
                 let total = crate::arith::sub_u64(read_stats(stats)?, amount)?;
-                stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stats.data =
+                    borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
             }
             StakingInstruction::ClaimReward => {
-                let stake_pk = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("ClaimReward requires accounts[0]".into()))?;
-                let pool_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("ClaimReward requires accounts[1]".into()))?;
+                let stake_pk = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("ClaimReward requires accounts[0]".into())
+                })?;
+                let pool_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("ClaimReward requires accounts[1]".into())
+                })?;
                 // Pin the reward-pool singleton (defense-in-depth, matches
                 // Delegate). A correct `reward_debt` makes a bogus-pool claim
                 // self-harm rather than an exploit, but pin for consistency.
                 if pool_pk != STAKING_REWARDS_POOL_ID {
-                    return Err(ExecError::Unauthorized("ClaimReward must name the canonical reward pool".into()));
+                    return Err(ExecError::Unauthorized(
+                        "ClaimReward must name the canonical reward pool".into(),
+                    ));
                 }
 
-                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
-                let mut data = StakeAccountData::try_from_slice(&stake_account.data)
+                let stake_account = accounts
+                    .get(&stake_pk)
+                    .ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let mut data = StakeAccountData::read_or_legacy(&stake_account.data)
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if data.owner != *payer {
-                    return Err(ExecError::Unauthorized("ClaimReward must be signed by the stake account's owner".into()));
+                    return Err(ExecError::Unauthorized(
+                        "ClaimReward must be signed by the stake account's owner".into(),
+                    ));
                 }
 
-                let pool_acc = read_pool(accounts.get(&pool_pk).ok_or(ExecError::AccountNotFound(pool_pk))?)?.acc_reward_per_share;
+                let pool_acc = read_pool(
+                    accounts
+                        .get(&pool_pk)
+                        .ok_or(ExecError::AccountNotFound(pool_pk))?,
+                )?
+                .acc_reward_per_share;
                 let reward = pending_reward(data.amount, data.reward_debt, pool_acc);
 
                 data.reward_debt = settled_reward_debt(data.amount, pool_acc);
                 let stake_account = accounts.get_mut(&stake_pk).unwrap();
-                stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stake_account.data =
+                    borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
 
                 if reward > 0 {
                     let pool_account = accounts.get_mut(&pool_pk).unwrap();
                     pool_account.balance = crate::arith::sub_u64(pool_account.balance, reward)?;
-                    let acct = accounts.entry(*payer).or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+                    let acct = accounts
+                        .entry(*payer)
+                        .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
                     acct.balance = crate::arith::add_u64(acct.balance, reward)?;
                 }
             }
             StakingInstruction::ReportEquivocation { evidence } => {
-                let stake_pk =
-                    *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[0]".into()))?;
+                let stake_pk = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("ReportEquivocation requires accounts[0]".into())
+                })?;
                 // Optional accounts[1] = the staking-stats singleton. The CLI
                 // always passes it (see `report-equivocation`), so in practice
                 // it is always present and the global `total_staked` counter
@@ -508,19 +662,27 @@ impl NativeProgram for StakingProgram {
                     }
                 }
 
-                if evidence.vertex_a.round != evidence.vertex_b.round || evidence.vertex_a.author != evidence.vertex_b.author {
-                    return Err(ExecError::ProgramError("evidence must reference the same (round, author)".into()));
+                if evidence.vertex_a.round != evidence.vertex_b.round
+                    || evidence.vertex_a.author != evidence.vertex_b.author
+                {
+                    return Err(ExecError::ProgramError(
+                        "evidence must reference the same (round, author)".into(),
+                    ));
                 }
                 let author = evidence.vertex_a.author;
                 if evidence.vertex_a.digest() == evidence.vertex_b.digest() {
-                    return Err(ExecError::ProgramError("evidence vertices are identical - not a conflict".into()));
+                    return Err(ExecError::ProgramError(
+                        "evidence vertices are identical - not a conflict".into(),
+                    ));
                 }
                 // The bundle must genuinely be the accused validator's own
                 // - otherwise anyone could submit two arbitrary signed
                 // vertices under a bundle they control and frame someone
                 // else's address.
                 if evidence.author_bundle.to_address() != author {
-                    return Err(ExecError::ProgramError("author_bundle does not match the accused validator's address".into()));
+                    return Err(ExecError::ProgramError(
+                        "author_bundle does not match the accused validator's address".into(),
+                    ));
                 }
                 // What actually makes this evidence, not merely an
                 // accusation: both signatures must independently verify
@@ -529,15 +691,29 @@ impl NativeProgram for StakingProgram {
                 // #187: las firmas de la evidencia SON votos del autor sobre
                 // dos vértices en conflicto → se verifican bajo el mismo dominio
                 // `VERTEX_VOTE_V1` que produjo el proponente.
-                if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_a.digest(), &evidence.signature_a) {
-                    return Err(ExecError::ProgramError("evidence signature_a does not verify".into()));
+                if !qchain_crypto::verify_vertex_vote(
+                    &evidence.author_bundle,
+                    &evidence.vertex_a.digest(),
+                    &evidence.signature_a,
+                ) {
+                    return Err(ExecError::ProgramError(
+                        "evidence signature_a does not verify".into(),
+                    ));
                 }
-                if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_b.digest(), &evidence.signature_b) {
-                    return Err(ExecError::ProgramError("evidence signature_b does not verify".into()));
+                if !qchain_crypto::verify_vertex_vote(
+                    &evidence.author_bundle,
+                    &evidence.vertex_b.digest(),
+                    &evidence.signature_b,
+                ) {
+                    return Err(ExecError::ProgramError(
+                        "evidence signature_b does not verify".into(),
+                    ));
                 }
 
-                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
-                let mut data = StakeAccountData::try_from_slice(&stake_account.data)
+                let stake_account = accounts
+                    .get(&stake_pk)
+                    .ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let mut data = StakeAccountData::read_or_legacy(&stake_account.data)
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if data.owner != author || data.validator != author {
                     return Err(ExecError::Unauthorized(
@@ -545,7 +721,9 @@ impl NativeProgram for StakingProgram {
                     ));
                 }
                 if data.amount == 0 {
-                    return Err(ExecError::ProgramError("nothing to slash - this self-stake position is already empty".into()));
+                    return Err(ExecError::ProgramError(
+                        "nothing to slash - this self-stake position is already empty".into(),
+                    ));
                 }
 
                 // Burn the whole position - see module docs for why this
@@ -559,7 +737,8 @@ impl NativeProgram for StakingProgram {
                 data.reward_debt = 0;
                 let stake_account = accounts.get_mut(&stake_pk).unwrap();
                 stake_account.balance = 0;
-                stake_account.data = borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                stake_account.data =
+                    borsh::to_vec(&data).map_err(|e| ExecError::ProgramError(e.to_string()))?;
 
                 // Decrement the global `total_staked` counter by the slashed
                 // amount - the same bookkeeping `Undelegate` does when a
@@ -571,28 +750,50 @@ impl NativeProgram for StakingProgram {
                 // guards against any pre-existing desync rather than
                 // underflowing.
                 if let Some(stats_pk) = stats_pk {
-                    let stats = accounts.get_mut(&stats_pk).ok_or(ExecError::AccountNotFound(stats_pk))?;
+                    let stats = accounts
+                        .get_mut(&stats_pk)
+                        .ok_or(ExecError::AccountNotFound(stats_pk))?;
                     let total = crate::arith::sub_u64(read_stats(stats)?, slashed)?;
-                    stats.data = borsh::to_vec(&total).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+                    stats.data = borsh::to_vec(&total)
+                        .map_err(|e| ExecError::ProgramError(e.to_string()))?;
                 }
             }
-            StakingInstruction::RegisterValidator { pubkey_bundle, address } => {
-                let validator = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[0]".into()))?;
-                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[1]".into()))?;
-                let stake_pk = *instruction.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RegisterValidator requires accounts[2]".into()))?;
+            StakingInstruction::RegisterValidator {
+                pubkey_bundle,
+                address,
+            } => {
+                let validator = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("RegisterValidator requires accounts[0]".into())
+                })?;
+                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("RegisterValidator requires accounts[1]".into())
+                })?;
+                let stake_pk = *instruction.accounts.get(2).ok_or_else(|| {
+                    ExecError::ProgramError("RegisterValidator requires accounts[2]".into())
+                })?;
 
                 if validator != *payer {
-                    return Err(ExecError::Unauthorized("RegisterValidator's validator account must be the transaction payer".into()));
+                    return Err(ExecError::Unauthorized(
+                        "RegisterValidator's validator account must be the transaction payer"
+                            .into(),
+                    ));
                 }
                 // The published consensus bundle must genuinely be the
                 // payer's own - otherwise a registrant could advertise
                 // someone else's keys (or a bundle that hashes to an address
                 // they don't control), poisoning peer discovery.
                 if pubkey_bundle.to_address() != validator {
-                    return Err(ExecError::ProgramError("pubkey_bundle does not match the validator's address".into()));
+                    return Err(ExecError::ProgramError(
+                        "pubkey_bundle does not match the validator's address".into(),
+                    ));
                 }
-                if address.is_empty() || address.len() > crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN {
-                    return Err(ExecError::ProgramError(format!("validator address must be 1..={} bytes", crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN)));
+                if address.is_empty()
+                    || address.len() > crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN
+                {
+                    return Err(ExecError::ProgramError(format!(
+                        "validator address must be 1..={} bytes",
+                        crate::validator_registry::MAX_VALIDATOR_ADDRESS_LEN
+                    )));
                 }
                 // AUDIT FIX (v4.1.4, defense-in-depth): pin the registry account
                 // to its canonical singleton, exactly as every sibling singleton
@@ -603,7 +804,8 @@ impl NativeProgram for StakingProgram {
                 // written and matches the codebase-wide singleton discipline.
                 if registry_pk != crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID {
                     return Err(ExecError::Unauthorized(
-                        "RegisterValidator's accounts[1] must be the canonical validator registry".into(),
+                        "RegisterValidator's accounts[1] must be the canonical validator registry"
+                            .into(),
                     ));
                 }
                 // Gate on a real, slashable self-stake - the Sybil-resistance
@@ -611,7 +813,9 @@ impl NativeProgram for StakingProgram {
                 // (owner == validator == payer) with at least the minimum,
                 // reusing the exact `StakeAccountData` the rest of this module
                 // already produces and slashes.
-                let stake_account = accounts.get(&stake_pk).ok_or(ExecError::AccountNotFound(stake_pk))?;
+                let stake_account = accounts
+                    .get(&stake_pk)
+                    .ok_or(ExecError::AccountNotFound(stake_pk))?;
                 // AUDIT FIX (v4.1.4, defense-in-depth): pin the ACCOUNT owner to
                 // the staking program, as `Vote` already does before reading a
                 // stake's weight. Not exploitable today (the only source of a
@@ -624,7 +828,7 @@ impl NativeProgram for StakingProgram {
                         "RegisterValidator's accounts[2] must be a staking-program-owned self-stake".into(),
                     ));
                 }
-                let stake_data = StakeAccountData::try_from_slice(&stake_account.data)
+                let stake_data = StakeAccountData::read_or_legacy(&stake_account.data)
                     .map_err(|e| ExecError::ProgramError(format!("corrupt stake account: {e}")))?;
                 if stake_data.owner != validator || stake_data.validator != validator {
                     return Err(ExecError::Unauthorized(
@@ -639,8 +843,12 @@ impl NativeProgram for StakingProgram {
                     )));
                 }
 
-                let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
-                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(&registry_account.data)?;
+                let registry_account = accounts
+                    .get(&registry_pk)
+                    .ok_or(ExecError::AccountNotFound(registry_pk))?;
+                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(
+                    &registry_account.data,
+                )?;
                 let entry = crate::validator_registry::RegisteredValidator {
                     validator,
                     pubkey_bundle,
@@ -654,8 +862,12 @@ impl NativeProgram for StakingProgram {
                 match registry.position_of(&validator) {
                     Some(idx) => registry.validators[idx] = entry, // re-register: refresh in place
                     None => {
-                        if registry.validators.len() >= crate::validator_registry::MAX_REGISTERED_VALIDATORS {
-                            return Err(ExecError::ProgramError("validator registry is full".into()));
+                        if registry.validators.len()
+                            >= crate::validator_registry::MAX_REGISTERED_VALIDATORS
+                        {
+                            return Err(ExecError::ProgramError(
+                                "validator registry is full".into(),
+                            ));
                         }
                         registry.validators.push(entry);
                     }
@@ -664,11 +876,18 @@ impl NativeProgram for StakingProgram {
                 accounts.get_mut(&registry_pk).unwrap().data = bytes;
             }
             StakingInstruction::UnregisterValidator => {
-                let validator = *instruction.accounts.first().ok_or_else(|| ExecError::ProgramError("UnregisterValidator requires accounts[0]".into()))?;
-                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| ExecError::ProgramError("UnregisterValidator requires accounts[1]".into()))?;
+                let validator = *instruction.accounts.first().ok_or_else(|| {
+                    ExecError::ProgramError("UnregisterValidator requires accounts[0]".into())
+                })?;
+                let registry_pk = *instruction.accounts.get(1).ok_or_else(|| {
+                    ExecError::ProgramError("UnregisterValidator requires accounts[1]".into())
+                })?;
 
                 if validator != *payer {
-                    return Err(ExecError::Unauthorized("UnregisterValidator's validator account must be the transaction payer".into()));
+                    return Err(ExecError::Unauthorized(
+                        "UnregisterValidator's validator account must be the transaction payer"
+                            .into(),
+                    ));
                 }
                 // AUDIT FIX (v4.1.4, defense-in-depth): pin the registry singleton,
                 // same as RegisterValidator above and every sibling singleton writer.
@@ -677,13 +896,21 @@ impl NativeProgram for StakingProgram {
                         "UnregisterValidator's accounts[1] must be the canonical validator registry".into(),
                     ));
                 }
-                let registry_account = accounts.get(&registry_pk).ok_or(ExecError::AccountNotFound(registry_pk))?;
-                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(&registry_account.data)?;
+                let registry_account = accounts
+                    .get(&registry_pk)
+                    .ok_or(ExecError::AccountNotFound(registry_pk))?;
+                let mut registry = crate::validator_registry::ValidatorRegistryData::try_read(
+                    &registry_account.data,
+                )?;
                 match registry.position_of(&validator) {
                     Some(idx) => {
                         registry.validators.remove(idx);
                     }
-                    None => return Err(ExecError::ProgramError("caller is not registered as a validator".into())),
+                    None => {
+                        return Err(ExecError::ProgramError(
+                            "caller is not registered as a validator".into(),
+                        ))
+                    }
                 }
                 let bytes = registry.to_bytes()?;
                 accounts.get_mut(&registry_pk).unwrap().data = bytes;
@@ -699,6 +926,114 @@ mod tests {
     use crate::ids::{STAKING_REWARDS_POOL_ID, STAKING_STATS_ID};
 
     #[test]
+    fn read_or_legacy_migrates_a_pre6_stake_account_and_round_trips_a_new_one() {
+        let owner = Pubkey::new([1u8; 32]);
+        let validator = Pubkey::new([2u8; 32]);
+
+        // A LEGACY (pre-#6) blob: exactly the 7 old fields, no created_round.
+        let legacy = StakeAccountDataLegacy {
+            owner,
+            validator,
+            amount: 5_000,
+            reward_debt: 7,
+            locked_until_round: 11,
+            bonding_until_round: 100,
+            unbonding_requested_at_round: Some(42),
+        };
+        let legacy_bytes = borsh::to_vec(&legacy).unwrap();
+        // A raw new-layout decode FAILS on it (8 bytes short → EOF).
+        assert!(
+            StakeAccountData::try_from_slice(&legacy_bytes).is_err(),
+            "a legacy blob is not a valid new blob"
+        );
+        // read_or_legacy migrates it, defaulting created_round to 0 (predates
+        // every proposal) and preserving every other field exactly.
+        let migrated = StakeAccountData::read_or_legacy(&legacy_bytes).unwrap();
+        assert_eq!(
+            migrated.created_round, 0,
+            "a legacy position predates every proposal"
+        );
+        assert_eq!(migrated.amount, 5_000);
+        assert_eq!(migrated.unbonding_requested_at_round, Some(42));
+        assert_eq!(migrated.bonding_until_round, 100);
+
+        // A NEW blob round-trips exactly, and does NOT cross-decode as legacy
+        // (its 8 trailing bytes make the strict legacy decode reject it), so the
+        // try-new-then-legacy order is unambiguous.
+        // Share the exact 7-field prefix of `legacy` so the only difference is
+        // the appended `created_round` — makes the +8 length assertion precise.
+        let fresh = StakeAccountData {
+            owner,
+            validator,
+            amount: 5_000,
+            reward_debt: 7,
+            locked_until_round: 11,
+            bonding_until_round: 100,
+            unbonding_requested_at_round: Some(42),
+            created_round: 777,
+        };
+        let fresh_bytes = borsh::to_vec(&fresh).unwrap();
+        assert_eq!(
+            fresh_bytes.len(),
+            legacy_bytes.len() + 8,
+            "created_round appends exactly 8 bytes to the legacy layout"
+        );
+        assert_eq!(
+            StakeAccountData::read_or_legacy(&fresh_bytes)
+                .unwrap()
+                .created_round,
+            777
+        );
+        assert!(
+            StakeAccountDataLegacy::try_from_slice(&fresh_bytes).is_err(),
+            "a new blob's trailing bytes must reject the legacy decode"
+        );
+
+        // And Delegate stamps the real creation round.
+        let mut accounts = HashMap::from([
+            (
+                owner,
+                Account {
+                    balance: 20_000,
+                    ..Account::new_wallet(Pubkey::system_program_id())
+                },
+            ),
+            (
+                STAKING_STATS_ID,
+                Account {
+                    data: borsh::to_vec(&0u64).unwrap(),
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
+            (
+                STAKING_REWARDS_POOL_ID,
+                Account {
+                    data: borsh::to_vec(&RewardPoolData::default()).unwrap(),
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
+        ]);
+        let stake_pk = Pubkey::new([9u8; 32]);
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![owner, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 5_000,
+            })
+            .unwrap(),
+        };
+        StakingProgram
+            .process(&mut accounts, &ix, &owner, 314)
+            .unwrap();
+        let data = StakeAccountData::read_or_legacy(&accounts[&stake_pk].data).unwrap();
+        assert_eq!(
+            data.created_round, 314,
+            "Delegate stamps the current round as the creation round"
+        );
+    }
+
+    #[test]
     fn stake_instruction_encoding_is_stable() {
         // The WASM wallet (crates/qchain-wasm) hand-rolls these encodings to
         // avoid depending on this crate (which pulls wasmtime, no wasm target).
@@ -708,21 +1043,42 @@ mod tests {
         let mut expected = vec![0u8];
         expected.extend_from_slice(&validator.to_bytes());
         expected.extend_from_slice(&amount.to_le_bytes());
-        assert_eq!(borsh::to_vec(&StakingInstruction::Delegate { validator, amount }).unwrap(), expected, "wasm Delegate encoding out of sync");
-        assert_eq!(borsh::to_vec(&StakingInstruction::Undelegate).unwrap(), vec![1u8], "wasm Undelegate encoding out of sync");
-        assert_eq!(borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(), vec![2u8], "wasm ClaimReward encoding out of sync");
+        assert_eq!(
+            borsh::to_vec(&StakingInstruction::Delegate { validator, amount }).unwrap(),
+            expected,
+            "wasm Delegate encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
+            vec![1u8],
+            "wasm Undelegate encoding out of sync"
+        );
+        assert_eq!(
+            borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(),
+            vec![2u8],
+            "wasm ClaimReward encoding out of sync"
+        );
     }
 
     fn wallet_with(balance: u64) -> Account {
-        Account { balance, ..Account::new_wallet(Pubkey::system_program_id()) }
+        Account {
+            balance,
+            ..Account::new_wallet(Pubkey::system_program_id())
+        }
     }
 
     fn stats_account() -> Account {
-        Account { data: borsh::to_vec(&0u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }
+        Account {
+            data: borsh::to_vec(&0u64).unwrap(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        }
     }
 
     fn pool_account() -> Account {
-        Account { data: borsh::to_vec(&RewardPoolData::default()).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }
+        Account {
+            data: borsh::to_vec(&RewardPoolData::default()).unwrap(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        }
     }
 
     #[test]
@@ -743,16 +1099,30 @@ mod tests {
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, fake_stats, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        assert!(StakingProgram.process(&mut accounts, &ix, &staker, 0).is_err(), "Delegate must reject a non-canonical stats account");
+        assert!(
+            StakingProgram
+                .process(&mut accounts, &ix, &staker, 0)
+                .is_err(),
+            "Delegate must reject a non-canonical stats account"
+        );
         // Undelegate likewise (accounts[1] = stats).
         let un = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![stake_pk, fake_stats, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
-        assert!(StakingProgram.process(&mut accounts, &un, &staker, 0).is_err(), "Undelegate must reject a non-canonical stats account");
+        assert!(
+            StakingProgram
+                .process(&mut accounts, &un, &staker, 0)
+                .is_err(),
+            "Undelegate must reject a non-canonical stats account"
+        );
     }
 
     #[test]
@@ -768,9 +1138,14 @@ mod tests {
         let stake_pk = Pubkey::new([20u8; 32]);
         let validator = Pubkey::new([21u8; 32]);
         let bogus_pool = Pubkey::new([99u8; 32]); // deliberately not in the map
-        // The real pool has already accrued (acc_reward_per_share > 0).
-        let pd = RewardPoolData { acc_reward_per_share: PRECISION }; // 1 unit-per-share
-        let real_pool = Account { data: borsh::to_vec(&pd).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) };
+                                                  // The real pool has already accrued (acc_reward_per_share > 0).
+        let pd = RewardPoolData {
+            acc_reward_per_share: PRECISION,
+        }; // 1 unit-per-share
+        let real_pool = Account {
+            data: borsh::to_vec(&pd).unwrap(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        };
         let mut accounts = HashMap::from([
             (staker, wallet_with(10_000)),
             (STAKING_STATS_ID, stats_account()),
@@ -780,22 +1155,42 @@ mod tests {
         let attack = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, bogus_pool],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
         let result = StakingProgram.process(&mut accounts, &attack, &staker, 0);
-        assert!(matches!(result, Err(ExecError::Unauthorized(_))), "Delegate must reject a non-canonical reward pool");
-        assert!(!accounts.contains_key(&stake_pk), "no position may be created by the rejected attack");
+        assert!(
+            matches!(result, Err(ExecError::Unauthorized(_))),
+            "Delegate must reject a non-canonical reward pool"
+        );
+        assert!(
+            !accounts.contains_key(&stake_pk),
+            "no position may be created by the rejected attack"
+        );
 
         // Naming the REAL pool seeds reward_debt from its accumulator (not 0),
         // so there is no retroactive claim.
         let ok = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &ok, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &ok, &staker, 0)
+            .unwrap();
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
-        assert_eq!(data.reward_debt, settled_reward_debt(4_000, PRECISION), "reward_debt must come from the real accumulator, not 0");
+        assert_eq!(
+            data.reward_debt,
+            settled_reward_debt(4_000, PRECISION),
+            "reward_debt must come from the real accumulator, not 0"
+        );
         assert!(data.reward_debt > 0);
     }
 
@@ -804,21 +1199,40 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
         let validator = Pubkey::new([21u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
 
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &ix, &staker, 0)
+            .unwrap();
 
         assert_eq!(accounts[&staker].balance, 6_000);
         assert_eq!(accounts[&stake_pk].balance, 4_000);
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
         assert_eq!(
             data,
-            StakeAccountData { owner: staker, validator, amount: 4_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: MINIMUM_BONDING_ROUNDS, unbonding_requested_at_round: None }
+            StakeAccountData {
+                owner: staker,
+                validator,
+                amount: 4_000,
+                reward_debt: 0,
+                locked_until_round: 0,
+                bonding_until_round: MINIMUM_BONDING_ROUNDS,
+                unbonding_requested_at_round: None,
+                created_round: 0
+            }
         );
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 4_000);
     }
@@ -828,12 +1242,20 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let attacker = Pubkey::new([23u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
 
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
         let result = StakingProgram.process(&mut accounts, &ix, &attacker, 0);
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
@@ -844,22 +1266,42 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
         let validator = Pubkey::new([21u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
         let undelegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &undelegate_ix,
+                &staker,
+                MINIMUM_BONDING_ROUNDS,
+            )
+            .unwrap();
 
-        assert_eq!(accounts[&staker].balance, 10_000, "funds must return in full once the minimum bonding period has elapsed");
+        assert_eq!(
+            accounts[&staker].balance, 10_000,
+            "funds must return in full once the minimum bonding period has elapsed"
+        );
         assert_eq!(accounts[&stake_pk].balance, 0);
         assert_eq!(read_stats(&accounts[&STAKING_STATS_ID]).unwrap(), 0);
     }
@@ -875,13 +1317,23 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
         let validator = Pubkey::new([21u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
         // Simulate what a real `Vote` would do: lock this position until
         // round 266.
@@ -895,14 +1347,25 @@ mod tests {
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
         let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 200);
-        assert!(result.is_err(), "undelegating before the locking proposal is decided must be rejected");
-        assert_eq!(accounts[&stake_pk].balance, 4_000, "the position must remain intact, not partially unwound");
+        assert!(
+            result.is_err(),
+            "undelegating before the locking proposal is decided must be rejected"
+        );
+        assert_eq!(
+            accounts[&stake_pk].balance, 4_000,
+            "the position must remain intact, not partially unwound"
+        );
 
         // Once the voting period has actually ended, the same position
         // can undelegate normally.
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 266).unwrap();
+        StakingProgram
+            .process(&mut accounts, &undelegate_ix, &staker, 266)
+            .unwrap();
         assert_eq!(accounts[&stake_pk].balance, 0);
-        assert_eq!(accounts[&staker].balance, 10_000, "funds return in full once the lock has genuinely expired");
+        assert_eq!(
+            accounts[&staker].balance, 10_000,
+            "funds return in full once the lock has genuinely expired"
+        );
     }
 
     /// The real, live-confirmed reward-sniping vulnerability this closes
@@ -914,13 +1377,23 @@ mod tests {
         let staker = Pubkey::new([24u8; 32]);
         let stake_pk = Pubkey::new([25u8; 32]);
         let validator = Pubkey::new([26u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator, amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator,
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
         let undelegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
@@ -931,20 +1404,44 @@ mod tests {
         // The exact reward-sniping window this closes: a same-round,
         // zero-duration delegate/undelegate round-trip must be rejected.
         let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, 0);
-        assert!(result.is_err(), "undelegating in the same round as delegating must be rejected");
+        assert!(
+            result.is_err(),
+            "undelegating in the same round as delegating must be rejected"
+        );
         assert_eq!(result.unwrap_err().to_string(), "program error: this position is still in its minimum bonding period until round 100 - cannot undelegate until then");
-        assert_eq!(accounts[&stake_pk].balance, 4_000, "the position must remain intact, not partially unwound");
+        assert_eq!(
+            accounts[&stake_pk].balance, 4_000,
+            "the position must remain intact, not partially unwound"
+        );
 
         // Still locked one round before the bonding period elapses.
-        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS - 1);
-        assert!(result.is_err(), "undelegating before the minimum bonding period has elapsed must be rejected");
+        let result = StakingProgram.process(
+            &mut accounts,
+            &undelegate_ix,
+            &staker,
+            MINIMUM_BONDING_ROUNDS - 1,
+        );
+        assert!(
+            result.is_err(),
+            "undelegating before the minimum bonding period has elapsed must be rejected"
+        );
         assert_eq!(accounts[&stake_pk].balance, 4_000);
 
         // Once the minimum bonding period has genuinely elapsed, the same
         // position can undelegate normally.
-        StakingProgram.process(&mut accounts, &undelegate_ix, &staker, MINIMUM_BONDING_ROUNDS).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &undelegate_ix,
+                &staker,
+                MINIMUM_BONDING_ROUNDS,
+            )
+            .unwrap();
         assert_eq!(accounts[&stake_pk].balance, 0);
-        assert_eq!(accounts[&staker].balance, 10_000, "funds return in full once the bonding period has genuinely elapsed");
+        assert_eq!(
+            accounts[&staker].balance, 10_000,
+            "funds return in full once the bonding period has genuinely elapsed"
+        );
     }
 
     #[test]
@@ -952,14 +1449,24 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let attacker = Pubkey::new([23u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
-        let mut accounts =
-            HashMap::from([(staker, wallet_with(10_000)), (attacker, wallet_with(0)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (attacker, wallet_with(0)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 4_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 4_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
         let undelegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
@@ -968,30 +1475,61 @@ mod tests {
         };
         let result = StakingProgram.process(&mut accounts, &undelegate_ix, &attacker, 0);
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
-        assert_eq!(accounts[&stake_pk].balance, 4_000, "an unauthorized undelegate must not touch the position");
+        assert_eq!(
+            accounts[&stake_pk].balance, 4_000,
+            "an unauthorized undelegate must not touch the position"
+        );
     }
 
     #[test]
     fn accrue_reward_pool_falls_back_when_nothing_is_delegated() {
         let mut accounts = HashMap::from([(STAKING_STATS_ID, stats_account())]);
-        let credited = accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, 500).unwrap();
-        assert!(!credited, "with zero total stake the caller must fall back to crediting the validator directly");
-        assert!(!accounts.contains_key(&STAKING_REWARDS_POOL_ID), "pool must be untouched when the accrual is skipped");
+        let credited = accrue_reward_pool(
+            &mut accounts,
+            STAKING_REWARDS_POOL_ID,
+            STAKING_STATS_ID,
+            500,
+        )
+        .unwrap();
+        assert!(
+            !credited,
+            "with zero total stake the caller must fall back to crediting the validator directly"
+        );
+        assert!(
+            !accounts.contains_key(&STAKING_REWARDS_POOL_ID),
+            "pool must be untouched when the accrual is skipped"
+        );
     }
 
     #[test]
     fn accrue_reward_pool_increases_acc_reward_per_share_proportionally() {
         let staker = Pubkey::new([22u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
 
-        let credited = accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, 100).unwrap();
+        let credited = accrue_reward_pool(
+            &mut accounts,
+            STAKING_REWARDS_POOL_ID,
+            STAKING_STATS_ID,
+            100,
+        )
+        .unwrap();
         assert!(credited);
         assert_eq!(accounts[&STAKING_REWARDS_POOL_ID].balance, 100);
 
@@ -1000,8 +1538,14 @@ mod tests {
             accounts: vec![stake_pk, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &claim_ix, &staker, 0).unwrap();
-        assert_eq!(accounts[&staker].balance, 9_000 + 100, "the sole delegator earns the entire pool_share");
+        StakingProgram
+            .process(&mut accounts, &claim_ix, &staker, 0)
+            .unwrap();
+        assert_eq!(
+            accounts[&staker].balance,
+            9_000 + 100,
+            "the sole delegator earns the entire pool_share"
+        );
         assert_eq!(accounts[&STAKING_REWARDS_POOL_ID].balance, 0);
     }
 
@@ -1009,26 +1553,49 @@ mod tests {
     fn claim_reward_pays_the_pending_amount_and_resets_debt() {
         let staker = Pubkey::new([22u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
-        accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, 100).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
+        accrue_reward_pool(
+            &mut accounts,
+            STAKING_REWARDS_POOL_ID,
+            STAKING_STATS_ID,
+            100,
+        )
+        .unwrap();
 
         let claim_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![stake_pk, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &claim_ix, &staker, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &claim_ix, &staker, 0)
+            .unwrap();
         assert_eq!(accounts[&staker].balance, 9_100);
 
         // A second, immediate claim with no new accrual must pay nothing more.
-        StakingProgram.process(&mut accounts, &claim_ix, &staker, 0).unwrap();
-        assert_eq!(accounts[&staker].balance, 9_100, "reward_debt must have been settled so a repeat claim pays zero");
+        StakingProgram
+            .process(&mut accounts, &claim_ix, &staker, 0)
+            .unwrap();
+        assert_eq!(
+            accounts[&staker].balance, 9_100,
+            "reward_debt must have been settled so a repeat claim pays zero"
+        );
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
         assert_eq!(data.amount, 1_000, "claiming must not touch the principal");
     }
@@ -1038,14 +1605,30 @@ mod tests {
         let staker = Pubkey::new([22u8; 32]);
         let attacker = Pubkey::new([23u8; 32]);
         let stake_pk = Pubkey::new([20u8; 32]);
-        let mut accounts = HashMap::from([(staker, wallet_with(10_000)), (STAKING_STATS_ID, stats_account()), (STAKING_REWARDS_POOL_ID, pool_account())]);
+        let mut accounts = HashMap::from([
+            (staker, wallet_with(10_000)),
+            (STAKING_STATS_ID, stats_account()),
+            (STAKING_REWARDS_POOL_ID, pool_account()),
+        ]);
         let delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![staker, stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &delegate_ix, &staker, 0).unwrap();
-        accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, 100).unwrap();
+        StakingProgram
+            .process(&mut accounts, &delegate_ix, &staker, 0)
+            .unwrap();
+        accrue_reward_pool(
+            &mut accounts,
+            STAKING_REWARDS_POOL_ID,
+            STAKING_STATS_ID,
+            100,
+        )
+        .unwrap();
 
         let claim_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
@@ -1054,7 +1637,10 @@ mod tests {
         };
         let result = StakingProgram.process(&mut accounts, &claim_ix, &attacker, 0);
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
-        assert_eq!(accounts[&STAKING_REWARDS_POOL_ID].balance, 100, "an unauthorized claim must not touch the pool");
+        assert_eq!(
+            accounts[&STAKING_REWARDS_POOL_ID].balance, 100,
+            "an unauthorized claim must not touch the pool"
+        );
     }
 
     #[test]
@@ -1072,46 +1658,106 @@ mod tests {
 
         let early_delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![early, early_stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            accounts: vec![
+                early,
+                early_stake_pk,
+                STAKING_STATS_ID,
+                STAKING_REWARDS_POOL_ID,
+            ],
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &early_delegate_ix, &early, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &early_delegate_ix, &early, 0)
+            .unwrap();
 
-        accrue_reward_pool(&mut accounts, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, 100).unwrap();
+        accrue_reward_pool(
+            &mut accounts,
+            STAKING_REWARDS_POOL_ID,
+            STAKING_STATS_ID,
+            100,
+        )
+        .unwrap();
 
         let late_delegate_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![late, late_stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
-            data: borsh::to_vec(&StakingInstruction::Delegate { validator: Pubkey::new([21u8; 32]), amount: 1_000 }).unwrap(),
+            accounts: vec![
+                late,
+                late_stake_pk,
+                STAKING_STATS_ID,
+                STAKING_REWARDS_POOL_ID,
+            ],
+            data: borsh::to_vec(&StakingInstruction::Delegate {
+                validator: Pubkey::new([21u8; 32]),
+                amount: 1_000,
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &late_delegate_ix, &late, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &late_delegate_ix, &late, 0)
+            .unwrap();
 
         let claim_late_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![late_stake_pk, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &claim_late_ix, &late, 0).unwrap();
-        assert_eq!(accounts[&late].balance, 9_000, "a delegator who joined after the accrual must earn nothing from it");
+        StakingProgram
+            .process(&mut accounts, &claim_late_ix, &late, 0)
+            .unwrap();
+        assert_eq!(
+            accounts[&late].balance, 9_000,
+            "a delegator who joined after the accrual must earn nothing from it"
+        );
 
         let claim_early_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![early_stake_pk, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::ClaimReward).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &claim_early_ix, &early, 0).unwrap();
-        assert_eq!(accounts[&early].balance, 9_000 + 100, "the pre-existing delegator must earn the entire prior accrual alone");
+        StakingProgram
+            .process(&mut accounts, &claim_early_ix, &early, 0)
+            .unwrap();
+        assert_eq!(
+            accounts[&early].balance,
+            9_000 + 100,
+            "the pre-existing delegator must earn the entire prior accrual alone"
+        );
     }
 
     /// Builds two genuinely conflicting, validly author-signed vertices for
     /// the same (round, author) - the real shape `qchain-node::engine`
     /// constructs from two conflicting live `VertexProposal`s.
-    fn conflicting_evidence(author_kp: &qchain_crypto::Keypair, round: qchain_core::Round) -> EquivocationEvidence {
-        let vertex_a = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
-        let vertex_b = qchain_core::Vertex { round, author: author_kp.pubkey(), batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
-        let signature_a = qchain_crypto::sign_vertex_vote(author_kp, &vertex_a.digest()[..]).unwrap();
-        let signature_b = qchain_crypto::sign_vertex_vote(author_kp, &vertex_b.digest()[..]).unwrap();
-        EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: author_kp.public_key_bundle() }
+    fn conflicting_evidence(
+        author_kp: &qchain_crypto::Keypair,
+        round: qchain_core::Round,
+    ) -> EquivocationEvidence {
+        let vertex_a = qchain_core::Vertex {
+            round,
+            author: author_kp.pubkey(),
+            batch_digests: vec![(0, [1u8; 32])],
+            parents: vec![],
+        };
+        let vertex_b = qchain_core::Vertex {
+            round,
+            author: author_kp.pubkey(),
+            batch_digests: vec![(0, [2u8; 32])],
+            parents: vec![],
+        };
+        let signature_a =
+            qchain_crypto::sign_vertex_vote(author_kp, &vertex_a.digest()[..]).unwrap();
+        let signature_b =
+            qchain_crypto::sign_vertex_vote(author_kp, &vertex_b.digest()[..]).unwrap();
+        EquivocationEvidence {
+            vertex_a,
+            signature_a,
+            vertex_b,
+            signature_b,
+            author_bundle: author_kp.public_key_bundle(),
+        }
     }
 
     #[test]
@@ -1123,20 +1769,42 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: validator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
         )]);
 
         let evidence = conflicting_evidence(&validator_kp, 7);
-        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
         // Permissionless: signed/paid by an unrelated reporter, not the
         // accused validator and not the stake account's owner via any
         // special relationship - the evidence alone is what authorizes this.
-        StakingProgram.process(&mut accounts, &ix, &reporter, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &ix, &reporter, 0)
+            .unwrap();
 
-        assert_eq!(accounts[&stake_pk].balance, 0, "the whole self-staked position must be burned");
+        assert_eq!(
+            accounts[&stake_pk].balance, 0,
+            "the whole self-staked position must be burned"
+        );
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
         assert_eq!(data.amount, 0);
         assert_eq!(data.reward_debt, 0);
@@ -1160,24 +1828,46 @@ mod tests {
             (
                 stake_pk,
                 Account {
-                    data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                    data: borsh::to_vec(&StakeAccountData {
+                        owner: validator,
+                        validator,
+                        amount: 5_000_000,
+                        reward_debt: 0,
+                        locked_until_round: 0,
+                        bonding_until_round: 0,
+                        unbonding_requested_at_round: None,
+                        created_round: 0,
+                    })
+                    .unwrap(),
                     balance: 5_000_000,
                     ..Account::new_wallet(STAKING_PROGRAM_ID)
                 },
             ),
-            (STAKING_STATS_ID, Account { data: borsh::to_vec(&8_000_000u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }),
+            (
+                STAKING_STATS_ID,
+                Account {
+                    data: borsh::to_vec(&8_000_000u64).unwrap(),
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
         ]);
 
         let evidence = conflicting_evidence(&validator_kp, 9);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![stake_pk, STAKING_STATS_ID],
-            data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
         };
-        StakingProgram.process(&mut accounts, &ix, &reporter, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &ix, &reporter, 0)
+            .unwrap();
 
         assert_eq!(accounts[&stake_pk].balance, 0, "the self-stake is burned");
-        let total: u64 = borsh::BorshDeserialize::try_from_slice(&accounts[&STAKING_STATS_ID].data).unwrap();
+        let total: u64 =
+            borsh::BorshDeserialize::try_from_slice(&accounts[&STAKING_STATS_ID].data).unwrap();
         assert_eq!(total, 3_000_000, "total_staked must drop by exactly the slashed 5,000,000, leaving the unrelated 3,000,000");
     }
 
@@ -1192,7 +1882,8 @@ mod tests {
     /// elapses is rejected; `ReportEquivocation` still finds and burns
     /// the position while it's merely "unbonding," not yet withdrawn.
     #[test]
-    fn a_self_stake_undelegate_starts_an_unbonding_window_instead_of_paying_out_immediately_and_stays_slashable_during_it() {
+    fn a_self_stake_undelegate_starts_an_unbonding_window_instead_of_paying_out_immediately_and_stays_slashable_during_it(
+    ) {
         let validator_kp = qchain_crypto::Keypair::generate().unwrap();
         let validator = validator_kp.pubkey();
         let stake_pk = Pubkey::new([40u8; 32]);
@@ -1208,6 +1899,7 @@ mod tests {
                         locked_until_round: 0,
                         bonding_until_round: 0,
                         unbonding_requested_at_round: None,
+                        created_round: 0,
                     })
                     .unwrap(),
                     balance: 5_000_000,
@@ -1224,19 +1916,35 @@ mod tests {
         };
 
         // First call: starts unbonding, funds stay exactly where they are.
-        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, 0).unwrap();
-        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the self-stake must not be paid out on the first Undelegate call");
+        StakingProgram
+            .process(&mut accounts, &undelegate_ix, &validator, 0)
+            .unwrap();
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "the self-stake must not be paid out on the first Undelegate call"
+        );
         let data = StakeAccountData::try_from_slice(&accounts[&stake_pk].data).unwrap();
-        assert_eq!(data.amount, 5_000_000, "the position's recorded amount must be untouched while merely unbonding");
+        assert_eq!(
+            data.amount, 5_000_000,
+            "the position's recorded amount must be untouched while merely unbonding"
+        );
         assert_eq!(data.unbonding_requested_at_round, Some(0));
 
         // Exactly the real attack: ReportEquivocation must still find and
         // burn the position while it's mid-unbonding, not yet withdrawn.
         let reporter = Pubkey::new([41u8; 32]);
         let evidence = conflicting_evidence(&validator_kp, 7);
-        let report_ix =
-            Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
-        StakingProgram.process(&mut accounts, &report_ix, &reporter, 1).unwrap();
+        let report_ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
+        StakingProgram
+            .process(&mut accounts, &report_ix, &reporter, 1)
+            .unwrap();
         assert_eq!(accounts[&stake_pk].balance, 0, "the slash must still burn the position even though it was mid-unbonding, not yet withdrawn");
     }
 
@@ -1257,6 +1965,7 @@ mod tests {
                         locked_until_round: 0,
                         bonding_until_round: 0,
                         unbonding_requested_at_round: None,
+                        created_round: 0,
                     })
                     .unwrap(),
                     balance: 5_000_000,
@@ -1266,7 +1975,13 @@ mod tests {
             // total_staked reflects this position (the real invariant: Delegate
             // keeps total_staked >= Σ staked amounts). #218 checked_sub relies on
             // that invariant, so seed the stats consistently rather than at 0.
-            (STAKING_STATS_ID, Account { data: borsh::to_vec(&5_000_000u64).unwrap(), ..Account::new_wallet(STAKING_PROGRAM_ID) }),
+            (
+                STAKING_STATS_ID,
+                Account {
+                    data: borsh::to_vec(&5_000_000u64).unwrap(),
+                    ..Account::new_wallet(STAKING_PROGRAM_ID)
+                },
+            ),
             (STAKING_REWARDS_POOL_ID, pool_account()),
         ]);
         let undelegate_ix = Instruction {
@@ -1274,15 +1989,38 @@ mod tests {
             accounts: vec![stake_pk, STAKING_STATS_ID, STAKING_REWARDS_POOL_ID],
             data: borsh::to_vec(&StakingInstruction::Undelegate).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &undelegate_ix, &validator, 0)
+            .unwrap();
 
-        let result = StakingProgram.process(&mut accounts, &undelegate_ix, &validator, SELF_STAKE_UNBONDING_ROUNDS - 1);
-        assert!(result.is_err(), "withdrawing before the unbonding window elapses must be rejected");
-        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the position must remain intact, not partially unwound");
+        let result = StakingProgram.process(
+            &mut accounts,
+            &undelegate_ix,
+            &validator,
+            SELF_STAKE_UNBONDING_ROUNDS - 1,
+        );
+        assert!(
+            result.is_err(),
+            "withdrawing before the unbonding window elapses must be rejected"
+        );
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "the position must remain intact, not partially unwound"
+        );
 
-        StakingProgram.process(&mut accounts, &undelegate_ix, &validator, SELF_STAKE_UNBONDING_ROUNDS).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &undelegate_ix,
+                &validator,
+                SELF_STAKE_UNBONDING_ROUNDS,
+            )
+            .unwrap();
         assert_eq!(accounts[&stake_pk].balance, 0);
-        assert_eq!(accounts[&validator].balance, 5_000_000, "principal returns in full once the unbonding window has genuinely elapsed");
+        assert_eq!(
+            accounts[&validator].balance, 5_000_000,
+            "principal returns in full once the unbonding window has genuinely elapsed"
+        );
     }
 
     #[test]
@@ -1298,18 +2036,38 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: delegator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: delegator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
         )]);
 
         let evidence = conflicting_evidence(&validator_kp, 7);
-        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
         let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
 
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
-        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "a delegator's funds must be untouched by someone else's equivocation");
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "a delegator's funds must be untouched by someone else's equivocation"
+        );
     }
 
     #[test]
@@ -1321,7 +2079,17 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: validator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -1329,11 +2097,21 @@ mod tests {
 
         let mut evidence = conflicting_evidence(&validator_kp, 7);
         evidence.signature_b.components[0].bytes[0] ^= 0xFF;
-        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
         let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
 
         assert!(matches!(result, Err(ExecError::ProgramError(_))));
-        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "a forged/tampered signature must never slash anything");
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "a forged/tampered signature must never slash anything"
+        );
     }
 
     #[test]
@@ -1345,7 +2123,17 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: validator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
@@ -1354,11 +2142,21 @@ mod tests {
         let mut evidence = conflicting_evidence(&validator_kp, 7);
         evidence.vertex_b = evidence.vertex_a.clone();
         evidence.signature_b = evidence.signature_a.clone();
-        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
         let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
 
         assert!(matches!(result, Err(ExecError::ProgramError(_))));
-        assert_eq!(accounts[&stake_pk].balance, 5_000_000, "the exact same vertex twice is not equivocation");
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "the exact same vertex twice is not equivocation"
+        );
     }
 
     #[test]
@@ -1370,18 +2168,53 @@ mod tests {
         let mut accounts = HashMap::from([(
             stake_pk,
             Account {
-                data: borsh::to_vec(&StakeAccountData { owner: validator, validator, amount: 5_000_000, reward_debt: 0, locked_until_round: 0, bonding_until_round: 0, unbonding_requested_at_round: None }).unwrap(),
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: validator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
                 balance: 5_000_000,
                 ..Account::new_wallet(STAKING_PROGRAM_ID)
             },
         )]);
 
-        let vertex_a = qchain_core::Vertex { round: 7, author: validator, batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
-        let vertex_b = qchain_core::Vertex { round: 8, author: validator, batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
-        let signature_a = qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_a.digest()[..]).unwrap();
-        let signature_b = qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_b.digest()[..]).unwrap();
-        let evidence = EquivocationEvidence { vertex_a, signature_a, vertex_b, signature_b, author_bundle: validator_kp.public_key_bundle() };
-        let ix = Instruction { program_id: STAKING_PROGRAM_ID, accounts: vec![stake_pk], data: borsh::to_vec(&StakingInstruction::ReportEquivocation { evidence: Box::new(evidence) }).unwrap() };
+        let vertex_a = qchain_core::Vertex {
+            round: 7,
+            author: validator,
+            batch_digests: vec![(0, [1u8; 32])],
+            parents: vec![],
+        };
+        let vertex_b = qchain_core::Vertex {
+            round: 8,
+            author: validator,
+            batch_digests: vec![(0, [2u8; 32])],
+            parents: vec![],
+        };
+        let signature_a =
+            qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_a.digest()[..]).unwrap();
+        let signature_b =
+            qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_b.digest()[..]).unwrap();
+        let evidence = EquivocationEvidence {
+            vertex_a,
+            signature_a,
+            vertex_b,
+            signature_b,
+            author_bundle: validator_kp.public_key_bundle(),
+        };
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(evidence),
+            })
+            .unwrap(),
+        };
         let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
 
         assert!(matches!(result, Err(ExecError::ProgramError(_))));
@@ -1391,10 +2224,15 @@ mod tests {
     // ---- validator registry (phase 3.1) ----
 
     use crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID;
-    use crate::validator_registry::{ValidatorRegistryData, MAX_VALIDATOR_ADDRESS_LEN, MIN_VALIDATOR_STAKE};
+    use crate::validator_registry::{
+        ValidatorRegistryData, MAX_VALIDATOR_ADDRESS_LEN, MIN_VALIDATOR_STAKE,
+    };
 
     fn registry_account() -> Account {
-        Account { data: crate::validator_registry::genesis_validator_registry_account_data(), ..Account::new_wallet(STAKING_PROGRAM_ID) }
+        Account {
+            data: crate::validator_registry::genesis_validator_registry_account_data(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        }
     }
 
     /// A genuine self-stake account for `validator` with `amount` bonded
@@ -1410,6 +2248,7 @@ mod tests {
                 locked_until_round: 0,
                 bonding_until_round: 0,
                 unbonding_requested_at_round: None,
+                created_round: 0,
             })
             .unwrap(),
             balance: amount,
@@ -1417,11 +2256,20 @@ mod tests {
         }
     }
 
-    fn register_ix(validator: Pubkey, stake_pk: Pubkey, bundle: qchain_crypto::PublicKeyBundle, address: &str) -> Instruction {
+    fn register_ix(
+        validator: Pubkey,
+        stake_pk: Pubkey,
+        bundle: qchain_crypto::PublicKeyBundle,
+        address: &str,
+    ) -> Instruction {
         Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![validator, VALIDATOR_REGISTRY_ACCOUNT_ID, stake_pk],
-            data: borsh::to_vec(&StakingInstruction::RegisterValidator { pubkey_bundle: bundle, address: address.to_string() }).unwrap(),
+            data: borsh::to_vec(&StakingInstruction::RegisterValidator {
+                pubkey_bundle: bundle,
+                address: address.to_string(),
+            })
+            .unwrap(),
         }
     }
 
@@ -1436,10 +2284,19 @@ mod tests {
             (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
 
-        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
-        StakingProgram.process(&mut accounts, &ix, &validator, 0).unwrap();
+        let ix = register_ix(
+            validator,
+            stake_pk,
+            kp.public_key_bundle(),
+            "203.0.113.7:9000",
+        );
+        StakingProgram
+            .process(&mut accounts, &ix, &validator, 0)
+            .unwrap();
 
-        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
+        let registry =
+            ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data)
+                .unwrap();
         assert_eq!(registry.validators.len(), 1);
         assert_eq!(registry.validators[0].validator, validator);
         assert_eq!(registry.validators[0].address, "203.0.113.7:9000");
@@ -1454,15 +2311,28 @@ mod tests {
         let stake_pk = Pubkey::new([51u8; 32]);
         let mut accounts = HashMap::from([
             (validator, wallet_with(0)),
-            (stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE - 1)),
+            (
+                stake_pk,
+                self_stake_account(validator, MIN_VALIDATOR_STAKE - 1),
+            ),
             (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
 
-        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
+        let ix = register_ix(
+            validator,
+            stake_pk,
+            kp.public_key_bundle(),
+            "203.0.113.7:9000",
+        );
         let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
         assert!(result.is_err(), "below-minimum self-stake must be rejected");
-        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert!(registry.validators.is_empty(), "nothing must be registered when the stake gate fails");
+        let registry =
+            ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data)
+                .unwrap();
+        assert!(
+            registry.validators.is_empty(),
+            "nothing must be registered when the stake gate fails"
+        );
     }
 
     #[test]
@@ -1478,7 +2348,12 @@ mod tests {
         ]);
 
         // Advertise someone else's bundle (hashes to a different address).
-        let ix = register_ix(validator, stake_pk, other_kp.public_key_bundle(), "203.0.113.7:9000");
+        let ix = register_ix(
+            validator,
+            stake_pk,
+            other_kp.public_key_bundle(),
+            "203.0.113.7:9000",
+        );
         let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
         assert!(matches!(result, Err(ExecError::ProgramError(_))));
     }
@@ -1493,11 +2368,19 @@ mod tests {
         // satisfy the payer's registration gate.
         let mut accounts = HashMap::from([
             (validator, wallet_with(0)),
-            (stake_pk, self_stake_account(someone_else, MIN_VALIDATOR_STAKE)),
+            (
+                stake_pk,
+                self_stake_account(someone_else, MIN_VALIDATOR_STAKE),
+            ),
             (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
 
-        let ix = register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000");
+        let ix = register_ix(
+            validator,
+            stake_pk,
+            kp.public_key_bundle(),
+            "203.0.113.7:9000",
+        );
         let result = StakingProgram.process(&mut accounts, &ix, &validator, 0);
         assert!(matches!(result, Err(ExecError::Unauthorized(_))));
     }
@@ -1514,10 +2397,25 @@ mod tests {
         ]);
 
         let empty = register_ix(validator, stake_pk, kp.public_key_bundle(), "");
-        assert!(StakingProgram.process(&mut accounts, &empty, &validator, 0).is_err(), "empty address must be rejected");
+        assert!(
+            StakingProgram
+                .process(&mut accounts, &empty, &validator, 0)
+                .is_err(),
+            "empty address must be rejected"
+        );
 
-        let oversized = register_ix(validator, stake_pk, kp.public_key_bundle(), &"a".repeat(MAX_VALIDATOR_ADDRESS_LEN + 1));
-        assert!(StakingProgram.process(&mut accounts, &oversized, &validator, 0).is_err(), "oversized address must be rejected");
+        let oversized = register_ix(
+            validator,
+            stake_pk,
+            kp.public_key_bundle(),
+            &"a".repeat(MAX_VALIDATOR_ADDRESS_LEN + 1),
+        );
+        assert!(
+            StakingProgram
+                .process(&mut accounts, &oversized, &validator, 0)
+                .is_err(),
+            "oversized address must be rejected"
+        );
     }
 
     #[test]
@@ -1531,13 +2429,46 @@ mod tests {
             (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
 
-        StakingProgram.process(&mut accounts, &register_ix(validator, stake_pk, kp.public_key_bundle(), "203.0.113.7:9000"), &validator, 0).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &register_ix(
+                    validator,
+                    stake_pk,
+                    kp.public_key_bundle(),
+                    "203.0.113.7:9000",
+                ),
+                &validator,
+                0,
+            )
+            .unwrap();
         // Second registration with a new address + a larger self-stake.
-        accounts.insert(stake_pk, self_stake_account(validator, MIN_VALIDATOR_STAKE * 3));
-        StakingProgram.process(&mut accounts, &register_ix(validator, stake_pk, kp.public_key_bundle(), "198.51.100.9:9001"), &validator, 0).unwrap();
+        accounts.insert(
+            stake_pk,
+            self_stake_account(validator, MIN_VALIDATOR_STAKE * 3),
+        );
+        StakingProgram
+            .process(
+                &mut accounts,
+                &register_ix(
+                    validator,
+                    stake_pk,
+                    kp.public_key_bundle(),
+                    "198.51.100.9:9001",
+                ),
+                &validator,
+                0,
+            )
+            .unwrap();
 
-        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert_eq!(registry.validators.len(), 1, "re-registering must update in place, not duplicate");
+        let registry =
+            ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data)
+                .unwrap();
+        assert_eq!(
+            registry.validators.len(),
+            1,
+            "re-registering must update in place, not duplicate"
+        );
         assert_eq!(registry.validators[0].address, "198.51.100.9:9001");
         assert_eq!(registry.validators[0].stake, MIN_VALIDATOR_STAKE * 3);
     }
@@ -1557,19 +2488,44 @@ mod tests {
             (stake_b, self_stake_account(b, MIN_VALIDATOR_STAKE)),
             (VALIDATOR_REGISTRY_ACCOUNT_ID, registry_account()),
         ]);
-        StakingProgram.process(&mut accounts, &register_ix(a, stake_a, kp_a.public_key_bundle(), "203.0.113.7:9000"), &a, 0).unwrap();
-        StakingProgram.process(&mut accounts, &register_ix(b, stake_b, kp_b.public_key_bundle(), "203.0.113.8:9000"), &b, 0).unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &register_ix(a, stake_a, kp_a.public_key_bundle(), "203.0.113.7:9000"),
+                &a,
+                0,
+            )
+            .unwrap();
+        StakingProgram
+            .process(
+                &mut accounts,
+                &register_ix(b, stake_b, kp_b.public_key_bundle(), "203.0.113.8:9000"),
+                &b,
+                0,
+            )
+            .unwrap();
 
         let unregister_a = Instruction {
             program_id: STAKING_PROGRAM_ID,
             accounts: vec![a, VALIDATOR_REGISTRY_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::UnregisterValidator).unwrap(),
         };
-        StakingProgram.process(&mut accounts, &unregister_a, &a, 0).unwrap();
+        StakingProgram
+            .process(&mut accounts, &unregister_a, &a, 0)
+            .unwrap();
 
-        let registry = ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data).unwrap();
-        assert_eq!(registry.validators.len(), 1, "only the caller's entry must be removed");
-        assert_eq!(registry.validators[0].validator, b, "the other validator's entry must survive");
+        let registry =
+            ValidatorRegistryData::try_read(&accounts[&VALIDATOR_REGISTRY_ACCOUNT_ID].data)
+                .unwrap();
+        assert_eq!(
+            registry.validators.len(),
+            1,
+            "only the caller's entry must be removed"
+        );
+        assert_eq!(
+            registry.validators[0].validator, b,
+            "the other validator's entry must survive"
+        );
     }
 
     #[test]
@@ -1579,8 +2535,16 @@ mod tests {
         // ReportEquivocation encodings the wallet and prior data depend on
         // never shift.
         let kp = qchain_crypto::Keypair::generate().unwrap();
-        let register = borsh::to_vec(&StakingInstruction::RegisterValidator { pubkey_bundle: kp.public_key_bundle(), address: "x".into() }).unwrap();
+        let register = borsh::to_vec(&StakingInstruction::RegisterValidator {
+            pubkey_bundle: kp.public_key_bundle(),
+            address: "x".into(),
+        })
+        .unwrap();
         assert_eq!(register[0], 4, "RegisterValidator must be discriminant 4");
-        assert_eq!(borsh::to_vec(&StakingInstruction::UnregisterValidator).unwrap(), vec![5u8], "UnregisterValidator must be discriminant 5");
+        assert_eq!(
+            borsh::to_vec(&StakingInstruction::UnregisterValidator).unwrap(),
+            vec![5u8],
+            "UnregisterValidator must be discriminant 5"
+        );
     }
 }

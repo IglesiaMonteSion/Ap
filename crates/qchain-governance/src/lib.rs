@@ -200,7 +200,12 @@ impl Proposal {
     }
 
     /// Records one stake account's vote. Returns `false` (no-op) if that
-    /// stake account already voted on this proposal.
+    /// stake account already voted on this proposal. Per-voter ELIGIBILITY —
+    /// that the position was bonded at or before `created_round` (the per-voter
+    /// creation-time snapshot, roadmap #6) — is enforced by the execution-layer
+    /// `Vote` handler (`qchain-execution::governance`) BEFORE it calls this,
+    /// since only the ledger knows a position's creation round; this pure crate
+    /// just tallies the `weight` it's handed.
     pub fn record_vote(&mut self, stake_account: Pubkey, choice: VoteChoice, weight: u64) -> bool {
         if self.voted_stake_accounts.contains(&stake_account) {
             return false;

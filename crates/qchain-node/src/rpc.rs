@@ -674,7 +674,7 @@ async fn get_stake(State(engine): State<Arc<Engine>>, Path(address): Path<String
     if acct.owner != STAKING_PROGRAM_ID || acct.data.is_empty() {
         return Ok(Json(json!({ "exists": false })));
     }
-    let sad = StakeAccountData::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stake account decode: {e}")))?;
+    let sad = StakeAccountData::read_or_legacy(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stake account decode: {e}")))?;
     // Pool's running accumulator (0 if the pool was never seeded/accrued).
     let acc_per_share = match engine.get_account(&STAKING_REWARDS_POOL_ID).await {
         Some(pool) if !pool.data.is_empty() => RewardPoolData::try_from_slice(&pool.data).map(|p| p.acc_reward_per_share).unwrap_or(0),

@@ -1982,7 +1982,7 @@ impl Ledger {
                 }),
                 Ok(crate::staking::StakingInstruction::Undelegate) => {
                     let stake_account = ix.accounts.first().copied().unwrap_or(sys);
-                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::try_from_slice(&a.data).ok());
+                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::read_or_legacy(&a.data).ok());
                     sad.map(|s| {
                         // A self-stake (owner == validator) withdraws in TWO steps:
                         // the FIRST Undelegate only starts a 100-round unbonding
@@ -2008,7 +2008,7 @@ impl Ledger {
                 }
                 Ok(crate::staking::StakingInstruction::ClaimReward) => {
                     let stake_account = ix.accounts.first().copied().unwrap_or(sys);
-                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::try_from_slice(&a.data).ok());
+                    let sad = self.store.get(&stake_account).and_then(|a| StakeAccountData::read_or_legacy(&a.data).ok());
                     let acc_per_share = self
                         .store
                         .get(&STAKING_REWARDS_POOL_ID)
