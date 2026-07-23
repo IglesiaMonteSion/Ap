@@ -837,6 +837,51 @@ impl NodeConfig {
                 missing.push("rounds_per_quanto: set the explicit quanto length (part of the network config hash)".into());
             }
         }
+        // 10. HARD CAP mandatory (task pre-mainnet #4): a mainnet cannot ship the
+        //     inflationary model — the 100M ceiling must be a consensus property.
+        if !self.hard_cap_supply {
+            missing.push("hard_cap_supply: set true — a mainnet must run the hard-capped supply (no minting; emission drawn from a pre-minted reserve). The inflationary model is dev-only.".into());
+        }
+        // 11. REAL treasury multisig (task pre-mainnet #1/#10): no single key may
+        //     control the funds. Require ≥3 signers, an effective threshold ≥2
+        //     (prohibit 1-of-N AND 1-of-1), a positive timelock, and BOTH a
+        //     per-operation and a rolling-window release cap.
+        let n = self.treasury_signers.len();
+        if n < 3 {
+            missing.push(format!(
+                "treasury_signers: configure a REAL multisig — at least 3 signers (got {n}); no single key may control administrative funds"
+            ));
+        } else {
+            // effective threshold: 0 in config means "majority" = floor(N/2)+1.
+            let eff = if self.treasury_threshold == 0 {
+                (n / 2 + 1) as u8
+            } else {
+                self.treasury_threshold
+            };
+            if eff < 2 {
+                missing.push(format!(
+                    "treasury_threshold: an effective M-of-N with M≥2 is required on mainnet (got effective M={eff}) — a 1-of-N (or 1-of-1) treasury is a single point of control"
+                ));
+            }
+            if (eff as usize) > n {
+                missing.push(format!(
+                    "treasury_threshold: M ({eff}) exceeds the number of signers N ({n}) — the treasury could never execute"
+                ));
+            }
+        }
+        if self.treasury_timelock_rounds == 0 {
+            missing.push("treasury_timelock_rounds: set a positive timelock (review window before a release/authority change may execute)".into());
+        }
+        if self.treasury_max_per_release_qch == 0 {
+            missing.push("treasury_max_per_release_qch: set a positive per-operation release cap".into());
+        }
+        if self.treasury_max_per_window_qch == 0 || self.treasury_window_rounds == 0 {
+            missing.push("treasury_max_per_window_qch + treasury_window_rounds: set a positive rolling-window release cap AND window length".into());
+        }
+        // 12. Explicit administrative-fee wallet (no hidden constant on mainnet).
+        if self.admin_fee_wallet.is_none() {
+            missing.push("admin_fee_wallet: set the explicit administrative-fee destination (point it at the multisig treasury) — a mainnet must not fall back to the hidden default constant".into());
+        }
 
         if !missing.is_empty() {
             anyhow::bail!(
@@ -1169,6 +1214,15 @@ mod tests {
         c.economics_v7 = true;
         c.quanto_rate_fp = Some(310_537_755_655_371);
         c.rounds_per_quanto = Some(86_400);
+        // Pre-mainnet #1/#4/#10: hard cap + a real multisig treasury + explicit admin wallet.
+        c.hard_cap_supply = true;
+        c.treasury_signers = vec!["s1addr".into(), "s2addr".into(), "s3addr".into(), "s4addr".into(), "s5addr".into()];
+        c.treasury_threshold = 3;
+        c.treasury_timelock_rounds = 5_760;
+        c.treasury_max_per_release_qch = 1_000;
+        c.treasury_max_per_window_qch = 5_000;
+        c.treasury_window_rounds = 172_800;
+        c.admin_fee_wallet = Some("adminwallet".into());
         c
     }
 
@@ -1205,6 +1259,16 @@ mod tests {
             ("economics_v7", Box::new(|c: &mut NodeConfig| c.economics_v7 = false)),
             ("quanto_rate_fp", Box::new(|c: &mut NodeConfig| c.quanto_rate_fp = None)),
             ("rounds_per_quanto", Box::new(|c: &mut NodeConfig| c.rounds_per_quanto = None)),
+            // Pre-mainnet #1/#4/#10:
+            ("hard_cap_supply", Box::new(|c: &mut NodeConfig| c.hard_cap_supply = false)),
+            ("no treasury signers", Box::new(|c: &mut NodeConfig| c.treasury_signers = vec![])),
+            ("too few signers", Box::new(|c: &mut NodeConfig| c.treasury_signers = vec!["a".into(), "b".into()])),
+            ("1-of-N threshold", Box::new(|c: &mut NodeConfig| c.treasury_threshold = 1)),
+            ("no timelock", Box::new(|c: &mut NodeConfig| c.treasury_timelock_rounds = 0)),
+            ("no per-op cap", Box::new(|c: &mut NodeConfig| c.treasury_max_per_release_qch = 0)),
+            ("no per-window cap", Box::new(|c: &mut NodeConfig| c.treasury_max_per_window_qch = 0)),
+            ("no window length", Box::new(|c: &mut NodeConfig| c.treasury_window_rounds = 0)),
+            ("no admin wallet", Box::new(|c: &mut NodeConfig| c.admin_fee_wallet = None)),
         ];
         for (name, knock) in knockouts {
             let mut c = mainnet_config_with(one_validator());

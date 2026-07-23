@@ -43,6 +43,12 @@ recuperación bajo caos.
 5. **Anotar**: `chain_id`, `network_fingerprint` (se loguea al arrancar), la
    ruta del `data_dir`, y el trust-anchor de state-sync (`state_sync_trusted_root`
    / `_round`) — necesarios para verificar una restauración.
+6. **ANTES de cada actualización**, correr la inspección READ-ONLY:
+   `qchain-inspect-state --config node.json` — reporta el formato de cada
+   singleton (incluido el registro de validadores: V2 / V1-migratable / corrupto),
+   el supply, la config de tesorería, y un veredicto START/HALT. Si dice
+   **WOULD HALT**, NO actualices hasta resolverlo (evita bloquear la red viva por
+   un formato incompatible no detectado).
 
 ---
 
