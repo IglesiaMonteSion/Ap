@@ -63,8 +63,16 @@ pub struct SimValidator {
     /// `qchain-node::engine`'s `pending_cert_requests`, see
     /// `retry_pending_cert_requests`'s doc comment for the real bug this
     /// closes (found live, not via this harness - see
-    /// `project-lessons-learned`).
-    pending_cert_requests: HashMap<Digest, ValidatorId>,
+    /// `project-lessons-learned`). **INSERTION-ORDERED** (a `Vec`, not a
+    /// `HashMap`): the retry loop re-emits these every tick, and a `HashMap`
+    /// iterated them in digest-value/`RandomState` order, which — because the
+    /// digests hash the run's random author keys — leaked into re-sync *timing*
+    /// and made the same seed produce different `max_committed_round`s run to
+    /// run (the residual half of the rotation flake, alongside the leader-sort
+    /// fix). Insertion order is driven only by the seeded delivery schedule, so
+    /// it is reproducible per seed. Requests outstanding at once are bounded by
+    /// a vertex's parent count, so the linear dedup is cheap.
+    pending_cert_requests: Vec<(Digest, ValidatorId)>,
     next_round: Round,
     /// Total order as this validator has observed it commit, in order -
     /// what the simulation's safety check compares across validators.
@@ -84,7 +92,7 @@ impl SimValidator {
             voted_for: HashMap::new(),
             first_seen_vertex: HashMap::new(),
             equivocation_evidence: HashMap::new(),
-            pending_cert_requests: HashMap::new(),
+            pending_cert_requests: Vec::new(),
             next_round: 0,
             committed_order: Vec::new(),
         }
@@ -195,7 +203,14 @@ impl SimValidator {
     fn missing_parent_requests(&mut self, parents: &[Digest], from: ValidatorId) -> Vec<(ValidatorId, SimMessage)> {
         let missing: Vec<Digest> = parents.iter().copied().filter(|d| !self.dag.contains(d)).collect();
         for &digest in &missing {
-            self.pending_cert_requests.insert(digest, from);
+            // Insertion-ordered set: update `from` in place if already
+            // outstanding (same last-requester semantics the HashMap had),
+            // else append — keeping a stable, digest-value-independent order.
+            if let Some(entry) = self.pending_cert_requests.iter_mut().find(|(d, _)| *d == digest) {
+                entry.1 = from;
+            } else {
+                self.pending_cert_requests.push((digest, from));
+            }
         }
         missing.into_iter().map(|digest| (from, SimMessage::CertificateRequest { digest })).collect()
     }
@@ -211,11 +226,11 @@ impl SimValidator {
     /// this harness, but closed here too so the simulator stays faithful
     /// to what the real node now does.
     pub fn retry_pending_cert_requests(&mut self) -> Vec<(ValidatorId, SimMessage)> {
-        let resolved: Vec<Digest> = self.pending_cert_requests.keys().copied().filter(|d| self.dag.contains(d)).collect();
-        for digest in &resolved {
-            self.pending_cert_requests.remove(digest);
-        }
-        self.pending_cert_requests.iter().map(|(&digest, &from)| (from, SimMessage::CertificateRequest { digest })).collect()
+        // Drop now-resolved requests; re-emit the rest in insertion order (the
+        // digest-value-independent, per-seed-reproducible order — see the field
+        // doc). No dedup needed: a digest is outstanding at most once.
+        self.pending_cert_requests.retain(|(d, _)| !self.dag.contains(d));
+        self.pending_cert_requests.iter().map(|&(digest, from)| (from, SimMessage::CertificateRequest { digest })).collect()
     }
 
     /// Mirrors `engine.rs`'s `handle_message`, synchronously.
