@@ -38,8 +38,8 @@ use crate::economics_v7::{
 };
 use crate::error::ExecError;
 use crate::ids::{
-    STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
-    VALIDATOR_UNBONDING_POOL_ID,
+    STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_RECOVERY_REGISTRY_ID,
+    VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, EquivocationEvidence, Instruction};
@@ -67,6 +67,14 @@ pub enum ValidatorV7State {
     Withdrawable,
     Slashed,
     Removed,
+    /// **Revocado por el comité de recuperación (KM#4).** Un validador cuya clave
+    /// de consenso/operador se comprometió, neutralizado por M-de-N firmas de
+    /// recuperación OFFLINE sin ninguna de las claves comprometidas. Como
+    /// `BeginExit`, el bono se mueve al pool de unbonding y queda slasheable en la
+    /// ventana de evidencia; `Revoked` (distinto de `Unbonding`) hace que la causa
+    /// sea auditable. Excluido del comité activo y de la elegibilidad de fees (no
+    /// es `Active`). Se APENDA al final del enum → discriminantes previos estables.
+    Revoked,
 }
 
 /// (#20) At most this many consensus keys a validator has ROTATED AWAY FROM are
@@ -84,6 +92,102 @@ pub const MAX_RETIRED_CONSENSUS_KEYS: usize = 4;
 pub struct RetiredConsensusKey {
     pub address: Pubkey,
     pub slash_until_quanto: u64,
+}
+
+/// (KM#4) Cap on the number of OFFLINE recovery signers a validator may register.
+/// Generous for a real 3-of-5 / 5-of-9 committee, bounded so the recovery
+/// registry account can't be bloated. A bond is required to be a validator, so
+/// this is a defensive backstop.
+pub const MAX_RECOVERY_SIGNERS: usize = 15;
+
+/// (KM#4) A validator's OFFLINE recovery committee: M-of-N recovery pubkeys held
+/// offline (e.g. Shamir 3-of-5). If the validator's consensus/operator keys are
+/// lost or compromised, `threshold` DISTINCT recovery signers — signing OFFLINE,
+/// never touching an online machine — can REVOKE the validator without any of the
+/// compromised keys. `signers` are addresses (an approval carries the full
+/// `PublicKeyBundle` so the handler can verify); `threshold` is M (1..=N).
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq, Default)]
+pub struct RecoveryConfig {
+    pub signers: Vec<Pubkey>,
+    pub threshold: u8,
+}
+
+impl RecoveryConfig {
+    /// Validate the committee: `1 ≤ threshold ≤ N`, `1 ≤ N ≤ MAX_RECOVERY_SIGNERS`,
+    /// all signers pairwise DISTINCT (a duplicate signer would let one key count
+    /// twice toward the threshold). Rejects an empty/zero-threshold config.
+    pub fn validate(&self) -> Result<(), ExecError> {
+        let n = self.signers.len();
+        if n == 0 || n > MAX_RECOVERY_SIGNERS {
+            return Err(ExecError::ProgramError(format!("recovery signers count {n} out of range 1..={MAX_RECOVERY_SIGNERS}")));
+        }
+        if self.threshold == 0 || self.threshold as usize > n {
+            return Err(ExecError::ProgramError(format!("recovery threshold {} out of range 1..={n}", self.threshold)));
+        }
+        let distinct: std::collections::HashSet<&Pubkey> = self.signers.iter().collect();
+        if distinct.len() != n {
+            return Err(ExecError::ProgramError("recovery signers must be distinct".into()));
+        }
+        Ok(())
+    }
+}
+
+/// (KM#4) One validator's recovery record in the recovery registry singleton:
+/// its committee plus a monotonic `nonce` that every successful revoke bumps, so
+/// a collected set of offline authorizations can never be replayed within the
+/// network.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct RecoveryEntry {
+    pub consensus_address: Pubkey,
+    pub config: RecoveryConfig,
+    pub nonce: u64,
+}
+
+/// (KM#4) The v7 recovery registry singleton
+/// (`VALIDATOR_RECOVERY_REGISTRY_ID.data`). Additive: absent/empty on a network
+/// that hasn't opted in.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct RecoveryRegistry {
+    pub entries: Vec<RecoveryEntry>,
+}
+
+impl RecoveryRegistry {
+    fn find(&self, addr: &Pubkey) -> Option<usize> {
+        self.entries.iter().position(|e| &e.consensus_address == addr)
+    }
+}
+
+/// (KM#4) One recovery signer's OFFLINE authorization of a recovery op: the
+/// signer's `bundle` (so the handler can check `to_address()` is a registered
+/// committee member and verify the signature) and its `signature` over
+/// `RECOVERY_AUTH_V1 ‖ consensus_address ‖ op_tag ‖ nonce_le`.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
+pub struct RecoveryApproval {
+    pub bundle: PublicKeyBundle,
+    pub signature: MultiSignature,
+}
+
+/// (KM#4) The recovery operation a committee authorizes. Only `Revoke` this
+/// increment; the `op_tag` byte binds the authorization so a future op's
+/// approval can never be replayed as a Revoke. REPLACE/rotate (→KM#6, already has
+/// the operator-authorized `RotateConsensusKey`) and FREEZE (→KM#9) are separate.
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub enum RecoveryOp {
+    Revoke,
+}
+
+/// (KM#4) The preimage each recovery signer signs OFFLINE (domain
+/// `RECOVERY_AUTH_V1`). Binds the target validator, the op, and the current
+/// per-validator recovery nonce (anti-replay within the network — consistent with
+/// `pop_message`, which also does not bind chain_id).
+pub fn recovery_message(consensus_address: &Pubkey, op: RecoveryOp, nonce: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(32 + 1 + 8);
+    m.extend_from_slice(&consensus_address.0);
+    m.push(match op {
+        RecoveryOp::Revoke => 0x01,
+    });
+    m.extend_from_slice(&nonce.to_le_bytes());
+    m
 }
 
 /// One validator's on-chain record (SPEC §7). The bond is always
@@ -400,6 +504,22 @@ pub enum ValidatorV7Instruction {
     /// `expiry_quanto` the validator is excluded from the committee AND fees until
     /// the operator rotates in a fresh key. accounts = [operator(payer), REGISTRY].
     SetConsensusKeyExpiry { consensus_address: Pubkey, expiry_quanto: u64 },
+    /// (KM#4) Set (or replace) the OFFLINE recovery committee of `consensus_address`
+    /// (authorized by the cold OPERATOR — set BEFORE any compromise, since it
+    /// doesn't need the recovery keys). Stored in the SEPARATE recovery registry
+    /// singleton (additive — no validator-entry format change). `config` empty →
+    /// clears the committee. accounts = [operator(payer), REGISTRY, RECOVERY_REGISTRY].
+    SetRecoveryCommittee { consensus_address: Pubkey, config: RecoveryConfig },
+    /// (KM#4) REVOKE `consensus_address` using its OFFLINE recovery committee —
+    /// neutralize a validator whose consensus/operator keys are lost or
+    /// compromised, WITHOUT any of those keys. `approvals` carries M offline
+    /// signatures collected out-of-band; the handler verifies ≥ threshold DISTINCT
+    /// valid signatures from REGISTERED recovery signers over the current recovery
+    /// nonce, then hard-exits the validator (bond → unbonding pool, state →
+    /// `Revoked`, nonce bumped). PERMISSIONLESS: the payer is just a fee relayer
+    /// (like `ReportEquivocation`) — the M signatures are the authorization.
+    /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL].
+    RecoverRevoke { consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval> },
 }
 
 pub struct ValidatorV7Program;
@@ -733,6 +853,31 @@ fn write_registry(accounts: &mut HashMap<Pubkey, Account>, r: &ValidatorV7Regist
     Ok(())
 }
 
+/// (KM#4) Read the recovery registry singleton, LAZILY DEFAULTED: absent OR empty
+/// data (an existing v7 network that hasn't opted in) → an empty registry. A
+/// PRESENT-but-undecodable one is fail-loud (like the validator registry): a
+/// per-node disk fault stops that node, it never forks. Additive: never touches
+/// the validator registry format, so the live network is byte-identical until a
+/// validator first opts in.
+fn read_recovery_registry(accounts: &HashMap<Pubkey, Account>) -> RecoveryRegistry {
+    match accounts.get(&VALIDATOR_RECOVERY_REGISTRY_ID) {
+        None => RecoveryRegistry::default(),
+        Some(a) if a.data.is_empty() => RecoveryRegistry::default(),
+        Some(a) => RecoveryRegistry::try_from_slice(&a.data).unwrap_or_else(|_| {
+            panic!(
+                "VALIDATOR_RECOVERY_REGISTRY (v7) is present but does not decode — refusing \
+                 to run on a corrupt recovery registry (restore from a good backup / re-sync)"
+            )
+        }),
+    }
+}
+
+fn write_recovery_registry(accounts: &mut HashMap<Pubkey, Account>, r: &RecoveryRegistry) -> Result<(), ExecError> {
+    let acct = accounts.entry(VALIDATOR_RECOVERY_REGISTRY_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
+    acct.data = borsh::to_vec(r).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+    Ok(())
+}
+
 fn current_quanto(accounts: &HashMap<Pubkey, Account>) -> u64 {
     crate::staking_v7::global_state(accounts).current_quanto
 }
@@ -768,7 +913,131 @@ impl ValidatorV7Program {
             }
             ValidatorV7Instruction::RevokeConsensusKey { consensus_address } => Self::revoke_consensus_key(accounts, instruction, payer, consensus_address),
             ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address, expiry_quanto } => Self::set_consensus_key_expiry(accounts, instruction, payer, consensus_address, expiry_quanto),
+            ValidatorV7Instruction::SetRecoveryCommittee { consensus_address, config } => Self::set_recovery_committee(accounts, instruction, payer, consensus_address, config),
+            ValidatorV7Instruction::RecoverRevoke { consensus_address, op, approvals } => Self::recover_revoke(accounts, instruction, payer, consensus_address, op, approvals),
         }
+    }
+
+    /// (KM#4) The OPERATOR sets/replaces/clears the OFFLINE recovery committee of
+    /// its own validator (before any compromise — it doesn't need the recovery
+    /// keys). Stored in the SEPARATE recovery registry singleton, lazily created.
+    /// accounts = [operator(payer), REGISTRY, RECOVERY_REGISTRY].
+    fn set_recovery_committee(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, config: RecoveryConfig) -> Result<(), ExecError> {
+        let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("SetRecoveryCommittee requires accounts[2]".into()))?;
+        if recovery_pk != VALIDATOR_RECOVERY_REGISTRY_ID {
+            return Err(ExecError::Unauthorized("SetRecoveryCommittee must name the canonical recovery registry account".into()));
+        }
+        // Only the cold operator of a LIVE validator may set its recovery committee.
+        let (reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "SetRecoveryCommittee")?;
+        // A revoked/removed validator can't (re)configure recovery.
+        if matches!(reg.validators[idx].state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
+            return Err(ExecError::ProgramError("validator is not in a state that can configure recovery".into()));
+        }
+        let clearing = config.signers.is_empty() && config.threshold == 0;
+        if !clearing {
+            config.validate()?;
+        }
+        let mut rec = read_recovery_registry(accounts);
+        match rec.find(&consensus_address) {
+            Some(i) => {
+                if clearing {
+                    rec.entries.remove(i);
+                } else {
+                    // Replacing the committee RESETS nothing about the nonce — keep it
+                    // monotonic so a stale offline authorization can never be replayed
+                    // across a committee change.
+                    rec.entries[i].config = config;
+                }
+            }
+            None => {
+                if !clearing {
+                    if rec.entries.len() >= MAX_V7_VALIDATORS {
+                        return Err(ExecError::ProgramError("recovery registry is full".into()));
+                    }
+                    rec.entries.push(RecoveryEntry { consensus_address, config, nonce: 0 });
+                }
+            }
+        }
+        write_recovery_registry(accounts, &rec)?;
+        Ok(())
+    }
+
+    /// (KM#4) REVOKE a validator using its OFFLINE recovery committee — WITHOUT any
+    /// of the (possibly compromised) consensus/operator keys. Permissionless: the M
+    /// offline signatures are the authorization; the payer is a fee relayer.
+    /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL].
+    fn recover_revoke(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
+        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[1]".into()))?;
+        let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[2]".into()))?;
+        let escrow_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[3]".into()))?;
+        let unbonding_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[4]".into()))?;
+        let global_pk = *ix.accounts.get(5).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[5]".into()))?;
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID
+            || recovery_pk != VALIDATOR_RECOVERY_REGISTRY_ID
+            || escrow_pk != VALIDATOR_BOND_ESCROW_ID
+            || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID
+            || global_pk != STAKING_GLOBAL_ID
+        {
+            return Err(ExecError::Unauthorized("RecoverRevoke must name the canonical accounts".into()));
+        }
+        // Recovery committee + current nonce.
+        let mut rec = read_recovery_registry(accounts);
+        let ridx = rec.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("no recovery committee registered for this validator".into()))?;
+        let threshold = rec.entries[ridx].config.threshold;
+        if threshold == 0 || rec.entries[ridx].config.signers.is_empty() {
+            return Err(ExecError::ProgramError("recovery committee is empty".into()));
+        }
+        let signer_set: std::collections::HashSet<Pubkey> = rec.entries[ridx].config.signers.iter().copied().collect();
+        let nonce = rec.entries[ridx].nonce;
+        // The exact bytes each recovery signer signed OFFLINE.
+        let msg = recovery_message(&consensus_address, op, nonce);
+        // Count DISTINCT valid approvals from REGISTERED signers. An approval whose
+        // signer isn't registered, or whose signature doesn't verify, is IGNORED
+        // (not counted) — so padded/garbage approvals can't grief a real quorum.
+        let mut counted: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        for a in &approvals {
+            let addr = a.bundle.to_address();
+            if !signer_set.contains(&addr) || counted.contains(&addr) {
+                continue;
+            }
+            if qchain_crypto::verify_domain(&a.bundle, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg, &a.signature) {
+                counted.insert(addr);
+            }
+        }
+        if (counted.len() as u8) < threshold {
+            return Err(ExecError::Unauthorized(format!(
+                "recovery quorum not met: {} distinct valid recovery signatures, need {threshold}",
+                counted.len()
+            )));
+        }
+        // Authorized. Hard-exit the validator (bond → unbonding, state → Revoked),
+        // mirroring `begin_exit`'s money move so the bond stays slashable through
+        // the evidence window; `Revoked` is terminal and the (compromised) operator
+        // cannot undo it.
+        let mut reg = read_registry(accounts);
+        let vidx = reg.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
+        let state = reg.validators[vidx].state;
+        if !matches!(state, ValidatorV7State::BondedPending | ValidatorV7State::Active | ValidatorV7State::Jailed) {
+            return Err(ExecError::ProgramError("validator is not in a revocable state".into()));
+        }
+        let escrow_bal = accounts.get(&escrow_pk).map(|a| a.balance).unwrap_or(0);
+        if escrow_bal < VALIDATOR_BOND_ATOMS {
+            return Err(ExecError::ProgramError("bond escrow underfunded (invariant violation)".into()));
+        }
+        { let a = accounts.get_mut(&escrow_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
+        credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS)?;
+        let q = current_quanto(accounts);
+        {
+            let e = &mut reg.validators[vidx];
+            e.state = ValidatorV7State::Revoked;
+            e.exit_requested_quanto = q;
+            e.bond_release_quanto = q.saturating_add(VALIDATOR_BOND_UNBONDING_QUANTOS.max(SLASH_EVIDENCE_WINDOW_QUANTOS));
+        }
+        write_registry(accounts, &reg)?;
+        // Bump the recovery nonce so this collected authorization can't be replayed.
+        rec.entries[ridx].nonce = nonce.saturating_add(1);
+        write_recovery_registry(accounts, &rec)?;
+        Ok(())
     }
 
     fn unjail(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey) -> Result<(), ExecError> {
@@ -1054,12 +1323,19 @@ impl ValidatorV7Program {
         }
         let mut reg = read_registry(accounts);
         let idx = reg.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
-        // Only the cold OPERATOR key may withdraw — a leaked consensus key cannot.
-        if reg.validators[idx].operator_address != *payer {
-            return Err(ExecError::Unauthorized("only the validator's operator (cold) key can withdraw the bond".into()));
-        }
-        if reg.validators[idx].state != ValidatorV7State::Unbonding {
+        let state = reg.validators[idx].state;
+        if !matches!(state, ValidatorV7State::Unbonding | ValidatorV7State::Revoked) {
             return Err(ExecError::ProgramError("bond is not unbonding".into()));
+        }
+        // For a normal exit (`Unbonding`), only the cold OPERATOR key may withdraw —
+        // a leaked consensus key cannot. For a RECOVERY REVOKE (`Revoked`), the
+        // operator key may itself be lost/compromised, so withdrawal is
+        // PERMISSIONLESS: the destination is FIXED to the recorded (cold) withdrawal
+        // address, so even a stranger triggering it can only push the bond to that
+        // address — never steal it. This makes the bond recoverable after the window
+        // even when the operator key is gone (KM#4).
+        if state == ValidatorV7State::Unbonding && reg.validators[idx].operator_address != *payer {
+            return Err(ExecError::Unauthorized("only the validator's operator (cold) key can withdraw the bond".into()));
         }
         // The bond returns to the recorded WITHDRAWAL (cold) address, which must be
         // named in accounts[4] so the ledger persists the credit. This is what keeps
@@ -1131,9 +1407,11 @@ impl ValidatorV7Program {
             return Err(ExecError::ProgramError("nothing to slash".into()));
         }
         // Burn the full bond from wherever it currently sits: the escrow (Active/
-        // BondedPending/Jailed) or the unbonding pool (Exiting/Unbonding). Burning
-        // = the QCH leaves circulation (real supply reduction).
-        let from_escrow = !matches!(e.state, ValidatorV7State::Unbonding);
+        // BondedPending/Jailed) or the unbonding pool (Exiting/Unbonding/Revoked —
+        // a recovery-revoked validator's bond was moved to the unbonding pool, and
+        // stays slashable there through the evidence window). Burning = the QCH
+        // leaves circulation (real supply reduction).
+        let from_escrow = !matches!(e.state, ValidatorV7State::Unbonding | ValidatorV7State::Revoked);
         let (pool_pk, bal) = if from_escrow {
             (escrow_pk, accounts.get(&escrow_pk).map(|a| a.balance).unwrap_or(0))
         } else {
@@ -1298,6 +1576,186 @@ mod tests {
         assert_eq!(accounts.get(&v.pubkey()).unwrap().balance, before + VALIDATOR_BOND_ATOMS, "bond returned");
         assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Removed);
         assert!(!is_registered_validator(&accounts, &v.pubkey()));
+    }
+
+    // ─── KM#4: recovery committee + REVOKE ────────────────────────────────────
+
+    fn recovery_of(accounts: &HashMap<Pubkey, Account>) -> RecoveryRegistry {
+        read_recovery_registry(accounts)
+    }
+    /// Set the recovery committee of `consensus` (authorized by `operator`).
+    fn set_recovery(accounts: &mut HashMap<Pubkey, Account>, operator: &Keypair, consensus: Pubkey, signers: &[Pubkey], threshold: u8) -> Result<(), ExecError> {
+        let cfg = RecoveryConfig { signers: signers.to_vec(), threshold };
+        let data = ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: consensus, config: cfg };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID]), &operator.pubkey())
+    }
+    /// One recovery signer's OFFLINE approval of a Revoke of `consensus` at `nonce`.
+    fn approve(signer: &Keypair, consensus: Pubkey, nonce: u64) -> RecoveryApproval {
+        let msg = recovery_message(&consensus, RecoveryOp::Revoke, nonce);
+        let sig = qchain_crypto::sign_domain(signer, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg).unwrap();
+        RecoveryApproval { bundle: signer.public_key_bundle(), signature: sig }
+    }
+    fn revoke(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, consensus: Pubkey, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
+        let data = ValidatorV7Instruction::RecoverRevoke { consensus_address: consensus, op: RecoveryOp::Revoke, approvals };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &relayer.pubkey())
+    }
+
+    #[test]
+    fn recovery_config_validation_bounds_and_distinctness() {
+        let s: Vec<Pubkey> = (0..5).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+        assert!(RecoveryConfig { signers: s.clone(), threshold: 3 }.validate().is_ok(), "valid 3-of-5");
+        assert!(RecoveryConfig { signers: s.clone(), threshold: 0 }.validate().is_err(), "threshold 0 rejected");
+        assert!(RecoveryConfig { signers: s.clone(), threshold: 6 }.validate().is_err(), "threshold > N rejected");
+        assert!(RecoveryConfig { signers: vec![], threshold: 1 }.validate().is_err(), "empty signers rejected");
+        let mut dup = s.clone();
+        dup[1] = dup[0];
+        assert!(RecoveryConfig { signers: dup, threshold: 2 }.validate().is_err(), "duplicate signers rejected");
+        let too_many: Vec<Pubkey> = (0..MAX_RECOVERY_SIGNERS + 1).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+        assert!(RecoveryConfig { signers: too_many, threshold: 2 }.validate().is_err(), "over MAX_RECOVERY_SIGNERS rejected");
+    }
+
+    #[test]
+    fn set_recovery_committee_is_operator_only_and_stored_in_the_separate_singleton() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "rec-node").unwrap();
+        // The validator registry format is UNCHANGED (recovery lives in its own account).
+        let reg_bytes_before = accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data.clone();
+
+        let signers: Vec<Pubkey> = (0..5).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+        // A NON-operator cannot set the committee.
+        let stranger = Keypair::generate().unwrap();
+        assert!(set_recovery(&mut accounts, &stranger, cons.pubkey(), &signers, 3).is_err(), "only the operator can set recovery");
+        // The operator sets a 3-of-5 committee → stored in the recovery singleton.
+        set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
+        let rec = recovery_of(&accounts);
+        assert_eq!(rec.entries.len(), 1);
+        assert_eq!(rec.entries[0].consensus_address, cons.pubkey());
+        assert_eq!(rec.entries[0].config.threshold, 3);
+        assert_eq!(rec.entries[0].nonce, 0);
+        // The validator registry bytes did NOT change (purely additive).
+        assert_eq!(accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data, reg_bytes_before, "recovery config does not touch the validator registry");
+        // Clearing (empty config) removes the entry.
+        set_recovery(&mut accounts, &op, cons.pubkey(), &[], 0).unwrap();
+        assert!(recovery_of(&accounts).entries.is_empty(), "empty config clears the committee");
+    }
+
+    #[test]
+    fn recover_revoke_requires_a_quorum_of_distinct_registered_signers() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "revoke-node").unwrap();
+        let signer_kps: Vec<Keypair> = (0..5).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // < threshold (2 of 3 needed) → rejected, bond untouched.
+        let two = vec![approve(&signer_kps[0], cons.pubkey(), 0), approve(&signer_kps[1], cons.pubkey(), 0)];
+        assert!(revoke(&mut accounts, &relayer, cons.pubkey(), two).is_err(), "2 < threshold 3 rejected");
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "bond untouched below quorum");
+        assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::BondedPending);
+
+        // A duplicate approval from the same signer counts ONCE; a NON-registered
+        // signer's approval is IGNORED. So [s0, s0, stranger, s1] = only 2 distinct.
+        let stranger = Keypair::generate().unwrap();
+        let padded = vec![
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&stranger, cons.pubkey(), 0),
+            approve(&signer_kps[1], cons.pubkey(), 0),
+        ];
+        assert!(revoke(&mut accounts, &relayer, cons.pubkey(), padded).is_err(), "duplicates + non-members don't reach quorum");
+
+        // Exactly threshold (3) DISTINCT registered signers → accepted.
+        let three = vec![
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&signer_kps[2], cons.pubkey(), 0),
+            approve(&signer_kps[4], cons.pubkey(), 0),
+        ];
+        revoke(&mut accounts, &relayer, cons.pubkey(), three).unwrap();
+        // Neutralized: state Revoked, bond → unbonding pool, nonce bumped.
+        assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked);
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, 0);
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).unwrap().balance, VALIDATOR_BOND_ATOMS);
+        assert_eq!(recovery_of(&accounts).entries[0].nonce, 1, "recovery nonce bumped");
+
+        // A REPLAYED authorization over the OLD nonce (0) is rejected — nonce moved.
+        let replay = vec![
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&signer_kps[2], cons.pubkey(), 0),
+            approve(&signer_kps[4], cons.pubkey(), 0),
+        ];
+        assert!(revoke(&mut accounts, &relayer, cons.pubkey(), replay).is_err(), "replayed old-nonce authorization rejected");
+    }
+
+    #[test]
+    fn a_revoked_validator_is_dropped_from_the_committee_bond_recoverable_and_still_slashable() {
+        use qchain_core::Vertex;
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let withdrawal = Keypair::generate().unwrap().pubkey();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, Some(withdrawal), "slash-node").unwrap();
+        // Activate it (flip the committed state) so it would be in the committee.
+        { let mut r = read_registry(&accounts); r.validators[0].state = ValidatorV7State::Active; write_registry(&mut accounts, &r).unwrap(); }
+        assert_eq!(active_committee(&registry_of(&accounts), 1).len(), 1, "active before revoke");
+
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        revoke(&mut accounts, &relayer, cons.pubkey(), vec![approve(&signer_kps[0], cons.pubkey(), 0), approve(&signer_kps[1], cons.pubkey(), 0)]).unwrap();
+
+        // Dropped from the active committee (not Active).
+        assert!(active_committee(&registry_of(&accounts), 1).is_empty(), "revoked validator is not in the committee");
+
+        // Still slashable from the unbonding pool if it equivocated (compromised key).
+        let mut accounts_slash = accounts.clone();
+        let va = Vertex { round: 7, author: cons.pubkey(), batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
+        let vb = Vertex { round: 7, author: cons.pubkey(), batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
+        let sa = qchain_crypto::sign_vertex_vote(&cons, &va.digest()[..]).unwrap();
+        let sb = qchain_crypto::sign_vertex_vote(&cons, &vb.digest()[..]).unwrap();
+        let evidence = EquivocationEvidence { vertex_a: va, vertex_b: vb, signature_a: sa, signature_b: sb, author_bundle: cons.public_key_bundle() };
+        let rep = ValidatorV7Instruction::ReportEquivocation { evidence: Box::new(evidence) };
+        ValidatorV7Program::execute(&mut accounts_slash, &ix(&rep, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID]), &relayer.pubkey()).unwrap();
+        assert_eq!(accounts_slash.get(&VALIDATOR_UNBONDING_POOL_ID).unwrap().balance, 0, "revoked equivocator's bond burned from the unbonding pool");
+        assert_eq!(registry_of(&accounts_slash).validators[0].state, ValidatorV7State::Slashed);
+
+        // Or, no equivocation: the bond is withdrawable PERMISSIONLESSLY to the cold
+        // withdrawal address after the window (operator key may be lost).
+        set_quanto(&mut accounts, 20);
+        let wd = ValidatorV7Instruction::WithdrawBond { consensus_address: cons.pubkey() };
+        // A stranger (not the operator) can push it — but ONLY to the recorded cold address.
+        let stranger = Keypair::generate().unwrap();
+        accounts.insert(stranger.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        ValidatorV7Program::execute(&mut accounts, &ix(&wd, vec![stranger.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, withdrawal]), &stranger.pubkey()).unwrap();
+        assert_eq!(accounts.get(&withdrawal).unwrap().balance, VALIDATOR_BOND_ATOMS, "revoked bond recovered to the cold withdrawal address");
+    }
+
+    #[test]
+    fn validator_v7_instruction_encoding_is_stable() {
+        // Pin the borsh discriminants so a CLI/relayer encoder can't silently drift.
+        let cons = Pubkey::new([9u8; 32]);
+        let cases: [(ValidatorV7Instruction, u8); 4] = [
+            (ValidatorV7Instruction::BeginExit { consensus_address: cons }, 1),
+            (ValidatorV7Instruction::Unjail { consensus_address: cons }, 4),
+            (ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: cons, config: RecoveryConfig::default() }, 10),
+            (ValidatorV7Instruction::RecoverRevoke { consensus_address: cons, op: RecoveryOp::Revoke, approvals: vec![] }, 11),
+        ];
+        for (instr, disc) in cases {
+            let bytes = borsh::to_vec(&instr).unwrap();
+            assert_eq!(bytes[0], disc, "discriminant of {instr:?} must stay {disc}");
+        }
+        // RecoveryOp::Revoke is discriminant 0 (the op_tag in the signed message is 0x01, separate).
+        assert_eq!(borsh::to_vec(&RecoveryOp::Revoke).unwrap(), vec![0u8]);
     }
 
     /// Role separation (the on-chain part of #193-B): a cold OPERATOR key registers

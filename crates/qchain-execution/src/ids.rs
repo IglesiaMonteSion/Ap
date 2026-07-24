@@ -166,6 +166,19 @@ pub const BURN_ADDRESS: Pubkey = Pubkey::new([0xFFu8; 32]);
 /// decision (a new leaf changes the state root). System-owned; carries no funds.
 pub const SCHEMA_MANIFEST_ID: Pubkey = Pubkey::new([21u8; 32]);
 
+/// Singleton account (owned by `STAKING_PROGRAM_ID`) whose `data` is the v7
+/// **recovery registry** (programa de gestión de claves, KM#4). Maps each
+/// validator's consensus address to its OFFLINE recovery committee (M-de-N
+/// recovery pubkeys + threshold + monotonic nonce). Held in its OWN account
+/// (not on each validator entry) so it is purely ADDITIVE: an existing v7
+/// network with no such account sees an empty recovery registry until a
+/// validator opts in via `SetRecoveryCommittee` — no registry-format migration,
+/// no chain_id change, brick-safe on a live network. Lazily created on the first
+/// `SetRecoveryCommittee`. If any validator's keys are lost/compromised, its
+/// recovery committee can REVOKE it (M-de-N offline signatures) WITHOUT any of
+/// the compromised keys. Carries no funds.
+pub const VALIDATOR_RECOVERY_REGISTRY_ID: Pubkey = Pubkey::new([22u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

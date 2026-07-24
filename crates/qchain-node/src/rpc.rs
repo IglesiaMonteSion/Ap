@@ -378,6 +378,7 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limi
         .route("/validators", get(validators))
         .route("/validator_registry", get(validator_registry))
         .route("/validator_v7_registry", get(validator_v7_registry))
+        .route("/validator_v7_recovery", get(validator_v7_recovery))
         .route("/treasury", get(treasury))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
@@ -986,6 +987,36 @@ async fn validators(State(engine): State<Arc<Engine>>) -> Json<Vec<crate::engine
 /// fixed set). Inert this increment - nothing consumes it for consensus yet,
 /// but it's the discovery surface a future joining node/wallet reads. Each
 /// entry's `stake` is a snapshot from registration time.
+/// (KM#4) The v7 recovery registry: each validator's OFFLINE recovery committee
+/// (signers + threshold) plus its current recovery `nonce`. A recovery signer
+/// reads its validator's `nonce` here to sign the OFFLINE authorization for the
+/// correct nonce. All public material — safe to expose.
+async fn validator_v7_recovery(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::VALIDATOR_RECOVERY_REGISTRY_ID;
+    use qchain_execution::validator_v7::RecoveryRegistry;
+    let Some(acct) = engine.get_account(&VALIDATOR_RECOVERY_REGISTRY_ID).await else {
+        return Ok(Json(json!({ "committees": [] })));
+    };
+    if acct.data.is_empty() {
+        return Ok(Json(json!({ "committees": [] })));
+    }
+    let rec = RecoveryRegistry::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("recovery registry decode: {e}")))?;
+    let committees: Vec<serde_json::Value> = rec
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "consensus_address": e.consensus_address.to_string(),
+                "signers": e.config.signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "threshold": e.config.threshold,
+                "nonce": e.nonce,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "committees": committees })))
+}
+
 async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use qchain_execution::validator_registry::ValidatorRegistryData;
     use qchain_execution::ids::VALIDATOR_REGISTRY_ACCOUNT_ID;

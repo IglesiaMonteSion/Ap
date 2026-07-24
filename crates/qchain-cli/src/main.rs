@@ -13,8 +13,8 @@ use qchain_execution::{
     BURN_ADDRESS, EconomicParams, EMERGENCY_ACCOUNT_ID, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
-use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
-use qchain_execution::validator_v7::ValidatorV7Instruction;
+use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
+use qchain_execution::validator_v7::{RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
 
@@ -434,6 +434,65 @@ enum Command {
         /// The consensus address of the jailed validator (base58). Defaults to the operator's own address.
         #[arg(long)]
         consensus_address: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#4): set/replace/clear the OFFLINE recovery committee of a validator.
+    /// `--keypair` is the cold OPERATOR key (set BEFORE any compromise — it doesn't
+    /// need the recovery keys). `--signers` is a comma-separated list of recovery
+    /// pubkeys (base58, e.g. a 3-of-5 committee held offline); `--threshold` is M.
+    /// Empty `--signers` clears the committee.
+    V7SetRecovery {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The consensus address of the validator (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// Comma-separated recovery signer pubkeys (base58). Empty clears the committee.
+        #[arg(long, default_value = "")]
+        signers: String,
+        /// M for the M-of-N recovery committee.
+        #[arg(long, default_value_t = 0)]
+        threshold: u8,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#4): OFFLINE — a recovery signer signs an authorization to REVOKE a
+    /// validator. Makes NO network call: run it on an air-gapped machine holding a
+    /// recovery key. `--nonce` is the validator's current recovery nonce (from
+    /// `GET /validator_v7_recovery`). Prints a hex-encoded approval for the relayer
+    /// to collect (`v7-recover-revoke --approvals ...`).
+    V7RecoverySign {
+        /// The recovery signer's keypair (offline).
+        #[arg(long)]
+        recovery_keypair: PathBuf,
+        /// The consensus address of the validator to revoke (base58).
+        #[arg(long)]
+        consensus_address: String,
+        /// The validator's current recovery nonce.
+        #[arg(long)]
+        recovery_nonce: u64,
+    },
+    /// v7 (KM#4): REVOKE a validator using M collected OFFLINE recovery approvals.
+    /// Permissionless: `--keypair` is just the fee relayer. `--approvals` is a
+    /// comma-separated list of the hex approvals produced by `v7-recovery-sign`.
+    V7RecoverRevoke {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The consensus address of the validator to revoke (base58).
+        #[arg(long)]
+        consensus_address: String,
+        /// Comma-separated hex recovery approvals (from `v7-recovery-sign`).
+        #[arg(long)]
+        approvals: String,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -1902,6 +1961,74 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("submitted: {body}");
             println!("withdrew the 500 QCH bond for v7 validator {target} to {wd} (removed from the registry)");
+        }
+        Command::V7SetRecovery { rpc, keypair, consensus_address, signers, threshold, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let signer_pks: Vec<qchain_crypto::Pubkey> = signers
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse().map_err(|e| anyhow::anyhow!("invalid recovery signer '{s}': {e}")))
+                .collect::<anyhow::Result<_>>()?;
+            let cfg = RecoveryConfig { signers: signer_pks.clone(), threshold };
+            let data = borsh::to_vec(&ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: target, config: cfg })?;
+            let body = submit_instruction(
+                &rpc,
+                &operator,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            if signer_pks.is_empty() {
+                println!("cleared the recovery committee for v7 validator {target}");
+            } else {
+                println!("set a {threshold}-of-{} OFFLINE recovery committee for v7 validator {target}", signer_pks.len());
+            }
+        }
+        Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce } => {
+            let kp = qchain_crypto::read_keypair_file(&recovery_keypair)?;
+            let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let msg = qchain_execution::validator_v7::recovery_message(&target, RecoveryOp::Revoke, recovery_nonce);
+            let sig = qchain_crypto::sign_domain(&kp, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg)?;
+            let approval = RecoveryApproval { bundle: kp.public_key_bundle(), signature: sig };
+            let hex = hex::encode(borsh::to_vec(&approval)?);
+            println!("recovery approval (hex) — give this to the relayer for `v7-recover-revoke --approvals`:");
+            println!("{hex}");
+        }
+        Command::V7RecoverRevoke { rpc, keypair, consensus_address, approvals, nonce, fee_limit } => {
+            let relayer = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let approvals: Vec<RecoveryApproval> = approvals
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let bytes = hex::decode(s).map_err(|e| anyhow::anyhow!("invalid approval hex: {e}"))?;
+                    borsh::from_slice::<RecoveryApproval>(&bytes).map_err(|e| anyhow::anyhow!("invalid approval encoding: {e}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            if approvals.is_empty() {
+                anyhow::bail!("--approvals must contain at least one recovery approval");
+            }
+            let data = borsh::to_vec(&ValidatorV7Instruction::RecoverRevoke { consensus_address: target, op: RecoveryOp::Revoke, approvals })?;
+            let body = submit_instruction(
+                &rpc,
+                &relayer,
+                VALIDATOR_V7_PROGRAM_ID,
+                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                data,
+                nonce,
+                fee_limit,
+            )?;
+            println!("submitted: {body}");
+            println!("REVOKED v7 validator {target} via its recovery committee — bond moved to the unbonding pool, dropped from the committee");
         }
         Command::V7Unjail { rpc, keypair, consensus_address, nonce, fee_limit } => {
             let operator = qchain_crypto::read_keypair_file(&keypair)?;

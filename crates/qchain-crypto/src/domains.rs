@@ -87,3 +87,17 @@ pub const STATE_CHECKPOINT_V1: &[u8] = b"qchain-state-checkpoint-v1";
 /// un voto/tx/checkpoint: una firma de cert NUNCA vale como voto ni al revés. Es
 /// una firma TIPADA de un objeto de largo fijo (32+32+32), no bytes arbitrarios.
 pub const NETWORK_KEY_CERT_V1: &[u8] = b"qchain-network-key-cert-v1";
+
+/// **Autorización de RECUPERACIÓN de un validador v7** (programa de gestión de
+/// claves, KM#4 — recovery key offline). Cada validador registra un COMITÉ DE
+/// RECUPERACIÓN (M-de-N claves OFFLINE, ej. 3-de-5). Si sus claves de
+/// consenso/operador se pierden o comprometen, el comité — SIN ninguna de las
+/// claves comprometidas — puede REVOCAR el validador (neutralizar su clave de
+/// consenso). Cada firmante de recuperación firma OFFLINE
+/// `RECOVERY_AUTH_V1 ‖ consensus_address ‖ op_tag ‖ recovery_nonce_le`; las M
+/// firmas recolectadas se envían en UNA sola tx on-chain. El dominio separa esta
+/// autorización de un voto/tx/checkpoint/cert-de-red: una firma de recuperación
+/// NUNCA vale como voto ni al revés. El `recovery_nonce` monotónico per-validador
+/// (que sube en cada revoke) es la defensa anti-replay dentro de la red — misma
+/// postura que `VALIDATOR_POP_V1`, que tampoco liga `chain_id`.
+pub const RECOVERY_AUTH_V1: &[u8] = b"qchain-v7-recovery-auth-v1";
