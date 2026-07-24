@@ -178,10 +178,43 @@ pub struct Proposal {
     pub voted_stake_accounts: Vec<Pubkey>,
     pub status: ProposalStatus,
     pub passed_round: Option<Round>,
+    /// Refundable anti-spam deposit locked at creation (roadmap #16), in atoms.
+    /// Charged from the proposer's wallet by the execution-layer `CreateProposal`
+    /// handler and held in the proposal account's own `balance`, then SETTLED
+    /// when the proposal is pruned (`CloseProposal`): refunded to the proposer if
+    /// the proposal reached the participation floor (`reached_participation_floor`
+    /// — a genuine, turned-out proposal), burned otherwise (a spam proposal that
+    /// nobody engaged with). `0` = the network has no deposit configured
+    /// (`EconomicParams.governance_proposal_deposit == 0`, the default), so this
+    /// is byte-identical to the pre-#16 behavior. APPENDED as the last field so a
+    /// pre-#16 proposal blob is a byte-prefix of the new layout —
+    /// `Proposal::read_or_legacy` migrates it with `deposit = 0`.
+    pub deposit: u64,
+}
+
+/// The pre-#16 `Proposal` layout (every field EXCEPT the trailing `deposit`),
+/// used only by `Proposal::read_or_legacy` to decode a proposal account written
+/// before the anti-spam deposit existed. Kept private and in exact field order —
+/// borsh serializes fields positionally, so this must mirror `Proposal` up to
+/// (but not including) `deposit`.
+#[derive(borsh::BorshDeserialize, borsh::BorshSerialize)]
+struct ProposalV0 {
+    id: ProposalId,
+    proposer: Pubkey,
+    action: ProposalAction,
+    created_round: Round,
+    voting_ends_round: Round,
+    snapshot_total_staked: u64,
+    yes_stake: u64,
+    no_stake: u64,
+    abstain_stake: u64,
+    voted_stake_accounts: Vec<Pubkey>,
+    status: ProposalStatus,
+    passed_round: Option<Round>,
 }
 
 impl Proposal {
-    pub fn new(id: ProposalId, proposer: Pubkey, action: ProposalAction, created_round: Round, snapshot_total_staked: u64) -> Self {
+    pub fn new(id: ProposalId, proposer: Pubkey, action: ProposalAction, created_round: Round, snapshot_total_staked: u64, deposit: u64) -> Self {
         let rule = quorum_rule(action.risk_tier());
         Proposal {
             id,
@@ -196,7 +229,59 @@ impl Proposal {
             voted_stake_accounts: Vec::new(),
             status: ProposalStatus::Voting,
             passed_round: None,
+            deposit,
         }
+    }
+
+    /// Decode a `Proposal`, migrating a pre-#16 record (the layout without the
+    /// trailing `deposit` field) by defaulting `deposit = 0`. This is what lets a
+    /// live network upgrade WITHOUT re-seeding: an existing proposal account
+    /// (written before this field existed) still decodes, as a zero-deposit
+    /// proposal (byte-identical settle: nothing to refund/burn). Try the new
+    /// layout first; a legacy blob is 8 bytes short, so borsh hits EOF reading
+    /// `deposit` → falls through to the legacy struct. A new blob has 8 trailing
+    /// bytes the legacy struct can't consume, and borsh rejects trailing bytes,
+    /// so the two never cross-decode — same discipline as
+    /// `StakeAccountData::read_or_legacy` / `EconomicParams::read_or_legacy`.
+    pub fn read_or_legacy(data: &[u8]) -> Option<Self> {
+        if let Ok(p) = borsh::from_slice::<Proposal>(data) {
+            return Some(p);
+        }
+        let v0 = borsh::from_slice::<ProposalV0>(data).ok()?;
+        Some(Proposal {
+            id: v0.id,
+            proposer: v0.proposer,
+            action: v0.action,
+            created_round: v0.created_round,
+            voting_ends_round: v0.voting_ends_round,
+            snapshot_total_staked: v0.snapshot_total_staked,
+            yes_stake: v0.yes_stake,
+            no_stake: v0.no_stake,
+            abstain_stake: v0.abstain_stake,
+            voted_stake_accounts: v0.voted_stake_accounts,
+            status: v0.status,
+            passed_round: v0.passed_round,
+            deposit: 0,
+        })
+    }
+
+    /// True if the proposal's turnout met its tier's participation floor —
+    /// i.e. it was a genuine, engaged-with proposal rather than one nobody
+    /// voted on. This is the pure predicate that decides whether the anti-spam
+    /// deposit is REFUNDED (floor reached) or BURNED (below floor = ignored /
+    /// spam) at prune time, mirroring the participation gate in `evaluate` but
+    /// independent of the yes/no outcome — a proposal that reached quorum yet was
+    /// voted down still refunds its deposit (standard Cosmos deposit semantics:
+    /// only failing to reach quorum forfeits it). Uses the frozen creation-time
+    /// `snapshot_total_staked` as the denominator, same as `evaluate`.
+    pub fn reached_participation_floor(&self) -> bool {
+        let total_staked = self.snapshot_total_staked;
+        if total_staked == 0 {
+            return false;
+        }
+        let participating = self.yes_stake.saturating_add(self.no_stake).saturating_add(self.abstain_stake).min(total_staked);
+        let participation_bps = (participating as u128 * 10_000 / total_staked as u128) as u32;
+        participation_bps >= quorum_rule(self.action.risk_tier()).min_participation_bps
     }
 
     /// Records one stake account's vote. Returns `false` (no-op) if that
@@ -283,14 +368,14 @@ mod tests {
     fn below_participation_floor_is_rejected_even_with_unanimous_yes() {
         // snapshot_total_staked = 100_000; 100 yes = 0.1% turnout, far under
         // the Registry floor, even though every vote cast was Yes.
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100_000);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100_000, 0);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 100);
         assert_eq!(p.evaluate(), ProposalStatus::Rejected);
     }
 
     #[test]
     fn supermajority_threshold_is_enforced_not_simple_majority() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100, 0);
         // 60% yes, 40% no, full participation - fails the 2/3 (66.67%)
         // supermajority bar for a Registry-tier proposal even though it
         // would pass a simple-majority rule.
@@ -301,7 +386,7 @@ mod tests {
 
     #[test]
     fn meeting_both_participation_and_supermajority_passes() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100, 0);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 70);
         p.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 30);
         assert_eq!(p.evaluate(), ProposalStatus::Passed);
@@ -309,7 +394,7 @@ mod tests {
 
     #[test]
     fn abstain_votes_count_toward_participation_but_not_approval() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100, 0);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 20);
         p.record_vote(Pubkey::new([2u8; 32]), VoteChoice::Abstain, 60);
         // Participation = 80/100 (way past the floor), but of *decided*
@@ -320,7 +405,7 @@ mod tests {
 
     #[test]
     fn the_same_stake_account_cannot_vote_twice() {
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 100, 0);
         let stake_account = Pubkey::new([1u8; 32]);
         assert!(p.record_vote(stake_account, VoteChoice::Yes, 50));
         assert!(!p.record_vote(stake_account, VoteChoice::No, 50), "a second vote from the same stake account must be rejected");
@@ -330,7 +415,7 @@ mod tests {
 
     #[test]
     fn zero_total_staked_never_passes() {
-        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 0);
+        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 0, 0, 0);
         assert_eq!(p.evaluate(), ProposalStatus::Rejected, "an empty staking pool (snapshot 0) must never be able to pass a proposal");
     }
 
@@ -340,7 +425,7 @@ mod tests {
         // total_staked later collapses, the frozen snapshot is the quorum
         // denominator, so 100 yes out of a 100_000 snapshot stays below the
         // floor — a shrink-the-denominator attack can't pass it (task #213).
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100_000);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100_000, 0);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 100);
         assert_eq!(p.evaluate(), ProposalStatus::Rejected);
     }
@@ -350,14 +435,14 @@ mod tests {
         // A voter who bonded after the snapshot votes with live weight far
         // exceeding the snapshot supply; participation clamps to 100%, it
         // never overflows the ratio.
-        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100);
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100, 0);
         p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 10_000);
         assert_eq!(p.evaluate(), ProposalStatus::Passed, "clamped to the snapshot, a lone huge Yes is 100% participation and 100% approval");
     }
 
     #[test]
     fn voting_period_and_timelock_are_derived_from_risk_tier() {
-        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 500, 0);
+        let p = Proposal::new(1, Pubkey::system_program_id(), sample_action(), 500, 0, 0);
         let rule = quorum_rule(RiskTier::Registry);
         assert_eq!(p.voting_ends_round, 500 + rule.voting_period_rounds);
     }
@@ -366,13 +451,13 @@ mod tests {
     fn economic_tier_requires_a_supermajority_and_a_real_timelock() {
         // 51/49 (a bare simple majority) must NOT pass an economic change —
         // monetary policy now demands a 2/3 supermajority (task #213).
-        let mut simple = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100);
+        let mut simple = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100, 0);
         simple.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 51);
         simple.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 49);
         assert_eq!(simple.evaluate(), ProposalStatus::Rejected, "a bare simple majority must not pass a monetary change");
 
         // 70/30 clears the 2/3 bar.
-        let mut super_maj = Proposal::new(2, Pubkey::system_program_id(), economic_action(), 0, 100);
+        let mut super_maj = Proposal::new(2, Pubkey::system_program_id(), economic_action(), 0, 100, 0);
         super_maj.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 70);
         super_maj.record_vote(Pubkey::new([2u8; 32]), VoteChoice::No, 30);
         assert_eq!(super_maj.evaluate(), ProposalStatus::Passed);
@@ -397,6 +482,66 @@ mod tests {
         assert_eq!(economic_action().risk_tier(), RiskTier::Economic);
         assert_eq!(ProposalAction::SetEmissionApr(1).risk_tier(), RiskTier::Economic);
         assert_eq!(sample_action().risk_tier(), RiskTier::Registry);
+    }
+
+    #[test]
+    fn read_or_legacy_migrates_a_pre16_proposal_and_round_trips_a_new_one() {
+        // A NEW proposal (with a non-zero deposit) round-trips exactly.
+        let mut p = Proposal::new(7, Pubkey::new([9u8; 32]), economic_action(), 3, 5_000, 1_000_000);
+        p.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 42);
+        let new_bytes = borsh::to_vec(&p).unwrap();
+        let decoded = Proposal::read_or_legacy(&new_bytes).unwrap();
+        assert_eq!(decoded.deposit, 1_000_000);
+        assert_eq!(decoded.id, 7);
+        assert_eq!(decoded.yes_stake, 42);
+
+        // A pre-#16 blob (the ProposalV0 layout, no trailing deposit) migrates
+        // with deposit = 0 — an existing on-chain proposal keeps working.
+        let legacy = ProposalV0 {
+            id: 7,
+            proposer: Pubkey::new([9u8; 32]),
+            action: economic_action(),
+            created_round: 3,
+            voting_ends_round: 3 + quorum_rule(RiskTier::Economic).voting_period_rounds,
+            snapshot_total_staked: 5_000,
+            yes_stake: 42,
+            no_stake: 0,
+            abstain_stake: 0,
+            voted_stake_accounts: vec![Pubkey::new([1u8; 32])],
+            status: ProposalStatus::Voting,
+            passed_round: None,
+        };
+        let legacy_bytes = borsh::to_vec(&legacy).unwrap();
+        // The legacy blob is exactly 8 bytes shorter (the missing u64 deposit).
+        assert_eq!(legacy_bytes.len() + 8, new_bytes.len());
+        let migrated = Proposal::read_or_legacy(&legacy_bytes).unwrap();
+        assert_eq!(migrated.deposit, 0, "a pre-#16 proposal migrates with a zero deposit");
+        assert_eq!(migrated.id, 7);
+        assert_eq!(migrated.yes_stake, 42);
+        // A new blob must NOT cross-decode as the legacy struct (borsh rejects
+        // its 8 trailing bytes), so the two layouts are unambiguous.
+        assert!(borsh::from_slice::<ProposalV0>(&new_bytes).is_err());
+    }
+
+    #[test]
+    fn reached_participation_floor_decides_refund_vs_burn() {
+        // Below the floor (only 100 of a 100_000 snapshot turned out) → the
+        // deposit would be BURNED (spam nobody engaged with).
+        let mut ignored = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100_000, 1);
+        ignored.record_vote(Pubkey::new([1u8; 32]), VoteChoice::Yes, 100);
+        assert!(!ignored.reached_participation_floor(), "a low-turnout proposal is below the floor");
+
+        // Reached the floor but voted DOWN → still REFUNDED (a genuine, engaged
+        // proposal; only failing to reach quorum forfeits, Cosmos-style).
+        let mut voted_down = Proposal::new(2, Pubkey::system_program_id(), economic_action(), 0, 100, 1);
+        voted_down.record_vote(Pubkey::new([1u8; 32]), VoteChoice::No, 40);
+        voted_down.record_vote(Pubkey::new([2u8; 32]), VoteChoice::Yes, 20);
+        assert_eq!(voted_down.evaluate(), ProposalStatus::Rejected, "40 no vs 20 yes fails the supermajority");
+        assert!(voted_down.reached_participation_floor(), "but 60/100 turnout meets the floor → deposit refunds");
+
+        // Zero snapshot → never reaches the floor.
+        let empty = Proposal::new(3, Pubkey::system_program_id(), economic_action(), 0, 0, 1);
+        assert!(!empty.reached_participation_floor());
     }
 }
 

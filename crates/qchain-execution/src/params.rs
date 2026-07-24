@@ -258,6 +258,18 @@ pub struct EconomicParams {
     /// via `read_or_legacy` (defaulting this field) rather than needing a fresh
     /// genesis.
     pub emission_apr_bps: u16,
+    /// Refundable anti-spam deposit required to open a governance proposal
+    /// (roadmap #16), in atoms. `0` (the default) = NO deposit — creating a
+    /// proposal costs only the normal transaction fee, byte-identical to the
+    /// pre-#16 behavior, which keeps a live network unchanged on upgrade. When
+    /// set > 0, `governance::CreateProposal` debits this from the proposer's
+    /// wallet and holds it in the proposal account's balance; `CloseProposal`
+    /// settles it at prune time — refunded to the proposer if the proposal
+    /// reached the participation floor (a genuine proposal), burned otherwise
+    /// (spam nobody engaged with). Governable like the other params. Appended
+    /// last, so a pre-#16 `EconomicParams` record (five fields) migrates via
+    /// `read_or_legacy` defaulting this to 0, no fresh genesis needed.
+    pub governance_proposal_deposit: u64,
 }
 
 impl Default for EconomicParams {
@@ -268,6 +280,7 @@ impl Default for EconomicParams {
             gas_price_per_fuel: DEFAULT_GAS_PRICE_UNITS_PER_FUEL,
             staking_commission_bps: DEFAULT_STAKING_COMMISSION_BPS,
             emission_apr_bps: DEFAULT_EMISSION_APR_BPS,
+            governance_proposal_deposit: 0,
         }
     }
 }
@@ -283,7 +296,21 @@ impl EconomicParams {
         if let Ok(p) = Self::try_from_slice(data) {
             return Some(p);
         }
-        // Legacy: three u64s + one u16 = 26 bytes, nothing after.
+        // v4 layout (pre-#16): three u64s + two u16s = 28 bytes, no
+        // `governance_proposal_deposit`. Migrate with a zero deposit — a network
+        // that upgrades to #16 WITHOUT a fresh genesis keeps every governance-set
+        // value and simply has the anti-spam deposit off until it's raised.
+        if data.len() == 28 {
+            return Some(EconomicParams {
+                base_fee_per_byte: u64::from_le_bytes(data[0..8].try_into().ok()?),
+                dust_threshold: u64::from_le_bytes(data[8..16].try_into().ok()?),
+                gas_price_per_fuel: u64::from_le_bytes(data[16..24].try_into().ok()?),
+                staking_commission_bps: u16::from_le_bytes(data[24..26].try_into().ok()?),
+                emission_apr_bps: u16::from_le_bytes(data[26..28].try_into().ok()?),
+                governance_proposal_deposit: 0,
+            });
+        }
+        // Pre-v4 layout: three u64s + one u16 = 26 bytes, nothing after.
         if data.len() == 26 {
             let base_fee_per_byte = u64::from_le_bytes(data[0..8].try_into().ok()?);
             let dust_threshold = u64::from_le_bytes(data[8..16].try_into().ok()?);
@@ -295,6 +322,7 @@ impl EconomicParams {
                 gas_price_per_fuel,
                 staking_commission_bps,
                 emission_apr_bps: DEFAULT_EMISSION_APR_BPS,
+                governance_proposal_deposit: 0,
             });
         }
         None
@@ -412,12 +440,26 @@ mod tests {
 
     #[test]
     fn economic_params_read_or_legacy_round_trips_and_migrates() {
-        // A v4 record round-trips exactly.
-        let p = EconomicParams { base_fee_per_byte: 200, dust_threshold: 1_000_000, gas_price_per_fuel: 1, staking_commission_bps: 1_000, emission_apr_bps: 800 };
+        // A current (#16, six-field) record round-trips exactly.
+        let p = EconomicParams { base_fee_per_byte: 200, dust_threshold: 1_000_000, gas_price_per_fuel: 1, staking_commission_bps: 1_000, emission_apr_bps: 800, governance_proposal_deposit: 5_000_000 };
         let bytes = borsh::to_vec(&p).unwrap();
+        assert_eq!(bytes.len(), 36, "six fields: 3×u64 + 2×u16 + u64");
         assert_eq!(EconomicParams::read_or_legacy(&bytes), Some(p));
-        // A legacy four-field record migrates with the default emission APR,
-        // keeping every governance-set value intact.
+        // A v4 five-field record (28 bytes, no deposit) migrates with deposit 0,
+        // keeping every governance-set value intact — the live-network path.
+        let mut v4 = Vec::new();
+        v4.extend_from_slice(&200u64.to_le_bytes());
+        v4.extend_from_slice(&1_000_000u64.to_le_bytes());
+        v4.extend_from_slice(&1u64.to_le_bytes());
+        v4.extend_from_slice(&1_000u16.to_le_bytes());
+        v4.extend_from_slice(&800u16.to_le_bytes());
+        assert_eq!(v4.len(), 28);
+        let m4 = EconomicParams::read_or_legacy(&v4).unwrap();
+        assert_eq!(m4.base_fee_per_byte, 200);
+        assert_eq!(m4.emission_apr_bps, 800);
+        assert_eq!(m4.governance_proposal_deposit, 0, "the deposit defaults off on a pre-#16 upgrade");
+        // A pre-v4 four-field record (26 bytes) migrates with the default
+        // emission APR AND a zero deposit.
         let mut legacy = Vec::new();
         legacy.extend_from_slice(&200u64.to_le_bytes());
         legacy.extend_from_slice(&1_000_000u64.to_le_bytes());
@@ -428,5 +470,6 @@ mod tests {
         assert_eq!(migrated.base_fee_per_byte, 200);
         assert_eq!(migrated.staking_commission_bps, 1_000);
         assert_eq!(migrated.emission_apr_bps, DEFAULT_EMISSION_APR_BPS);
+        assert_eq!(migrated.governance_proposal_deposit, 0);
     }
 }

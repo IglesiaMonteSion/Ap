@@ -144,6 +144,18 @@ pub const EMERGENCY_ACCOUNT_ID: Pubkey = Pubkey::new([19u8; 32]);
 /// unchanged — this is a fresh-genesis, chain_id-folded decision.
 pub const EMISSION_RESERVE_ID: Pubkey = Pubkey::new([20u8; 32]);
 
+/// Unspendable BURN sink — the all-`0xFF` address. Nobody can derive its private
+/// key, so value credited here is permanently out of circulation (the same
+/// deflationary burn address the wallet already uses when deleting a funded
+/// account, v4.0.2). Used by governance `CloseProposal` (roadmap #16) to forfeit
+/// a spam proposal's anti-spam deposit: routing it to a real (if unspendable)
+/// balance keeps supply conservation trivially intact (`Σ balances` is
+/// unchanged, the value just moves to an address no one controls), unlike
+/// zeroing an account, which would silently destroy supply. System-owned, so if
+/// the forfeited amount happens to be below `dust_threshold` the ordinary dust
+/// sweep also removes it — either way it leaves circulation.
+pub const BURN_ADDRESS: Pubkey = Pubkey::new([0xFFu8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

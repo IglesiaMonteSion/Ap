@@ -81,6 +81,18 @@ pub enum GovernanceInstruction {
     /// records a guardian's approval to UNPAUSE; once `threshold` distinct
     /// guardians approve, `paused` becomes false. Discriminant 5.
     EmergencyUnpause,
+    /// PRUNE a terminal proposal (roadmap #16). accounts[0] = the proposal
+    /// account, accounts[1] = the proposal's proposer wallet (for a deposit
+    /// refund), accounts[2] = the canonical `BURN_ADDRESS` (for a deposit
+    /// forfeit). Permissionless: anyone can call it once the proposal is
+    /// `Rejected`/`Executed` AND `PROPOSAL_RETENTION_ROUNDS` have elapsed past
+    /// its voting-end. It settles the anti-spam deposit (refund if the proposal
+    /// reached the participation floor, burn otherwise) and clears the proposal
+    /// account's data — reclaiming the unbounded `voted_stake_accounts` blob so
+    /// terminal proposals don't accumulate in state forever. Appended
+    /// (discriminant 6) so the wallet's Vote/Finalize/Execute encodings (1/2/3)
+    /// stay byte-identical.
+    CloseProposal,
 }
 
 fn borsh_err(e: impl std::fmt::Display) -> ExecError {
@@ -89,7 +101,10 @@ fn borsh_err(e: impl std::fmt::Display) -> ExecError {
 
 fn read_proposal(accounts: &HashMap<Pubkey, Account>, pk: &Pubkey) -> Result<Proposal, ExecError> {
     let account = accounts.get(pk).ok_or(ExecError::AccountNotFound(*pk))?;
-    Proposal::try_from_slice(&account.data).map_err(borsh_err)
+    // `read_or_legacy` so a proposal account created before the anti-spam deposit
+    // field existed (roadmap #16) still decodes — as a zero-deposit proposal.
+    Proposal::read_or_legacy(&account.data)
+        .ok_or_else(|| ExecError::ProgramError("proposal account does not decode".into()))
 }
 
 fn write_proposal(
@@ -137,6 +152,24 @@ impl NativeProgram for GovernanceProgram {
                             .into(),
                     ));
                 }
+                // accounts[3] = the canonical economic-params singleton (read-only),
+                // so the anti-spam deposit (roadmap #16) is read from the SAME
+                // authoritative source the ledger uses. Pinned like the others. When
+                // `governance_proposal_deposit == 0` (the default) this is a no-op —
+                // nothing is charged — so a network without the deposit configured
+                // behaves byte-identically; only the account-list of CreateProposal
+                // grew (an operator/CLI action, not a wallet one — the wallet never
+                // creates proposals), so node + CLI upgrade together.
+                let params_pk = *instruction.accounts.get(3).ok_or_else(|| {
+                    ExecError::ProgramError(
+                        "CreateProposal requires accounts[3] = the canonical economic-params account (anti-spam deposit source)".into(),
+                    )
+                })?;
+                if params_pk != crate::ids::PARAMS_ACCOUNT_ID {
+                    return Err(ExecError::ProgramError(
+                        "CreateProposal accounts[3] must be the canonical economic-params account".into(),
+                    ));
+                }
                 if proposer != *payer {
                     return Err(ExecError::Unauthorized(
                         "CreateProposal's proposer account must be the transaction payer".into(),
@@ -154,9 +187,37 @@ impl NativeProgram for GovernanceProgram {
                         .data,
                 )
                 .map_err(borsh_err)?;
+                // The anti-spam deposit (0 = off). `read_or_legacy` tolerates a
+                // pre-#16 params blob (deposit defaults to 0).
+                let deposit = crate::params::EconomicParams::read_or_legacy(
+                    &accounts
+                        .get(&params_pk)
+                        .ok_or(ExecError::AccountNotFound(params_pk))?
+                        .data,
+                )
+                .ok_or_else(|| ExecError::ProgramError("economic-params account is unreadable".into()))?
+                .governance_proposal_deposit;
+
+                // Charge the deposit from the proposer (== payer, already in the
+                // working set with the tx fee debited) and HOLD it in the proposal
+                // account's balance. Checked arithmetic (#218): reject the whole
+                // transition on underflow rather than wrap.
+                if deposit > 0 {
+                    let proposer_acct = accounts
+                        .get_mut(&proposer)
+                        .ok_or(ExecError::AccountNotFound(proposer))?;
+                    if proposer_acct.balance < deposit {
+                        return Err(ExecError::ProgramError(format!(
+                            "insufficient balance for the governance proposal deposit: need {deposit}, have {}",
+                            proposer_acct.balance
+                        )));
+                    }
+                    proposer_acct.balance = crate::arith::sub_u64(proposer_acct.balance, deposit)?;
+                }
                 let proposal =
-                    Proposal::new(id, proposer, action, current_round, snapshot_total_staked);
+                    Proposal::new(id, proposer, action, current_round, snapshot_total_staked, deposit);
                 let mut account = Account::new_wallet(GOVERNANCE_PROGRAM_ID);
+                account.balance = deposit;
                 account.data = borsh::to_vec(&proposal).map_err(borsh_err)?;
                 accounts.insert(proposal_pk, account);
             }
@@ -425,9 +486,133 @@ impl NativeProgram for GovernanceProgram {
             GovernanceInstruction::EmergencyUnpause => {
                 apply_emergency_approval(accounts, instruction, payer, false)?
             }
+            GovernanceInstruction::CloseProposal => {
+                apply_close_proposal(accounts, instruction, current_round)?
+            }
         }
         Ok(())
     }
+}
+
+/// Minimum rounds a terminal proposal is retained (measured from its
+/// `voting_ends_round`) before `CloseProposal` may prune it (roadmap #16).
+/// Generous — comfortably larger than any tier's voting period + execution
+/// time-lock (~200 + ~120 rounds max) — so a proposal is never pruned while it
+/// still has a pending effect: only `Rejected`/`Executed` proposals are
+/// closeable, and an `Executed` one already ran, so its execution window (which
+/// opened at `passed_round + timelock`, long before `voting_ends + retention`)
+/// is long past. At the ~500 ms reference round interval this is ~42 minutes.
+const PROPOSAL_RETENTION_ROUNDS: Round = 5_000;
+
+/// Prune a terminal proposal and settle its anti-spam deposit (roadmap #16).
+/// accounts[0] = proposal, accounts[1] = the proposer (deposit refund target),
+/// accounts[2] = `BURN_ADDRESS` (deposit forfeit sink). Permissionless: anyone
+/// can janitor a stale terminal proposal to reclaim its state.
+///
+/// The proposal must be `Rejected` or `Executed` (never `Voting`, and never a
+/// `Passed`-but-not-yet-`Executed` proposal — that still has a pending effect,
+/// so it's left until it's executed) AND at least `PROPOSAL_RETENTION_ROUNDS`
+/// past its voting end. The proposal account's balance holds the deposit; it is
+/// REFUNDED to the proposer if the proposal reached the participation floor (a
+/// genuine, engaged proposal) and BURNED otherwise (spam nobody voted on). Any
+/// balance beyond the recorded deposit (e.g. an unsolicited transfer to the
+/// proposal address) is burned defensively. Finally the proposal account's data
+/// is cleared — reclaiming the unbounded `voted_stake_accounts` blob so terminal
+/// proposals don't accumulate in state forever.
+fn apply_close_proposal(
+    accounts: &mut HashMap<Pubkey, Account>,
+    instruction: &Instruction,
+    current_round: Round,
+) -> Result<(), ExecError> {
+    let proposal_pk = *instruction
+        .accounts
+        .first()
+        .ok_or_else(|| ExecError::ProgramError("CloseProposal requires accounts[0] = the proposal".into()))?;
+    let refund_pk = *instruction
+        .accounts
+        .get(1)
+        .ok_or_else(|| ExecError::ProgramError("CloseProposal requires accounts[1] = the proposer (refund target)".into()))?;
+    let burn_pk = *instruction
+        .accounts
+        .get(2)
+        .ok_or_else(|| ExecError::ProgramError("CloseProposal requires accounts[2] = the canonical burn address".into()))?;
+    if burn_pk != crate::ids::BURN_ADDRESS {
+        return Err(ExecError::ProgramError(
+            "CloseProposal accounts[2] must be the canonical burn address".into(),
+        ));
+    }
+
+    let proposal = read_proposal(accounts, &proposal_pk)?;
+
+    // Only prune a settled, terminal proposal — never one still open, and never
+    // a Passed-awaiting-execution one (it still has a pending effect).
+    match proposal.status {
+        ProposalStatus::Rejected | ProposalStatus::Executed => {}
+        ProposalStatus::Voting => {
+            return Err(ExecError::ProgramError("proposal is still open for voting — cannot close it".into()));
+        }
+        ProposalStatus::Passed => {
+            return Err(ExecError::ProgramError(
+                "proposal passed but has not been executed yet — execute it before closing".into(),
+            ));
+        }
+    }
+    let closeable_at = proposal.voting_ends_round.saturating_add(PROPOSAL_RETENTION_ROUNDS);
+    if current_round < closeable_at {
+        return Err(ExecError::ProgramError(format!(
+            "proposal is within its retention window — closeable at round {closeable_at}, current round is {current_round}"
+        )));
+    }
+    // accounts[1] must genuinely be this proposal's proposer, so a caller can't
+    // redirect a refund to an account they control.
+    if refund_pk != proposal.proposer {
+        return Err(ExecError::ProgramError(
+            "CloseProposal accounts[1] must be the proposal's own proposer".into(),
+        ));
+    }
+
+    // The proposal account holds the deposit in its balance. Split it: refund the
+    // recorded deposit to the proposer IF the proposal reached the participation
+    // floor; burn everything else. Conservation holds — the whole balance is
+    // routed (refund + burn == balance), nothing is destroyed off-book.
+    let held = accounts
+        .get(&proposal_pk)
+        .ok_or(ExecError::AccountNotFound(proposal_pk))?
+        .balance;
+    let refund = if proposal.deposit > 0 && proposal.reached_participation_floor() {
+        proposal.deposit.min(held)
+    } else {
+        0
+    };
+    let burn = crate::arith::sub_u64(held, refund)?;
+
+    if refund > 0 {
+        // Credit the proposer. If their account no longer exists in the working
+        // set (they emptied their wallet), create a fresh one to receive it.
+        let proposer_acct = accounts
+            .entry(refund_pk)
+            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+        proposer_acct.balance = crate::arith::add_u64(proposer_acct.balance, refund)?;
+    }
+    if burn > 0 {
+        let burn_acct = accounts
+            .entry(burn_pk)
+            .or_insert_with(|| Account::new_wallet(Pubkey::system_program_id()));
+        burn_acct.balance = crate::arith::add_u64(burn_acct.balance, burn)?;
+    }
+
+    // Prune: clear the proposal account's balance (routed out above) and its data
+    // (the unbounded voted-accounts blob). The leaf itself remains (a native
+    // program can't delete an account through the working-set commit), but the
+    // growth term — the Borsh Proposal payload — is reclaimed. A subsequent
+    // CloseProposal on the emptied account fails to decode the proposal (empty
+    // data), so it can't be double-settled.
+    let proposal_acct = accounts
+        .get_mut(&proposal_pk)
+        .ok_or(ExecError::AccountNotFound(proposal_pk))?;
+    proposal_acct.balance = 0;
+    proposal_acct.data = Vec::new();
+    Ok(())
 }
 
 /// One guardian's approval to pause (`want_paused = true`) or unpause
@@ -843,6 +1028,13 @@ mod tests {
             vec![3u8],
             "wasm Execute encoding out of sync"
         );
+        // CloseProposal (roadmap #16) is APPENDED at discriminant 6, so it does
+        // not shift the wallet's Vote/Finalize/Execute encodings (1/2/3) above.
+        assert_eq!(
+            borsh::to_vec(&GovernanceInstruction::CloseProposal).unwrap(),
+            vec![6u8],
+            "CloseProposal must stay discriminant 6 (appended, no shift)"
+        );
     }
 
     fn wallet(balance: u64) -> Account {
@@ -910,9 +1102,13 @@ mod tests {
         action: ProposalAction,
         round: Round,
     ) {
+        // CreateProposal now reads the anti-spam deposit from PARAMS (roadmap
+        // #16). Seed a default params account (deposit = 0) if the test didn't,
+        // so every existing test stays byte-identical (no deposit charged).
+        accounts.entry(PARAMS_ACCOUNT_ID).or_insert_with(params_account);
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![proposer, PROPOSAL_PK, STAKING_STATS_ID],
+            accounts: vec![proposer, PROPOSAL_PK, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 1, action }).unwrap(),
         };
         GovernanceProgram
@@ -1125,7 +1321,7 @@ mod tests {
         let retire_proposal_pk = Pubkey::new([40u8; 32]);
         let retire_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![proposer, retire_proposal_pk, STAKING_STATS_ID],
+            accounts: vec![proposer, retire_proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal {
                 id: 2,
                 action: ProposalAction::RetireAlgorithm {
@@ -1773,5 +1969,117 @@ mod tests {
             ProposalStatus::Rejected,
             "a 500/500 tie is nowhere near the 2/3 supermajority a monetary change needs"
         );
+    }
+
+    /// Roadmap #16 end to end: an anti-spam deposit is charged at creation and
+    /// held in the proposal account; `CloseProposal` prunes a terminal proposal
+    /// and settles the deposit — REFUNDED to the proposer if the proposal reached
+    /// the participation floor (a genuine proposal), BURNED to the canonical burn
+    /// address otherwise (spam nobody engaged with); the guards (retention window,
+    /// still-voting, wrong burn address) reject; and supply is conserved.
+    #[test]
+    fn governance_deposit_is_charged_then_refunded_or_burned_and_close_prunes() {
+        let proposer = Pubkey::new([1u8; 32]);
+        let voter = Pubkey::new([2u8; 32]);
+        let p_genuine = Pubkey::new([40u8; 32]);
+        let p_spam = Pubkey::new([41u8; 32]);
+        let deposit = 5_000_000u64;
+        let start_balance = 100_000_000u64;
+
+        // A params account whose `governance_proposal_deposit` is set > 0.
+        let params = crate::params::EconomicParams { governance_proposal_deposit: deposit, ..Default::default() };
+        let params_acct = Account {
+            data: borsh::to_vec(&params).unwrap(),
+            ..Account::new_wallet(GOVERNANCE_PROGRAM_ID)
+        };
+        let mut accounts = HashMap::from([
+            (proposer, wallet(start_balance)),
+            (STAKE_PK, stake_account(voter, 1_000)),
+            (STAKING_STATS_ID, stats_account(1_000)),
+            (PARAMS_ACCOUNT_ID, params_acct),
+        ]);
+
+        let create = |accounts: &mut HashMap<Pubkey, Account>, ppk: Pubkey, id: u64| {
+            let ix = Instruction {
+                program_id: GOVERNANCE_PROGRAM_ID,
+                accounts: vec![proposer, ppk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
+                data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id, action: ProposalAction::SetDustThreshold(1_000_000) }).unwrap(),
+            };
+            GovernanceProgram.process(accounts, &ix, &proposer, 0).unwrap();
+        };
+        let vote_no = |accounts: &mut HashMap<Pubkey, Account>, ppk: Pubkey| {
+            let ix = Instruction {
+                program_id: GOVERNANCE_PROGRAM_ID,
+                accounts: vec![ppk, STAKE_PK],
+                data: borsh::to_vec(&GovernanceInstruction::Vote { choice: VoteChoice::No }).unwrap(),
+            };
+            GovernanceProgram.process(accounts, &ix, &voter, 1).unwrap();
+        };
+        let finalize_at = |accounts: &mut HashMap<Pubkey, Account>, ppk: Pubkey, round: Round| {
+            let ix = Instruction {
+                program_id: GOVERNANCE_PROGRAM_ID,
+                accounts: vec![ppk, STAKING_STATS_ID],
+                data: borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(),
+            };
+            GovernanceProgram.process(accounts, &ix, &proposer, round).unwrap();
+        };
+        let close = |accounts: &mut HashMap<Pubkey, Account>, ppk: Pubkey, refund_to: Pubkey, burn: Pubkey, round: Round| -> Result<(), ExecError> {
+            let ix = Instruction {
+                program_id: GOVERNANCE_PROGRAM_ID,
+                accounts: vec![ppk, refund_to, burn],
+                data: borsh::to_vec(&GovernanceInstruction::CloseProposal).unwrap(),
+            };
+            GovernanceProgram.process(accounts, &ix, &proposer, round)
+        };
+
+        // --- Charge: two proposals, each debits `deposit`, holding it in-account.
+        create(&mut accounts, p_genuine, 1);
+        create(&mut accounts, p_spam, 2);
+        assert_eq!(accounts[&proposer].balance, start_balance - 2 * deposit, "each proposal debits the deposit");
+        assert_eq!(accounts[&p_genuine].balance, deposit, "the deposit is held in the proposal account");
+        assert_eq!(accounts[&p_spam].balance, deposit);
+        assert_eq!(read_proposal(&accounts, &p_genuine).unwrap().deposit, deposit, "the deposit is recorded on the proposal");
+
+        // --- Genuine: reaches the floor (full turnout) but is voted down → Rejected.
+        vote_no(&mut accounts, p_genuine);
+        let rule = quorum_rule(qchain_governance::RiskTier::Economic);
+        finalize_at(&mut accounts, p_genuine, rule.voting_period_rounds);
+        finalize_at(&mut accounts, p_spam, rule.voting_period_rounds); // no votes → Rejected below floor
+        let g = read_proposal(&accounts, &p_genuine).unwrap();
+        assert_eq!(g.status, ProposalStatus::Rejected);
+        assert!(g.reached_participation_floor(), "full turnout → deposit will refund");
+        let s = read_proposal(&accounts, &p_spam).unwrap();
+        assert_eq!(s.status, ProposalStatus::Rejected);
+        assert!(!s.reached_participation_floor(), "no turnout → deposit will burn");
+
+        let voting_ends = rule.voting_period_rounds;
+        let closeable = voting_ends + 5_000; // PROPOSAL_RETENTION_ROUNDS
+
+        // --- Guards.
+        assert!(close(&mut accounts, p_genuine, proposer, crate::ids::BURN_ADDRESS, voting_ends + 10).is_err(), "within the retention window → rejected");
+        assert!(close(&mut accounts, p_genuine, proposer, Pubkey::new([7u8; 32]), closeable).is_err(), "a non-canonical burn address → rejected");
+        // A still-Voting proposal cannot be closed (create a throwaway one).
+        let p_open = Pubkey::new([42u8; 32]);
+        create(&mut accounts, p_open, 3);
+        assert!(close(&mut accounts, p_open, proposer, crate::ids::BURN_ADDRESS, closeable).is_err(), "a still-open proposal cannot be closed");
+
+        // --- Settle: genuine refunds, spam burns; both proposals are pruned.
+        let before_refund = accounts[&proposer].balance;
+        close(&mut accounts, p_genuine, proposer, crate::ids::BURN_ADDRESS, closeable).unwrap();
+        assert_eq!(accounts[&proposer].balance, before_refund + deposit, "a genuine proposal refunds its deposit");
+        assert_eq!(accounts[&p_genuine].balance, 0, "the pruned proposal holds nothing");
+        assert!(accounts[&p_genuine].data.is_empty(), "the pruned proposal's data (the vote blob) is cleared");
+
+        close(&mut accounts, p_spam, proposer, crate::ids::BURN_ADDRESS, closeable).unwrap();
+        assert_eq!(accounts[&crate::ids::BURN_ADDRESS].balance, deposit, "a spam proposal's deposit is burned");
+        assert!(accounts[&p_spam].data.is_empty());
+
+        // A second close of an already-pruned proposal fails (empty data won't decode).
+        assert!(close(&mut accounts, p_spam, proposer, crate::ids::BURN_ADDRESS, closeable).is_err(), "cannot double-settle a pruned proposal");
+
+        // --- Conservation: every atom is accounted for (the p_open deposit is
+        // still held in its account, un-refunded, since it was never closed).
+        let total: u64 = accounts.values().map(|a| a.balance).sum();
+        assert_eq!(total, start_balance + 1_000, "supply conserved (start balance + the 1_000-atom stake account)");
     }
 }
