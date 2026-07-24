@@ -26,8 +26,8 @@ es el que entregó el operador; acá se registra el trabajo.
 | 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18)** — `CURRENT_TX_VERSION` re-verificado en `apply` + test |
 | 8 | Medio | Shamir de la wallet: checksum de 16 bits → 1/65536 de reconstruir una semilla equivocada que pasa la validación; sin id de grupo/consistencia K-N fuerte | EC-15 | P1 | ✅ **CORREGIDO (v8.6.21)** — formato v2: chk de semilla 136-bit + id de grupo 4 B + consistencia K/N/grupo/chk; retro-compatible con el v1; 10 aserciones en harness node |
 | 9 | Bajo | *(ver texto canónico del operador)* | por mapear | P2 | pendiente de mapear |
-| 10 | Bajo | Parámetros Argon2id (m/t/p) leídos del blob de respaldo sin topes → DoS de descifrado | EC-14 | P2 | por verificar |
-| 11 | Bajo | `byte_size()` no cuenta todo el framing borsh del wire → fee/cap inexacto | EC-13 | P2 | por verificar |
+| 10 | Bajo | Parámetros Argon2id (m/t/p) leídos del blob de respaldo sin topes → DoS de descifrado | EC-14 | P2 | ✅ CORREGIDO (v8.6.22) |
+| 11 | Bajo | `byte_size()` no cuenta todo el framing borsh del wire → fee/cap inexacto | EC-13 | P2 | ✅ CORREGIDO (v8.6.22) |
 
 ## Orden de corrección
 
@@ -226,12 +226,29 @@ RECHAZADO por el chk de 136 bits; y un fragmento v1 legacy sigue reconstruyendo
 honesto:** NO se afirma interop SLIP-39 (se usa su lista de palabras, no su
 protocolo — el v2 lo documenta como formato propio).
 
-## #10 — Argon2 sin topes (Bajo)
+## #10 — KDF sin topes (Bajo) — CORREGIDO v8.6.22
 
-Ver EC-14. Clampar m/t/p del blob de respaldo a un rango documentado; aceptar los
-valores legítimos históricos (19456 KiB / 2 / 1).
+Ver EC-14. `decryptSeed` (`app.js`) leía los parámetros de la KDF del blob de
+respaldo —dato controlable por quien arme el archivo— sin topes: Argon2id (`m`/`t`/
+`p`) y, en el barrido de la clase, PBKDF2 legacy (`iter`). Un respaldo hostil con
+`m` de varios GiB / `iter=1e12` colgaba u OOMeaba el navegador al importar (DoS de
+descifrado). **Fix (ambos sitios):** validación contra un rango DOCUMENTADO **antes**
+de correr la KDF (un blob malo no gasta ni un byte de KDF) — Argon2
+`m∈[8,1048576] KiB, t∈[1,24], p∈[1,16]` (legítimo 19456/2/1); PBKDF2 `iter∈[1,20M]`
+(legítimo 250k/600k); fuera de rango → error claro, respaldo rechazado. **Verificado:**
+harness node sobre el `app.js` real — Argon2 14 aserciones + PBKDF2 7 aserciones.
+Assets/manifiesto regenerados. Sólo wallet JS — CERO cambio de protocolo/consenso/wire.
 
-## #11 — `byte_size()` inexacto (Bajo)
+## #11 — `byte_size()` inexacto (Bajo) — CORREGIDO v8.6.22
 
-Ver EC-13. Unificar el tamaño-wire a `borsh::to_vec(tx).len()` en
-transporte/mempool/cobro.
+Ver EC-13. `Transaction::byte_size()` (`qchain-core`) calculaba
+`borsh(message) + Σ c.bytes.len()`, omitiendo el framing borsh de la firma (el
+largo-prefijo del `Vec`, el `scheme` de cada componente, y el largo-prefijo del
+`Vec<u8>` de cada firma — ~16 B en una tx híbrida), así que el fee se cobraba de
+menos y una tx un pelo mayor que `MAX_TRANSACTION_BYTES` en el wire podía pasar el
+cap. **Fix:** `byte_size()` = `borsh::to_vec(self).len()` — el tamaño REAL de la tx
+completa. Determinista (sin fork) pero cambia el fee cobrado → **actualización
+COORDINADA** de todos los nodos. **Verificado:** test
+`byte_size_equals_the_exact_borsh_wire_length` (tx de 1 y 2 instrucciones:
+`byte_size() == borsh::to_vec(&tx).len()`, y > la suma parcial vieja). Barrido EC-13:
+no hay otra suma parcial en las rutas de fee/cap.

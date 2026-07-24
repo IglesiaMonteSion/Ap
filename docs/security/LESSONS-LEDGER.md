@@ -47,8 +47,8 @@ sigue cerrada.
 | EC-10 | Hueco de autorización en flujo privilegiado | parcial | **CERRADA-VIGILADA** (#6 Cancel corregido v8.6.18; sweep hecho) |
 | EC-11 | Sesgo de test al camino feliz / al modelo de amenazas propio | proceso | permanente |
 | EC-12 | Punto ciego del auditor = autor/mismo modelo | proceso (revisión externa) | permanente |
-| EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **ABIERTA** (#11) |
-| EC-14 | Parámetro controlado externamente sin topes | parcial | **ABIERTA** (#10) |
+| EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **CERRADA** (#11, v8.6.22) |
+| EC-14 | Parámetro controlado externamente sin topes | sí | **CERRADA** (#10, v8.6.22) |
 | EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **CERRADA-VIGILADA** (#8 Shamir v2: chk 136-bit + id de grupo, corregido v8.6.21) |
 
 ---
@@ -323,21 +323,54 @@ sigue cerrada.
 
 - **Clase:** calcular el tamaño para fees/límites distinto de los bytes realmente
   serializados.
-- **Instancias:** v8.6.13 #11 (`byte_size()` no cuenta todo el framing borsh).
+- **Instancias:** v8.6.13 #11 (`byte_size()` no contaba todo el framing borsh →
+  fee/cap inexacto → **CORREGIDO en v8.6.22**): la forma vieja era
+  `borsh(message) + Σ c.bytes.len()`, que OMITÍA el largo-prefijo del `Vec` de
+  firmas, el `scheme` de cada componente, y el largo-prefijo del `Vec<u8>` de cada
+  firma (~16 B para una tx híbrida de 2 componentes), así que una tx un pelo más
+  grande que `MAX_TRANSACTION_BYTES` en el wire podía pasar el cap y el fee se
+  cobraba de menos. **Fix:** `byte_size()` = `borsh::to_vec(self).len()` — el
+  tamaño REAL de la tx completa que el nodo transmite. Determinista (todo validador
+  computa igual → sin fork) pero cambia el fee cobrado → **actualización
+  COORDINADA** (todos los nodos juntos; un nodo viejo y uno nuevo cobrarían distinto
+  por la misma tx). **Verificado:** test `byte_size_equals_the_exact_borsh_wire_length`
+  (tx de 1 y de 2 instrucciones: `byte_size() == borsh::to_vec(&tx).len()`, y
+  estrictamente mayor que la suma parcial vieja).
+- **Barrido de la clase (v8.6.22):** grep de sumas parciales de tamaño en las rutas
+  de fee/cap — no hay otra (los otros `components.iter().map(...)` colectan
+  `scheme`, no tamaños; los demás consumidores de `byte_size()` lo llaman en vivo →
+  toman el número exacto automáticamente).
 - **Regla:** una única función de tamaño = `borsh::to_vec(tx).len()` compartida
   por transporte/mempool/cobro.
 - **Pregunta recurrente:** *¿el fee y el cap usan EXACTAMENTE los bytes del wire?*
 
 ## EC-14 — Parámetro externo sin topes
 
-- **Clase:** parámetros (Argon2 m/t/p, nº de páginas, límites) tomados de un input
-  no confiable sin máximos → DoS.
-- **Instancias:** v8.6.13 #10 (Argon2 del blob de respaldo sin topes); #109
-  (páginas de snapshot, ya acotadas).
-- **Regla:** todo parámetro de un input externo se clampa a un rango documentado;
-  los valores legítimos históricos se aceptan explícitamente.
+- **Clase:** parámetros (Argon2 m/t/p, iteraciones PBKDF2, nº de páginas, límites)
+  tomados de un input no confiable sin máximos → DoS.
+- **Instancias:** v8.6.13 #10 (KDF params del blob de respaldo sin topes → DoS de
+  descifrado → **CORREGIDO en v8.6.22**): `decryptSeed` leía `m`/`t`/`p` (Argon2id)
+  del blob de respaldo —dato controlable por quien arme el archivo— sin ningún tope,
+  así que importar un respaldo hostil con `m` de varios GiB (o `t`/`p` enormes)
+  colgaba u OOMeaba el navegador. **Barrido de la clase (mismo fix):** el camino
+  PBKDF2 legacy (`else`) leía `iter` del MISMO blob no confiable con el mismo
+  problema. **Fix (ambos sitios):** validación contra un rango DOCUMENTADO **antes**
+  de correr la KDF (un blob malo no gasta ni un byte de KDF) — Argon2:
+  `m∈[8, 1048576] KiB, t∈[1,24], p∈[1,16]` (legítimo 19456/2/1 con amplio margen);
+  PBKDF2: `iter∈[1, 20_000_000]` (legítimo 250k/600k). Se ACEPTAN los valores
+  legítimos históricos y se RECHAZA lo fuera de rango con un error claro (un blob
+  legítimo nunca cae fuera; el AES-GCM ya autentica, esto sólo acota el trabajo del
+  atacante a CERO). **Verificado:** harness node sobre el `app.js` real —
+  `checkedArgon2Params` 14 aserciones (legítimo y bordes aceptados; multi-GiB /
+  t=1e6 / p=1000 / no-entero / negativo rechazados) + PBKDF2 7 aserciones
+  (250k/600k aceptados; 1e12/0/NaN/-1 rechazados). #109 (páginas de snapshot) ya
+  estaba acotado.
+- **Regla:** todo parámetro de un input externo se clampa/valida a un rango
+  documentado ANTES de usarlo; los valores legítimos históricos se aceptan
+  explícitamente; se barren TODOS los sitios de la misma clase (Argon2 Y PBKDF2 leen
+  del mismo blob).
 - **Pregunta recurrente:** *¿qué parámetros vienen de datos externos sin un
-  máximo?*
+  máximo, y están TODOS los sitios de esa clase acotados?*
 
 ## EC-15 — Cripto/recuperación propia con checksum/estándar insuficiente
 

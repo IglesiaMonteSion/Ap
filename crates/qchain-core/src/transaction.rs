@@ -223,9 +223,22 @@ impl Transaction {
     /// automatically for a triple-hybrid (SLH-DSA opt-in) combo, since it
     /// sums every signature component's real length rather than assuming a
     /// fixed two-component shape.
+    ///
+    /// #11 (auditoría v8.6.13, EC-13): el número que el fee y el cap de tamaño
+    /// cobran DEBE ser el tamaño REAL de la tx en el wire — todo el framing
+    /// borsh: el largo-prefijo del `Vec` de firmas, el `scheme` (AlgorithmId) de
+    /// cada componente, y el largo-prefijo del `Vec<u8>` de cada firma. La forma
+    /// vieja (`borsh(message) + Σ c.bytes.len()`) sub-contaba ese framing (~16 B
+    /// para una tx híbrida de 2 componentes: 4 del prefijo del Vec + 2×(tamaño
+    /// del scheme + 4 del prefijo de bytes)), así que fee y cap eran INEXACTOS
+    /// (una tx un pelo más grande que `MAX_TRANSACTION_BYTES` en el wire podía
+    /// pasar el cap). Serializar la tx COMPLETA es exactamente lo que el nodo
+    /// transmite y lo que se debe cobrar. Es determinista (función pura de la
+    /// tx), así que todo validador computa el mismo tamaño → sin fork, PERO
+    /// cambia el fee cobrado → actualización COORDINADA (todos los nodos juntos;
+    /// un nodo viejo y uno nuevo cobrarían distinto por la misma tx).
     pub fn byte_size(&self) -> usize {
-        borsh::to_vec(&self.message).map(|b| b.len()).unwrap_or(0)
-            + self.signature.components.iter().map(|c| c.bytes.len()).sum::<usize>()
+        borsh::to_vec(self).map(|b| b.len()).unwrap_or(0)
     }
 }
 
@@ -362,6 +375,41 @@ mod tests {
         // the handful of bytes of instruction data - the exact number this
         // project's fee model has to account for (ARCHITECTURE.md §2).
         assert!(tx.byte_size() > 5_000, "byte_size = {}", tx.byte_size());
+    }
+
+    /// #11 (auditoría v8.6.13, EC-13): `byte_size()` DEBE ser el tamaño exacto
+    /// de la tx en el wire — todo el framing borsh, no una suma parcial que
+    /// omitía el largo-prefijo del Vec de firmas + el `scheme` y el prefijo de
+    /// cada componente. Se prueba para una tx híbrida (2 componentes) Y para una
+    /// tx multi-instrucción (el framing del Vec de instrucciones también cuenta).
+    #[test]
+    fn byte_size_equals_the_exact_borsh_wire_length() {
+        let payer = Keypair::generate().unwrap();
+        let to = Keypair::generate().unwrap().pubkey();
+
+        // Tx de una instrucción.
+        let ix = sample_ix(payer.pubkey(), to);
+        let tx = Transaction::new_signed(&payer, 0, [0u8; 32], 1_000, vec![ix]).unwrap();
+        let wire = borsh::to_vec(&tx).unwrap().len();
+        assert_eq!(tx.byte_size(), wire, "byte_size debe igualar el largo borsh exacto de la tx");
+
+        // La suma vieja (message + Σ bytes crudos) sub-contaba el framing de la
+        // firma → el número exacto es ESTRICTAMENTE mayor, y por al menos el
+        // prefijo del Vec de firmas (4 B) + por componente (scheme + prefijo).
+        let old_undercount = borsh::to_vec(&tx.message).unwrap().len()
+            + tx.signature.components.iter().map(|c| c.bytes.len()).sum::<usize>();
+        assert!(
+            tx.byte_size() > old_undercount,
+            "el tamaño exacto ({}) debe superar la suma parcial vieja ({old_undercount})",
+            tx.byte_size()
+        );
+
+        // Tx multi-instrucción: el framing del Vec de instrucciones también
+        // se cuenta (la exactitud no depende de la forma de la tx).
+        let ix2a = sample_ix(payer.pubkey(), to);
+        let ix2b = sample_ix(payer.pubkey(), to);
+        let tx2 = Transaction::new_signed(&payer, 1, [0u8; 32], 1_000, vec![ix2a, ix2b]).unwrap();
+        assert_eq!(tx2.byte_size(), borsh::to_vec(&tx2).unwrap().len());
     }
 }
 

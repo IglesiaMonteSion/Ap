@@ -148,6 +148,25 @@ async function api(path, opts){ const r=await fetch(path,opts); const b=await r.
 // GUARDAN en cada blob (`m`/`t`/`p`) para que subirlos en el futuro siga
 // descifrando los blobs viejos.
 const ARGON2_MEM_KIB = 19456, ARGON2_ITERS = 2, ARGON2_PARALLELISM = 1;
+// #10 (auditoría v8.6.13, EC-14): los parámetros Argon2id (m/t/p) al DESCIFRAR
+// vienen del BLOB de respaldo — dato controlable por quien arme el archivo. Sin
+// topes, un blob malicioso con m de varios GiB (o t/p enormes) cuelga u OOMea el
+// navegador al descifrar = un DoS de descifrado (importar un respaldo hostil). Se
+// validan contra un rango DOCUMENTADO **antes** de correr Argon2 (un blob malo no
+// gasta ni un byte de KDF): se ACEPTAN los valores legítimos históricos
+// (19456/2/1) con amplísimo margen para un bump futuro razonable, y se RECHAZA
+// cualquier valor fuera de rango con un error claro (un blob legítimo nunca cae
+// fuera; el AES-GCM ya autentica, esto sólo acota el trabajo del atacante a CERO).
+const ARGON2_MIN_MEM_KIB = 8,  ARGON2_MAX_MEM_KIB = 1048576;  // 8 KiB .. 1 GiB (legítimo: 19456 = 19 MiB)
+const ARGON2_MIN_ITERS   = 1,  ARGON2_MAX_ITERS   = 24;       // legítimo: 2
+const ARGON2_MIN_PAR     = 1,  ARGON2_MAX_PAR     = 16;       // legítimo: 1
+function checkedArgon2Params(m, t, p){
+  const ok = Number.isInteger(m) && m >= ARGON2_MIN_MEM_KIB && m <= ARGON2_MAX_MEM_KIB
+          && Number.isInteger(t) && t >= ARGON2_MIN_ITERS   && t <= ARGON2_MAX_ITERS
+          && Number.isInteger(p) && p >= ARGON2_MIN_PAR     && p <= ARGON2_MAX_PAR;
+  if(!ok) throw new Error("parámetros Argon2id del respaldo fuera de rango — respaldo rechazado por seguridad");
+  return {m, t, p};
+}
 async function argon2Key(password, salt){
   // 32 bytes de Argon2id -> clave AES-256-GCM (no extraíble).
   const raw = argon2idRaw(new TextEncoder().encode(password), salt, ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLELISM, 32);
@@ -158,6 +177,9 @@ async function argon2Key(password, salt){
 // PBKDF2 se conserva SÓLO para descifrar blobs viejos (compatibilidad hacia
 // atrás — nadie queda afuera). Ya no se cifra nada nuevo con él.
 const PBKDF2_ITERS = 600000;
+// #10 (EC-14): tope de iteraciones PBKDF2 leídas del blob legacy — 20 MM es ~33×
+// el hardened 600k (WebCrypto lo resuelve en <1 s), bloquea el DoS de iter=huge.
+const PBKDF2_MAX_ITERS = 20000000;
 async function pbkdf2Key(password, salt, iters){
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:iters, hash:'SHA-256'}, base,
@@ -179,12 +201,19 @@ async function decryptSeed(store, password){
   if(store.kdf==="argon2id"){
     const salt=ub64(store.salt);
     const m=Number(store.m)||ARGON2_MEM_KIB, t=Number(store.t)||ARGON2_ITERS, p=Number(store.p)||ARGON2_PARALLELISM;
+    checkedArgon2Params(m, t, p);   // #10 (EC-14): acota el trabajo de Argon2 a un rango documentado ANTES de correrlo
     const raw=argon2idRaw(new TextEncoder().encode(password), salt, m, t, p, 32);
     key=await crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
     zeroize(raw);   // #13: borrá los bytes crudos de la KDF tras importarlos
   } else {
     // Blob PBKDF2 legacy. Los pre-hardening (v1 sin `iter`) eran 250k.
+    // #10 (EC-14, barrido de la clase): `iter` también viene del blob no
+    // confiable — un PBKDF2 legacy malicioso con iter=1e12 cuelga
+    // `crypto.subtle.deriveKey`. Mismo tope-antes-de-correr: se aceptan los
+    // valores legítimos (250k/600k) con margen y se rechaza lo absurdo.
     const iters=Number(store.iter)||250000;
+    if(!(Number.isInteger(iters) && iters>=1 && iters<=PBKDF2_MAX_ITERS))
+      throw new Error("iteraciones PBKDF2 del respaldo fuera de rango — respaldo rechazado por seguridad");
     key=await pbkdf2Key(password, ub64(store.salt), iters);
   }
   const pt=await crypto.subtle.decrypt({name:'AES-GCM', iv:ub64(store.iv)}, key, ub64(store.ct));
