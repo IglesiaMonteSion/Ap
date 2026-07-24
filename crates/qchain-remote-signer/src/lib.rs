@@ -19,14 +19,30 @@
 //!   central de un firmante de validador (evita la auto-equivocación aun si el
 //!   proceso del nodo estuviera buggeado/comprometido).
 //!
-//! # Modelo de confianza del socket
+//! # Modelo de confianza del socket (#4.2, auditoría v8.6.13 — CERRADO)
 //!
-//! Quien alcanza el socket puede pedir firmas (votos de peer + bytes de
-//! handshake; NUNCA un auto-voto en conflicto, por la guardia). Por eso el
-//! daemon **bindea loopback por defecto** y el operador lo corre en el mismo
-//! host que el nodo (o un host de firma dedicado con un enlace privado). La
-//! guardia acota el peor caso a "no hay auto-equivocación", nunca "robar
-//! fondos" (la clave nunca sale del daemon).
+//! El socket tiene ahora **DOS capas de autenticación del cliente**, cerrando el
+//! residual "cualquier proceso local puede pedir firmas sin autenticarse":
+//!
+//! 1. **Transporte** — se soporta un **socket Unix (UDS)** con permisos estrictos
+//!    del SO (dir `0700`, socket `0600`) además de TCP loopback. Con UDS, sólo un
+//!    proceso que corre como el MISMO usuario del firmante puede siquiera abrir el
+//!    socket (aislamiento reforzado por el kernel, el modelo `tmkms` local).
+//! 2. **Criptográfica** — **challenge-response de token pre-compartido** (opcional
+//!    en el protocolo, OBLIGATORIA en el perfil mainnet). Al conectar, el servidor
+//!    manda un `AuthChallenge` con un nonce FRESCO (getrandom); el cliente responde
+//!    con `tag = SHA3-256(dominio ‖ len(token) ‖ token ‖ nonce)` y el servidor lo
+//!    verifica en tiempo constante ANTES de servir cualquier pedido de firma. Un
+//!    proceso que no conoce el token es rechazado sin poder firmar nada. El nonce
+//!    fresco por conexión evita replay; SHA3 es resistente a extensión de longitud
+//!    (FIPS 202 — la base del prefix-MAC de KMAC), así que el prefix-MAC es un
+//!    autenticador sólido (no se inventa cripto).
+//!
+//! Defensa en profundidad, ADEMÁS de lo previo: la `DoubleSignGuard` (peor caso
+//! "no hay auto-equivocación"), la verificación de AUTORÍA de `SignPeerVote`
+//! (#4.1) y la allowlist estricta de `SignRaw` (sólo el transcript de handshake).
+//! El daemon **bindea loopback por defecto** (o un UDS local); en mainnet el
+//! endpoint debe ser loopback/UDS **y** llevar token (fail-stop en `config.rs`).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_crypto::{Keypair, MultiSignature, PublicKeyBundle};
@@ -35,8 +51,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Versión del protocolo del socket (por si cambia el framing/enum a futuro).
-pub const PROTO_VERSION: u8 = 1;
+/// Versión del protocolo del socket. Bump al agregar el handshake de auth (#4.2).
+pub const PROTO_VERSION: u8 = 2;
+/// Dominio del prefix-MAC del challenge-response (separación de dominio).
+pub const RS_AUTH_DOMAIN: &[u8] = b"qchain-remote-signer-auth-v1";
 /// Cota dura de un frame (anti-OOM de un cliente malicioso en el socket).
 pub const MAX_FRAME_BYTES: u32 = 1 << 20; // 1 MiB — de sobra para un bundle/firma híbrida (~35 KB).
 /// Timeout de I/O del socket (una firma es sub-ms local; un HSM real, unos ms).
@@ -84,9 +102,79 @@ pub enum SignerResponse {
     Refused(String),
 }
 
-// ---- framing (u32 LE len-prefix, ambos sentidos), bloqueante ----
+/// #4.2 — Primer mensaje que el SERVIDOR manda en cada conexión: negocia la
+/// versión y (si el daemon corre con token) exige el challenge-response. El nonce
+/// es fresco por conexión (anti-replay).
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct AuthChallenge {
+    pub proto_version: u8,
+    pub auth_required: bool,
+    pub nonce: [u8; 32],
+}
 
-fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> anyhow::Result<()> {
+/// #4.2 — Respuesta del CLIENTE al challenge: prueba que conoce el token sin
+/// enviarlo. `tag = SHA3-256(RS_AUTH_DOMAIN ‖ len(token) ‖ token ‖ nonce)`.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct AuthResponse {
+    pub tag: [u8; 32],
+}
+
+/// Prefix-MAC del challenge-response. SHA3-256 es resistente a extensión de
+/// longitud (FIPS 202; es la base del prefix-MAC de KMAC), así que
+/// `SHA3-256(dominio ‖ len(token) ‖ token ‖ nonce)` es un autenticador sólido:
+/// el nonce es fresco por conexión (anti-replay) y sólo quien tiene el token
+/// puede producir el tag. Se prefija la longitud del token para que no haya
+/// ambigüedad de frontera token/nonce. No se inventa cripto — es un keyed-hash
+/// SHA3 estándar.
+pub fn auth_tag(token: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(RS_AUTH_DOMAIN);
+    h.update((token.len() as u64).to_le_bytes());
+    h.update(token);
+    h.update(nonce);
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&h.finalize());
+    tag
+}
+
+/// Comparación en tiempo constante (sin cortar temprano) para el tag del MAC —
+/// evita un canal lateral de temporización al verificar la autenticación.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn fresh_nonce() -> anyhow::Result<[u8; 32]> {
+    let mut n = [0u8; 32];
+    getrandom::getrandom(&mut n)
+        .map_err(|e| anyhow::anyhow!("OS randomness unavailable for the signer auth nonce: {e}"))?;
+    Ok(n)
+}
+
+/// ¿Es `endpoint` una ruta de socket Unix? (`unix:/ruta`, o una ruta absoluta /
+/// relativa `./`). Si no, es un `host:puerto` TCP. Compat hacia atrás: un
+/// `127.0.0.1:9200` existente sigue siendo TCP.
+pub fn unix_endpoint_path(endpoint: &str) -> Option<&str> {
+    if let Some(p) = endpoint.strip_prefix("unix:") {
+        return Some(p);
+    }
+    if endpoint.starts_with('/') || endpoint.starts_with("./") {
+        return Some(endpoint);
+    }
+    None
+}
+
+// ---- framing (u32 LE len-prefix, ambos sentidos), bloqueante, genérico sobre
+// Read/Write para servir TCP y UDS con el mismo código ----
+
+fn write_frame<S: Write>(stream: &mut S, bytes: &[u8]) -> anyhow::Result<()> {
     let len = bytes.len();
     if len as u64 > MAX_FRAME_BYTES as u64 {
         anyhow::bail!("frame too large: {len} bytes");
@@ -97,7 +185,7 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_frame(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
+fn read_frame<S: Read>(stream: &mut S) -> anyhow::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf);
@@ -107,6 +195,84 @@ fn read_frame(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+// ---- transporte: TCP (loopback / enlace privado) o UDS (mismo host) ----
+
+/// Un flujo del firmante: TCP o socket Unix. Ambos implementan `Read`+`Write`,
+/// así que el framing y el handshake son idénticos.
+pub enum SignerStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Read for SignerStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SignerStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            SignerStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for SignerStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SignerStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            SignerStream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SignerStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            SignerStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+impl SignerStream {
+    fn configure(&self, timeout: Duration) {
+        match self {
+            SignerStream::Tcp(s) => {
+                s.set_read_timeout(Some(timeout)).ok();
+                s.set_write_timeout(Some(timeout)).ok();
+                s.set_nodelay(true).ok();
+            }
+            #[cfg(unix)]
+            SignerStream::Unix(s) => {
+                s.set_read_timeout(Some(timeout)).ok();
+                s.set_write_timeout(Some(timeout)).ok();
+            }
+        }
+    }
+    fn peer_desc(&self) -> String {
+        match self {
+            SignerStream::Tcp(s) => s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
+            #[cfg(unix)]
+            SignerStream::Unix(_) => "unix-socket".into(),
+        }
+    }
+}
+
+/// Un listener del firmante: TCP o socket Unix.
+pub enum SignerListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixListener),
+}
+
+impl SignerListener {
+    fn accept(&self) -> std::io::Result<SignerStream> {
+        match self {
+            SignerListener::Tcp(l) => l.accept().map(|(s, _)| SignerStream::Tcp(s)),
+            #[cfg(unix)]
+            SignerListener::Unix(l) => l.accept().map(|(s, _)| SignerStream::Unix(s)),
+        }
+    }
 }
 
 // ============================ CLIENTE ============================
@@ -119,31 +285,71 @@ fn read_frame(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
 pub struct RemoteSigner {
     endpoint: String,
     bundle: PublicKeyBundle,
-    conn: Mutex<Option<TcpStream>>,
+    /// Token pre-compartido para el challenge-response (#4.2). `None` = sin token
+    /// (sólo aceptable en loopback/UDS de desarrollo; el perfil mainnet lo exige).
+    auth_token: Option<Vec<u8>>,
+    conn: Mutex<Option<SignerStream>>,
 }
 
 impl RemoteSigner {
-    /// Conecta al firmante y obtiene su bundle (la identidad del validador).
-    /// Falla ruidoso si el firmante no responde al arrancar — mejor no arrancar
-    /// que arrancar sin poder firmar.
+    /// Conecta SIN token (compat: loopback/UDS de desarrollo). Prefiere
+    /// `connect_with_token` en producción; mainnet exige el token.
     pub fn connect(endpoint: &str) -> anyhow::Result<Self> {
+        Self::connect_with_token(endpoint, None)
+    }
+
+    /// Conecta al firmante y obtiene su bundle (la identidad del validador),
+    /// autenticándose con `auth_token` si el daemon lo exige. Falla ruidoso si el
+    /// firmante no responde o si exige auth y no tenemos token — mejor no arrancar
+    /// que arrancar sin poder firmar.
+    pub fn connect_with_token(endpoint: &str, auth_token: Option<Vec<u8>>) -> anyhow::Result<Self> {
         let s = RemoteSigner {
             endpoint: endpoint.to_string(),
             bundle: PublicKeyBundle { components: Vec::new() },
+            auth_token: auth_token.clone(),
             conn: Mutex::new(None),
         };
         let bundle = match s.request(&SignerRequest::GetBundle)? {
             SignerResponse::Bundle(b) => b,
             other => anyhow::bail!("remote signer returned an unexpected response to GetBundle: {other:?}"),
         };
-        Ok(RemoteSigner { endpoint: s.endpoint, bundle, conn: Mutex::new(None) })
+        Ok(RemoteSigner { endpoint: s.endpoint, bundle, auth_token, conn: Mutex::new(None) })
     }
 
-    fn dial(&self) -> anyhow::Result<TcpStream> {
-        let stream = TcpStream::connect(&self.endpoint)?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        stream.set_nodelay(true).ok();
+    /// Conecta y hace el handshake de auth (#4.2): lee el `AuthChallenge` del
+    /// servidor y, si exige auth, responde con el tag del token. Devuelve un
+    /// stream YA autenticado listo para pedidos.
+    fn dial(&self) -> anyhow::Result<SignerStream> {
+        let mut stream = if let Some(path) = unix_endpoint_path(&self.endpoint) {
+            #[cfg(unix)]
+            {
+                SignerStream::Unix(std::os::unix::net::UnixStream::connect(path)?)
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!("unix-socket signer endpoints require a unix platform: {path}");
+            }
+        } else {
+            SignerStream::Tcp(TcpStream::connect(&self.endpoint)?)
+        };
+        stream.configure(IO_TIMEOUT);
+        // Handshake de auth: el servidor habla primero.
+        let ch_bytes = read_frame(&mut stream)?;
+        let ch: AuthChallenge = borsh::from_slice(&ch_bytes)
+            .map_err(|e| anyhow::anyhow!("malformed AuthChallenge from signer: {e}"))?;
+        if ch.proto_version != PROTO_VERSION {
+            anyhow::bail!(
+                "remote signer speaks protocol v{} but this node speaks v{PROTO_VERSION} — update both together",
+                ch.proto_version
+            );
+        }
+        if ch.auth_required {
+            let token = self.auth_token.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("remote signer requires client authentication but no auth token is configured on this node")
+            })?;
+            let tag = auth_tag(token, &ch.nonce);
+            write_frame(&mut stream, &borsh::to_vec(&AuthResponse { tag })?)?;
+        }
         Ok(stream)
     }
 
@@ -312,20 +518,24 @@ impl DoubleSignGuard {
 
 // ============================ SERVIDOR ============================
 
-/// Sirve pedidos de firma sobre `listener`, sosteniendo `keypair` y aplicando
-/// `guard` a los auto-votos. Bloqueante: una conexión por vez en un bucle (un
-/// nodo mantiene una sola conexión persistente; el volumen es ~una firma por
-/// ronda). Cada conexión se atiende hasta que el par la cierra.
-pub fn serve(keypair: Keypair, listener: TcpListener, guard: Arc<Mutex<DoubleSignGuard>>) {
-    for stream in listener.incoming() {
-        match stream {
+/// Sirve pedidos de firma sobre `listener` (TCP o UDS), sosteniendo `keypair` y
+/// aplicando `guard` a los auto-votos. Si `auth_token` es `Some`, cada conexión
+/// DEBE pasar el challenge-response antes de que se sirva ningún pedido (#4.2).
+/// Bloqueante: una conexión por vez en un bucle (un nodo mantiene una sola
+/// conexión persistente; el volumen es ~una firma por ronda).
+pub fn serve(
+    keypair: Keypair,
+    listener: SignerListener,
+    guard: Arc<Mutex<DoubleSignGuard>>,
+    auth_token: Option<Vec<u8>>,
+) {
+    loop {
+        match listener.accept() {
             Ok(mut s) => {
-                s.set_read_timeout(Some(IO_TIMEOUT)).ok();
-                s.set_write_timeout(Some(IO_TIMEOUT)).ok();
-                s.set_nodelay(true).ok();
-                let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+                s.configure(IO_TIMEOUT);
+                let peer = s.peer_desc();
                 tracing::info!("signer: connection from {peer}");
-                if let Err(e) = handle_conn(&mut s, &keypair, &guard) {
+                if let Err(e) = handle_conn(&mut s, &keypair, &guard, auth_token.as_deref()) {
                     tracing::warn!("signer: connection from {peer} ended: {e}");
                 }
             }
@@ -337,7 +547,34 @@ pub fn serve(keypair: Keypair, listener: TcpListener, guard: Arc<Mutex<DoubleSig
     }
 }
 
-fn handle_conn(stream: &mut TcpStream, keypair: &Keypair, guard: &Arc<Mutex<DoubleSignGuard>>) -> anyhow::Result<()> {
+fn handle_conn(
+    stream: &mut SignerStream,
+    keypair: &Keypair,
+    guard: &Arc<Mutex<DoubleSignGuard>>,
+    auth_token: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    // #4.2 — Handshake de auth PRIMERO: el servidor habla. Si corremos con token,
+    // el cliente debe probar que lo conoce ANTES de que firmemos nada.
+    let auth_required = auth_token.is_some();
+    let nonce = fresh_nonce()?;
+    write_frame(
+        stream,
+        &borsh::to_vec(&AuthChallenge { proto_version: PROTO_VERSION, auth_required, nonce })?,
+    )?;
+    if let Some(token) = auth_token {
+        let resp_bytes = match read_frame(stream) {
+            Ok(b) => b,
+            Err(_) => return Ok(()), // el cliente no completó el handshake → cerrar
+        };
+        let resp: AuthResponse = borsh::from_slice(&resp_bytes)
+            .map_err(|e| anyhow::anyhow!("malformed AuthResponse: {e}"))?;
+        let expected = auth_tag(token, &nonce);
+        if !ct_eq(&resp.tag, &expected) {
+            tracing::warn!("signer: client authentication FAILED — closing without signing");
+            return Ok(()); // cerrar sin firmar; no se sirve ningún pedido
+        }
+        tracing::info!("signer: client authenticated");
+    }
     loop {
         let req_bytes = match read_frame(stream) {
             Ok(b) => b,
@@ -556,7 +793,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let g = guard(&tmp);
-        std::thread::spawn(move || serve(kp, listener, g));
+        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, None));
 
         let client = RemoteSigner::connect(&addr).unwrap();
         assert_eq!(client.bundle().to_address(), expected_bundle.to_address());
@@ -625,6 +862,105 @@ mod tests {
             ),
             "malformed vertex bytes must be refused, not panic"
         );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// El prefix-MAC del challenge-response es determinista, sensible al token y
+    /// al nonce; la comparación en tiempo constante acepta iguales y rechaza
+    /// distintos y longitudes distintas.
+    #[test]
+    fn auth_tag_is_deterministic_token_and_nonce_sensitive() {
+        let tok_a = b"shared-secret-A".to_vec();
+        let tok_b = b"shared-secret-B".to_vec();
+        let n1 = [1u8; 32];
+        let n2 = [2u8; 32];
+        assert_eq!(auth_tag(&tok_a, &n1), auth_tag(&tok_a, &n1), "determinista");
+        assert_ne!(auth_tag(&tok_a, &n1), auth_tag(&tok_b, &n1), "sensible al token");
+        assert_ne!(auth_tag(&tok_a, &n1), auth_tag(&tok_a, &n2), "sensible al nonce");
+        // La longitud del token se prefija → dos tokens con un byte-boundary
+        // ambiguo NO colisionan.
+        assert_ne!(auth_tag(b"ab", &n1), auth_tag(b"a", &n1));
+        let t = auth_tag(&tok_a, &n1);
+        assert!(ct_eq(&t, &t));
+        assert!(!ct_eq(&t, &auth_tag(&tok_b, &n1)));
+        assert!(!ct_eq(&t, &t[..31])); // longitud distinta
+    }
+
+    /// #4.2 (auditoría v8.6.13) — el socket AUTENTICA al cliente por
+    /// challenge-response de token: con el token correcto el cliente obtiene el
+    /// bundle y una firma que verifica; un token INCORRECTO o AUSENTE es rechazado
+    /// ANTES de firmar nada. Cierra "cualquier proceso local puede pedir firmas
+    /// sin autenticarse".
+    #[test]
+    fn a_client_without_the_right_token_cannot_get_any_signature() {
+        use qchain_crypto::Signer;
+        let tmp = std::env::temp_dir().join(format!("qrs-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let expected = kp.public_key_bundle();
+        let token = b"the-pre-shared-signer-token".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let g = guard(&tmp);
+        let tok_srv = token.clone();
+        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, Some(tok_srv)));
+
+        // (a) Token CORRECTO → autentica, obtiene bundle y firma un voto que verifica.
+        let ok = RemoteSigner::connect_with_token(&addr, Some(token.clone())).unwrap();
+        assert_eq!(ok.bundle().to_address(), expected.to_address());
+        let digest = [3u8; 32];
+        let sig = ok.sign_own_vote(1, &digest).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected, &digest, &sig));
+
+        // (b) Token INCORRECTO → la conexión se cierra sin servir; GetBundle falla.
+        assert!(
+            RemoteSigner::connect_with_token(&addr, Some(b"wrong-token".to_vec())).is_err(),
+            "a wrong token must not authenticate — no signing oracle"
+        );
+        // (c) SIN token cuando el servidor lo EXIGE → falla (no puede responder el challenge).
+        assert!(
+            RemoteSigner::connect_with_token(&addr, None).is_err(),
+            "a client with no token must be rejected when the daemon requires auth"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// #4.2 — el transporte por SOCKET UNIX funciona de punta a punta con token:
+    /// un peer-vote firma correctamente sobre el UDS (aislamiento de permisos del
+    /// SO + challenge-response encima).
+    #[cfg(unix)]
+    #[test]
+    fn client_server_roundtrip_over_a_unix_socket_with_token() {
+        use qchain_crypto::Signer;
+        let tmp = std::env::temp_dir().join(format!("qrs-uds-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("signer.sock");
+        let _ = std::fs::remove_file(&sock);
+        let kp = Keypair::generate().unwrap();
+        let expected = kp.public_key_bundle();
+        let token = b"uds-token".to_vec();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let g = guard(&tmp);
+        let tok_srv = token.clone();
+        std::thread::spawn(move || serve(kp, SignerListener::Unix(listener), g, Some(tok_srv)));
+
+        let endpoint = format!("unix:{}", sock.display());
+        let client = RemoteSigner::connect_with_token(&endpoint, Some(token)).unwrap();
+        assert_eq!(client.bundle().to_address(), expected.to_address());
+        let peer_v = qchain_core::dag::Vertex {
+            round: 4,
+            author: Keypair::generate().unwrap().public_key_bundle().to_address(),
+            batch_digests: vec![],
+            parents: vec![],
+        };
+        let pd = peer_v.digest();
+        let sig = client.sign_peer_vote(&borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected, &pd, &sig));
+        // Un endpoint UDS se reconoce como tal; un host:puerto no.
+        assert_eq!(unix_endpoint_path(&endpoint), Some(sock.to_str().unwrap()));
+        assert_eq!(unix_endpoint_path("127.0.0.1:9200"), None);
 
         std::fs::remove_dir_all(&tmp).ok();
     }

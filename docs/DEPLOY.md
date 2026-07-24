@@ -200,7 +200,7 @@ arreglás en una pasada, no una por una). Exige:
 | Almacenamiento transaccional | `storage_engine: "redb"` (commit atómico estado+ronda+economía) |
 | Transporte P2P autenticado | `authenticated_transport: true` |
 | Transporte cifrado | `encrypted_transport: true` |
-| Firmante remoto (clave fuera del proceso) | `remote_signer: "host:port"` |
+| Firmante remoto (clave fuera del proceso) | `remote_signer: "host:port"` o `"unix:/ruta.sock"` **+** `remote_signer_auth_token_path` (token de auth del cliente, obligatorio en mainnet) |
 | RPC del validador en red privada | `rpc_addr` loopback/RFC1918 (nunca ruteable) |
 | Trust anchor de state-sync | `require_state_sync_trust_anchor: true` (+ `state_sync_trusted_root`/`_round` si hay `state_sync_peers`) |
 | Límites de RPC explícitos | `rpc_rate_limit_per_10s`, `simulate_rate_limit_per_10s`, `tx_rate_limit_per_10s` (> 0) |
@@ -436,13 +436,21 @@ Cómo activarlo (OPT-IN; por defecto sigue todo en-proceso, byte-idéntico):
 
 1. **Mové** el `keypair.json` del validador de `/opt/qchain` a `/opt/qchain-signer`
    (para que el nodo ya no lo tenga).
-2. **Arrancá el firmante** (bindea loopback — sólo el nodo del mismo host lo
-   alcanza): `sudo systemctl enable --now qchain-remote-signer` (unidad nueva
-   `deploy/systemd/qchain-remote-signer.service`), o a mano:
-   `qchain-remote-signer --keypair /opt/qchain-signer/keypair.json --listen 127.0.0.1:9200 --guard-file /opt/qchain-signer/guard.bin`
-3. **Poné** `"remote_signer": "127.0.0.1:9200"` en el `config.json` del nodo y
-   reiniciá el validador. En el arranque el nodo loguea
-   `consensus signer: REMOTE ... the block-signing key is NOT in this node process`.
+2. **Generá el token de auth del cliente** (#4.2 — un secreto compartido entre el
+   nodo y el firmante):
+   `head -c 32 /dev/urandom | base64 > /opt/qchain-signer/signer.token && chmod 600 /opt/qchain-signer/signer.token`
+   (el mismo archivo lo verá el nodo — copialo a donde el nodo lo lea, p.ej.
+   `/opt/qchain/signer.token`, 0600).
+3. **Arrancá el firmante** (bindea loopback — sólo el nodo del mismo host lo
+   alcanza — y EXIGE el token): `sudo systemctl enable --now qchain-remote-signer`
+   (unidad `deploy/systemd/qchain-remote-signer.service`), o a mano:
+   `qchain-remote-signer --keypair /opt/qchain-signer/keypair.json --listen 127.0.0.1:9200 --guard-file /opt/qchain-signer/guard.bin --auth-token-file /opt/qchain-signer/signer.token`
+   (o `--listen unix:/run/qchain/signer.sock` para un socket Unix con aislamiento
+   de permisos del SO).
+4. **Poné** `"remote_signer": "127.0.0.1:9200"` **y** `"remote_signer_auth_token_path":
+   "/opt/qchain/signer.token"` en el `config.json` del nodo y reiniciá el validador.
+   En el arranque el nodo loguea
+   `consensus signer: REMOTE ... [client auth: TOKEN]`.
 
 Es una migración **sin cambio de identidad**: el firmante sostiene la MISMA clave,
 así que el validador es el mismo (misma dirección, mismo registro on-chain, mismo
@@ -450,11 +458,17 @@ así que el validador es el mismo (misma dirección, mismo registro on-chain, mi
 anti-doble-firma persistida** (`guard.bin`): se niega a firmar dos vértices
 PROPIOS distintos para la misma ronda, aun si el proceso del nodo estuviera
 comprometido — la propiedad de seguridad central de un firmante de validador.
-**Confiá el socket:** quien lo alcance puede pedir firmas (nunca un auto-voto en
-conflicto, y la clave nunca sale del daemon), así que corré el firmante en el
-MISMO host que el nodo (loopback). `--allow-non-loopback` es necesario a
-propósito para bindear una dirección pública (sólo sobre un enlace privado +
-firewall). Esto saca la clave del proceso del nodo (incremento A de #193).
+**Autenticación del cliente del socket (#4.2, auditoría v8.6.13 — CERRADO):** con
+el token, cada conexión debe probar que lo conoce por **challenge-response** (el
+servidor manda un nonce fresco; el cliente responde con
+`SHA3-256(dominio ‖ token ‖ nonce)`, verificado en tiempo constante) ANTES de que
+el daemon firme nada — un proceso local que no conoce el token es **rechazado**.
+Con un socket **Unix**, además, sólo un proceso del MISMO usuario puede abrirlo
+(dir `0700`, socket `0600`). El perfil **mainnet del nodo EXIGE** tanto un endpoint
+loopback/UDS como el token (fail-stop). `--allow-non-loopback` sigue existiendo
+para una dirección TCP pública (sólo sobre un enlace privado + firewall + el
+token). Esto saca la clave del proceso del nodo (incremento A de #193) y cierra el
+"cualquier proceso local puede pedir firmas sin autenticarse" (#4.2).
 
 **Separación de roles de clave — dirección FRÍA de retiro (`withdrawal_address`,
 tarea #193-B, incremento B).** La clave de consenso (online, en el nodo o en el

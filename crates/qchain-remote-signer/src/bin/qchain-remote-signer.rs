@@ -1,38 +1,55 @@
-//! Daemon del firmante remoto / HSM de la clave de validador (tarea #193).
+//! Daemon del firmante remoto / HSM de la clave de validador (tarea #193 + #4.2).
 //!
 //! Sostiene el `keypair.json` del validador y firma votos de consenso + bytes de
 //! handshake por un socket, para que la clave NO viva en el proceso del nodo. El
-//! nodo se conecta con `remote_signer: "<host:puerto>"` en su `config.json`.
+//! nodo se conecta con `remote_signer: "<host:puerto>"` (o `"unix:/ruta.sock"`) en
+//! su `config.json`.
 //!
-//!   qchain-remote-signer --keypair /opt/qchain/keypair.json --listen 127.0.0.1:9200
+//!   # TCP loopback + token de auth (recomendado):
+//!   qchain-remote-signer --keypair /opt/qchain/keypair.json \
+//!       --listen 127.0.0.1:9200 --auth-token-file /opt/qchain/signer.token
 //!
-//! **Seguridad:** bindea LOOPBACK por defecto. Quien alcance el socket puede
-//! pedir firmas (nunca un auto-voto en conflicto — la guardia lo bloquea, y la
-//! clave nunca sale del daemon), así que corré el firmante en el MISMO host que
-//! el nodo (o un host de firma dedicado con un enlace privado + firewall).
-//! `--allow-non-loopback` es necesario, a propósito, para bindear una dirección
-//! pública (desaconsejado sin un enlace protegido).
+//!   # Socket Unix (aislamiento por permisos del SO) + token:
+//!   qchain-remote-signer --keypair /opt/qchain/keypair.json \
+//!       --listen unix:/run/qchain/signer.sock --auth-token-file /opt/qchain/signer.token
+//!
+//! **Seguridad (#4.2, auditoría v8.6.13):** el cliente se AUTENTICA. Con
+//! `--auth-token-file` cada conexión debe probar que conoce el token
+//! (challenge-response) ANTES de que se firme nada — un proceso local que no lo
+//! conoce es rechazado. Con un socket Unix, además, sólo un proceso del MISMO
+//! usuario puede abrir el socket (dir 0700, socket 0600). El daemon bindea
+//! loopback/UDS por defecto; `--allow-non-loopback` es necesario a propósito para
+//! una dirección TCP pública (desaconsejado sin un enlace privado + firewall + el
+//! token). El perfil mainnet del NODO exige tanto loopback/UDS como el token.
 
 use anyhow::Context;
 use clap::Parser;
-use std::net::TcpListener;
+use qchain_remote_signer::SignerListener;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "qchain-remote-signer", about = "Firmante remoto/HSM de la clave de validador de qchain (#193)")]
+#[command(name = "qchain-remote-signer", about = "Firmante remoto/HSM de la clave de validador de qchain (#193 + #4.2)")]
 struct Cli {
     /// Ruta al keypair.json del validador (la clave que firma bloques).
     #[arg(long)]
     keypair: String,
-    /// Dirección donde escuchar (por defecto loopback). Ej: 127.0.0.1:9200
+    /// Dónde escuchar. `host:puerto` (TCP, por defecto loopback) o `unix:/ruta`
+    /// (socket Unix). Ej: 127.0.0.1:9200  |  unix:/run/qchain/signer.sock
     #[arg(long, default_value = "127.0.0.1:9200")]
     listen: String,
+    /// Archivo con el TOKEN pre-compartido de autenticación del cliente (#4.2).
+    /// Cuando se pasa, cada conexión debe probar que conoce el token antes de que
+    /// el daemon firme nada. El MISMO archivo lo lee el nodo
+    /// (`remote_signer_auth_token_path`). Sin él, el socket queda sin auth
+    /// criptográfica (sólo aceptable en loopback/UDS de desarrollo).
+    #[arg(long)]
+    auth_token_file: Option<String>,
     /// Archivo de la guardia anti-doble-firma (persiste la ronda/vértice propio
     /// más alto firmado). Por defecto, junto al keypair.
     #[arg(long)]
     guard_file: Option<String>,
-    /// Permitir bindear una dirección NO-loopback (desaconsejado sin enlace
-    /// privado + firewall — cualquiera que alcance el socket puede pedir firmas).
+    /// Permitir bindear una dirección TCP NO-loopback (desaconsejado sin enlace
+    /// privado + firewall + token — no aplica a UDS).
     #[arg(long, default_value_t = false)]
     allow_non_loopback: bool,
 }
@@ -53,24 +70,85 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("cannot load double-sign guard from {guard_path}"))?,
     ));
 
-    let listener = TcpListener::bind(&cli.listen)
-        .with_context(|| format!("cannot bind signer socket on {}", cli.listen))?;
-    let bound = listener.local_addr()?;
-    let is_loopback = bound.ip().is_loopback();
-    if !is_loopback && !cli.allow_non_loopback {
-        anyhow::bail!(
-            "refusing to bind a NON-loopback address ({bound}) without --allow-non-loopback: \
-             anyone reaching this socket can request signatures. Run the signer on the node's \
-             host (loopback), or pass --allow-non-loopback only over a private, firewalled link."
+    // Token de auth del cliente (#4.2). Se lee crudo del archivo (que el operador
+    // protege 0600); un archivo vacío se rechaza (un token vacío no autentica).
+    let auth_token = match &cli.auth_token_file {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("cannot read auth token file {path}"))?;
+            let trimmed = trim_token(&bytes);
+            if trimmed.is_empty() {
+                anyhow::bail!("auth token file {path} is empty — refusing to run with an empty token");
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    // Bindear el listener: UDS (permisos estrictos del SO) o TCP.
+    let listener = if let Some(path) = qchain_remote_signer::unix_endpoint_path(&cli.listen) {
+        bind_unix(path)?
+    } else {
+        let l = std::net::TcpListener::bind(&cli.listen)
+            .with_context(|| format!("cannot bind signer socket on {}", cli.listen))?;
+        let bound = l.local_addr()?;
+        if !bound.ip().is_loopback() && !cli.allow_non_loopback {
+            anyhow::bail!(
+                "refusing to bind a NON-loopback address ({bound}) without --allow-non-loopback: \
+                 use a loopback endpoint or a unix socket. Even with --allow-non-loopback, set \
+                 --auth-token-file so clients must authenticate."
+            );
+        }
+        SignerListener::Tcp(l)
+    };
+
+    tracing::info!(
+        "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}]",
+        bundle.to_address(),
+        cli.listen,
+        if auth_token.is_some() { "TOKEN required" } else { "NONE — dev/loopback only" }
+    );
+    if auth_token.is_none() {
+        tracing::warn!(
+            "signer running WITHOUT a client auth token — any process that reaches the socket can request signatures. Set --auth-token-file for production (required by the node's mainnet profile)."
         );
     }
 
-    tracing::info!(
-        "qchain remote signer up: validator {} listening on {bound} (guard: {guard_path}){}",
-        bundle.to_address(),
-        if is_loopback { "" } else { " [NON-LOOPBACK — ensure the link is private]" }
-    );
-
-    qchain_remote_signer::serve(keypair, listener, guard);
+    qchain_remote_signer::serve(keypair, listener, guard, auth_token);
     Ok(())
+}
+
+/// Recorta espacios/nueva-línea de los bordes del token (para que un archivo con
+/// un `\n` final no cambie el secreto respecto de lo que el nodo lee).
+fn trim_token(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+    bytes[start..end].to_vec()
+}
+
+/// Bindea un socket Unix con permisos estrictos: el directorio a 0700 y el socket
+/// a 0600, de modo que sólo un proceso del MISMO usuario pueda alcanzarlo.
+fn bind_unix(path: &str) -> anyhow::Result<SignerListener> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = std::path::Path::new(path);
+        // Un socket previo (de un reinicio) impide el bind → removerlo.
+        let _ = std::fs::remove_file(p);
+        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create signer socket dir {}", dir.display()))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("cannot chmod 0700 signer socket dir {}", dir.display()))?;
+        }
+        let listener = std::os::unix::net::UnixListener::bind(p)
+            .with_context(|| format!("cannot bind unix signer socket {path}"))?;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot chmod 0600 signer socket {path}"))?;
+        Ok(SignerListener::Unix(listener))
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("unix-socket listen endpoints require a unix platform: {path}");
+    }
 }

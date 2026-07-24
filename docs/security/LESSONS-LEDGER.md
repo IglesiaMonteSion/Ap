@@ -419,6 +419,37 @@ sigue cerrada.
 
 ---
 
+## EC-16 — Endpoint/socket privilegiado sin autenticar (y 'acotado' ≠ 'eliminado')
+
+- **Clase:** un endpoint que ejecuta una operación PRIVILEGIADA (firmar, mutar,
+  administrar) confía en que "sólo el proceso correcto lo alcanza" en vez de
+  AUTENTICAR al cliente. La forma sutil de la clase: tras acotar el *peor caso*
+  (una guardia limita el daño), se **declara cerrado** el hallazgo aunque el
+  cliente siga sin autenticarse — confundir 'daño acotado' con 'vector eliminado'.
+- **Instancias:** v8.6.13 #4.2 (CORREGIDO v8.6.26): el socket del firmante remoto
+  era TCP/Borsh **sin autenticación de cliente** — cualquier proceso local que
+  alcanzara el puerto loopback podía pedir firmas (peer-votes/handshakes/
+  checkpoints). Se había "mitigado" (loopback-only en mainnet, v8.6.24) y
+  archivado el client-auth como follow-up, tratándolo como cerrado porque el peor
+  caso estaba acotado (nunca valor ni auto-equivocación). **El auditor tuvo razón:
+  para mainnet, 'un proceso local puede pedir firmas sin autenticarse' es un
+  residual real, no eliminado.** **Fix:** challenge-response de token
+  pre-compartido (nonce fresco + `SHA3-256(dominio‖token‖nonce)` en tiempo
+  constante ANTES de firmar) + socket Unix con permisos 0700/0600; mainnet EXIGE
+  ambos. Barrido de la clase: el resto de endpoints privilegiados ya autentican o
+  están acotados (RPC verifica firma+chain_id + rate-limits #196/#210 + privado en
+  mainnet #211; P2P handshake ML-DSA #176 + cifrado ML-KEM). El socket del firmante
+  era el único sin auth de cliente.
+- **Regla:** todo endpoint que ejecute una operación privilegiada AUTENTICA al que
+  llama (token/mTLS/permisos-de-SO), no sólo acota el daño. Un 'peor caso acotado'
+  NO cierra el hallazgo de auth — se documenta como mitigación parcial y la auth
+  real queda como trabajo abierto, no como cerrado.
+- **Pregunta recurrente:** *¿este endpoint privilegiado PRUEBA quién es el cliente,
+  o sólo asume que 'nadie más lo alcanza'? Si sólo acoté el daño, ¿lo estoy
+  declarando 'cerrado' cuando en realidad sigue sin autenticar?*
+
+---
+
 ## Registro de auditorías
 
 | Auditoría | Archivo | Hallazgos | Estado |

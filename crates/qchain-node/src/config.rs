@@ -415,6 +415,18 @@ pub struct NodeConfig {
     #[serde(default)]
     pub remote_signer: Option<String>,
 
+    /// **Token de autenticación del cliente del firmante remoto (#4.2, auditoría
+    /// v8.6.13).** Ruta a un archivo (0600) con el token pre-compartido que
+    /// autentica ESTE nodo ante el `qchain-remote-signer` por challenge-response:
+    /// el daemon manda un nonce fresco y el nodo prueba que conoce el token antes
+    /// de que se firme nada. El MISMO archivo lo lee el daemon
+    /// (`--auth-token-file`). `None` (el default) = sin token (sólo aceptable en
+    /// loopback/UDS de desarrollo); el perfil **mainnet lo EXIGE** cuando
+    /// `remote_signer` está seteado, cerrando "cualquier proceso local puede pedir
+    /// firmas sin autenticarse". Node-LOCAL, NO se pliega en `chain_id`.
+    #[serde(default)]
+    pub remote_signer_auth_token_path: Option<String>,
+
     /// **Postura de MAINNET (obligatorio auth + cifrado P2P).** `false` (el
     /// default, y lo que resuelve todo config existente) no impone nada — un
     /// testnet corre exactamente como antes. `true` hace OBLIGATORIOS al arrancar
@@ -854,22 +866,28 @@ impl NodeConfig {
         if self.remote_signer.is_none() {
             missing.push("remote_signer: set \"host:port\" of a qchain-remote-signer/HSM so the block-signing key is NOT in the node process".into());
         } else if let Some(ep) = &self.remote_signer {
-            // Audit v8.6.13 #4: the signer socket is an UNAUTHENTICATED signing
-            // oracle — no client mTLS / session challenge yet — so anyone who
-            // reaches it can request consensus votes / handshake sigs (= compromise
-            // of the validator's consensus identity). A mainnet validator must
-            // reach it over LOOPBACK (same machine) ONLY; a public or even
-            // private-LAN endpoint is rejected fail-closed. (Cross-host signing
-            // needs the mTLS/UDS client-auth that is the documented follow-up.)
+            // Audit v8.6.13 #4.2 (CERRADO): the signer socket now authenticates the
+            // CLIENT via a pre-shared token challenge-response, and supports a Unix
+            // socket (OS-permission isolation). A mainnet validator must (a) reach
+            // it over LOOPBACK TCP or a UNIX socket (never a public/LAN TCP
+            // address), AND (b) set the auth token — so no local process can
+            // request signatures without proving it knows the token. Both are
+            // fail-closed.
+            let is_unix = qchain_remote_signer::unix_endpoint_path(ep).is_some();
             let host_is_loopback = ep
                 .rsplit_once(':')
                 .and_then(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().ok())
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false);
-            if !host_is_loopback {
+            if !is_unix && !host_is_loopback {
                 missing.push(format!(
-                    "remote_signer: {ep} must be a LOOPBACK endpoint (e.g. 127.0.0.1:9200) on mainnet — the signer socket is unauthenticated (no client mTLS yet), so a public/LAN address is an open signing oracle for the consensus key"
+                    "remote_signer: {ep} must be a LOOPBACK TCP endpoint (e.g. 127.0.0.1:9200) or a UNIX socket (e.g. unix:/run/qchain/signer.sock) on mainnet — a public/LAN address is an exposed signing oracle for the consensus key"
                 ));
+            }
+            if self.remote_signer_auth_token_path.is_none() {
+                missing.push(
+                    "remote_signer_auth_token_path: set the client auth token file (0600) — on mainnet the signer socket must authenticate the client (challenge-response), not just rely on loopback/OS perms, so no local process can request signatures without the token".into(),
+                );
             }
         }
         // 6. validator RPC on a private network.
@@ -1051,6 +1069,7 @@ mod tests {
             tx_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
+            remote_signer_auth_token_path: None,
             mainnet: false,
             network_profile: None,
             state_checkpoints: false,
@@ -1298,6 +1317,7 @@ mod tests {
         c.authenticated_transport = true;
         c.encrypted_transport = true;
         c.remote_signer = Some("127.0.0.1:9200".into());
+        c.remote_signer_auth_token_path = Some("/opt/qchain/signer.token".into()); // #4.2 client auth
         c.rpc_addr = "127.0.0.1:28001".parse().unwrap(); // private
         c.require_state_sync_trust_anchor = true;
         c.rpc_rate_limit_per_10s = Some(64);
@@ -1396,6 +1416,9 @@ mod tests {
             // signing oracle — mainnet must reject it (loopback only until mTLS).
             ("public remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = Some("8.8.8.8:9200".into()))),
             ("LAN remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = Some("192.168.1.10:9200".into()))),
+            // Audit v8.6.13 #4.2: the signer socket must AUTHENTICATE the client on
+            // mainnet — the token file is required (loopback/UDS alone is not enough).
+            ("no signer auth token", Box::new(|c: &mut NodeConfig| c.remote_signer_auth_token_path = None)),
             ("public rpc_addr", Box::new(|c: &mut NodeConfig| c.rpc_addr = "8.8.8.8:28001".parse().unwrap())),
             ("trust_anchor", Box::new(|c: &mut NodeConfig| c.require_state_sync_trust_anchor = false)),
             ("rpc_rate_limit", Box::new(|c: &mut NodeConfig| c.rpc_rate_limit_per_10s = None)),
@@ -1420,6 +1443,15 @@ mod tests {
             knock(&mut c);
             assert!(c.validate_network_profile().is_err(), "mainnet with {name} missing must fail-stop");
         }
+
+        // #4.2 — a UNIX-socket signer endpoint (with the token) is accepted on
+        // mainnet (OS-permission isolation + challenge-response), same as loopback TCP.
+        let mut uds = mainnet_config_with(one_validator());
+        uds.remote_signer = Some("unix:/run/qchain/signer.sock".into());
+        assert!(uds.validate_network_profile().is_ok(), "a unix-socket signer with a token must be accepted on mainnet; err: {:?}", uds.validate_network_profile().err());
+        // ...but a UNIX-socket signer WITHOUT the token still fails.
+        uds.remote_signer_auth_token_path = None;
+        assert!(uds.validate_network_profile().is_err(), "even a unix-socket signer must carry the client auth token on mainnet");
 
         // When a state_sync peer is set, the anchor's (round, root) must be pinned.
         let mut sync = mainnet_config_with(one_validator());

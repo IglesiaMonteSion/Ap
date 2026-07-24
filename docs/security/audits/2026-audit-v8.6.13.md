@@ -20,7 +20,7 @@ es el que entregó el operador; acá se registra el trabajo.
 | 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | ✅ **CORREGIDO (v8.6.18)** — owner check + dirección canónica + saturating timelock + 2 tests de exploit + sweep EC-01 limpio |
 | 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryState::decode_any_version` único, compartido gate+runtime |
 | 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryOpV0`/`PendingOpV0` históricos exactos + conversión + test |
-| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | ✅ **CORREGIDO (v8.6.20 + v8.6.24)** — `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación; **v8.6.24: el perfil mainnet ahora RECHAZA un `remote_signer` no-loopback** (público/LAN = oráculo de firma sin auth) — el socket sólo se alcanza same-machine hasta que exista mTLS/UDS. Client-auth mTLS/UDS completo sigue como follow-up documentado |
+| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma (4.1); el daemon no autentica la identidad del cliente (4.2) | EC-06 / EC-16 | P1 | ✅ **CORREGIDO — 4.1 (v8.6.20) + 4.2 (v8.6.26)** — **4.1:** `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación. **4.2 (CERRADO, no sólo mitigado):** el socket AUTENTICA al cliente — (a) **challenge-response de token pre-compartido** (nonce fresco del servidor + `SHA3-256(dominio‖token‖nonce)` verificado en tiempo constante ANTES de firmar nada) y (b) soporte de **socket Unix** (dir 0700 / socket 0600 = sólo el mismo UID). El perfil **mainnet EXIGE** endpoint loopback/UDS **y** el token (fail-stop). Ningún proceso local puede pedir firmas sin el token. Follow-up opcional: mTLS cross-host (loopback/UDS same-machine + token ya es seguro) |
 | 5 | Medio | Op puede alcanzar quorum y aun así ser IMPOSIBLE de ejecutar: expiry medido desde `proposed_round`, pero el timelock arranca al alcanzar quorum → `ready_round` puede caer PASADO el deadline | EC-05 | P1 | ✅ **CORREGIDO (v8.6.24)** — **el `expiry>timelock` (v8.6.18) NO cerraba el escenario del auditor** (quorum tardío → `ready > proposed+expiry`): `prune_expired` ahora separa el deadline de APROBACIÓN (`proposed+expiry`) del de EJECUCIÓN (`ready+expiry`) → una op con quorum SIEMPRE tiene ventana para ejecutar; test `a_late_quorum_op_survives_the_approval_deadline_and_still_executes` |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
 | 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18 + v8.6.25)** — `CURRENT_TX_VERSION` re-verificado en la ejecución comprometida (`apply`, la parte *imprescindible*) + test; **v8.6.25: la verificación punto-por-punto agregó el early-reject en ADMISIÓN** (RPC `/tx`, `/simulate`, gossip P2P) que el auditor listaba como defensa-en-profundidad — barato, antes del verify PQC, byte-idéntico para tráfico v1 honesto |
@@ -296,3 +296,57 @@ client-auth completo del firmante remoto (mTLS/UDS cross-host — mainnet ya exi
 loopback same-machine, seguro sin mTLS), y los gates de PROCESO del auditor
 (auditoría externa formal, bug bounty, 2ª impl interoperable, testnet adversarial
 prolongada, CI sobre el commit final) = tarea #203, humanos/externos.
+
+## #4.2 — Autenticación del cliente del socket del firmante remoto (v8.6.26) — ✅ CERRADO
+
+**Estado previo (honesto):** hasta v8.6.24 el hallazgo 4.2 estaba **mitigado, NO
+eliminado**. Se había: (a) cerrado 4.1 (autoría de `SignPeerVote`, v8.6.20), y
+(b) hecho que el perfil mainnet RECHACE un `remote_signer` no-loopback (v8.6.24).
+Pero el socket seguía siendo **TCP/Borsh sin autenticación de cliente**: cualquier
+proceso local que alcanzara el puerto loopback podía pedir firmas (peer-votes
+sobre vértices de OTROS validadores, transcripts de handshake, checkpoints) — nunca
+auto-equivocación ni valor (la guardia + la allowlist + la autoría lo acotan), pero
+sí firmas que el validador no pretendía emitir.
+
+**Por qué se había quedado (causa raíz del episodio):** en sesiones previas se
+DOCUMENTÓ 4.2 como "FOLLOW-UP DIFERIDO" con el razonamiento *"el daemon bindea
+loopback y, tras el fix de autoría, el peor caso queda acotado a peer-votes +
+handshakes, nunca valor → aceptable para una testnet controlada"*. Es la trampa
+de **confundir 'acotado' con 'eliminado'**: se marcó como cerrada la parte
+loopback-mitigación y se archivó el client-auth como follow-up, en vez de tratar
+"un proceso local puede pedir firmas sin autenticarse" como un residual real que
+para mainnet NO debe declararse eliminado. El auditor tuvo razón.
+
+**Fix (CERRADO, `qchain-remote-signer` + `qchain-node`):** DOS capas de auth de
+cliente, protocolo opt-in / mainnet-obligatorio:
+1. **Transporte** — soporte de **socket Unix (UDS)** con permisos estrictos del SO
+   (dir `0700`, socket `0600`): sólo un proceso del MISMO usuario puede abrirlo.
+2. **Criptográfica** — **challenge-response de token pre-compartido**: el servidor
+   manda un `AuthChallenge{nonce}` fresco por conexión; el cliente responde con
+   `AuthResponse{tag = SHA3-256(RS_AUTH_DOMAIN ‖ len(token) ‖ token ‖ nonce)}`,
+   verificado en **tiempo constante** ANTES de servir cualquier pedido. Nonce
+   fresco = anti-replay; SHA3 resistente a extensión de longitud (FIPS 202, base
+   del prefix-MAC de KMAC) = autenticador sólido (no se inventa cripto).
+
+El perfil **mainnet del nodo EXIGE** (fail-stop) tanto un endpoint loopback-TCP/UDS
+como el `remote_signer_auth_token_path`. `PROTO_VERSION` 1→2 (cutover coordinado
+cliente+daemon, opt-in — no afecta la red viva del usuario: el firmante remoto es
+default in-process).
+
+**Tests:** `a_client_without_the_right_token_cannot_get_any_signature` (token
+correcto firma; token INCORRECTO y token AUSENTE rechazados sin servir),
+`client_server_roundtrip_over_a_unix_socket_with_token` (UDS end-to-end),
+`auth_tag_is_deterministic_token_and_nonce_sensitive`; en config, el knockout
+`no signer auth token` + el caso positivo UDS-con-token. Remote-signer 8/8, node
+mainnet 2/2, clippy limpio.
+
+**Barrido de la clase (EC-16 — socket/endpoint privilegiado sin autenticar):** los
+demás endpoints privilegiados del sistema ya autentican o están acotados —
+`submit_transaction`/gossip verifican firma+chain_id; el P2P tiene handshake ML-DSA
+(#176) + cifrado ML-KEM; el RPC del validador es loopback/privado en mainnet
+(#211) con rate-limits (#196/#210). El socket del firmante era el ÚNICO endpoint
+privilegiado sin auth de cliente; queda cerrado.
+
+**Follow-up opcional (no bloqueante):** mTLS con cert de cliente fijado para
+firmado genuinamente cross-host — el modelo loopback/UDS same-machine + token ya
+es seguro para el despliegue estándar (firmante en el mismo host que el nodo).

@@ -13,9 +13,13 @@ Before=qchain-validator.service
 
 [Service]
 # Expects /opt/qchain-signer to contain keypair.json (la clave del validador,
-# MOVIDA acá desde /opt/qchain) y un guard.bin que persiste la ronda/vértice
-# propio más alto firmado (anti-doble-firma). Bindea LOOPBACK: sólo el nodo del
-# MISMO host lo alcanza. --network host para que 127.0.0.1:9200 sea el del host.
+# MOVIDA acá desde /opt/qchain), un guard.bin que persiste la ronda/vértice propio
+# más alto firmado (anti-doble-firma), y signer.token (#4.2 — el token de
+# autenticación del cliente, mismo archivo que el nodo lee en
+# `remote_signer_auth_token_path`; generarlo con `head -c 32 /dev/urandom | base64
+# > /opt/qchain-signer/signer.token && chmod 600 ...`). Bindea LOOPBACK: sólo el
+# nodo del MISMO host lo alcanza, y con el token DEBE autenticarse antes de firmar.
+# --network host para que 127.0.0.1:9200 sea el del host.
 Type=simple
 WorkingDirectory=/opt/qchain-signer
 ExecStartPre=-/usr/bin/docker rm -f qchain-remote-signer
@@ -28,7 +32,7 @@ ExecStart=/usr/bin/docker run --rm --name qchain-remote-signer \
   --ulimit nofile=4096:4096 \
   -v /opt/qchain-signer:/keys \
   qchain:latest \
-  qchain-remote-signer --keypair /keys/keypair.json --listen 127.0.0.1:9200 --guard-file /keys/guard.bin
+  qchain-remote-signer --keypair /keys/keypair.json --listen 127.0.0.1:9200 --guard-file /keys/guard.bin --auth-token-file /keys/signer.token
 ExecStop=/usr/bin/docker stop qchain-remote-signer
 Restart=on-failure
 RestartSec=3

@@ -26,6 +26,12 @@ qchain-crypto = { path = "../qchain-crypto" }
 # qchain-crypto (qchain-core no depende de qchain-remote-signer).
 qchain-core = { path = "../qchain-core" }
 borsh.workspace = true
+# #4.2 (auditoría v8.6.13): autenticación del cliente del socket por
+# challenge-response de token pre-compartido — el servidor manda un nonce fresco
+# (getrandom) y el cliente prueba conocer el token con un tag SHA3-256; cierra el
+# "cualquier proceso local puede pedir firmas sin autenticarse".
+getrandom = "0.2"
+sha3.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

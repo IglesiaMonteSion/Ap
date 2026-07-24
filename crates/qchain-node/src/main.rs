@@ -140,10 +140,28 @@ async fn main() -> anyhow::Result<()> {
     // migration needs no re-registration and does not change `chain_id`.
     let signer: Arc<dyn qchain_crypto::Signer> = match &config.remote_signer {
         Some(endpoint) => {
-            let rs = qchain_remote_signer::RemoteSigner::connect(endpoint)
+            // #4.2 — client-auth token for the signer socket challenge-response.
+            let auth_token = match &config.remote_signer_auth_token_path {
+                Some(path) => {
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("cannot read remote_signer_auth_token_path {path}"))?;
+                    // Trim edge whitespace/newline so a trailing \n in the file
+                    // doesn't change the shared secret vs what the daemon reads.
+                    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+                    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+                    let tok = bytes[start..end].to_vec();
+                    if tok.is_empty() {
+                        anyhow::bail!("remote_signer_auth_token_path {path} is empty — refusing to run with an empty token");
+                    }
+                    Some(tok)
+                }
+                None => None,
+            };
+            let rs = qchain_remote_signer::RemoteSigner::connect_with_token(endpoint, auth_token.clone())
                 .with_context(|| format!("cannot connect to the remote signer at {endpoint}"))?;
             tracing::info!(
-                "consensus signer: REMOTE at {endpoint} — the block-signing key is NOT in this node process (#193)"
+                "consensus signer: REMOTE at {endpoint} — the block-signing key is NOT in this node process (#193) [client auth: {}]",
+                if auth_token.is_some() { "TOKEN" } else { "none" }
             );
             Arc::new(rs) as Arc<dyn qchain_crypto::Signer>
         }

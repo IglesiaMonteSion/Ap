@@ -475,6 +475,7 @@ fn main() -> anyhow::Result<()> {
             tx_rate_limit_per_10s: None,
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
+            remote_signer_auth_token_path: None,
             mainnet: false,
             network_profile: cli.network_profile.clone(),
             state_checkpoints: cli.network_profile.as_deref()==Some("mainnet"),
