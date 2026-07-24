@@ -1,0 +1,43 @@
+# cargo-deny — supply-chain gate (QSEP-1 §10).
+#
+# Config INERTE hasta que el operador agregue `cargo deny check` al CI. Se
+# incluye como punto de partida; la primera corrida requiere triage (licencias
+# de dependencias transitivas). No cambia el runtime.
+#
+# Correr localmente:  cargo install cargo-deny && cargo deny check
+# En CI:              cargo deny check advisories bans sources   (licenses tras triage)
+
+[advisories]
+# La base de RustSec (la misma que usa `cargo audit`, que ya pasa en CI).
+# Una vulnerabilidad conocida DEBE bloquear (QSEP-1 §11).
+version = 2
+yanked = "deny"
+
+[bans]
+# Alertar sobre versiones duplicadas de una misma crate (bloat / superficie).
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Sólo el registro oficial crates.io (más liboqs vendorizado en el repo).
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[licenses]
+# Allowlist de licencias permisivas comunes del ecosistema Rust. Ampliar tras el
+# triage inicial (`cargo deny check licenses` lista las que falten).
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+]
