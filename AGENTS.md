@@ -49,12 +49,32 @@ por defecto; fusionar directamente a la rama protegida. **La respuesta de una IA
 NO es una fuente técnica** (ayuda a localizar/resumir/comparar; sus conclusiones
 se verifican contra la fuente real — código, spec, vector de prueba).
 
+## Sistema de aprendizaje (obligatorio)
+
+Cada hallazgo se aprende UNA vez y para siempre. La memoria de **clases** de
+error vive en **[`docs/security/LESSONS-LEDGER.md`](docs/security/LESSONS-LEDGER.md)**
+(EC-01…EC-NN: causa raíz, invariante que la cierra, detección automática, y la
+"pregunta recurrente" que toda auditoría vuelve a responder).
+
+- **Al empezar un cambio:** leé las clases que toca; el diseño debe cerrarlas por
+  construcción.
+- **Al encontrar un bug:** clasificalo en el ledger (casi siempre encaja en una
+  clase existente → es recurrente). Si es nuevo, agregá `EC-NN`. Registrá la
+  instancia con su commit — la columna *Instancias* es la **comparación con
+  errores previos** (si una clase reaparece, se endurece el DETECTOR, no sólo el
+  sitio).
+- **Al cerrar una auditoría:** corré `./deploy/qsep-sweep.sh` (detector heurístico
+  de las clases mecánicamente detectables) **y** respondé la "pregunta recurrente"
+  de CADA clase con evidencia (test/grep/línea). Registrá la auditoría en
+  `docs/security/audits/`.
+
 ## Cada vulnerabilidad corregida debe producir
 
-1. Una prueba de regresión.
-2. Un análisis de causa raíz.
-3. Una **búsqueda de la misma clase de error en todo el repositorio** (no sólo la
-   línea vulnerable).
+1. Una prueba de regresión (que reproduzca el exploit exacto y falle sin el fix).
+2. Un análisis de causa raíz **registrado en `LESSONS-LEDGER.md`** (clase EC-NN).
+3. Una **búsqueda de la misma clase de error en todo el repositorio** vía
+   `./deploy/qsep-sweep.sh EC-NN` + la lista de TODOS los sitios revisados (no
+   sólo la línea vulnerable).
 
 ## Después de implementar
 

@@ -291,6 +291,15 @@ el repositorio**. No se considera resuelta si sólo se corrige la línea. Pregun
 automatización lo detectaría? ¿qué documentación cambia? ¿qué control evita su
 reaparición?
 
+**Sistema de aprendizaje (obligatorio).** La causa raíz y la clase de todo
+hallazgo se registran en [`LESSONS-LEDGER.md`](LESSONS-LEDGER.md) (memoria de
+clases EC-01…EC-NN comparada contra errores previos); el barrido de la clase se
+corre con [`../../deploy/qsep-sweep.sh`](../../deploy/qsep-sweep.sh); cada
+auditoría se archiva en [`audits/`](audits/) y no se cierra sin correr el sweep y
+responder la "pregunta recurrente" de cada clase con evidencia. Si una clase
+REAPARECE, la corrección primaria es endurecer el detector/invariante, no sólo el
+sitio.
+
 ## 14. Estructura documental
 
 ```
