@@ -20,7 +20,7 @@ es el que entregó el operador; acá se registra el trabajo.
 | 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | ✅ **CORREGIDO (v8.6.18)** — owner check + dirección canónica + saturating timelock + 2 tests de exploit + sweep EC-01 limpio |
 | 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryState::decode_any_version` único, compartido gate+runtime |
 | 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryOpV0`/`PendingOpV0` históricos exactos + conversión + test |
-| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma (4.1); el daemon no autentica la identidad del cliente (4.2) | EC-06 / EC-16 | P1 | ✅ **CORREGIDO — 4.1 (v8.6.20) + 4.2 (v8.6.26)** — **4.1:** `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación. **4.2 (CERRADO, no sólo mitigado):** el socket AUTENTICA al cliente — (a) **challenge-response de token pre-compartido** (nonce fresco del servidor + `SHA3-256(dominio‖token‖nonce)` verificado en tiempo constante ANTES de firmar nada) y (b) soporte de **socket Unix** (dir 0700 / socket 0600 = sólo el mismo UID). El perfil **mainnet EXIGE** endpoint loopback/UDS **y** el token (fail-stop). Ningún proceso local puede pedir firmas sin el token. Follow-up opcional: mTLS cross-host (loopback/UDS same-machine + token ya es seguro) |
+| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma (4.1); el daemon no autentica la identidad del cliente (4.2) | EC-06 / EC-16 | P1 | ✅ **CORREGIDO — 4.1 (v8.6.20) + 4.2 (v8.6.26)** — **4.1:** `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación. **4.2 (CERRADO, no sólo mitigado):** el socket AUTENTICA al cliente — (a) **challenge-response de token pre-compartido** (nonce fresco del servidor + `SHA3-256(dominio‖token‖nonce)` verificado en tiempo constante ANTES de firmar nada) y (b) soporte de **socket Unix** (dir 0700 / socket 0600 = sólo el mismo UID). El perfil **mainnet EXIGE** endpoint loopback/UDS **y** el token (fail-stop). Ningún proceso local puede pedir firmas sin el token. **v8.6.27: cross-host cerrado también** — handshake mutuo + binding de canal por-frame (MAC de sesión SHA3, anti-inyección/tamper/reorder) sin cripto clásica (equivalente PQ de mTLS) |
 | 5 | Medio | Op puede alcanzar quorum y aun así ser IMPOSIBLE de ejecutar: expiry medido desde `proposed_round`, pero el timelock arranca al alcanzar quorum → `ready_round` puede caer PASADO el deadline | EC-05 | P1 | ✅ **CORREGIDO (v8.6.24)** — **el `expiry>timelock` (v8.6.18) NO cerraba el escenario del auditor** (quorum tardío → `ready > proposed+expiry`): `prune_expired` ahora separa el deadline de APROBACIÓN (`proposed+expiry`) del de EJECUCIÓN (`ready+expiry`) → una op con quorum SIEMPRE tiene ventana para ejecutar; test `a_late_quorum_op_survives_the_approval_deadline_and_still_executes` |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
 | 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18 + v8.6.25)** — `CURRENT_TX_VERSION` re-verificado en la ejecución comprometida (`apply`, la parte *imprescindible*) + test; **v8.6.25: la verificación punto-por-punto agregó el early-reject en ADMISIÓN** (RPC `/tx`, `/simulate`, gossip P2P) que el auditor listaba como defensa-en-profundidad — barato, antes del verify PQC, byte-idéntico para tráfico v1 honesto |
@@ -347,6 +347,22 @@ demás endpoints privilegiados del sistema ya autentican o están acotados —
 (#211) con rate-limits (#196/#210). El socket del firmante era el ÚNICO endpoint
 privilegiado sin auth de cliente; queda cerrado.
 
-**Follow-up opcional (no bloqueante):** mTLS con cert de cliente fijado para
-firmado genuinamente cross-host — el modelo loopback/UDS same-machine + token ya
-es seguro para el despliegue estándar (firmante en el mismo host que el nodo).
+**Ampliación cross-host (v8.6.27 — binding de canal PQ-consistente):** en vez de
+mTLS clásico (X25519/RSA/ECDSA, roto por Shor y prohibido por el diseño PQ del
+proyecto), el handshake se hizo **MUTUO** (ambos lados aportan un nonce) y tras
+autenticar se deriva una **clave de sesión** `SHA3-256(dominio‖token‖nonce_s‖
+nonce_c)` con la que se **MAC-ea CADA frame** (`SHA3-256(clave‖dir‖seq‖payload)`,
+seq monótono por dirección). Esto da sobre un enlace TCP cross-host NO confiable
+lo que un mTLS daría —**autenticación mutua + integridad + anti-inyección +
+anti-replay/reorder**— sin cripto clásica: un atacante on-path que no conoce el
+token no puede inyectar/alterar un pedido de firma ni reordenar frames. NO cifra
+(el tráfico del firmante es público: digests/vértices/firmas), sólo autentica.
+Tests: `per_frame_session_mac_rejects_tamper_reflection_and_reorder` (tamper /
+reflexión de dirección / reorder de seq rechazados) + los roundtrips con token
+ejercitan el handshake mutuo + los frames MAC-eados end-to-end. Con esto **#4.2
+queda cerrado también para el caso cross-host**, no sólo same-host.
+
+**Follow-up genuinamente residual (no bloqueante):** cifrado del canal (no sólo
+autenticación) para ocultar el análisis de tráfico — innecesario porque el
+tráfico del firmante es público; si se quisiera, se reusa el transporte cifrado
+ML-KEM-768 de `qchain-network` sobre un enlace privado.

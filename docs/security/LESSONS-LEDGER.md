@@ -439,7 +439,11 @@ sigue cerrada.
   ambos. Barrido de la clase: el resto de endpoints privilegiados ya autentican o
   están acotados (RPC verifica firma+chain_id + rate-limits #196/#210 + privado en
   mainnet #211; P2P handshake ML-DSA #176 + cifrado ML-KEM). El socket del firmante
-  era el único sin auth de cliente.
+  era el único sin auth de cliente. **Cross-host (v8.6.27):** en vez de mTLS clásico
+  (prohibido por la postura PQ), el handshake se hizo MUTUO + binding de canal
+  por-frame (MAC de sesión SHA3, anti-inyección/tamper/reorder) → un atacante
+  on-path sin el token no puede inyectar/alterar un pedido sobre un enlace TCP
+  cross-host, el equivalente PQ de mTLS.
 - **Regla:** todo endpoint que ejecute una operación privilegiada AUTENTICA al que
   llama (token/mTLS/permisos-de-SO), no sólo acota el daño. Un 'peor caso acotado'
   NO cierra el hallazgo de auth — se documenta como mitigación parcial y la auth

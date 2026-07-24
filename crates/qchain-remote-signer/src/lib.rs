@@ -38,6 +38,18 @@
 //!    (FIPS 202 — la base del prefix-MAC de KMAC), así que el prefix-MAC es un
 //!    autenticador sólido (no se inventa cripto).
 //!
+//! 3. **Binding de canal (mutuo + integridad, cross-host).** El handshake es
+//!    MUTUO (ambos lados aportan un nonce), y tras autenticar se deriva una
+//!    **clave de sesión** `SHA3-256(dominio ‖ token ‖ nonce_s ‖ nonce_c)` con la
+//!    que se **MAC-ea CADA frame** (`SHA3-256(clave ‖ dirección ‖ seq ‖ payload)`,
+//!    seq monótono por dirección, verificado en tiempo constante). Esto da, sobre
+//!    un enlace TCP cross-host NO confiable, lo que un mTLS daría —autenticación
+//!    mutua + integridad + anti-inyección + anti-replay/reorder— **sin cripto
+//!    clásica** (nada de X25519/RSA/ECDSA, roto por Shor): un atacante on-path que
+//!    no conoce el token no puede inyectar/alterar un pedido ni reordenar frames.
+//!    NO cifra (el tráfico del firmante es público: digests/vértices/firmas), sólo
+//!    autentica — que es lo que hace falta acá.
+//!
 //! Defensa en profundidad, ADEMÁS de lo previo: la `DoubleSignGuard` (peor caso
 //! "no hay auto-equivocación"), la verificación de AUTORÍA de `SignPeerVote`
 //! (#4.1) y la allowlist estricta de `SignRaw` (sólo el transcript de handshake).
@@ -51,10 +63,17 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Versión del protocolo del socket. Bump al agregar el handshake de auth (#4.2).
-pub const PROTO_VERSION: u8 = 2;
+/// Versión del protocolo del socket. v2 agregó el handshake de auth (#4.2); v3
+/// agregó el nonce del cliente (handshake mutuo) + el binding de canal por-frame.
+pub const PROTO_VERSION: u8 = 3;
 /// Dominio del prefix-MAC del challenge-response (separación de dominio).
 pub const RS_AUTH_DOMAIN: &[u8] = b"qchain-remote-signer-auth-v1";
+/// Dominio de la derivación de la clave de sesión (binding de canal, #4.2 v3).
+pub const RS_SESSION_DOMAIN: &[u8] = b"qchain-remote-signer-session-v1";
+/// Dirección de un frame para el MAC de sesión (separa los dos sentidos → un
+/// frame cliente→servidor nunca se puede reflejar como servidor→cliente).
+const DIR_C2S: u8 = 0;
+const DIR_S2C: u8 = 1;
 /// Cota dura de un frame (anti-OOM de un cliente malicioso en el socket).
 pub const MAX_FRAME_BYTES: u32 = 1 << 20; // 1 MiB — de sobra para un bundle/firma híbrida (~35 KB).
 /// Timeout de I/O del socket (una firma es sub-ms local; un HSM real, unos ms).
@@ -113,9 +132,12 @@ pub struct AuthChallenge {
 }
 
 /// #4.2 — Respuesta del CLIENTE al challenge: prueba que conoce el token sin
-/// enviarlo. `tag = SHA3-256(RS_AUTH_DOMAIN ‖ len(token) ‖ token ‖ nonce)`.
+/// enviarlo, y aporta su propio nonce (handshake MUTUO → la clave de sesión
+/// depende de ambos lados). `tag = SHA3-256(RS_AUTH_DOMAIN ‖ len(token) ‖ token ‖
+/// server_nonce ‖ client_nonce)`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct AuthResponse {
+    pub client_nonce: [u8; 32],
     pub tag: [u8; 32],
 }
 
@@ -126,16 +148,96 @@ pub struct AuthResponse {
 /// puede producir el tag. Se prefija la longitud del token para que no haya
 /// ambigüedad de frontera token/nonce. No se inventa cripto — es un keyed-hash
 /// SHA3 estándar.
-pub fn auth_tag(token: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
+pub fn auth_tag(token: &[u8], server_nonce: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
     h.update(RS_AUTH_DOMAIN);
     h.update((token.len() as u64).to_le_bytes());
     h.update(token);
-    h.update(nonce);
+    h.update(server_nonce);
+    h.update(client_nonce);
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&h.finalize());
     tag
+}
+
+/// Clave de sesión para el binding de canal (#4.2 v3). Depende de AMBOS nonces
+/// (fresca por conexión) y del token (sólo quien lo conoce la deriva). Mismo
+/// keyed-hash SHA3 length-extension-resistente que el tag de auth.
+fn derive_session_key(token: &[u8], server_nonce: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(RS_SESSION_DOMAIN);
+    h.update((token.len() as u64).to_le_bytes());
+    h.update(token);
+    h.update(server_nonce);
+    h.update(client_nonce);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&h.finalize());
+    key
+}
+
+/// MAC de un frame de sesión: `SHA3-256(clave ‖ dirección ‖ seq ‖ payload)`. La
+/// dirección separa los dos sentidos (anti-reflexión) y `seq` (monótono por
+/// dirección) da anti-replay/reorder dentro de la sesión.
+fn frame_mac(key: &[u8; 32], dir: u8, seq: u64, payload: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(key);
+    h.update([dir]);
+    h.update(seq.to_le_bytes());
+    h.update((payload.len() as u64).to_le_bytes());
+    h.update(payload);
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&h.finalize());
+    mac
+}
+
+/// Estado de una sesión autenticada: la clave + los contadores de secuencia por
+/// dirección. `None` = conexión sin token (dev/loopback) → frames en claro.
+struct Session {
+    key: [u8; 32],
+    send_seq: u64,
+    recv_seq: u64,
+}
+
+/// Envía un frame: en claro si no hay sesión, o con MAC de sesión anexado
+/// (payload ‖ mac(32), como UN frame len-prefixado) si la hay. `dir` es el
+/// sentido de ESTE envío (C2S en el cliente, S2C en el servidor).
+fn send_frame<S: Write>(stream: &mut S, payload: &[u8], sess: Option<&mut Session>, dir: u8) -> anyhow::Result<()> {
+    match sess {
+        None => write_frame(stream, payload),
+        Some(s) => {
+            let mac = frame_mac(&s.key, dir, s.send_seq, payload);
+            s.send_seq = s.send_seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("signer session frame seq overflow"))?;
+            let mut buf = Vec::with_capacity(payload.len() + 32);
+            buf.extend_from_slice(payload);
+            buf.extend_from_slice(&mac);
+            write_frame(stream, &buf)
+        }
+    }
+}
+
+/// Recibe un frame: en claro si no hay sesión, o verificando+quitando el MAC de
+/// sesión si la hay (rechaza un frame alterado/inyectado/reordenado). `dir` es el
+/// sentido de la RECEPCIÓN (S2C en el cliente, C2S en el servidor).
+fn recv_frame<S: Read>(stream: &mut S, sess: Option<&mut Session>, dir: u8) -> anyhow::Result<Vec<u8>> {
+    let raw = read_frame(stream)?;
+    match sess {
+        None => Ok(raw),
+        Some(s) => {
+            if raw.len() < 32 {
+                anyhow::bail!("authed frame too short (missing session MAC)");
+            }
+            let (payload, mac) = raw.split_at(raw.len() - 32);
+            let expected = frame_mac(&s.key, dir, s.recv_seq, payload);
+            if !ct_eq(mac, &expected) {
+                anyhow::bail!("session frame MAC verification failed — channel tampered, injected, reordered, or wrong token");
+            }
+            s.recv_seq = s.recv_seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("signer session frame seq overflow"))?;
+            Ok(payload.to_vec())
+        }
+    }
 }
 
 /// Comparación en tiempo constante (sin cortar temprano) para el tag del MAC —
@@ -288,7 +390,9 @@ pub struct RemoteSigner {
     /// Token pre-compartido para el challenge-response (#4.2). `None` = sin token
     /// (sólo aceptable en loopback/UDS de desarrollo; el perfil mainnet lo exige).
     auth_token: Option<Vec<u8>>,
-    conn: Mutex<Option<SignerStream>>,
+    /// Conexión cacheada + su sesión autenticada (si hay token). Reconexión
+    /// transparente re-hace el handshake y deriva una sesión fresca.
+    conn: Mutex<Option<(SignerStream, Option<Session>)>>,
 }
 
 impl RemoteSigner {
@@ -316,10 +420,11 @@ impl RemoteSigner {
         Ok(RemoteSigner { endpoint: s.endpoint, bundle, auth_token, conn: Mutex::new(None) })
     }
 
-    /// Conecta y hace el handshake de auth (#4.2): lee el `AuthChallenge` del
-    /// servidor y, si exige auth, responde con el tag del token. Devuelve un
-    /// stream YA autenticado listo para pedidos.
-    fn dial(&self) -> anyhow::Result<SignerStream> {
+    /// Conecta y hace el handshake de auth MUTUO (#4.2 v3): lee el
+    /// `AuthChallenge` del servidor y, si exige auth, responde con su nonce + el
+    /// tag del token y deriva la clave de sesión. Devuelve un stream YA
+    /// autenticado + su sesión (para el binding de canal por-frame).
+    fn dial(&self) -> anyhow::Result<(SignerStream, Option<Session>)> {
         let mut stream = if let Some(path) = unix_endpoint_path(&self.endpoint) {
             #[cfg(unix)]
             {
@@ -333,7 +438,7 @@ impl RemoteSigner {
             SignerStream::Tcp(TcpStream::connect(&self.endpoint)?)
         };
         stream.configure(IO_TIMEOUT);
-        // Handshake de auth: el servidor habla primero.
+        // Handshake de auth: el servidor habla primero (en claro — aún no hay clave).
         let ch_bytes = read_frame(&mut stream)?;
         let ch: AuthChallenge = borsh::from_slice(&ch_bytes)
             .map_err(|e| anyhow::anyhow!("malformed AuthChallenge from signer: {e}"))?;
@@ -347,10 +452,14 @@ impl RemoteSigner {
             let token = self.auth_token.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("remote signer requires client authentication but no auth token is configured on this node")
             })?;
-            let tag = auth_tag(token, &ch.nonce);
-            write_frame(&mut stream, &borsh::to_vec(&AuthResponse { tag })?)?;
+            let client_nonce = fresh_nonce()?;
+            let tag = auth_tag(token, &ch.nonce, &client_nonce);
+            write_frame(&mut stream, &borsh::to_vec(&AuthResponse { client_nonce, tag })?)?;
+            let key = derive_session_key(token, &ch.nonce, &client_nonce);
+            Ok((stream, Some(Session { key, send_seq: 0, recv_seq: 0 })))
+        } else {
+            Ok((stream, None))
         }
-        Ok(stream)
     }
 
     /// Una request/respuesta. Reusa la conexión cacheada; si falla la I/O,
@@ -362,16 +471,18 @@ impl RemoteSigner {
             if guard.is_none() {
                 *guard = Some(self.dial()?);
             }
-            let stream = guard.as_mut().expect("just set");
+            let (stream, sess) = guard.as_mut().expect("just set");
             let io: anyhow::Result<SignerResponse> = (|| {
-                write_frame(stream, &req_bytes)?;
-                let resp = read_frame(stream)?;
+                // Cliente: envía C2S, recibe S2C (con el MAC de sesión si hay token).
+                send_frame(stream, &req_bytes, sess.as_mut(), DIR_C2S)?;
+                let resp = recv_frame(stream, sess.as_mut(), DIR_S2C)?;
                 Ok(borsh::from_slice::<SignerResponse>(&resp)?)
             })();
             match io {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    // Conexión muerta: descartarla y (si queda intento) reconectar.
+                    // Conexión muerta / MAC fallido: descartarla y (si queda intento)
+                    // reconectar con una sesión fresca.
                     *guard = None;
                     if attempt == 1 {
                         return Err(e);
@@ -553,14 +664,16 @@ fn handle_conn(
     guard: &Arc<Mutex<DoubleSignGuard>>,
     auth_token: Option<&[u8]>,
 ) -> anyhow::Result<()> {
-    // #4.2 — Handshake de auth PRIMERO: el servidor habla. Si corremos con token,
-    // el cliente debe probar que lo conoce ANTES de que firmemos nada.
+    // #4.2 — Handshake de auth MUTUO PRIMERO: el servidor habla (en claro). Si
+    // corremos con token, el cliente debe probar que lo conoce ANTES de que
+    // firmemos nada, y desde ahí el canal queda con binding por-frame.
     let auth_required = auth_token.is_some();
-    let nonce = fresh_nonce()?;
+    let server_nonce = fresh_nonce()?;
     write_frame(
         stream,
-        &borsh::to_vec(&AuthChallenge { proto_version: PROTO_VERSION, auth_required, nonce })?,
+        &borsh::to_vec(&AuthChallenge { proto_version: PROTO_VERSION, auth_required, nonce: server_nonce })?,
     )?;
+    let mut sess: Option<Session> = None;
     if let Some(token) = auth_token {
         let resp_bytes = match read_frame(stream) {
             Ok(b) => b,
@@ -568,22 +681,33 @@ fn handle_conn(
         };
         let resp: AuthResponse = borsh::from_slice(&resp_bytes)
             .map_err(|e| anyhow::anyhow!("malformed AuthResponse: {e}"))?;
-        let expected = auth_tag(token, &nonce);
+        let expected = auth_tag(token, &server_nonce, &resp.client_nonce);
         if !ct_eq(&resp.tag, &expected) {
             tracing::warn!("signer: client authentication FAILED — closing without signing");
             return Ok(()); // cerrar sin firmar; no se sirve ningún pedido
         }
-        tracing::info!("signer: client authenticated");
+        let key = derive_session_key(token, &server_nonce, &resp.client_nonce);
+        sess = Some(Session { key, send_seq: 0, recv_seq: 0 });
+        tracing::info!("signer: client authenticated (channel bound)");
     }
     loop {
-        let req_bytes = match read_frame(stream) {
+        // Servidor: recibe C2S, envía S2C (con el MAC de sesión si hay token). Un
+        // frame alterado/inyectado/reordenado por un atacante on-path se rechaza.
+        let req_bytes = match recv_frame(stream, sess.as_mut(), DIR_C2S) {
             Ok(b) => b,
-            Err(_) => return Ok(()), // el par cerró / timeout → fin de la conexión
+            Err(e) => {
+                // Un fallo de MAC (no un cierre limpio) es un ataque/corrupción:
+                // logueá y cerrá — no sirvas ningún pedido más en esta conexión.
+                if sess.is_some() {
+                    tracing::warn!("signer: closing connection: {e}");
+                }
+                return Ok(());
+            }
         };
         let req = borsh::from_slice::<SignerRequest>(&req_bytes)
             .map_err(|e| anyhow::anyhow!("malformed request: {e}"))?;
         let resp = respond(&req, keypair, guard);
-        write_frame(stream, &borsh::to_vec(&resp)?)?;
+        send_frame(stream, &borsh::to_vec(&resp)?, sess.as_mut(), DIR_S2C)?;
     }
 }
 
@@ -873,18 +997,69 @@ mod tests {
     fn auth_tag_is_deterministic_token_and_nonce_sensitive() {
         let tok_a = b"shared-secret-A".to_vec();
         let tok_b = b"shared-secret-B".to_vec();
-        let n1 = [1u8; 32];
-        let n2 = [2u8; 32];
-        assert_eq!(auth_tag(&tok_a, &n1), auth_tag(&tok_a, &n1), "determinista");
-        assert_ne!(auth_tag(&tok_a, &n1), auth_tag(&tok_b, &n1), "sensible al token");
-        assert_ne!(auth_tag(&tok_a, &n1), auth_tag(&tok_a, &n2), "sensible al nonce");
+        let ns = [1u8; 32];
+        let ns2 = [2u8; 32];
+        let nc = [9u8; 32];
+        let nc2 = [8u8; 32];
+        assert_eq!(auth_tag(&tok_a, &ns, &nc), auth_tag(&tok_a, &ns, &nc), "determinista");
+        assert_ne!(auth_tag(&tok_a, &ns, &nc), auth_tag(&tok_b, &ns, &nc), "sensible al token");
+        assert_ne!(auth_tag(&tok_a, &ns, &nc), auth_tag(&tok_a, &ns2, &nc), "sensible al nonce del servidor");
+        assert_ne!(auth_tag(&tok_a, &ns, &nc), auth_tag(&tok_a, &ns, &nc2), "sensible al nonce del cliente");
         // La longitud del token se prefija → dos tokens con un byte-boundary
         // ambiguo NO colisionan.
-        assert_ne!(auth_tag(b"ab", &n1), auth_tag(b"a", &n1));
-        let t = auth_tag(&tok_a, &n1);
+        assert_ne!(auth_tag(b"ab", &ns, &nc), auth_tag(b"a", &ns, &nc));
+        let t = auth_tag(&tok_a, &ns, &nc);
         assert!(ct_eq(&t, &t));
-        assert!(!ct_eq(&t, &auth_tag(&tok_b, &n1)));
+        assert!(!ct_eq(&t, &auth_tag(&tok_b, &ns, &nc)));
         assert!(!ct_eq(&t, &t[..31])); // longitud distinta
+        // La clave de sesión también depende del token + ambos nonces.
+        let k = derive_session_key(&tok_a, &ns, &nc);
+        assert_eq!(k, derive_session_key(&tok_a, &ns, &nc));
+        assert_ne!(k, derive_session_key(&tok_b, &ns, &nc));
+        assert_ne!(k, derive_session_key(&tok_a, &ns2, &nc));
+        assert_ne!(k, derive_session_key(&tok_a, &ns, &nc2));
+        // El dominio separa el tag de auth de la clave de sesión (mismos inputs).
+        assert_ne!(auth_tag(&tok_a, &ns, &nc).to_vec(), k.to_vec());
+    }
+
+    /// #4.2 v3 — binding de canal: el MAC por-frame depende de la clave de sesión,
+    /// la dirección y el seq; un frame alterado, reflejado (dirección cambiada) o
+    /// reordenado (seq cambiado) NO verifica → un atacante on-path sin el token no
+    /// puede inyectar/alterar/reordenar sobre un enlace cross-host.
+    #[test]
+    fn per_frame_session_mac_rejects_tamper_reflection_and_reorder() {
+        let key = derive_session_key(b"tok", &[1u8; 32], &[2u8; 32]);
+        let payload = b"a signing request";
+        let good = frame_mac(&key, DIR_C2S, 0, payload);
+        assert!(ct_eq(&good, &frame_mac(&key, DIR_C2S, 0, payload)), "determinista");
+        // Payload alterado → MAC distinto.
+        assert!(!ct_eq(&good, &frame_mac(&key, DIR_C2S, 0, b"a signing requesX")));
+        // Dirección reflejada (C2S ↔ S2C) → MAC distinto (anti-reflexión).
+        assert!(!ct_eq(&good, &frame_mac(&key, DIR_S2C, 0, payload)));
+        // Seq reordenado → MAC distinto (anti-replay/reorder).
+        assert!(!ct_eq(&good, &frame_mac(&key, DIR_C2S, 1, payload)));
+        // Clave (token) distinta → MAC distinto.
+        assert!(!ct_eq(&good, &frame_mac(&derive_session_key(b"other", &[1u8; 32], &[2u8; 32]), DIR_C2S, 0, payload)));
+
+        // Round-trip real de send/recv sobre un buffer en memoria: lo que un
+        // sender MAC-ea, el receiver con la MISMA clave/dirección/seq lo acepta,
+        // y un bit-flip del byte de wire lo rechaza.
+        let mut tx = Session { key, send_seq: 0, recv_seq: 0 };
+        let mut buf: Vec<u8> = Vec::new();
+        send_frame(&mut buf, payload, Some(&mut tx), DIR_C2S).unwrap();
+        // Receiver correcto.
+        let mut rx = Session { key, send_seq: 0, recv_seq: 0 };
+        let got = recv_frame(&mut &buf[..], Some(&mut rx), DIR_C2S).unwrap();
+        assert_eq!(got, payload);
+        // Un bit-flip en el frame de wire → recv rechaza.
+        let mut tampered = buf.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let mut rx2 = Session { key, send_seq: 0, recv_seq: 0 };
+        assert!(recv_frame(&mut &tampered[..], Some(&mut rx2), DIR_C2S).is_err(), "un frame alterado se rechaza");
+        // El receiver esperando la dirección equivocada (reflexión) rechaza.
+        let mut rx3 = Session { key, send_seq: 0, recv_seq: 0 };
+        assert!(recv_frame(&mut &buf[..], Some(&mut rx3), DIR_S2C).is_err(), "un frame reflejado se rechaza");
     }
 
     /// #4.2 (auditoría v8.6.13) — el socket AUTENTICA al cliente por

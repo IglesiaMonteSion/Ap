@@ -465,10 +465,15 @@ servidor manda un nonce fresco; el cliente responde con
 el daemon firme nada — un proceso local que no conoce el token es **rechazado**.
 Con un socket **Unix**, además, sólo un proceso del MISMO usuario puede abrirlo
 (dir `0700`, socket `0600`). El perfil **mainnet del nodo EXIGE** tanto un endpoint
-loopback/UDS como el token (fail-stop). `--allow-non-loopback` sigue existiendo
-para una dirección TCP pública (sólo sobre un enlace privado + firewall + el
-token). Esto saca la clave del proceso del nodo (incremento A de #193) y cierra el
-"cualquier proceso local puede pedir firmas sin autenticarse" (#4.2).
+loopback/UDS como el token (fail-stop). **Cross-host (v8.6.27):** el handshake es
+MUTUO y tras autenticar se **MAC-ea cada frame** con una clave de sesión derivada
+del token + ambos nonces → sobre un enlace TCP cross-host no confiable, un atacante
+on-path que no conoce el token **no puede inyectar/alterar/reordenar** un pedido de
+firma (el equivalente PQ de mTLS, con SHA3 en vez de X25519/RSA). `--allow-non-loopback`
+sigue existiendo para una dirección TCP pública (sólo sobre un enlace privado +
+firewall + el token). Esto saca la clave del proceso del nodo (incremento A de #193)
+y cierra el "cualquier proceso local puede pedir firmas sin autenticarse" (#4.2),
+same-host y cross-host.
 
 **Separación de roles de clave — dirección FRÍA de retiro (`withdrawal_address`,
 tarea #193-B, incremento B).** La clave de consenso (online, en el nodo o en el
