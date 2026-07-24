@@ -110,13 +110,14 @@ fn main() -> anyhow::Result<()> {
         Some(a) => {
             match qchain_execution::validator_v7::decode_registry(&a.data) {
                 Some(reg) => {
-                    // Report the EXPLICIT schema_version (pre-mainnet #3). A V1
-                    // registry migrates to V2 on read; `qchain-migrate-registry`
+                    // Report the EXPLICIT schema_version (pre-mainnet #3). A V1 or
+                    // V2 registry migrates to V3 on read; `qchain-migrate-registry`
                     // persists that migration offline.
+                    use qchain_execution::validator_v7::RegistrySchema;
                     let schema = qchain_execution::validator_v7::detect_registry_schema(&a.data);
                     let fmt = match schema {
-                        Some(s) if s == qchain_execution::validator_v7::RegistrySchema::V1Legacy => {
-                            format!("schema_version {} — {s} — MIGRATES to V2 on read (persist with qchain-migrate-registry)", s.version())
+                        Some(s) if matches!(s, RegistrySchema::V1Legacy | RegistrySchema::V2Prior) => {
+                            format!("schema_version {} — {s} — MIGRATES to V3 on read (persist with qchain-migrate-registry)", s.version())
                         }
                         Some(s) => format!("schema_version {} — {s}", s.version()),
                         None => "schema_version UNKNOWN".to_string(),

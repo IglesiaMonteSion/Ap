@@ -1027,13 +1027,13 @@ async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json
     use borsh::BorshDeserialize;
     use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_REGISTRY_ACCOUNT_ID};
     use qchain_execution::staking_v7::GlobalStakingState;
-    use qchain_execution::validator_v7::ValidatorV7Registry;
     let Some(acct) = engine.get_account(&VALIDATOR_REGISTRY_ACCOUNT_ID).await else {
         return Ok(Json(json!({ "current_quanto": 0, "validators": [] })));
     };
-    // Decode the v7 format; a v6-format registry (or empty) → empty list, so a
-    // caller hitting this on a v6 network gets a clean answer, not a 500.
-    let Ok(registry) = ValidatorV7Registry::try_from_slice(&acct.data) else {
+    // Decode + migrate any known layout (V3/V2/V1); a v6-format registry (or
+    // empty) → empty list, so a caller hitting this on a v6 network gets a clean
+    // answer, not a 500.
+    let Some(registry) = qchain_execution::validator_v7::decode_registry(&acct.data) else {
         return Ok(Json(json!({ "current_quanto": 0, "validators": [] })));
     };
     let current_quanto = engine
@@ -1060,6 +1060,14 @@ async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json
                 "bond_release_quanto": v.bond_release_quanto,
                 "participation_bps": v.participation_bps(),
                 "eligible_now": qchain_execution::fees_v7::is_eligible(v, current_quanto),
+                // #20 advanced key-role fields.
+                "consensus_key_revoked": v.consensus_key_revoked,
+                "consensus_key_expiry_quanto": v.consensus_key_expiry_quanto,
+                "consensus_key_disabled": v.consensus_key_disabled(current_quanto),
+                "retired_consensus_keys": v.retired_consensus_keys.iter().map(|r| json!({
+                    "address": r.address.to_string(),
+                    "slash_until_quanto": r.slash_until_quanto,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();

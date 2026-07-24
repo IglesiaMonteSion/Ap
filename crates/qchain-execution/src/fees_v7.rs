@@ -57,6 +57,9 @@ pub fn is_eligible(entry: &ValidatorV7Entry, quanto: u64) -> bool {
     entry.state == ValidatorV7State::Active
         && entry.activation_quanto <= quanto
         && entry.participation_bps() >= VALIDATOR_MIN_PARTICIPATION_BPS
+        // (#20) A revoked/expired consensus key is excluded from the fee split too
+        // — the same deterministic gate `active_committee` uses.
+        && !entry.consensus_key_disabled(quanto)
 }
 
 /// The eligible validators' **withdrawal (cold) addresses** for `quanto`, in
@@ -152,6 +155,9 @@ mod tests {
             bond_release_quanto: 0,
             participation_credits: credits,
             participation_opportunities: opps,
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         }
     }
 

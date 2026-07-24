@@ -342,6 +342,9 @@ mod tests {
                 bond_release_quanto: 0,
                 participation_credits: 100,
                 participation_opportunities: 100,
+                consensus_key_expiry_quanto: 0,
+                consensus_key_revoked: false,
+                retired_consensus_keys: Vec::new(),
             });
         }
 

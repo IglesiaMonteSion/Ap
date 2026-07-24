@@ -439,6 +439,99 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
+    /// v7 (#20): rotate the cold OPERATOR key of a validator to a new address
+    /// (authorized by the CURRENT operator keypair). Keeps the bond/activation.
+    V7RotateOperator {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The CURRENT operator (cold) keypair — the payer/authorizer.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's consensus address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The NEW operator (cold) address (base58).
+        #[arg(long)]
+        new_operator: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (#20): change the cold WITHDRAWAL address of a validator (where the bond
+    /// returns AND fee commissions accrue), authorized by the operator keypair.
+    V7RotateWithdrawal {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The operator (cold) keypair.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The NEW withdrawal (cold) address (base58).
+        #[arg(long)]
+        new_withdrawal: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (#20): rotate the CONSENSUS (block-signing) key to a fresh keypair
+    /// (authorized by the operator keypair). Keeps the bond/activation; the old key
+    /// stays slashable through the evidence window; takes effect next epoch.
+    V7RotateConsensusKey {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The operator (cold) keypair — the payer/authorizer.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's CURRENT consensus address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The NEW consensus keypair file (produces the fresh proof-of-possession).
+        #[arg(long)]
+        new_consensus_keypair: PathBuf,
+        /// The NEW P2P "ip:port" advertised for the rotated key.
+        #[arg(long)]
+        new_p2p_address: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (#20): REVOKE the consensus key (operator emergency — suspected leak).
+    /// Excludes the validator from the committee + fees at the next epoch until a
+    /// fresh key is rotated in. The key stays slashable meanwhile.
+    V7RevokeConsensusKey {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        consensus_address: Option<String>,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (#20): set (or clear, with 0) the forced-rotation EXPIRY quanto of the
+    /// consensus key, authorized by the operator keypair. At/after the expiry the
+    /// validator is excluded from the committee + fees until a fresh key is rotated.
+    V7SetConsensusKeyExpiry {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The expiry quanto (0 = never / clear the deadline).
+        #[arg(long)]
+        expiry_quanto: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
     /// v7 treasury (MULTISIG, #222): PROPOSE releasing locked funds to an address.
     /// The keypair MUST be one of the treasury signers; the proposal counts as its
     /// approval. Prints the operation id — other signers `treasury-approve` it, then
@@ -1815,6 +1908,82 @@ fn main() -> anyhow::Result<()> {
             )?;
             println!("submitted: {body}");
             println!("un-jailed v7 validator {target} - rejoins the active committee at the next epoch");
+        }
+        Command::V7RotateOperator { rpc, keypair, consensus_address, new_operator, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let new_op: qchain_crypto::Pubkey = new_operator.parse().map_err(|e| anyhow::anyhow!("invalid --new-operator: {e}"))?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::RotateOperator { consensus_address: target, new_operator: new_op })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("rotated the operator (cold) key of v7 validator {target} → {new_op}");
+        }
+        Command::V7RotateWithdrawal { rpc, keypair, consensus_address, new_withdrawal, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let new_wd: qchain_crypto::Pubkey = new_withdrawal.parse().map_err(|e| anyhow::anyhow!("invalid --new-withdrawal: {e}"))?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: target, new_withdrawal: new_wd })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("rotated the withdrawal (cold) address of v7 validator {target} → {new_wd}");
+        }
+        Command::V7RotateConsensusKey { rpc, keypair, consensus_address, new_consensus_keypair, new_p2p_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let new_consensus = qchain_crypto::read_keypair_file(&new_consensus_keypair)?;
+            // The NEW consensus key proves possession, bound to the validator's
+            // recorded operator/withdrawal/moniker. Fetch those from the registry.
+            let reg_json: serde_json::Value = reqwest::blocking::get(format!("{}/validator_v7_registry", rpc.trim_end_matches('/')))?.json()?;
+            let me = reg_json["validators"].as_array().and_then(|vs| vs.iter().find(|v| v["address"].as_str() == Some(&target.to_string())))
+                .ok_or_else(|| anyhow::anyhow!("consensus address {target} is not a registered v7 validator"))?;
+            let op_addr: qchain_crypto::Pubkey = me["operator_address"].as_str().unwrap().parse().map_err(|e| anyhow::anyhow!("bad operator_address from node: {e}"))?;
+            let wd_addr: qchain_crypto::Pubkey = me["withdrawal_address"].as_str().unwrap().parse().map_err(|e| anyhow::anyhow!("bad withdrawal_address from node: {e}"))?;
+            let moniker = me["moniker"].as_str().unwrap().to_string();
+            // pop_message = operator ‖ withdrawal ‖ moniker (the registry's stored, normalized moniker).
+            let mut msg = Vec::with_capacity(64 + moniker.len());
+            msg.extend_from_slice(&op_addr.0);
+            msg.extend_from_slice(&wd_addr.0);
+            msg.extend_from_slice(moniker.as_bytes());
+            let pop = qchain_crypto::sign_domain(&new_consensus, qchain_crypto::domains::VALIDATOR_POP_V1, &msg)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::RotateConsensusKey { consensus_address: target, new_bundle: new_consensus.public_key_bundle(), new_p2p_address, new_pop: pop })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("rotated the consensus key of v7 validator {target} → {} (old key slashable through the evidence window; effective next epoch)", new_consensus.pubkey());
+        }
+        Command::V7RevokeConsensusKey { rpc, keypair, consensus_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::RevokeConsensusKey { consensus_address: target })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("REVOKED the consensus key of v7 validator {target} — excluded from the committee + fees next epoch until you rotate in a fresh key");
+        }
+        Command::V7SetConsensusKeyExpiry { rpc, keypair, consensus_address, expiry_quanto, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address: target, expiry_quanto })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            if expiry_quanto == 0 {
+                println!("cleared the consensus-key expiry for v7 validator {target}");
+            } else {
+                println!("set the consensus-key forced-rotation expiry for v7 validator {target} to quanto {expiry_quanto}");
+            }
         }
         Command::TreasuryProposeRelease { rpc, keypair, to, amount, nonce, fee_limit } => {
             use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};

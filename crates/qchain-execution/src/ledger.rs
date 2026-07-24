@@ -838,7 +838,7 @@ impl Ledger {
         let mut registry = match self
             .store
             .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
-            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+            .and_then(|a| crate::validator_v7::decode_registry(&a.data))
         {
             Some(r) => r,
             None => return,
@@ -903,7 +903,7 @@ impl Ledger {
         let mut registry = match self
             .store
             .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
-            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+            .and_then(|a| crate::validator_v7::decode_registry(&a.data))
         {
             Some(r) => r,
             None => return,
@@ -965,7 +965,7 @@ impl Ledger {
         let registry = self
             .store
             .get(&crate::ids::VALIDATOR_REGISTRY_ACCOUNT_ID)
-            .and_then(|a| crate::validator_v7::ValidatorV7Registry::try_from_slice(&a.data).ok())
+            .and_then(|a| crate::validator_v7::decode_registry(&a.data))
             .unwrap_or_default();
         let eligible = crate::fees_v7::eligible_addresses(&registry, quanto);
         if eligible.is_empty() {
@@ -3177,6 +3177,9 @@ mod tests {
             bond_release_quanto: 0,
             participation_credits: 0,
             participation_opportunities: 0,
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         };
         // va/vb already Active; vc is BondedPending with its activation quanto
         // already arrived (0) — the close must flip it to Active AND pay it,
@@ -3276,6 +3279,9 @@ mod tests {
             bond_release_quanto: 0,
             participation_credits: 0,
             participation_opportunities: 0,
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         };
         let registry = ValidatorV7Registry { validators: vec![mk(va), mk(vb), mk(vc)] };
         let mut reg = Account::new_wallet(STAKING_PROGRAM_ID);

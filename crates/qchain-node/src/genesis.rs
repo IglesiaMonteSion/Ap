@@ -239,6 +239,12 @@ pub fn seed_genesis(ledger: &mut Ledger, config: &NodeConfig) -> anyhow::Result<
                 bond_release_quanto: 0,
                 participation_credits: 0,
                 participation_opportunities: 0,
+                // #20 advanced key-role fields: a genesis founder starts with no
+                // forced expiry, not revoked, and no retired keys (byte-identical
+                // behavior to a network that never uses key rotation).
+                consensus_key_expiry_quanto: 0,
+                consensus_key_revoked: false,
+                retired_consensus_keys: Vec::new(),
             });
         }
         let escrow_total = VALIDATOR_BOND_ATOMS.saturating_mul(founders.len() as u64);

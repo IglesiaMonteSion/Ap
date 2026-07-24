@@ -69,6 +69,23 @@ pub enum ValidatorV7State {
     Removed,
 }
 
+/// (#20) At most this many consensus keys a validator has ROTATED AWAY FROM are
+/// kept slashable at once. Bounded so an operator can't grow the registry without
+/// limit by rapid-fire rotations (a rotation without a prior would be pointless);
+/// the oldest still-in-window key is dropped if a rotation would exceed the cap.
+/// A retired key past its slash window is pruned at the quanto close.
+pub const MAX_RETIRED_CONSENSUS_KEYS: usize = 4;
+
+/// (#20) A consensus key a validator ROTATED AWAY FROM (or was REVOKED and then
+/// rotated), kept slashable until `slash_until_quanto` so an equivocation by the
+/// old key within its evidence window is still punished even though the registry
+/// entry's live `address` is now the new key.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct RetiredConsensusKey {
+    pub address: Pubkey,
+    pub slash_until_quanto: u64,
+}
+
 /// One validator's on-chain record (SPEC §7). The bond is always
 /// `VALIDATOR_BOND_ATOMS`; `moniker` is normalized + unique while registered.
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
@@ -115,9 +132,57 @@ pub struct ValidatorV7Entry {
     pub participation_credits: u64,
     /// Total participation events this quanto (the denominator).
     pub participation_opportunities: u64,
+    /// (#20) Forced-rotation deadline for the CONSENSUS key: the quanto at/after
+    /// which this validator is EXCLUDED from the active committee AND fee
+    /// eligibility until the operator rotates in a fresh consensus key. 0 = never
+    /// expires — the default, so an entry that never uses expiry is byte-identical
+    /// in BEHAVIOR to the pre-#20 layout (the honest path).
+    pub consensus_key_expiry_quanto: u64,
+    /// (#20) The cold operator REVOKED the consensus key (suspected leak):
+    /// excluded from the committee AND fees at the next epoch. The key stays as the
+    /// live `address` (so an in-epoch equivocation remains slashable via the normal
+    /// path); cleared by `RotateConsensusKey`. false = default (not revoked).
+    pub consensus_key_revoked: bool,
+    /// (#20) Consensus keys this validator ROTATED AWAY FROM, each kept slashable
+    /// until its quanto. Empty by default. Bounded by `MAX_RETIRED_CONSENSUS_KEYS`;
+    /// pruned when a key's window passes.
+    pub retired_consensus_keys: Vec<RetiredConsensusKey>,
 }
 
 impl ValidatorV7Entry {
+    /// (#20) Whether the CONSENSUS key is currently disabled — revoked by the
+    /// operator, or past its forced-rotation expiry — so this validator is excluded
+    /// from BOTH the active committee and fee eligibility until the operator rotates
+    /// in a fresh key. Deterministic (reads committed state). A default entry
+    /// (`expiry 0`, not revoked) is NEVER disabled → byte-identical honest path.
+    pub fn consensus_key_disabled(&self, current_quanto: u64) -> bool {
+        self.consensus_key_revoked
+            || (self.consensus_key_expiry_quanto != 0 && self.consensus_key_expiry_quanto <= current_quanto)
+    }
+
+    /// (#20) Record `old` as a retired-but-still-slashable consensus key, slashable
+    /// through the evidence window, and drop any retired key whose window already
+    /// passed. Keeps the list bounded (`MAX_RETIRED_CONSENSUS_KEYS`): if full after
+    /// pruning, the earliest-expiring retired key is evicted (its window would end
+    /// soonest anyway). Deterministic.
+    fn retire_consensus_key(&mut self, old: Pubkey, current_quanto: u64, slash_window: u64) {
+        self.retired_consensus_keys.retain(|r| r.slash_until_quanto > current_quanto);
+        self.retired_consensus_keys.push(RetiredConsensusKey {
+            address: old,
+            slash_until_quanto: current_quanto.saturating_add(slash_window),
+        });
+        if self.retired_consensus_keys.len() > MAX_RETIRED_CONSENSUS_KEYS {
+            // Evict the soonest-to-expire (its slashable window ends first).
+            if let Some((i, _)) = self
+                .retired_consensus_keys
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, r)| r.slash_until_quanto)
+            {
+                self.retired_consensus_keys.remove(i);
+            }
+        }
+    }
     /// Participation this quanto, in basis points. No recorded opportunities yet
     /// → treated as full (10000): a freshly-activated validator the node hasn't
     /// scored is not penalized. Once real data accrues the ratio gates eligibility.
@@ -139,6 +204,22 @@ pub struct ValidatorV7Registry {
 impl ValidatorV7Registry {
     fn find(&self, addr: &Pubkey) -> Option<usize> {
         self.validators.iter().position(|v| &v.address == addr)
+    }
+    /// (#20) The validator slashable for an equivocation signed by `author`: its
+    /// LIVE consensus key, or — if `author` was ROTATED AWAY FROM — a validator
+    /// whose `retired_consensus_keys` still holds `author` within its slash window
+    /// (`slash_until_quanto >= current_quanto`). Ensures a rotated-out (e.g. leaked)
+    /// key stays punishable through the evidence window even after the operator
+    /// rotates the live address to a fresh key. Deterministic.
+    fn find_slashable(&self, author: &Pubkey, current_quanto: u64) -> Option<usize> {
+        if let Some(i) = self.find(author) {
+            return Some(i);
+        }
+        self.validators.iter().position(|v| {
+            v.retired_consensus_keys
+                .iter()
+                .any(|r| &r.address == author && r.slash_until_quanto >= current_quanto)
+        })
     }
     fn moniker_taken(&self, moniker: &str, except: Option<&Pubkey>) -> bool {
         self.validators
@@ -182,7 +263,8 @@ pub struct ActiveV7Member {
 /// The consensus-eligible ACTIVE committee derived from the v7 registry — the
 /// SINGLE canonical source that unifies economics and consensus. A validator is
 /// in the committee iff it is `Active`, its `activation_quanto` has arrived
-/// (`<= current_quanto`), and it holds the full bond (`bond == VALIDATOR_BOND_ATOMS`).
+/// (`<= current_quanto`), it holds the full bond (`bond == VALIDATOR_BOND_ATOMS`),
+/// and its consensus key is not disabled (revoked/expired — #20).
 ///
 /// Every bonded validator carries EQUAL consensus weight (one bond = one unit),
 /// so each member's reported weight is `VALIDATOR_BOND_ATOMS`. Deterministic:
@@ -201,7 +283,10 @@ pub fn active_committee(reg: &ValidatorV7Registry, current_quanto: u64) -> Vec<A
     let mut members: Vec<ActiveV7Member> = reg
         .validators
         .iter()
-        .filter(|v| v.state == ValidatorV7State::Active && v.activation_quanto <= current_quanto && v.bond == VALIDATOR_BOND_ATOMS)
+        // (#20) A validator whose consensus key is REVOKED or EXPIRED is excluded
+        // from the committee until the operator rotates in a fresh key — the same
+        // deterministic gate the fee eligibility uses (`fees_v7::is_eligible`).
+        .filter(|v| v.state == ValidatorV7State::Active && v.activation_quanto <= current_quanto && v.bond == VALIDATOR_BOND_ATOMS && !v.consensus_key_disabled(current_quanto))
         .map(|v| ActiveV7Member { address: v.address, pubkey_bundle: v.pubkey_bundle.clone(), p2p_address: v.p2p_address.clone(), bond: v.bond })
         .collect();
     members.sort_by(|a, b| a.address.cmp(&b.address));
@@ -283,6 +368,38 @@ pub enum ValidatorV7Instruction {
     /// bond was never touched by jailing, so nothing moves here.
     /// accounts = [operator(payer), REGISTRY].
     Unjail { consensus_address: Pubkey },
+    /// (#20) Hand off the cold OPERATOR role of `consensus_address` to
+    /// `new_operator` (authorized by the CURRENT operator, the payer). Keeps the
+    /// bond/activation/consensus key; only who may exit/withdraw/unjail/rotate in
+    /// future changes. `new_operator` must not already be a live validator's
+    /// consensus/operator/withdrawal key. accounts = [operator(payer), REGISTRY].
+    RotateOperator { consensus_address: Pubkey, new_operator: Pubkey },
+    /// (#20) Change the cold WITHDRAWAL address of `consensus_address` (authorized
+    /// by the operator, the payer) — where the bond returns AND where fee
+    /// commissions accrue. `new_withdrawal` must not collide with another live
+    /// validator's key. accounts = [operator(payer), REGISTRY].
+    RotateWithdrawal { consensus_address: Pubkey, new_withdrawal: Pubkey },
+    /// (#20) Rotate the CONSENSUS (block-signing) key of `consensus_address` to a
+    /// fresh `new_bundle` (authorized by the operator, the payer), proving
+    /// possession of the new key via `new_pop` (a signature by the NEW consensus
+    /// key over `VALIDATOR_POP_V1 ‖ operator ‖ withdrawal ‖ moniker`). Keeps the
+    /// bond/activation/participation and identity; the OLD key is recorded as
+    /// slashable through the evidence window, and any revocation/expiry is cleared.
+    /// The rotation takes effect at the next epoch boundary via the standard
+    /// deterministic committee derivation. accounts = [operator(payer), REGISTRY,
+    /// STAKING_GLOBAL].
+    RotateConsensusKey { consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String, new_pop: MultiSignature },
+    /// (#20) REVOKE the consensus key of `consensus_address` (operator emergency —
+    /// suspected leak). Excludes the validator from the committee AND fees at the
+    /// next epoch, but the key stays as `address` so an in-epoch equivocation is
+    /// still slashable. Recovery: `RotateConsensusKey`. accounts =
+    /// [operator(payer), REGISTRY, STAKING_GLOBAL].
+    RevokeConsensusKey { consensus_address: Pubkey },
+    /// (#20) Set (or clear, with 0) the forced-rotation EXPIRY quanto of the
+    /// consensus key of `consensus_address` (authorized by the operator). At/after
+    /// `expiry_quanto` the validator is excluded from the committee AND fees until
+    /// the operator rotates in a fresh key. accounts = [operator(payer), REGISTRY].
+    SetConsensusKeyExpiry { consensus_address: Pubkey, expiry_quanto: u64 },
 }
 
 pub struct ValidatorV7Program;
@@ -297,14 +414,76 @@ pub struct ValidatorV7Program;
 // never as empty.
 //
 // Known layouts at `VALIDATOR_REGISTRY_ACCOUNT_ID`:
-//   V2 (current) — `ValidatorV7Entry` with the role-separated cold keys
-//                  (`operator_address` / `withdrawal_address`), since v6.19.0.
+//   V3 (current) — `ValidatorV7Entry` with the #20 advanced key-role fields
+//                  (`consensus_key_expiry_quanto` / `consensus_key_revoked` /
+//                  `retired_consensus_keys`) appended after the participation
+//                  counters, since v8.6.16.
+//   V2 (prior)   — the role-separated `ValidatorV7Entry` WITHOUT the #20 fields
+//                  (v6.19.0 .. v8.6.15): byte-identical to V3 minus the three
+//                  appended fields → migrate by defaulting them (expiry 0, not
+//                  revoked, no retired keys), i.e. behavior-identical.
 //   V1 (legacy)  — the pre-role-separation `ValidatorV7Entry` (v6.3.x .. v6.19.0):
-//                  byte-identical to V2 except it lacks the two cold-key fields
-//                  inserted after `address`. `ValidatorV7State` is byte-identical
-//                  between V1 and V2, so migration is exact and lossless:
+//                  lacks the two cold-key fields AND the #20 fields. Migrate:
 //                  operator = withdrawal = the consensus address (the pre-#193-B
-//                  behavior, where one key held every role).
+//                  behavior, where one key held every role) + the #20 defaults.
+//
+// borsh appends fields and rejects trailing bytes, so a shorter layout never
+// cross-decodes as a longer one: V3 is tried first; a V2 registry (fewer bytes)
+// fails V3 with EOF and falls to the V2 mirror; a V3 registry has trailing bytes
+// for the V2 mirror and is rejected there (but V3 already matched). No ambiguity.
+
+/// The prior role-separated (V2) validator entry layout — the #193-B entry WITHOUT
+/// the #20 advanced key-role fields. Kept ONLY to decode a V2 on-disk registry and
+/// migrate it forward — never written.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7EntryV2 {
+    pub(crate) address: Pubkey,
+    pub(crate) operator_address: Pubkey,
+    pub(crate) withdrawal_address: Pubkey,
+    pub(crate) moniker: String,
+    pub(crate) pubkey_bundle: PublicKeyBundle,
+    pub(crate) p2p_address: String,
+    pub(crate) bond: u64,
+    pub(crate) state: ValidatorV7State,
+    pub(crate) registered_quanto: u64,
+    pub(crate) activation_quanto: u64,
+    pub(crate) exit_requested_quanto: u64,
+    pub(crate) bond_release_quanto: u64,
+    pub(crate) participation_credits: u64,
+    pub(crate) participation_opportunities: u64,
+}
+
+/// The prior (V2) registry container — a `Vec` of the pre-#20 entry.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7RegistryV2 {
+    pub(crate) validators: Vec<ValidatorV7EntryV2>,
+}
+
+impl ValidatorV7EntryV2 {
+    fn migrate(self) -> ValidatorV7Entry {
+        ValidatorV7Entry {
+            address: self.address,
+            operator_address: self.operator_address,
+            withdrawal_address: self.withdrawal_address,
+            moniker: self.moniker,
+            pubkey_bundle: self.pubkey_bundle,
+            p2p_address: self.p2p_address,
+            bond: self.bond,
+            state: self.state,
+            registered_quanto: self.registered_quanto,
+            activation_quanto: self.activation_quanto,
+            exit_requested_quanto: self.exit_requested_quanto,
+            bond_release_quanto: self.bond_release_quanto,
+            participation_credits: self.participation_credits,
+            participation_opportunities: self.participation_opportunities,
+            // #20 defaults: no forced expiry, not revoked, no retired keys →
+            // behavior-identical to the pre-#20 entry.
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
+        }
+    }
+}
 
 /// The pre-role-separation (V1) validator entry layout. Kept ONLY to decode a
 /// legacy on-disk registry and migrate it forward — never written.
@@ -348,6 +527,10 @@ impl ValidatorV7EntryV1 {
             bond_release_quanto: self.bond_release_quanto,
             participation_credits: self.participation_credits,
             participation_opportunities: self.participation_opportunities,
+            // #20 defaults.
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         }
     }
 }
@@ -363,12 +546,18 @@ impl ValidatorV7EntryV1 {
 /// only (the stored bytes are NOT rewritten here), so it introduces no
 /// state-root change; the first real registry write persists the V2 form.
 pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
-    // Current format first: a real V2 registry always decodes here. A non-empty
-    // V1 one won't (V2 entries carry two extra Pubkey fields, so the byte lengths
-    // differ and borsh — which rejects trailing bytes — fails cleanly). An empty
-    // registry (`[0,0,0,0]`) is a valid empty V2 and decodes here directly.
-    if let Ok(v2) = ValidatorV7Registry::try_from_slice(data) {
-        return Some(v2);
+    // Current format first: a real V3 registry always decodes here. A shorter V2
+    // or V1 one won't (V3 appends the #20 fields, so a V2/V1 registry runs out of
+    // bytes and borsh fails cleanly with EOF). An empty registry (`[0,0,0,0]`) is a
+    // valid empty V3 and decodes here directly.
+    if let Ok(v3) = ValidatorV7Registry::try_from_slice(data) {
+        return Some(v3);
+    }
+    // Prior role-separated layout without the #20 fields → migrate (default them).
+    if let Ok(v2) = ValidatorV7RegistryV2::try_from_slice(data) {
+        return Some(ValidatorV7Registry {
+            validators: v2.validators.into_iter().map(|e| e.migrate()).collect(),
+        });
     }
     // Legacy pre-role-separation layout → migrate each entry forward.
     if let Ok(v1) = ValidatorV7RegistryV1::try_from_slice(data) {
@@ -395,18 +584,22 @@ pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
 /// persisted bytes stay the plain V2 form the running node already understands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegistrySchema {
-    /// Pre-role-separation layout (v6.3.x .. v6.19.0) — migratable to V2.
+    /// Pre-role-separation layout (v6.3.x .. v6.19.0) — migratable to V3.
     V1Legacy,
-    /// Current layout, with the role-separated cold keys (v6.19.0+).
-    V2Current,
+    /// Role-separated layout WITHOUT the #20 advanced key-role fields
+    /// (v6.19.0 .. v8.6.15) — migratable to V3 (default the #20 fields).
+    V2Prior,
+    /// Current layout, with the #20 advanced key-role fields (v8.6.16+).
+    V3Current,
 }
 
 impl RegistrySchema {
-    /// The explicit numeric schema version (1 or 2).
+    /// The explicit numeric schema version (1, 2, or 3).
     pub fn version(&self) -> u16 {
         match self {
             RegistrySchema::V1Legacy => 1,
-            RegistrySchema::V2Current => 2,
+            RegistrySchema::V2Prior => 2,
+            RegistrySchema::V3Current => 3,
         }
     }
 }
@@ -415,7 +608,8 @@ impl std::fmt::Display for RegistrySchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegistrySchema::V1Legacy => write!(f, "V1 (legacy, pre-role-separation)"),
-            RegistrySchema::V2Current => write!(f, "V2 (current)"),
+            RegistrySchema::V2Prior => write!(f, "V2 (prior, pre-#20 key-role fields)"),
+            RegistrySchema::V3Current => write!(f, "V3 (current)"),
         }
     }
 }
@@ -423,10 +617,14 @@ impl std::fmt::Display for RegistrySchema {
 /// Report the EXPLICIT schema of a registry's on-disk `data`, or `None` if the
 /// bytes match no known version (genuinely corrupt — the caller must fail-loud,
 /// never guess). Same structural detection `decode_registry` uses, surfaced as a
-/// named value (see [`RegistrySchema`]).
+/// named value (see [`RegistrySchema`]). V3 is tried first (a V2/V1 registry has
+/// fewer bytes and fails it cleanly), so the newest matching layout is reported.
 pub fn detect_registry_schema(data: &[u8]) -> Option<RegistrySchema> {
     if ValidatorV7Registry::try_from_slice(data).is_ok() {
-        return Some(RegistrySchema::V2Current);
+        return Some(RegistrySchema::V3Current);
+    }
+    if ValidatorV7RegistryV2::try_from_slice(data).is_ok() {
+        return Some(RegistrySchema::V2Prior);
     }
     if ValidatorV7RegistryV1::try_from_slice(data).is_ok() {
         return Some(RegistrySchema::V1Legacy);
@@ -459,14 +657,14 @@ pub enum RegistryMigration {
 /// result yields `AlreadyCurrent` (migrating twice is a no-op).
 pub fn plan_registry_migration(data: &[u8]) -> RegistryMigration {
     match detect_registry_schema(data) {
-        Some(RegistrySchema::V2Current) => {
-            let reg = ValidatorV7Registry::try_from_slice(data).expect("just detected as V2");
+        Some(RegistrySchema::V3Current) => {
+            let reg = ValidatorV7Registry::try_from_slice(data).expect("just detected as V3");
             RegistryMigration::AlreadyCurrent { validators: reg.validators.len() }
         }
-        Some(RegistrySchema::V1Legacy) => {
-            // `decode_registry` migrates V1 -> V2 in memory; encode that as the
+        Some(RegistrySchema::V2Prior) | Some(RegistrySchema::V1Legacy) => {
+            // `decode_registry` migrates V2/V1 -> V3 in memory; encode that as the
             // bytes to persist.
-            let reg = decode_registry(data).expect("V1 detected, so it decodes+migrates");
+            let reg = decode_registry(data).expect("V2/V1 detected, so it decodes+migrates");
             let new_bytes = encode_registry(&reg);
             RegistryMigration::Migrated { validators: reg.validators.len(), new_bytes }
         }
@@ -563,6 +761,13 @@ impl ValidatorV7Program {
             ValidatorV7Instruction::WithdrawBond { consensus_address } => Self::withdraw_bond(accounts, instruction, payer, consensus_address),
             ValidatorV7Instruction::ReportEquivocation { evidence } => Self::report_equivocation(accounts, instruction, payer, *evidence),
             ValidatorV7Instruction::Unjail { consensus_address } => Self::unjail(accounts, instruction, payer, consensus_address),
+            ValidatorV7Instruction::RotateOperator { consensus_address, new_operator } => Self::rotate_operator(accounts, instruction, payer, consensus_address, new_operator),
+            ValidatorV7Instruction::RotateWithdrawal { consensus_address, new_withdrawal } => Self::rotate_withdrawal(accounts, instruction, payer, consensus_address, new_withdrawal),
+            ValidatorV7Instruction::RotateConsensusKey { consensus_address, new_bundle, new_p2p_address, new_pop } => {
+                Self::rotate_consensus_key(accounts, instruction, payer, consensus_address, new_bundle, new_p2p_address, new_pop)
+            }
+            ValidatorV7Instruction::RevokeConsensusKey { consensus_address } => Self::revoke_consensus_key(accounts, instruction, payer, consensus_address),
+            ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address, expiry_quanto } => Self::set_consensus_key_expiry(accounts, instruction, payer, consensus_address, expiry_quanto),
         }
     }
 
@@ -587,6 +792,119 @@ impl ValidatorV7Program {
         // full until the node scores the next quanto).
         e.participation_credits = 0;
         e.participation_opportunities = 0;
+        write_registry(accounts, &reg)?;
+        Ok(())
+    }
+
+    /// (#20) Shared gate for the operator-authorized key-role instructions: pin the
+    /// canonical registry account, read it, find `consensus_address`, and require
+    /// the payer to be its cold OPERATOR. Returns the decoded registry + the found
+    /// index for the caller to mutate.
+    fn require_operator(
+        accounts: &HashMap<Pubkey, Account>,
+        ix: &Instruction,
+        payer: &Pubkey,
+        consensus_address: &Pubkey,
+        op: &str,
+    ) -> Result<(ValidatorV7Registry, usize), ExecError> {
+        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError(format!("{op} requires accounts[1]")))?;
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID {
+            return Err(ExecError::Unauthorized(format!("{op} must name the canonical registry account")));
+        }
+        let reg = read_registry(accounts);
+        let idx = reg.find(consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
+        if matches!(reg.validators[idx].state, ValidatorV7State::Removed) {
+            return Err(ExecError::ProgramError("validator has been removed".into()));
+        }
+        if reg.validators[idx].operator_address != *payer {
+            return Err(ExecError::Unauthorized(format!("only the validator's operator (cold) key can {op}")));
+        }
+        Ok((reg, idx))
+    }
+
+    fn rotate_operator(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_operator: Pubkey) -> Result<(), ExecError> {
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateOperator")?;
+        // The new operator must not collide with ANY live validator's identity
+        // (consensus/operator/withdrawal), except this validator's own slot.
+        let in_use = reg.addresses_in_use(Some(&consensus_address));
+        if in_use.contains(&new_operator) {
+            return Err(ExecError::ProgramError("new operator address is already registered to another validator".into()));
+        }
+        reg.validators[idx].operator_address = new_operator;
+        write_registry(accounts, &reg)?;
+        Ok(())
+    }
+
+    fn rotate_withdrawal(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_withdrawal: Pubkey) -> Result<(), ExecError> {
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateWithdrawal")?;
+        let in_use = reg.addresses_in_use(Some(&consensus_address));
+        if in_use.contains(&new_withdrawal) {
+            return Err(ExecError::ProgramError("new withdrawal address is already registered to another validator".into()));
+        }
+        reg.validators[idx].withdrawal_address = new_withdrawal;
+        write_registry(accounts, &reg)?;
+        Ok(())
+    }
+
+    fn rotate_consensus_key(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String, new_pop: MultiSignature) -> Result<(), ExecError> {
+        let global_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RotateConsensusKey requires accounts[2]".into()))?;
+        if global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("RotateConsensusKey must name the canonical global account".into()));
+        }
+        if !(1..=128).contains(&new_p2p_address.len()) {
+            return Err(ExecError::ProgramError("p2p address length out of range".into()));
+        }
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateConsensusKey")?;
+        let new_addr = new_bundle.to_address();
+        let old_addr = reg.validators[idx].address;
+        if new_addr == old_addr {
+            return Err(ExecError::ProgramError("new consensus key is identical to the current one".into()));
+        }
+        // The NEW consensus key must prove possession, bound to THIS validator's
+        // operator/withdrawal/moniker (the same PoP the registration requires), so
+        // nobody can rotate in a key they don't hold, nor replay a PoP elsewhere.
+        let operator = reg.validators[idx].operator_address;
+        let withdrawal = reg.validators[idx].withdrawal_address;
+        let moniker = reg.validators[idx].moniker.clone();
+        if !qchain_crypto::verify_domain(&new_bundle, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&operator, &withdrawal, &moniker), &new_pop) {
+            return Err(ExecError::Unauthorized("new_pop does not prove possession of the new consensus key for this operator/withdrawal/moniker".into()));
+        }
+        // The new consensus address must not collide with another LIVE validator's
+        // identity (its own slot is excepted via `except = old consensus address`).
+        let in_use = reg.addresses_in_use(Some(&consensus_address));
+        if in_use.contains(&new_addr) {
+            return Err(ExecError::ProgramError("new consensus key is already registered to another validator".into()));
+        }
+        let q = current_quanto(accounts);
+        let e = &mut reg.validators[idx];
+        // Keep the OLD key slashable through the evidence window: an equivocation by
+        // the rotated-out key (e.g. a leaked key still in the current epoch's fixed
+        // committee) is still punished even though the live `address` is now new.
+        e.retire_consensus_key(old_addr, q, SLASH_EVIDENCE_WINDOW_QUANTOS);
+        e.address = new_addr;
+        e.pubkey_bundle = new_bundle;
+        e.p2p_address = new_p2p_address;
+        // A fresh key clears any revocation/expiry that excluded the validator.
+        e.consensus_key_revoked = false;
+        e.consensus_key_expiry_quanto = 0;
+        write_registry(accounts, &reg)?;
+        Ok(())
+    }
+
+    fn revoke_consensus_key(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey) -> Result<(), ExecError> {
+        let global_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RevokeConsensusKey requires accounts[2]".into()))?;
+        if global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("RevokeConsensusKey must name the canonical global account".into()));
+        }
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RevokeConsensusKey")?;
+        reg.validators[idx].consensus_key_revoked = true;
+        write_registry(accounts, &reg)?;
+        Ok(())
+    }
+
+    fn set_consensus_key_expiry(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, expiry_quanto: u64) -> Result<(), ExecError> {
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "SetConsensusKeyExpiry")?;
+        reg.validators[idx].consensus_key_expiry_quanto = expiry_quanto;
         write_registry(accounts, &reg)?;
         Ok(())
     }
@@ -675,6 +993,11 @@ impl ValidatorV7Program {
             bond_release_quanto: 0,
             participation_credits: 0,
             participation_opportunities: 0,
+            // #20: a fresh registration starts with no forced expiry, not revoked,
+            // and no retired keys.
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         };
         match reg.find(&consensus_addr) {
             Some(idx) => reg.validators[idx] = entry, // re-register a Removed slot
@@ -799,7 +1122,10 @@ impl ValidatorV7Program {
         }
 
         let mut reg = read_registry(accounts);
-        let idx = reg.find(&author).ok_or_else(|| ExecError::ProgramError("accused is not a registered validator".into()))?;
+        // #20: also slash a validator that ROTATED AWAY FROM this key, while the
+        // old key is still within its evidence window (a leaked rotated-out key).
+        let q = current_quanto(accounts);
+        let idx = reg.find_slashable(&author, q).ok_or_else(|| ExecError::ProgramError("accused is not a registered validator".into()))?;
         let e = &reg.validators[idx];
         if matches!(e.state, ValidatorV7State::Slashed | ValidatorV7State::Removed) {
             return Err(ExecError::ProgramError("nothing to slash".into()));
@@ -1068,6 +1394,9 @@ mod tests {
             bond_release_quanto: 0,
             participation_credits: 0,
             participation_opportunities: 0,
+            consensus_key_expiry_quanto: 0,
+            consensus_key_revoked: false,
+            retired_consensus_keys: Vec::new(),
         };
         let reg = ValidatorV7Registry {
             validators: vec![
@@ -1218,11 +1547,12 @@ mod tests {
             }],
         };
         let bytes = borsh::to_vec(&v1).unwrap();
-        // A real (non-empty) V1 registry must NOT clean-decode as the current V2
-        // layout — V2 entries carry two extra Pubkey fields, so the lengths differ.
+        // A real (non-empty) V1 registry must NOT clean-decode as the current V3
+        // layout — a V3 entry carries the cold-key + #20 fields, so it runs out of
+        // bytes (EOF) reading them.
         assert!(
             ValidatorV7Registry::try_from_slice(&bytes).is_err(),
-            "a non-empty V1 registry must not decode as V2"
+            "a non-empty V1 registry must not decode as V3"
         );
         // ...but `decode_registry` migrates it forward.
         let migrated = decode_registry(&bytes).expect("a legacy V1 registry migrates, never None");
@@ -1238,9 +1568,13 @@ mod tests {
         assert_eq!(e.activation_quanto, 4);
         assert_eq!(e.participation_credits, 7);
         assert_eq!(e.participation_opportunities, 9);
-        // The migrated registry round-trips as the current V2 format.
-        let v2_bytes = borsh::to_vec(&migrated).unwrap();
-        assert_eq!(decode_registry(&v2_bytes).unwrap().validators.len(), 1);
+        // #20 defaults on migration: no forced expiry, not revoked, no retired keys.
+        assert_eq!(e.consensus_key_expiry_quanto, 0);
+        assert!(!e.consensus_key_revoked);
+        assert!(e.retired_consensus_keys.is_empty());
+        // The migrated registry round-trips as the current V3 format.
+        let v3_bytes = borsh::to_vec(&migrated).unwrap();
+        assert_eq!(decode_registry(&v3_bytes).unwrap().validators.len(), 1);
         // A current empty registry decodes directly (no migration path).
         assert!(decode_registry(&borsh::to_vec(&ValidatorV7Registry::default()).unwrap()).is_some());
         // Genuinely-corrupt bytes → None: the caller halts, never uses empty.
@@ -1267,24 +1601,24 @@ mod tests {
             }
             _ => panic!("a V1 registry must plan as Migrated"),
         };
-        // The persisted bytes are the exact V2 form the running node reads: they
-        // detect as V2, decode losslessly, and match `decode_registry` of the V1.
-        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V2Current));
-        assert_eq!(RegistrySchema::V2Current.version(), 2);
-        let migrated = ValidatorV7Registry::try_from_slice(&new_bytes).expect("new bytes are valid V2");
-        assert_eq!(encode_registry(&decode_registry(&v1_bytes).unwrap()), new_bytes, "persist == decode_registry's V2");
+        // The persisted bytes are the exact V3 form the running node reads: they
+        // detect as V3, decode losslessly, and match `decode_registry` of the V1.
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V3Current));
+        assert_eq!(RegistrySchema::V3Current.version(), 3);
+        let migrated = ValidatorV7Registry::try_from_slice(&new_bytes).expect("new bytes are valid V3");
+        assert_eq!(encode_registry(&decode_registry(&v1_bytes).unwrap()), new_bytes, "persist == decode_registry's V3");
         assert_eq!(migrated.validators[0].operator_address, addr);
         assert_eq!(migrated.validators[0].withdrawal_address, addr);
 
-        // Idempotent: re-planning the migrated V2 bytes is a no-op.
+        // Idempotent: re-planning the migrated V3 bytes is a no-op.
         match plan_registry_migration(&new_bytes) {
             RegistryMigration::AlreadyCurrent { validators } => assert_eq!(validators, 1),
-            _ => panic!("re-migrating V2 must be AlreadyCurrent (no-op)"),
+            _ => panic!("re-migrating V3 must be AlreadyCurrent (no-op)"),
         }
 
-        // An empty V2 registry is AlreadyCurrent (0 validators), not V1.
+        // An empty V3 registry is AlreadyCurrent (0 validators), not V1.
         let empty = encode_registry(&ValidatorV7Registry::default());
-        assert_eq!(detect_registry_schema(&empty), Some(RegistrySchema::V2Current));
+        assert_eq!(detect_registry_schema(&empty), Some(RegistrySchema::V3Current));
         assert!(matches!(plan_registry_migration(&empty), RegistryMigration::AlreadyCurrent { validators: 0 }));
 
         // Genuinely corrupt bytes: no schema, plan refuses (Corrupt).
