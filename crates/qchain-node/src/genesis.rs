@@ -301,6 +301,26 @@ pub fn seed_genesis(ledger: &mut Ledger, config: &NodeConfig) -> anyhow::Result<
                 );
         }
     }
+    // Explicit schema manifest (roadmap #19): opt-in, seeded for ANY network
+    // (independent of economics_v7). Records the canonical `{singleton ->
+    // schema_version}` map on-chain so the node verifies each singleton's format
+    // against the declared version at startup. Seeding it is what changes the
+    // genesis state root (a new leaf), which is why `explicit_schema_versions`
+    // folds into the chain_id — a network without it is byte-identical.
+    if config.explicit_schema_versions {
+        let manifest = qchain_execution::SchemaManifest::canonical();
+        ledger.seed_account(
+            qchain_execution::SCHEMA_MANIFEST_ID,
+            qchain_core::Account {
+                data: borsh::to_vec(&manifest)?,
+                ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        );
+        tracing::info!(
+            "schema manifest: seeded {} explicit singleton schema versions (roadmap #19)",
+            manifest.versions.len()
+        );
+    }
     Ok(())
 }
 
@@ -534,6 +554,45 @@ mod tests {
             "rounds_per_quanto": 100u64,
         });
         serde_json::from_value(json).unwrap()
+    }
+
+    /// Roadmap #19: with `explicit_schema_versions`, genesis seeds the on-chain
+    /// SCHEMA_MANIFEST and `verify_schema_manifest` passes against the seeded
+    /// state; without it, no manifest is seeded and verification is a no-op
+    /// (byte-identical). Also: seeding the manifest changes the genesis root.
+    #[test]
+    fn schema_manifest_is_seeded_and_verifies_only_when_enabled() {
+        fn seed(explicit: bool, economics_v7: bool) -> (Ledger, String) {
+            let mut c = cfg(50_000_000_000, economics_v7);
+            c.explicit_schema_versions = explicit;
+            let mut ledger = Ledger::new_with_config(
+                Box::new(InMemoryStore::new()),
+                c.compressed_state_tree,
+                c.economics_v7,
+                c.quanto_rate_fp(),
+                c.rounds_per_quanto(),
+            )
+            .unwrap();
+            seed_genesis(&mut ledger, &c).unwrap();
+            let root = hex::encode(ledger.merkle_root());
+            (ledger, root)
+        }
+
+        // OFF: no manifest account, verify is a no-op (None).
+        let (off_ledger, off_root) = seed(false, true);
+        assert!(off_ledger.store().get(&qchain_execution::SCHEMA_MANIFEST_ID).is_none());
+        assert_eq!(off_ledger.verify_schema_manifest().unwrap(), None);
+
+        // ON: the manifest is seeded, verify passes and returns how many
+        // singletons it checked (the ones actually present on this network).
+        let (on_ledger, on_root) = seed(true, true);
+        assert!(on_ledger.store().get(&qchain_execution::SCHEMA_MANIFEST_ID).is_some());
+        let verified = on_ledger.verify_schema_manifest().unwrap();
+        assert!(verified.is_some_and(|n| n >= 4), "verified the present singletons");
+
+        // Seeding the manifest changed the genesis state root (a new leaf) — this
+        // is why the flag folds into the chain_id.
+        assert_ne!(off_root, on_root, "the manifest adds a leaf → different genesis root");
     }
 
     #[test]

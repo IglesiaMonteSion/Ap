@@ -1324,6 +1324,32 @@ impl Ledger {
         Ok(())
     }
 
+    /// Verify the on-chain SCHEMA MANIFEST (roadmap #19), if present. Runs at
+    /// startup after `validate_critical_singletons`. When the manifest account is
+    /// present it decodes it (fail-loud if the manifest itself is corrupt) and
+    /// checks every declared singleton's ACTUAL detected schema version against
+    /// the declared version — an explicit, fail-loud replacement for trusting
+    /// trial-Borsh. Absent (a network that didn't opt into
+    /// `explicit_schema_versions`) → `Ok(None)`, byte-identical to before #19.
+    /// Returns the number of singletons verified, or `None` if no manifest.
+    pub fn verify_schema_manifest(&self) -> Result<Option<usize>, String> {
+        let Some(acct) = self.store.get(&crate::ids::SCHEMA_MANIFEST_ID) else {
+            return Ok(None);
+        };
+        let manifest = crate::schema::SchemaManifest::try_from_slice(&acct.data)
+            .map_err(|_| "SCHEMA_MANIFEST is present but does not decode — refusing to start on corrupt state".to_string())?;
+        // Build the small map of just the singleton accounts the manifest names.
+        let mut accounts = std::collections::HashMap::new();
+        for (tag, _) in &manifest.versions {
+            if let Some(s) = crate::schema::Singleton::from_tag(*tag) {
+                if let Some(a) = self.store.get(&s.id()) {
+                    accounts.insert(s.id(), a);
+                }
+            }
+        }
+        manifest.verify(&accounts).map(|verified| Some(verified.len()))
+    }
+
     pub fn get_balance(&self, pk: &Pubkey) -> u64 {
         self.store.get(pk).map(|a| a.balance).unwrap_or(0)
     }

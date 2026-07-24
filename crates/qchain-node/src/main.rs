@@ -696,6 +696,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("FATAL: {e}. Restore from a good backup / re-sync a fresh data_dir before restarting.");
     }
 
+    // EXPLICIT SCHEMA MANIFEST gate (roadmap #19): if this network opted into the
+    // on-chain schema manifest, verify every critical singleton's ACTUAL format
+    // against the DECLARED version — fail-loud on a mismatch rather than silently
+    // trusting a Borsh decode. Absent (a network that didn't opt in) is a no-op.
+    match ledger.verify_schema_manifest() {
+        Ok(Some(n)) => tracing::info!("schema manifest: verified {n} singleton schema versions (roadmap #19)"),
+        Ok(None) => {}
+        Err(e) => anyhow::bail!("FATAL: {e}. A coordinated schema migration is required before this node can run."),
+    }
+
     // HARD-CAP GATE (§5, #221): under the hard cap, refuse to start if the total
     // supply exceeds the absolute cap. This is a genesis-config check (nothing
     // mints post-genesis under the hard cap, so total supply is constant) — a

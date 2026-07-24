@@ -335,6 +335,16 @@ pub struct NodeConfig {
     /// with `economics_v7` + `hard_cap_supply`; part of the network config hash.
     #[serde(default)]
     pub emission_reserve_qch: Option<u64>,
+    /// Seed the on-chain SCHEMA MANIFEST (roadmap #19). When `true`, genesis seeds
+    /// `SCHEMA_MANIFEST_ID` with the canonical `{singleton -> schema_version}` map
+    /// and the node VERIFIES every critical singleton's actual format against the
+    /// declared version at startup (fail-loud on a mismatch), instead of relying on
+    /// trial-Borsh alone. Default `false` = byte-identical to a pre-#19 network (no
+    /// manifest account, no state-root change, exact same `chain_id`). Folded into
+    /// `chain_id` only when enabled — a fresh-genesis, network-wide decision every
+    /// node must set identically. See `docs/SCHEMA-VERSIONS.md`.
+    #[serde(default)]
+    pub explicit_schema_versions: bool,
     /// Per-IP RPC rate limit (task #196, QCH-S6): max requests any single client
     /// IP may make in a 10-second window before it's temporarily banned (60 s).
     /// `None`/`0` (the default, and what every existing config resolves to)
@@ -614,6 +624,14 @@ impl NodeConfig {
                 bytes.extend_from_slice(&self.supply_cap_atoms().to_le_bytes());
                 bytes.extend_from_slice(&self.emission_reserve_atoms().to_le_bytes());
             }
+        }
+        // Explicit schema manifest (roadmap #19): seeding the SCHEMA_MANIFEST
+        // singleton adds a genesis account (a new Merkle leaf) → a different
+        // genesis state root, so it is part of the network identity. Folded ONLY
+        // when enabled, so a network that doesn't opt in keeps its exact chain_id
+        // byte-identical. Independent of economics_v7 (any network may opt in).
+        if self.explicit_schema_versions {
+            bytes.extend_from_slice(b"explicit-schema-versions-v1");
         }
         // Emergency governance guardians (task #213) are genesis STATE that
         // varies by operator config, so they fold into the network identity —
@@ -1007,6 +1025,7 @@ mod tests {
             treasury_op_expiry_rounds: 0,
             admin_fee_wallet: None,
             hard_cap_supply: false,
+            explicit_schema_versions: false,
             supply_cap_qch: None,
             emission_reserve_qch: None,
             rpc_rate_limit_per_10s: None,
@@ -1233,6 +1252,22 @@ mod tests {
     fn one_validator() -> Vec<ValidatorConfig> {
         let bundle = Keypair::generate().unwrap().public_key_bundle();
         vec![ValidatorConfig { pubkey_bundle: bundle, addr: "127.0.0.1:35001".parse().unwrap(), stake: 1_000_000, name: None, withdrawal_address: None }]
+    }
+
+    /// Roadmap #19: seeding the schema manifest changes the genesis state root,
+    /// so `explicit_schema_versions` folds into the chain_id — but ONLY when set,
+    /// so a network that doesn't opt in keeps its exact chain_id byte-identical.
+    #[test]
+    fn explicit_schema_versions_folds_into_chain_id_only_when_set() {
+        // One config, flip only the flag: off is byte-identical (the fold adds
+        // nothing), on changes the chain_id (a fresh-genesis, distinct network).
+        let mut c = config_with(one_validator(), vec![]);
+        assert!(!c.explicit_schema_versions, "default is off");
+        let off = c.chain_id();
+        let off_again = c.chain_id();
+        assert_eq!(off, off_again, "chain_id is deterministic");
+        c.explicit_schema_versions = true;
+        assert_ne!(c.chain_id(), off, "enabling the schema manifest changes the chain_id");
     }
 
     /// Build a config that satisfies EVERY mainnet-profile requirement, so a test

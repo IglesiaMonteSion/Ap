@@ -134,6 +134,45 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Explicit schema version of EVERY critical singleton (roadmap #19) — the
+    // uniform generalization of the validator-registry schema report above.
+    println!("\n-- schema versions (all singletons, roadmap #19) --");
+    for s in qchain_execution::Singleton::ALL {
+        match get(s.id()) {
+            None => println!("  {:<22} absent", s.name()),
+            Some(a) => match s.detect_version(&a.data) {
+                Some(v) if v == s.current_version() => {
+                    println!("  {:<22} schema_version {v} (current)", s.name())
+                }
+                Some(v) => {
+                    println!("  {:<22} schema_version {v} — build expects v{} (migrate)", s.name(), s.current_version());
+                }
+                None => {
+                    println!("  {:<22} present but CORRUPT (no known schema)  -> WOULD HALT", s.name());
+                    problems.push(format!("{} corrupt schema", s.name()));
+                }
+            },
+        }
+    }
+    // The on-chain schema MANIFEST (opt-in): declared vs actual, verified.
+    match get(qchain_execution::SCHEMA_MANIFEST_ID) {
+        None => println!("  {:<22} absent (explicit_schema_versions off — trial-Borsh detection)", "schema_manifest"),
+        Some(a) => match qchain_execution::SchemaManifest::try_from_slice(&a.data) {
+            Ok(m) => {
+                println!("  {:<22} present: {} declared versions", "schema_manifest", m.versions.len());
+                for (tag, v) in &m.versions {
+                    if let Some(s) = qchain_execution::Singleton::from_tag(*tag) {
+                        println!("      {:<20} declared v{v}", s.name());
+                    }
+                }
+            }
+            Err(_) => {
+                println!("  {:<22} present but CORRUPT  -> WOULD HALT", "schema_manifest");
+                problems.push("schema manifest corrupt".into());
+            }
+        },
+    }
+
     // Supply + pools (informational; the invariant is Σ balances vs the cap).
     println!("\n-- supply & pools --");
     let mut total: u128 = 0;

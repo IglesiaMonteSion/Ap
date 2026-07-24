@@ -10,6 +10,7 @@ pub mod ledger;
 pub mod native;
 pub mod params;
 pub mod receipt;
+pub mod schema;
 pub mod staking;
 pub mod staking_v7;
 pub mod treasury_v7;
@@ -25,6 +26,8 @@ pub use native::{NativeProgram, SystemInstruction, SystemProgram};
 pub use params::EconomicParams;
 pub use ledger::EconomicSnapshot;
 pub use receipt::{CompressedProofSet, StakingEvent, StakingEventKind, TransferReceipt};
+pub use schema::{SchemaManifest, Singleton};
+pub use ids::SCHEMA_MANIFEST_ID;
 pub use staking::{RewardPoolData, StakeAccountData, StakingInstruction, StakingProgram};
 pub use wasm::{WasmCallResult, WasmExecutor};
 

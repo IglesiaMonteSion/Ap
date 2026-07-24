@@ -165,6 +165,13 @@ struct Cli {
     /// supply exceeds the cap. Requires `--economics-v7`. Folded into `chain_id`.
     #[arg(long)]
     hard_cap_supply: bool,
+    /// Seed the on-chain SCHEMA MANIFEST (roadmap #19): record every critical
+    /// singleton's explicit `schema_version` on-chain and have the node verify
+    /// each singleton's actual format against it at startup (fail-loud on a
+    /// mismatch) instead of trusting trial-Borsh. Folded into `chain_id`; a
+    /// network without it is byte-identical. See `docs/SCHEMA-VERSIONS.md`.
+    #[arg(long)]
+    explicit_schema_versions: bool,
     /// (v7 hard-cap) the maximum total supply in whole QCH (default 100000000 =
     /// 100M). Only meaningful with `--hard-cap-supply`.
     #[arg(long)]
@@ -460,6 +467,7 @@ fn main() -> anyhow::Result<()> {
             treasury_op_expiry_rounds: cli.treasury_op_expiry_rounds,
             admin_fee_wallet: cli.admin_fee_wallet.clone(),
             hard_cap_supply: cli.hard_cap_supply,
+            explicit_schema_versions: cli.explicit_schema_versions,
             supply_cap_qch,
             emission_reserve_qch,
             rpc_rate_limit_per_10s: None,

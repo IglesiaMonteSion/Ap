@@ -156,6 +156,16 @@ pub const EMISSION_RESERVE_ID: Pubkey = Pubkey::new([20u8; 32]);
 /// sweep also removes it — either way it leaves circulation.
 pub const BURN_ADDRESS: Pubkey = Pubkey::new([0xFFu8; 32]);
 
+/// On-chain SCHEMA MANIFEST singleton (roadmap #19). Holds the canonical,
+/// EXPLICIT `{singleton -> schema_version}` map for this chain, so a node no
+/// longer relies on trial-Borsh alone to know a singleton's format — the
+/// expected version is declared on-chain and verified at startup (fail-loud on
+/// a mismatch). **Absent** on a network that doesn't opt in
+/// (`explicit_schema_versions` off — the default), so existing genesis roots and
+/// chain_ids are unchanged; seeding it is a fresh-genesis, chain_id-folded
+/// decision (a new leaf changes the state root). System-owned; carries no funds.
+pub const SCHEMA_MANIFEST_ID: Pubkey = Pubkey::new([21u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

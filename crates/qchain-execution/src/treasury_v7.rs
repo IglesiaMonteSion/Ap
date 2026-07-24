@@ -251,7 +251,7 @@ impl TreasuryState {
     /// appended fields missing) → borsh hits EOF → falls through to `TreasuryStateV0`.
     /// A new blob has trailing bytes the V0 struct can't consume (borsh rejects
     /// trailing), so the two never cross-decode.
-    fn read_or_legacy(data: &[u8]) -> Option<Self> {
+    pub fn read_or_legacy(data: &[u8]) -> Option<Self> {
         if let Ok(s) = borsh::from_slice::<TreasuryState>(data) {
             return Some(s);
         }
