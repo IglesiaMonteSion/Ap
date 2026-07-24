@@ -5215,6 +5215,7 @@ mod tests {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            frozen_until_quanto: 0,
         };
         // Two Active + one Jailed → the committee is the two Active ones.
         let reg = ValidatorV7Registry {

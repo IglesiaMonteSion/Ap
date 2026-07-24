@@ -87,19 +87,19 @@ fn migrate_registry_tool_migrates_v1_to_v2_and_rolls_back() {
     assert!(!backup.exists(), "no backup written on abort");
     assert_eq!(registry_schema(&data_dir), Some(RegistrySchema::V1Legacy), "abort changed nothing");
 
-    // 3) --apply --yes: backs up, migrates to V3, verifies.
+    // 3) --apply --yes: backs up, migrates to V4, verifies.
     let out = run(cfg_str, &["--apply", "--yes", "--backup", backup.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "apply exits 0: {stdout}");
     assert!(stdout.contains("MIGRATED"), "apply reports success: {stdout}");
     assert!(backup.exists(), "backup written");
-    assert_eq!(registry_schema(&data_dir), Some(RegistrySchema::V3Current), "persisted V3");
+    assert_eq!(registry_schema(&data_dir), Some(RegistrySchema::V4Current), "persisted V4");
 
     // The backup holds the original V1 account (rollback source).
     let backup_acct = Account::try_from_slice(&std::fs::read(&backup).unwrap()).unwrap();
     assert_eq!(backup_acct.data, v1_bytes, "backup is the original V1 registry");
 
-    // 4) Re-apply is a safe no-op (already V3).
+    // 4) Re-apply is a safe no-op (already V4).
     let out = run(cfg_str, &["--apply", "--yes", "--backup", tmp.path().join("reg2.bak").to_str().unwrap()]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("ALREADY CURRENT"), "re-apply is a no-op");

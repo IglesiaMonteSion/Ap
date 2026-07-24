@@ -40,11 +40,13 @@ use crate::error::ExecError;
 use crate::ids::{
     STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID,
     VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID,
-    VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID,
+    VALIDATOR_KM_AUDIT_LOG_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
+    VALIDATOR_UNBONDING_POOL_ID,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, EquivocationEvidence, Instruction};
 use qchain_crypto::{MultiSignature, Pubkey, PublicKeyBundle};
+use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 
 /// Cap on the on-chain validator registry (anti-bloat/DoS; a bond is required to
@@ -168,25 +170,62 @@ pub struct RecoveryApproval {
     pub signature: MultiSignature,
 }
 
-/// (KM#4) The recovery operation a committee authorizes. Only `Revoke` this
-/// increment; the `op_tag` byte binds the authorization so a future op's
-/// approval can never be replayed as a Revoke. REPLACE/rotate (→KM#6, already has
-/// the operator-authorized `RotateConsensusKey`) and FREEZE (→KM#9) are separate.
+/// The recovery operation a committee authorizes (KM#4 + KM#9). The `op_tag` byte
+/// AND any parameter (a `until_quanto`) are bound into the signed preimage, so an
+/// approval for one op/param can NEVER be replayed as another. `Revoke` (KM#4) is a
+/// terminal hard-exit; `Freeze`/`Unfreeze`/`SetExpiry` (KM#9) are reversible
+/// emergency controls that DON'T touch the bond:
+/// - **Freeze { until_quanto }** — an EMERGENCY reversible PAUSE (suspected but
+///   unconfirmed compromise): the validator is excluded from the committee AND fees
+///   until `until_quanto` (`u64::MAX` = indefinite, until an explicit Unfreeze), but
+///   its bond stays escrowed/slashable and its state stays `Active`. Unlike `Revoke`
+///   (terminal), a freeze can be lifted.
+/// - **Unfreeze** — lift a freeze (re-enable), WITHOUT needing the (possibly
+///   compromised) operator key — the recovery committee re-enables it.
+/// - **SetExpiry { until_quanto }** — a MANDATORY consensus-key rotation deadline
+///   the recovery committee can impose (the guardians force a stale/suspicious key
+///   to be rotated even if the operator won't): the validator is excluded at/after
+///   `until_quanto` until a fresh consensus key is rotated in.
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum RecoveryOp {
     Revoke,
+    Freeze { until_quanto: u64 },
+    Unfreeze,
+    SetExpiry { until_quanto: u64 },
 }
 
-/// (KM#4) The preimage each recovery signer signs OFFLINE (domain
-/// `RECOVERY_AUTH_V1`). Binds the target validator, the op, and the current
-/// per-validator recovery nonce (anti-replay within the network — consistent with
-/// `pop_message`, which also does not bind chain_id).
+impl RecoveryOp {
+    /// The 1-byte op tag bound into the signed preimage (stable discriminants —
+    /// a future op appends, never reorders, so an old approval can't be re-tagged).
+    fn tag(&self) -> u8 {
+        match self {
+            RecoveryOp::Revoke => 0x01,
+            RecoveryOp::Freeze { .. } => 0x02,
+            RecoveryOp::Unfreeze => 0x03,
+            RecoveryOp::SetExpiry { .. } => 0x04,
+        }
+    }
+    /// The op's parameter bound into the preimage (a `until_quanto`, or 0). Binding
+    /// it means an approval for "Freeze until 100" can't authorize "Freeze until 200".
+    fn param(&self) -> u64 {
+        match self {
+            RecoveryOp::Freeze { until_quanto } | RecoveryOp::SetExpiry { until_quanto } => *until_quanto,
+            RecoveryOp::Revoke | RecoveryOp::Unfreeze => 0,
+        }
+    }
+}
+
+/// (KM#4/#9) The preimage each recovery signer signs OFFLINE (domain
+/// `RECOVERY_AUTH_V1`). Binds the target validator, the op TAG, the op PARAMETER
+/// (a `until_quanto`), and the current per-validator recovery nonce (anti-replay
+/// within the network — consistent with `pop_message`, which also does not bind
+/// chain_id). Binding the tag+param means an approval collected for one op/param
+/// can never be replayed for a different one.
 pub fn recovery_message(consensus_address: &Pubkey, op: RecoveryOp, nonce: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(32 + 1 + 8);
+    let mut m = Vec::with_capacity(32 + 1 + 8 + 8);
     m.extend_from_slice(&consensus_address.0);
-    m.push(match op {
-        RecoveryOp::Revoke => 0x01,
-    });
+    m.push(op.tag());
+    m.extend_from_slice(&op.param().to_le_bytes());
     m.extend_from_slice(&nonce.to_le_bytes());
     m
 }
@@ -401,17 +440,36 @@ pub struct ValidatorV7Entry {
     /// until its quanto. Empty by default. Bounded by `MAX_RETIRED_CONSENSUS_KEYS`;
     /// pruned when a key's window passes.
     pub retired_consensus_keys: Vec<RetiredConsensusKey>,
+    /// (KM#9) **Emergency FREEZE deadline.** `0` = not frozen (the default → a V3
+    /// entry migrates with 0 and is byte-identical in behavior). Otherwise this
+    /// validator is FROZEN (excluded from the committee AND fees) until this quanto;
+    /// `u64::MAX` means frozen indefinitely until an explicit `Unfreeze`. Set by the
+    /// recovery committee (`RecoverOp { Freeze }`) for a suspected-but-unconfirmed
+    /// compromise — a REVERSIBLE pause that, unlike `Revoked`, keeps the bond
+    /// escrowed/slashable and the state `Active`, and can be lifted (`Unfreeze`)
+    /// without the (possibly compromised) operator key.
+    pub frozen_until_quanto: u64,
 }
 
 impl ValidatorV7Entry {
-    /// (#20) Whether the CONSENSUS key is currently disabled — revoked by the
-    /// operator, or past its forced-rotation expiry — so this validator is excluded
-    /// from BOTH the active committee and fee eligibility until the operator rotates
-    /// in a fresh key. Deterministic (reads committed state). A default entry
-    /// (`expiry 0`, not revoked) is NEVER disabled → byte-identical honest path.
+    /// (KM#9) Whether this validator is currently FROZEN (emergency reversible
+    /// pause). A default entry (`frozen_until_quanto 0`) is NEVER frozen.
+    pub fn is_frozen(&self, current_quanto: u64) -> bool {
+        self.frozen_until_quanto != 0 && current_quanto < self.frozen_until_quanto
+    }
+
+    /// (#20 + KM#9) Whether the CONSENSUS key is currently disabled — revoked by the
+    /// operator, past its forced-rotation expiry, OR emergency-FROZEN by the recovery
+    /// committee (KM#9) — so this validator is excluded from BOTH the active committee
+    /// and fee eligibility. This is the SINGLE gate both enforcement paths
+    /// (`active_committee` + `fees_v7::is_eligible`) read, so a freeze takes effect at
+    /// exactly the same two points as a revoke/expiry, with no extra plumbing.
+    /// Deterministic (reads committed state). A default entry is NEVER disabled →
+    /// byte-identical honest path.
     pub fn consensus_key_disabled(&self, current_quanto: u64) -> bool {
         self.consensus_key_revoked
             || (self.consensus_key_expiry_quanto != 0 && self.consensus_key_expiry_quanto <= current_quanto)
+            || self.is_frozen(current_quanto)
     }
 
     /// (#20) Record `old` as a retired-but-still-slashable consensus key, slashable
@@ -667,16 +725,19 @@ pub enum ValidatorV7Instruction {
     /// empty → clears the committee. accounts = [operator(payer), REGISTRY,
     /// KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     SetRecoveryCommittee { consensus_address: Pubkey, config: RecoveryConfig },
-    /// (KM#4) REVOKE `consensus_address` using its OFFLINE recovery committee —
-    /// neutralize a validator whose consensus/operator keys are lost or
-    /// compromised, WITHOUT any of those keys. `approvals` carries M offline
-    /// signatures collected out-of-band; the handler verifies ≥ threshold DISTINCT
-    /// valid signatures from REGISTERED recovery signers over the current recovery
-    /// nonce, then hard-exits the validator (bond → unbonding pool, state →
-    /// `Revoked`, nonce bumped). PERMISSIONLESS: the payer is just a fee relayer
-    /// (like `ReportEquivocation`) — the M signatures are the authorization.
-    /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL].
-    RecoverRevoke { consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval> },
+    /// (KM#4/#9) Apply a RECOVERY-COMMITTEE-authorized operation to
+    /// `consensus_address` — using its OFFLINE recovery committee, WITHOUT any of
+    /// the (possibly compromised) consensus/operator keys. `approvals` carries M
+    /// offline signatures collected out-of-band; the handler verifies ≥ threshold
+    /// DISTINCT valid signatures from REGISTERED recovery signers over the current
+    /// recovery nonce (which binds the op TAG + PARAMETER), then applies `op`:
+    /// `Revoke` (KM#4, terminal hard-exit), or the reversible KM#9 emergency controls
+    /// `Freeze`/`Unfreeze` (pause without touching the bond) and `SetExpiry`
+    /// (mandatory rotation deadline). Every op is appended to the hash-chained KM
+    /// audit trail and bumps the recovery nonce (anti-replay). PERMISSIONLESS: the
+    /// payer is just a fee relayer — the M signatures are the authorization.
+    /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL, KM_AUDIT_LOG].
+    RecoverOp { consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval> },
     /// (KM#5) Apply a validator's timelocked cold-key change once its window has
     /// elapsed. PERMISSIONLESS (the operator authorized it at propose; the payer is
     /// a fee relayer). `kind` names which pending change (operator/withdrawal/
@@ -780,6 +841,8 @@ impl ValidatorV7EntryV2 {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            // KM#9 default: not frozen → behavior-identical.
+            frozen_until_quanto: 0,
         }
     }
 }
@@ -830,6 +893,65 @@ impl ValidatorV7EntryV1 {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            // KM#9 default: not frozen.
+            frozen_until_quanto: 0,
+        }
+    }
+}
+
+/// The prior (V3) validator entry layout — the #20 entry WITHOUT the KM#9
+/// `frozen_until_quanto` field. Kept ONLY to decode a V3 on-disk registry (a
+/// pre-KM#9 network) and migrate it forward (default `frozen_until_quanto = 0`,
+/// i.e. never frozen → behavior-identical). Never written.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7EntryV3 {
+    pub(crate) address: Pubkey,
+    pub(crate) operator_address: Pubkey,
+    pub(crate) withdrawal_address: Pubkey,
+    pub(crate) moniker: String,
+    pub(crate) pubkey_bundle: PublicKeyBundle,
+    pub(crate) p2p_address: String,
+    pub(crate) bond: u64,
+    pub(crate) state: ValidatorV7State,
+    pub(crate) registered_quanto: u64,
+    pub(crate) activation_quanto: u64,
+    pub(crate) exit_requested_quanto: u64,
+    pub(crate) bond_release_quanto: u64,
+    pub(crate) participation_credits: u64,
+    pub(crate) participation_opportunities: u64,
+    pub(crate) consensus_key_expiry_quanto: u64,
+    pub(crate) consensus_key_revoked: bool,
+    pub(crate) retired_consensus_keys: Vec<RetiredConsensusKey>,
+}
+
+/// The prior (V3) registry container — a `Vec` of the pre-KM#9 entry.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug)]
+pub(crate) struct ValidatorV7RegistryV3 {
+    pub(crate) validators: Vec<ValidatorV7EntryV3>,
+}
+
+impl ValidatorV7EntryV3 {
+    fn migrate(self) -> ValidatorV7Entry {
+        ValidatorV7Entry {
+            address: self.address,
+            operator_address: self.operator_address,
+            withdrawal_address: self.withdrawal_address,
+            moniker: self.moniker,
+            pubkey_bundle: self.pubkey_bundle,
+            p2p_address: self.p2p_address,
+            bond: self.bond,
+            state: self.state,
+            registered_quanto: self.registered_quanto,
+            activation_quanto: self.activation_quanto,
+            exit_requested_quanto: self.exit_requested_quanto,
+            bond_release_quanto: self.bond_release_quanto,
+            participation_credits: self.participation_credits,
+            participation_opportunities: self.participation_opportunities,
+            consensus_key_expiry_quanto: self.consensus_key_expiry_quanto,
+            consensus_key_revoked: self.consensus_key_revoked,
+            retired_consensus_keys: self.retired_consensus_keys,
+            // KM#9 default: not frozen → behavior-identical to the pre-KM#9 entry.
+            frozen_until_quanto: 0,
         }
     }
 }
@@ -845,12 +967,18 @@ impl ValidatorV7EntryV1 {
 /// only (the stored bytes are NOT rewritten here), so it introduces no
 /// state-root change; the first real registry write persists the V2 form.
 pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
-    // Current format first: a real V3 registry always decodes here. A shorter V2
-    // or V1 one won't (V3 appends the #20 fields, so a V2/V1 registry runs out of
-    // bytes and borsh fails cleanly with EOF). An empty registry (`[0,0,0,0]`) is a
-    // valid empty V3 and decodes here directly.
-    if let Ok(v3) = ValidatorV7Registry::try_from_slice(data) {
-        return Some(v3);
+    // Current format first (V4, KM#9): a real V4 registry always decodes here. A
+    // shorter V3/V2/V1 one won't (V4 appends `frozen_until_quanto` per entry, so an
+    // older registry runs out of bytes and borsh fails cleanly with EOF). An empty
+    // registry (`[0,0,0,0]`) is a valid empty V4 and decodes here directly.
+    if let Ok(v4) = ValidatorV7Registry::try_from_slice(data) {
+        return Some(v4);
+    }
+    // Prior (V3) layout without the KM#9 freeze field → migrate (default it to 0).
+    if let Ok(v3) = ValidatorV7RegistryV3::try_from_slice(data) {
+        return Some(ValidatorV7Registry {
+            validators: v3.validators.into_iter().map(|e| e.migrate()).collect(),
+        });
     }
     // Prior role-separated layout without the #20 fields → migrate (default them).
     if let Ok(v2) = ValidatorV7RegistryV2::try_from_slice(data) {
@@ -883,22 +1011,26 @@ pub fn decode_registry(data: &[u8]) -> Option<ValidatorV7Registry> {
 /// persisted bytes stay the plain V2 form the running node already understands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegistrySchema {
-    /// Pre-role-separation layout (v6.3.x .. v6.19.0) — migratable to V3.
+    /// Pre-role-separation layout (v6.3.x .. v6.19.0) — migratable to V4.
     V1Legacy,
     /// Role-separated layout WITHOUT the #20 advanced key-role fields
-    /// (v6.19.0 .. v8.6.15) — migratable to V3 (default the #20 fields).
+    /// (v6.19.0 .. v8.6.15) — migratable to V4 (default the #20 + KM#9 fields).
     V2Prior,
-    /// Current layout, with the #20 advanced key-role fields (v8.6.16+).
-    V3Current,
+    /// Layout with the #20 advanced key-role fields but WITHOUT the KM#9
+    /// `frozen_until_quanto` field (v8.6.16 .. v8.6.34) — migratable to V4.
+    V3Prior,
+    /// Current layout, with the KM#9 emergency-freeze field (v8.6.35+).
+    V4Current,
 }
 
 impl RegistrySchema {
-    /// The explicit numeric schema version (1, 2, or 3).
+    /// The explicit numeric schema version (1, 2, 3, or 4).
     pub fn version(&self) -> u16 {
         match self {
             RegistrySchema::V1Legacy => 1,
             RegistrySchema::V2Prior => 2,
-            RegistrySchema::V3Current => 3,
+            RegistrySchema::V3Prior => 3,
+            RegistrySchema::V4Current => 4,
         }
     }
 }
@@ -908,7 +1040,8 @@ impl std::fmt::Display for RegistrySchema {
         match self {
             RegistrySchema::V1Legacy => write!(f, "V1 (legacy, pre-role-separation)"),
             RegistrySchema::V2Prior => write!(f, "V2 (prior, pre-#20 key-role fields)"),
-            RegistrySchema::V3Current => write!(f, "V3 (current)"),
+            RegistrySchema::V3Prior => write!(f, "V3 (prior, pre-KM#9 freeze field)"),
+            RegistrySchema::V4Current => write!(f, "V4 (current)"),
         }
     }
 }
@@ -916,11 +1049,14 @@ impl std::fmt::Display for RegistrySchema {
 /// Report the EXPLICIT schema of a registry's on-disk `data`, or `None` if the
 /// bytes match no known version (genuinely corrupt — the caller must fail-loud,
 /// never guess). Same structural detection `decode_registry` uses, surfaced as a
-/// named value (see [`RegistrySchema`]). V3 is tried first (a V2/V1 registry has
+/// named value (see [`RegistrySchema`]). V4 is tried first (an older registry has
 /// fewer bytes and fails it cleanly), so the newest matching layout is reported.
 pub fn detect_registry_schema(data: &[u8]) -> Option<RegistrySchema> {
     if ValidatorV7Registry::try_from_slice(data).is_ok() {
-        return Some(RegistrySchema::V3Current);
+        return Some(RegistrySchema::V4Current);
+    }
+    if ValidatorV7RegistryV3::try_from_slice(data).is_ok() {
+        return Some(RegistrySchema::V3Prior);
     }
     if ValidatorV7RegistryV2::try_from_slice(data).is_ok() {
         return Some(RegistrySchema::V2Prior);
@@ -956,14 +1092,14 @@ pub enum RegistryMigration {
 /// result yields `AlreadyCurrent` (migrating twice is a no-op).
 pub fn plan_registry_migration(data: &[u8]) -> RegistryMigration {
     match detect_registry_schema(data) {
-        Some(RegistrySchema::V3Current) => {
-            let reg = ValidatorV7Registry::try_from_slice(data).expect("just detected as V3");
+        Some(RegistrySchema::V4Current) => {
+            let reg = ValidatorV7Registry::try_from_slice(data).expect("just detected as V4");
             RegistryMigration::AlreadyCurrent { validators: reg.validators.len() }
         }
-        Some(RegistrySchema::V2Prior) | Some(RegistrySchema::V1Legacy) => {
-            // `decode_registry` migrates V2/V1 -> V3 in memory; encode that as the
+        Some(RegistrySchema::V3Prior) | Some(RegistrySchema::V2Prior) | Some(RegistrySchema::V1Legacy) => {
+            // `decode_registry` migrates V3/V2/V1 -> V4 in memory; encode that as the
             // bytes to persist.
-            let reg = decode_registry(data).expect("V2/V1 detected, so it decodes+migrates");
+            let reg = decode_registry(data).expect("V3/V2/V1 detected, so it decodes+migrates");
             let new_bytes = encode_registry(&reg);
             RegistryMigration::Migrated { validators: reg.validators.len(), new_bytes }
         }
@@ -1102,6 +1238,149 @@ fn write_consensus_rotation_registry(accounts: &mut HashMap<Pubkey, Account>, r:
     Ok(())
 }
 
+// ── KM#9: hash-chained key-management audit trail ────────────────────────────
+//
+// Every security-sensitive key-lifecycle event of a validator (emergency
+// freeze/unfreeze, mandatory rotation/expiry, revoke by recovery) is APPENDED to
+// an on-chain log where each entry commits to the previous one's hash, and the
+// log's `head_hash` commits to the ENTIRE history. Since the log lives in
+// committed state it's already tamper-evident by consensus; the hash chain adds a
+// COMPACT commitment (the head hash) that a light-client / external auditor can
+// verify against the full log without trusting the node, and tamper-evidence even
+// if the log is exported off-chain.
+
+/// KM audit event codes (stable — a new event appends, never reorders).
+pub const KM_AUDIT_FREEZE: u8 = 1;
+pub const KM_AUDIT_UNFREEZE: u8 = 2;
+pub const KM_AUDIT_SET_EXPIRY: u8 = 3;
+pub const KM_AUDIT_REVOKE: u8 = 4;
+
+/// Retained tail of the audit log (bounded, anti-bloat). The `head_hash` still
+/// commits to ALL appended entries even after older ones are evicted, so the
+/// chain integrity of the retained suffix + its link to `head_hash` remains
+/// verifiable. Generous: a validator's key lifecycle produces few such events.
+pub const MAX_KM_AUDIT_ENTRIES: usize = 256;
+
+/// (KM#9) One entry in the hash-chained KM audit trail.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct KmAuditEntry {
+    /// Monotonic sequence number (0-based), never reused.
+    pub seq: u64,
+    /// The `entry_hash` of the previous entry (`[0u8;32]` for the first).
+    pub prev_hash: [u8; 32],
+    /// Event code (`KM_AUDIT_*`).
+    pub event: u8,
+    /// The validator this event is about (its consensus address).
+    pub consensus_address: Pubkey,
+    /// The quanto the event was applied.
+    pub quanto: u64,
+    /// Event-specific detail (a `until_quanto` for freeze/set-expiry, else 0).
+    pub detail: u64,
+    /// `SHA3-256(KM_AUDIT_V1 ‖ prev_hash ‖ seq ‖ event ‖ addr ‖ quanto ‖ detail)`.
+    pub entry_hash: [u8; 32],
+}
+
+/// (KM#9) The KM audit-log singleton (`VALIDATOR_KM_AUDIT_LOG_ID.data`). Additive:
+/// absent/empty on a network that hasn't opted in. `head_hash` commits to the WHOLE
+/// history (including pruned entries); `count` is the total ever appended.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct KmAuditLog {
+    pub head_hash: [u8; 32],
+    pub count: u64,
+    pub entries: Vec<KmAuditEntry>,
+}
+
+/// Compute an entry's chained hash. Deterministic → every node computes the same
+/// hash from the same committed inputs (no fork).
+pub fn km_audit_entry_hash(prev_hash: &[u8; 32], seq: u64, event: u8, addr: &Pubkey, quanto: u64, detail: u64) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(qchain_crypto::domains::KM_AUDIT_V1);
+    h.update(prev_hash);
+    h.update(seq.to_le_bytes());
+    h.update([event]);
+    h.update(addr.0);
+    h.update(quanto.to_le_bytes());
+    h.update(detail.to_le_bytes());
+    let out = h.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&out);
+    hash
+}
+
+impl KmAuditLog {
+    /// Append an event, chaining to the current head. Evicts the oldest retained
+    /// entry beyond the cap (the `head_hash` still commits to it).
+    pub fn append(&mut self, event: u8, addr: &Pubkey, quanto: u64, detail: u64) {
+        let seq = self.count; // 0-based; monotonic.
+        let prev_hash = self.head_hash;
+        let entry_hash = km_audit_entry_hash(&prev_hash, seq, event, addr, quanto, detail);
+        self.entries.push(KmAuditEntry { seq, prev_hash, event, consensus_address: *addr, quanto, detail, entry_hash });
+        while self.entries.len() > MAX_KM_AUDIT_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.head_hash = entry_hash;
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// Verify the retained suffix is internally chained and links to `head_hash`.
+    /// Returns `Err` naming the first inconsistency. (Pruned entries can't be
+    /// re-derived, but the retained chain + its head link is tamper-evident.)
+    pub fn verify(&self) -> Result<(), String> {
+        if self.entries.is_empty() {
+            // An empty retained log is consistent iff head_hash is the zero seed
+            // AND count is 0, OR count>0 (everything was pruned — can't check the
+            // suffix, but head_hash still commits to history; treat as OK).
+            return Ok(());
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            let expect = km_audit_entry_hash(&e.prev_hash, e.seq, e.event, &e.consensus_address, e.quanto, e.detail);
+            if expect != e.entry_hash {
+                return Err(format!("audit entry seq {} hash mismatch (tampered)", e.seq));
+            }
+            if i > 0 && self.entries[i - 1].entry_hash != e.prev_hash {
+                return Err(format!("audit chain broken between seq {} and {}", self.entries[i - 1].seq, e.seq));
+            }
+        }
+        if self.entries.last().unwrap().entry_hash != self.head_hash {
+            return Err("audit head_hash does not match the last entry".into());
+        }
+        Ok(())
+    }
+}
+
+/// (KM#9) Read the KM audit-log singleton, LAZILY DEFAULTED like the other KM
+/// singletons: absent/empty → empty; present-but-undecodable → fail-loud.
+fn read_km_audit_log(accounts: &HashMap<Pubkey, Account>) -> KmAuditLog {
+    match accounts.get(&VALIDATOR_KM_AUDIT_LOG_ID) {
+        None => KmAuditLog::default(),
+        Some(a) if a.data.is_empty() => KmAuditLog::default(),
+        Some(a) => KmAuditLog::try_from_slice(&a.data).unwrap_or_else(|_| {
+            panic!(
+                "VALIDATOR_KM_AUDIT_LOG (v7) is present but does not decode — refusing \
+                 to run on a corrupt KM audit log (restore from a good backup / re-sync)"
+            )
+        }),
+    }
+}
+
+fn write_km_audit_log(accounts: &mut HashMap<Pubkey, Account>, log: &KmAuditLog) -> Result<(), ExecError> {
+    let acct = accounts.entry(VALIDATOR_KM_AUDIT_LOG_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
+    acct.data = borsh::to_vec(log).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+    Ok(())
+}
+
+/// (KM#9) Read the audit log, append one event chained to the head, write it back.
+fn append_km_audit(accounts: &mut HashMap<Pubkey, Account>, event: u8, addr: &Pubkey, quanto: u64, detail: u64) -> Result<(), ExecError> {
+    let mut log = read_km_audit_log(accounts);
+    log.append(event, addr, quanto, detail);
+    write_km_audit_log(accounts, &log)
+}
+
+/// Read the KM audit log (public, for RPC/tools).
+pub fn km_audit_log(accounts: &HashMap<Pubkey, Account>) -> KmAuditLog {
+    read_km_audit_log(accounts)
+}
+
 fn current_quanto(accounts: &HashMap<Pubkey, Account>) -> u64 {
     crate::staking_v7::global_state(accounts).current_quanto
 }
@@ -1138,7 +1417,7 @@ impl ValidatorV7Program {
             ValidatorV7Instruction::RevokeConsensusKey { consensus_address } => Self::revoke_consensus_key(accounts, instruction, payer, consensus_address),
             ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address, expiry_quanto } => Self::set_consensus_key_expiry(accounts, instruction, payer, consensus_address, expiry_quanto),
             ValidatorV7Instruction::SetRecoveryCommittee { consensus_address, config } => Self::set_recovery_committee(accounts, instruction, payer, consensus_address, config),
-            ValidatorV7Instruction::RecoverRevoke { consensus_address, op, approvals } => Self::recover_revoke(accounts, instruction, payer, consensus_address, op, approvals),
+            ValidatorV7Instruction::RecoverOp { consensus_address, op, approvals } => Self::recover_op(accounts, instruction, payer, consensus_address, op, approvals),
             ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address, kind } => Self::apply_pending_key_change(accounts, instruction, payer, consensus_address, kind),
             ValidatorV7Instruction::CancelPendingKeyChange { consensus_address, kind } => Self::cancel_pending_key_change(accounts, instruction, payer, consensus_address, kind),
             ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address, new_bundle, new_p2p_address } => Self::propose_consensus_key_rotation(accounts, instruction, payer, consensus_address, new_bundle, new_p2p_address),
@@ -1302,23 +1581,31 @@ impl ValidatorV7Program {
         Ok(())
     }
 
-    /// (KM#4) REVOKE a validator using its OFFLINE recovery committee — WITHOUT any
-    /// of the (possibly compromised) consensus/operator keys. Permissionless: the M
-    /// offline signatures are the authorization; the payer is a fee relayer.
-    /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL].
-    fn recover_revoke(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
-        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[1]".into()))?;
-        let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[2]".into()))?;
-        let escrow_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[3]".into()))?;
-        let unbonding_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[4]".into()))?;
-        let global_pk = *ix.accounts.get(5).ok_or_else(|| ExecError::ProgramError("RecoverRevoke requires accounts[5]".into()))?;
+    /// (KM#4/#9) Apply a RECOVERY-COMMITTEE-authorized operation to a validator —
+    /// WITHOUT any of the (possibly compromised) consensus/operator keys.
+    /// Permissionless: the M offline signatures are the authorization; the payer is
+    /// a fee relayer. `op` selects the effect:
+    /// - **Revoke** (KM#4) — terminal hard-exit (bond → unbonding, state `Revoked`).
+    /// - **Freeze/Unfreeze** (KM#9) — REVERSIBLE emergency pause (no money move).
+    /// - **SetExpiry** (KM#9) — mandatory consensus-key rotation deadline.
+    ///
+    /// Every op is APPENDED to the hash-chained KM audit trail. accounts =
+    /// [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL, KM_AUDIT_LOG].
+    fn recover_op(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
+        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[1]".into()))?;
+        let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[2]".into()))?;
+        let escrow_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[3]".into()))?;
+        let unbonding_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[4]".into()))?;
+        let global_pk = *ix.accounts.get(5).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[5]".into()))?;
+        let audit_pk = *ix.accounts.get(6).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[6] (KM audit log)".into()))?;
         if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID
             || recovery_pk != VALIDATOR_RECOVERY_REGISTRY_ID
             || escrow_pk != VALIDATOR_BOND_ESCROW_ID
             || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID
             || global_pk != STAKING_GLOBAL_ID
+            || audit_pk != VALIDATOR_KM_AUDIT_LOG_ID
         {
-            return Err(ExecError::Unauthorized("RecoverRevoke must name the canonical accounts".into()));
+            return Err(ExecError::Unauthorized("RecoverOp must name the canonical accounts".into()));
         }
         // Recovery committee + current nonce.
         let mut rec = read_recovery_registry(accounts);
@@ -1329,7 +1616,8 @@ impl ValidatorV7Program {
         }
         let signer_set: std::collections::HashSet<Pubkey> = rec.entries[ridx].config.signers.iter().copied().collect();
         let nonce = rec.entries[ridx].nonce;
-        // The exact bytes each recovery signer signed OFFLINE.
+        // The exact bytes each recovery signer signed OFFLINE — binds the op TAG and
+        // its PARAMETER, so an approval for one op/param can't authorize another.
         let msg = recovery_message(&consensus_address, op, nonce);
         // Count DISTINCT valid approvals from REGISTERED signers. An approval whose
         // signer isn't registered, or whose signature doesn't verify, is IGNORED
@@ -1350,46 +1638,79 @@ impl ValidatorV7Program {
                 counted.len()
             )));
         }
-        // Authorized. Hard-exit the validator (bond → unbonding, state → Revoked),
-        // mirroring `begin_exit`'s money move so the bond stays slashable through
-        // the evidence window; `Revoked` is terminal and the (compromised) operator
-        // cannot undo it.
+        // Authorized. Apply the op.
+        let q = current_quanto(accounts);
         let mut reg = read_registry(accounts);
         let vidx = reg.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
-        let state = reg.validators[vidx].state;
-        if !matches!(state, ValidatorV7State::BondedPending | ValidatorV7State::Active | ValidatorV7State::Jailed) {
-            return Err(ExecError::ProgramError("validator is not in a revocable state".into()));
-        }
-        let escrow_bal = accounts.get(&escrow_pk).map(|a| a.balance).unwrap_or(0);
-        if escrow_bal < VALIDATOR_BOND_ATOMS {
-            return Err(ExecError::ProgramError("bond escrow underfunded (invariant violation)".into()));
-        }
-        { let a = accounts.get_mut(&escrow_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
-        credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS)?;
-        let q = current_quanto(accounts);
-        {
-            let e = &mut reg.validators[vidx];
-            e.state = ValidatorV7State::Revoked;
-            e.exit_requested_quanto = q;
-            e.bond_release_quanto = q.saturating_add(VALIDATOR_BOND_UNBONDING_QUANTOS.max(SLASH_EVIDENCE_WINDOW_QUANTOS));
-        }
+        let (audit_event, audit_detail) = match op {
+            RecoveryOp::Revoke => {
+                // Terminal hard-exit (bond → unbonding, state → Revoked), mirroring
+                // `begin_exit`'s money move so the bond stays slashable through the
+                // evidence window; `Revoked` is terminal — the (compromised) operator
+                // cannot undo it.
+                let state = reg.validators[vidx].state;
+                if !matches!(state, ValidatorV7State::BondedPending | ValidatorV7State::Active | ValidatorV7State::Jailed) {
+                    return Err(ExecError::ProgramError("validator is not in a revocable state".into()));
+                }
+                let escrow_bal = accounts.get(&escrow_pk).map(|a| a.balance).unwrap_or(0);
+                if escrow_bal < VALIDATOR_BOND_ATOMS {
+                    return Err(ExecError::ProgramError("bond escrow underfunded (invariant violation)".into()));
+                }
+                { let a = accounts.get_mut(&escrow_pk).unwrap(); a.balance = crate::arith::sub_u64(a.balance, VALIDATOR_BOND_ATOMS)?; }
+                credit(accounts, &unbonding_pk, STAKING_PROGRAM_ID, VALIDATOR_BOND_ATOMS)?;
+                {
+                    let e = &mut reg.validators[vidx];
+                    e.state = ValidatorV7State::Revoked;
+                    e.exit_requested_quanto = q;
+                    e.bond_release_quanto = q.saturating_add(VALIDATOR_BOND_UNBONDING_QUANTOS.max(SLASH_EVIDENCE_WINDOW_QUANTOS));
+                }
+                (KM_AUDIT_REVOKE, 0)
+            }
+            RecoveryOp::Freeze { until_quanto } => {
+                // Reversible emergency PAUSE — no money move; bond stays escrowed and
+                // state stays as-is. Excluded from committee+fees via
+                // `consensus_key_disabled`. A `Revoked`/`Removed` validator can't be
+                // frozen (nothing to pause).
+                let state = reg.validators[vidx].state;
+                if matches!(state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
+                    return Err(ExecError::ProgramError("validator is not in a freezable state".into()));
+                }
+                if until_quanto == 0 {
+                    return Err(ExecError::ProgramError("freeze until_quanto must be non-zero (use Unfreeze to lift)".into()));
+                }
+                reg.validators[vidx].frozen_until_quanto = until_quanto;
+                (KM_AUDIT_FREEZE, until_quanto)
+            }
+            RecoveryOp::Unfreeze => {
+                reg.validators[vidx].frozen_until_quanto = 0;
+                (KM_AUDIT_UNFREEZE, 0)
+            }
+            RecoveryOp::SetExpiry { until_quanto } => {
+                // Mandatory consensus-key rotation deadline imposed by the guardians.
+                reg.validators[vidx].consensus_key_expiry_quanto = until_quanto;
+                (KM_AUDIT_SET_EXPIRY, until_quanto)
+            }
+        };
         write_registry(accounts, &reg)?;
-        // (KM#5) A revoked validator is terminal; any pending timelocked cold-key
-        // change for it is moot (and must never apply post-revoke) — drop it.
-        let mut tl = read_key_timelock_registry(accounts);
-        if tl.find(&consensus_address, KeyChangeKind::Operator).is_some()
-            || tl.find(&consensus_address, KeyChangeKind::Withdrawal).is_some()
-            || tl.find(&consensus_address, KeyChangeKind::RecoveryCommittee).is_some()
-        {
-            tl.purge(&consensus_address);
-            write_key_timelock_registry(accounts, &tl)?;
+        // Revoke is terminal → drop any pending timelocked cold-key changes (KM#5)
+        // and any pending two-phase consensus rotation (KM#6).
+        if matches!(op, RecoveryOp::Revoke) {
+            let mut tl = read_key_timelock_registry(accounts);
+            if tl.find(&consensus_address, KeyChangeKind::Operator).is_some()
+                || tl.find(&consensus_address, KeyChangeKind::Withdrawal).is_some()
+                || tl.find(&consensus_address, KeyChangeKind::RecoveryCommittee).is_some()
+            {
+                tl.purge(&consensus_address);
+                write_key_timelock_registry(accounts, &tl)?;
+            }
+            let mut cr = read_consensus_rotation_registry(accounts);
+            if cr.find(&consensus_address).is_some() {
+                cr.purge(&consensus_address);
+                write_consensus_rotation_registry(accounts, &cr)?;
+            }
         }
-        // (KM#6) Likewise drop any pending two-phase consensus-key rotation.
-        let mut cr = read_consensus_rotation_registry(accounts);
-        if cr.find(&consensus_address).is_some() {
-            cr.purge(&consensus_address);
-            write_consensus_rotation_registry(accounts, &cr)?;
-        }
+        // Append the event to the hash-chained KM audit trail (KM#9).
+        append_km_audit(accounts, audit_event, &consensus_address, q, audit_detail)?;
         // Bump the recovery nonce so this collected authorization can't be replayed.
         rec.entries[ridx].nonce = nonce.saturating_add(1);
         write_recovery_registry(accounts, &rec)?;
@@ -1756,6 +2077,8 @@ impl ValidatorV7Program {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            // KM#9: a fresh registration is never frozen.
+            frozen_until_quanto: 0,
         };
         match reg.find(&consensus_addr) {
             Some(idx) => reg.validators[idx] = entry, // re-register a Removed slot
@@ -2101,8 +2424,18 @@ mod tests {
         RecoveryApproval { bundle: signer.public_key_bundle(), signature: sig }
     }
     fn revoke(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, consensus: Pubkey, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
-        let data = ValidatorV7Instruction::RecoverRevoke { consensus_address: consensus, op: RecoveryOp::Revoke, approvals };
-        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID]), &relayer.pubkey())
+        recover_op_tx(accounts, relayer, consensus, RecoveryOp::Revoke, approvals)
+    }
+    /// One recovery signer's OFFLINE approval of `op` on `consensus` at `nonce`.
+    fn approve_op(signer: &Keypair, consensus: Pubkey, op: RecoveryOp, nonce: u64) -> RecoveryApproval {
+        let msg = recovery_message(&consensus, op, nonce);
+        let sig = qchain_crypto::sign_domain(signer, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg).unwrap();
+        RecoveryApproval { bundle: signer.public_key_bundle(), signature: sig }
+    }
+    /// Submit a `RecoverOp` (KM#4/#9) with the canonical account list (incl. the KM audit log).
+    fn recover_op_tx(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, consensus: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
+        let data = ValidatorV7Instruction::RecoverOp { consensus_address: consensus, op, approvals };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID]), &relayer.pubkey())
     }
 
     #[test]
@@ -2257,6 +2590,250 @@ mod tests {
         assert_eq!(accounts.get(&withdrawal).unwrap().balance, VALIDATOR_BOND_ATOMS, "revoked bond recovered to the cold withdrawal address");
     }
 
+    // ─── KM#9: emergency freeze + expiry + hash-chained audit trail ────────────
+
+    /// One recovery signer's OFFLINE approval of `op` on `consensus` at `nonce`,
+    /// then submit the collected approvals as a `RecoverOp`.
+    fn recover_op(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, consensus: Pubkey, op: RecoveryOp, signers: &[&Keypair], nonce: u64) -> Result<(), ExecError> {
+        let approvals: Vec<RecoveryApproval> = signers.iter().map(|s| approve_op(s, consensus, op, nonce)).collect();
+        recover_op_tx(accounts, relayer, consensus, op, approvals)
+    }
+
+    /// KM#9 (A): the recovery committee can FREEZE a validator (reversible emergency
+    /// pause) and later UNFREEZE it — via the SAME M-of-N offline authorization as a
+    /// revoke. A freeze drops it from the active committee and fee eligibility
+    /// WITHOUT moving the bond or changing its state; unfreeze restores it.
+    #[test]
+    fn emergency_freeze_then_unfreeze_via_recovery_committee_without_moving_the_bond() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "freeze-node").unwrap();
+        // Activate it (flip committed state) so it would be in the committee.
+        { let mut r = read_registry(&accounts); r.validators[0].state = ValidatorV7State::Active; write_registry(&mut accounts, &r).unwrap(); }
+        set_quanto(&mut accounts, 5);
+        assert_eq!(active_committee(&registry_of(&accounts), 5).len(), 1, "active before freeze");
+
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        set_quanto(&mut accounts, 5); // set_recovery_now advanced the quanto; reset to 5.
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // FREEZE until quanto 100 (2-of-3).
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 100 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        let e = &registry_of(&accounts).validators[0];
+        assert_eq!(e.frozen_until_quanto, 100, "frozen until 100");
+        assert_eq!(e.state, ValidatorV7State::Active, "state unchanged (reversible pause, not a revoke)");
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "bond NOT moved — no money move on freeze");
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).map(|a| a.balance).unwrap_or(0), 0, "nothing went to the unbonding pool");
+        // Excluded from the committee AND fee eligibility while frozen (before quanto 100).
+        assert!(active_committee(&registry_of(&accounts), 5).is_empty(), "frozen validator is out of the committee");
+        assert!(!crate::fees_v7::is_eligible(e, 5), "frozen validator is not fee-eligible");
+        // At/after the freeze deadline it auto-unfreezes (the pause is time-bounded).
+        assert_eq!(active_committee(&registry_of(&accounts), 100).len(), 1, "auto-unfreezes at the deadline quanto");
+
+        // UNFREEZE early (2-of-3), nonce is now 1 (the freeze bumped it).
+        assert_eq!(recovery_of(&accounts).entries[0].nonce, 1, "nonce bumped by the freeze");
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Unfreeze, &[&signer_kps[1], &signer_kps[2]], 1).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 0, "unfrozen");
+        assert_eq!(active_committee(&registry_of(&accounts), 5).len(), 1, "back in the committee after unfreeze");
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "bond still escrowed throughout");
+    }
+
+    /// KM#9: a freeze — like a revoke — needs a QUORUM of DISTINCT registered
+    /// recovery signers; below quorum it's rejected and the validator stays un-frozen.
+    #[test]
+    fn emergency_freeze_requires_a_quorum_of_distinct_registered_signers() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "freeze-q").unwrap();
+        let signer_kps: Vec<Keypair> = (0..5).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // 2 < threshold 3 → rejected, not frozen.
+        assert!(recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 50 }, &[&signer_kps[0], &signer_kps[1]], 0).is_err(), "below quorum rejected");
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 0, "not frozen below quorum");
+        // Duplicates + a non-member don't reach quorum: [s0, s0, stranger] = 1 distinct.
+        let stranger = Keypair::generate().unwrap();
+        let op_f = RecoveryOp::Freeze { until_quanto: 50 };
+        let padded = vec![approve_op(&signer_kps[0], cons.pubkey(), op_f, 0), approve_op(&signer_kps[0], cons.pubkey(), op_f, 0), approve_op(&stranger, cons.pubkey(), op_f, 0)];
+        assert!(recover_op_tx(&mut accounts, &relayer, cons.pubkey(), op_f, padded).is_err(), "dups + non-member don't reach quorum");
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 0, "still not frozen");
+        // 3 distinct registered signers → accepted.
+        recover_op(&mut accounts, &relayer, cons.pubkey(), op_f, &[&signer_kps[0], &signer_kps[2], &signer_kps[4]], 0).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 50, "frozen at quorum");
+        // freeze until_quanto 0 is rejected (use Unfreeze to lift).
+        assert!(recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 0 }, &[&signer_kps[0], &signer_kps[2], &signer_kps[4]], 1).is_err(), "freeze until 0 rejected");
+    }
+
+    /// KM#9: a recovery approval binds the op TAG + its PARAMETER + the nonce, so an
+    /// approval for one op/param/nonce can't authorize another — closing replay and
+    /// op-confusion.
+    #[test]
+    fn a_recovery_approval_is_bound_to_its_op_param_and_nonce() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "bind-node").unwrap();
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // Signatures collected for Freeze{until=100} at nonce 0.
+        let f100_n0 = vec![approve_op(&signer_kps[0], cons.pubkey(), RecoveryOp::Freeze { until_quanto: 100 }, 0), approve_op(&signer_kps[1], cons.pubkey(), RecoveryOp::Freeze { until_quanto: 100 }, 0)];
+        // …do NOT authorize Unfreeze (different op tag).
+        assert!(recover_op_tx(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Unfreeze, f100_n0.clone()).is_err(), "freeze approval can't authorize unfreeze");
+        // …do NOT authorize Freeze{until=200} (different param).
+        assert!(recover_op_tx(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 200 }, f100_n0.clone()).is_err(), "freeze-100 approval can't authorize freeze-200");
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 0, "nothing applied yet");
+        // The exact op DOES apply → bumps nonce to 1.
+        recover_op_tx(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 100 }, f100_n0.clone()).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].frozen_until_quanto, 100);
+        // REPLAY of the same nonce-0 approvals is now rejected (nonce moved to 1).
+        assert!(recover_op_tx(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 100 }, f100_n0).is_err(), "replayed old-nonce authorization rejected");
+    }
+
+    /// KM#9 (B): the recovery committee can impose a MANDATORY consensus-key rotation
+    /// deadline (SetExpiry). At/after that quanto the consensus key is disabled →
+    /// dropped from the committee (the operator must rotate before then).
+    #[test]
+    fn recovery_committee_can_impose_a_mandatory_consensus_key_rotation_deadline() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "expiry-node").unwrap();
+        { let mut r = read_registry(&accounts); r.validators[0].state = ValidatorV7State::Active; write_registry(&mut accounts, &r).unwrap(); }
+        set_quanto(&mut accounts, 5);
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        set_quanto(&mut accounts, 5);
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::SetExpiry { until_quanto: 20 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        let e = registry_of(&accounts).validators[0].clone();
+        assert_eq!(e.consensus_key_expiry_quanto, 20, "mandatory rotation deadline set");
+        // Before the deadline: still active.
+        assert!(!e.consensus_key_disabled(19), "active before the deadline");
+        assert_eq!(active_committee(&registry_of(&accounts), 19).len(), 1);
+        // At/after the deadline: disabled → dropped.
+        assert!(e.consensus_key_disabled(20), "disabled at the deadline");
+        assert!(active_committee(&registry_of(&accounts), 20).is_empty(), "dropped once the mandatory rotation deadline passes");
+    }
+
+    /// KM#9 (C): the KM audit trail is hash-chained and tamper-evident. A sequence of
+    /// key-management ops appends chained entries; `head_hash` commits to the last;
+    /// `verify()` passes; tampering any field breaks the chain.
+    #[test]
+    fn the_km_audit_trail_is_hash_chained_and_tamper_evident() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "audit-node").unwrap();
+        set_quanto(&mut accounts, 3);
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        set_quanto(&mut accounts, 3);
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // Empty log before any KM event.
+        assert_eq!(km_audit_log(&accounts).count, 0);
+        // Freeze (nonce 0) → SetExpiry (nonce 1) → Unfreeze (nonce 2): 3 chained events.
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Freeze { until_quanto: 90 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::SetExpiry { until_quanto: 200 }, &[&signer_kps[0], &signer_kps[1]], 1).unwrap();
+        recover_op(&mut accounts, &relayer, cons.pubkey(), RecoveryOp::Unfreeze, &[&signer_kps[0], &signer_kps[1]], 2).unwrap();
+
+        let log = km_audit_log(&accounts);
+        assert_eq!(log.count, 3, "three events appended");
+        assert_eq!(log.entries.len(), 3);
+        // Events + details recorded in order, chained.
+        assert_eq!((log.entries[0].event, log.entries[0].detail), (KM_AUDIT_FREEZE, 90));
+        assert_eq!((log.entries[1].event, log.entries[1].detail), (KM_AUDIT_SET_EXPIRY, 200));
+        assert_eq!((log.entries[2].event, log.entries[2].detail), (KM_AUDIT_UNFREEZE, 0));
+        assert_eq!(log.entries[0].prev_hash, [0u8; 32], "genesis prev_hash is zero");
+        assert_eq!(log.entries[1].prev_hash, log.entries[0].entry_hash, "chained");
+        assert_eq!(log.entries[2].prev_hash, log.entries[1].entry_hash, "chained");
+        assert_eq!(log.head_hash, log.entries[2].entry_hash, "head commits to the last entry");
+        assert!(log.verify().is_ok(), "the chain verifies");
+
+        // Tampering a recorded field (without recomputing the hash) breaks verify.
+        let mut tampered = log.clone();
+        tampered.entries[1].detail = 999;
+        assert!(tampered.verify().is_err(), "tampered detail is caught");
+        // Tampering the entry_hash of a link breaks the chain link too.
+        let mut tampered2 = log.clone();
+        tampered2.entries[0].entry_hash = [7u8; 32];
+        assert!(tampered2.verify().is_err(), "tampered entry_hash breaks the chain");
+    }
+
+    /// KM#9: a prior (V3, pre-KM#9) registry migrates to V4 on read with
+    /// `frozen_until_quanto` DEFAULTED to 0 (behavior-identical: never frozen); a V4
+    /// registry round-trips and a V3 one doesn't cross-decode as V4.
+    #[test]
+    fn a_v3_registry_migrates_to_v4_with_frozen_defaulted() {
+        let v = Keypair::generate().unwrap();
+        let (op, wd) = (Pubkey::new([9u8; 32]), Pubkey::new([8u8; 32]));
+        let v3 = ValidatorV7RegistryV3 {
+            validators: vec![ValidatorV7EntryV3 {
+                address: v.pubkey(),
+                operator_address: op,
+                withdrawal_address: wd,
+                moniker: "prior3".to_string(),
+                pubkey_bundle: v.public_key_bundle(),
+                p2p_address: "1.2.3.4:9000".to_string(),
+                bond: VALIDATOR_BOND_ATOMS,
+                state: ValidatorV7State::Active,
+                registered_quanto: 2,
+                activation_quanto: 3,
+                exit_requested_quanto: 0,
+                bond_release_quanto: 0,
+                participation_credits: 5,
+                participation_opportunities: 5,
+                consensus_key_expiry_quanto: 0,
+                consensus_key_revoked: false,
+                retired_consensus_keys: Vec::new(),
+            }],
+        };
+        let bytes = borsh::to_vec(&v3).unwrap();
+        assert_eq!(detect_registry_schema(&bytes), Some(RegistrySchema::V3Prior));
+        assert_eq!(RegistrySchema::V3Prior.version(), 3);
+        // A V3 registry must NOT clean-decode as the current V4 (fewer bytes → EOF).
+        assert!(ValidatorV7Registry::try_from_slice(&bytes).is_err(), "V3 must not decode as V4");
+        let migrated = decode_registry(&bytes).expect("V3 migrates, never None");
+        let e = &migrated.validators[0];
+        assert_eq!(e.operator_address, op, "cold operator preserved");
+        assert_eq!(e.withdrawal_address, wd, "cold withdrawal preserved");
+        assert_eq!(e.consensus_key_expiry_quanto, 0);
+        assert!(!e.consensus_key_revoked);
+        // KM#9 default applied → behavior-identical (never frozen).
+        assert_eq!(e.frozen_until_quanto, 0, "frozen defaulted to 0");
+        assert!(!e.is_frozen(1_000_000), "a migrated V3 entry is never frozen");
+        assert!(!e.consensus_key_disabled(1_000_000), "a migrated V3 entry is never disabled");
+        // plan classifies V3 as Migrated; re-planning the V4 is a no-op.
+        let new_bytes = match plan_registry_migration(&bytes) {
+            RegistryMigration::Migrated { validators, new_bytes } => { assert_eq!(validators, 1); new_bytes }
+            _ => panic!("a V3 registry must plan as Migrated"),
+        };
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V4Current));
+        assert!(matches!(plan_registry_migration(&new_bytes), RegistryMigration::AlreadyCurrent { validators: 1 }));
+    }
+
     #[test]
     fn validator_v7_instruction_encoding_is_stable() {
         // Pin the borsh discriminants so a CLI/relayer encoder can't silently drift.
@@ -2266,7 +2843,7 @@ mod tests {
             (ValidatorV7Instruction::BeginExit { consensus_address: cons }, 1),
             (ValidatorV7Instruction::Unjail { consensus_address: cons }, 4),
             (ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: cons, config: RecoveryConfig::default() }, 10),
-            (ValidatorV7Instruction::RecoverRevoke { consensus_address: cons, op: RecoveryOp::Revoke, approvals: vec![] }, 11),
+            (ValidatorV7Instruction::RecoverOp { consensus_address: cons, op: RecoveryOp::Revoke, approvals: vec![] }, 11),
             (ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::Operator }, 12),
             (ValidatorV7Instruction::CancelPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::RecoveryCommittee }, 13),
             (ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address: cons, new_bundle: kp.public_key_bundle(), new_p2p_address: "1.2.3.4:9000".into() }, 14),
@@ -2378,6 +2955,7 @@ mod tests {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            frozen_until_quanto: 0,
         };
         let reg = ValidatorV7Registry {
             validators: vec![
@@ -2584,8 +3162,8 @@ mod tests {
         };
         // The persisted bytes are the exact V3 form the running node reads: they
         // detect as V3, decode losslessly, and match `decode_registry` of the V1.
-        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V3Current));
-        assert_eq!(RegistrySchema::V3Current.version(), 3);
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V4Current));
+        assert_eq!(RegistrySchema::V4Current.version(), 4);
         let migrated = ValidatorV7Registry::try_from_slice(&new_bytes).expect("new bytes are valid V3");
         assert_eq!(encode_registry(&decode_registry(&v1_bytes).unwrap()), new_bytes, "persist == decode_registry's V3");
         assert_eq!(migrated.validators[0].operator_address, addr);
@@ -2599,7 +3177,7 @@ mod tests {
 
         // An empty V3 registry is AlreadyCurrent (0 validators), not V1.
         let empty = encode_registry(&ValidatorV7Registry::default());
-        assert_eq!(detect_registry_schema(&empty), Some(RegistrySchema::V3Current));
+        assert_eq!(detect_registry_schema(&empty), Some(RegistrySchema::V4Current));
         assert!(matches!(plan_registry_migration(&empty), RegistryMigration::AlreadyCurrent { validators: 0 }));
 
         // Genuinely corrupt bytes: no schema, plan refuses (Corrupt).
@@ -2654,7 +3232,7 @@ mod tests {
             RegistryMigration::Migrated { validators, new_bytes } => { assert_eq!(validators, 1); new_bytes }
             _ => panic!("a V2 registry must plan as Migrated"),
         };
-        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V3Current));
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V4Current));
         assert!(matches!(plan_registry_migration(&new_bytes), RegistryMigration::AlreadyCurrent { validators: 1 }));
     }
 

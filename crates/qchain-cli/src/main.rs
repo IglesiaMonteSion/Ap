@@ -13,7 +13,7 @@ use qchain_execution::{
     BURN_ADDRESS, EconomicParams, EMERGENCY_ACCOUNT_ID, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
-use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
+use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_KM_AUDIT_LOG_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
 use qchain_execution::validator_v7::{rotation_accept_message, KeyChangeKind, RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
@@ -74,6 +74,28 @@ fn parse_key_change_kind(s: &str) -> anyhow::Result<KeyChangeKind> {
         "withdrawal" => Ok(KeyChangeKind::Withdrawal),
         "recovery" | "recovery_committee" | "recovery-committee" => Ok(KeyChangeKind::RecoveryCommittee),
         other => anyhow::bail!("invalid --kind '{other}' (expected: operator | withdrawal | recovery)"),
+    }
+}
+
+/// Parse a recovery-committee op (KM#4/#9) from its CLI name + optional deadline.
+/// Both the offline signer and the on-chain relayer MUST parse the SAME op — the
+/// recovery signature binds the op tag + its `until_quanto` param.
+fn parse_recovery_op(s: &str, until_quanto: Option<u64>) -> anyhow::Result<RecoveryOp> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "revoke" => Ok(RecoveryOp::Revoke),
+        "freeze" => {
+            let q = until_quanto.ok_or_else(|| anyhow::anyhow!("--op freeze requires --until-quanto <q> (non-zero)"))?;
+            if q == 0 {
+                anyhow::bail!("--until-quanto must be non-zero for a freeze (use --op unfreeze to lift)");
+            }
+            Ok(RecoveryOp::Freeze { until_quanto: q })
+        }
+        "unfreeze" => Ok(RecoveryOp::Unfreeze),
+        "set-expiry" | "set_expiry" | "setexpiry" => {
+            let q = until_quanto.ok_or_else(|| anyhow::anyhow!("--op set-expiry requires --until-quanto <q>"))?;
+            Ok(RecoveryOp::SetExpiry { until_quanto: q })
+        }
+        other => anyhow::bail!("invalid --op '{other}' (expected: revoke | freeze | unfreeze | set-expiry)"),
     }
 }
 
@@ -511,35 +533,51 @@ enum Command {
         fee_limit: u64,
     },
     /// v7 (KM#4): OFFLINE — a recovery signer signs an authorization to REVOKE a
-    /// validator. Makes NO network call: run it on an air-gapped machine holding a
-    /// recovery key. `--nonce` is the validator's current recovery nonce (from
-    /// `GET /validator_v7_recovery`). Prints a hex-encoded approval for the relayer
-    /// to collect (`v7-recover-revoke --approvals ...`).
+    /// validator's recovery committee. Makes NO network call: run it on an air-gapped
+    /// machine holding a recovery key. `--nonce` is the validator's current recovery
+    /// nonce (from `GET /validator_v7_recovery`). `--op` selects the effect (KM#4/#9):
+    /// `revoke` (terminal), `freeze --until-quanto Q` / `unfreeze` (reversible
+    /// emergency pause), or `set-expiry --until-quanto Q` (mandatory rotation
+    /// deadline). Prints a hex-encoded approval for the relayer to collect
+    /// (`v7-recover-op --approvals ...`).
     V7RecoverySign {
         /// The recovery signer's keypair (offline).
         #[arg(long)]
         recovery_keypair: PathBuf,
-        /// The consensus address of the validator to revoke (base58).
+        /// The consensus address of the validator (base58).
         #[arg(long)]
         consensus_address: String,
         /// The validator's current recovery nonce.
         #[arg(long)]
         recovery_nonce: u64,
+        /// The recovery op: revoke | freeze | unfreeze | set-expiry.
+        #[arg(long, default_value = "revoke")]
+        op: String,
+        /// For freeze/set-expiry: the deadline quanto (must be non-zero for freeze).
+        #[arg(long)]
+        until_quanto: Option<u64>,
     },
-    /// v7 (KM#4): REVOKE a validator using M collected OFFLINE recovery approvals.
-    /// Permissionless: `--keypair` is just the fee relayer. `--approvals` is a
-    /// comma-separated list of the hex approvals produced by `v7-recovery-sign`.
-    V7RecoverRevoke {
+    /// v7 (KM#4/#9): apply a recovery-committee op using M collected OFFLINE
+    /// approvals. Permissionless: `--keypair` is just the fee relayer. `--approvals`
+    /// is a comma-separated list of the hex approvals produced by `v7-recovery-sign`.
+    /// `--op` (and `--until-quanto`) MUST match what the signers approved.
+    V7RecoverOp {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
         #[arg(short, long)]
         keypair: PathBuf,
-        /// The consensus address of the validator to revoke (base58).
+        /// The consensus address of the validator (base58).
         #[arg(long)]
         consensus_address: String,
         /// Comma-separated hex recovery approvals (from `v7-recovery-sign`).
         #[arg(long)]
         approvals: String,
+        /// The recovery op: revoke | freeze | unfreeze | set-expiry.
+        #[arg(long, default_value = "revoke")]
+        op: String,
+        /// For freeze/set-expiry: the deadline quanto (must match what was approved).
+        #[arg(long)]
+        until_quanto: Option<u64>,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -2209,19 +2247,21 @@ fn main() -> anyhow::Result<()> {
                 println!("PROPOSED a {threshold}-of-{} OFFLINE recovery committee for v7 validator {target} (KM#5 timelock ~7d; apply with `v7-apply-key-change --kind recovery` after the window)", signer_pks.len());
             }
         }
-        Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce } => {
+        Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce, op, until_quanto } => {
             let kp = qchain_crypto::read_keypair_file(&recovery_keypair)?;
             let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
-            let msg = qchain_execution::validator_v7::recovery_message(&target, RecoveryOp::Revoke, recovery_nonce);
+            let recovery_op = parse_recovery_op(&op, until_quanto)?;
+            let msg = qchain_execution::validator_v7::recovery_message(&target, recovery_op, recovery_nonce);
             let sig = qchain_crypto::sign_domain(&kp, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg)?;
             let approval = RecoveryApproval { bundle: kp.public_key_bundle(), signature: sig };
             let hex = hex::encode(borsh::to_vec(&approval)?);
-            println!("recovery approval (hex) — give this to the relayer for `v7-recover-revoke --approvals`:");
+            println!("recovery approval (hex) for op `{op}` — give this to the relayer for `v7-recover-op --op {op} --approvals`:");
             println!("{hex}");
         }
-        Command::V7RecoverRevoke { rpc, keypair, consensus_address, approvals, nonce, fee_limit } => {
+        Command::V7RecoverOp { rpc, keypair, consensus_address, approvals, op, until_quanto, nonce, fee_limit } => {
             let relayer = qchain_crypto::read_keypair_file(&keypair)?;
             let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let recovery_op = parse_recovery_op(&op, until_quanto)?;
             let approvals: Vec<RecoveryApproval> = approvals
                 .split(',')
                 .map(|s| s.trim())
@@ -2234,18 +2274,23 @@ fn main() -> anyhow::Result<()> {
             if approvals.is_empty() {
                 anyhow::bail!("--approvals must contain at least one recovery approval");
             }
-            let data = borsh::to_vec(&ValidatorV7Instruction::RecoverRevoke { consensus_address: target, op: RecoveryOp::Revoke, approvals })?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::RecoverOp { consensus_address: target, op: recovery_op, approvals })?;
             let body = submit_instruction(
                 &rpc,
                 &relayer,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID],
                 data,
                 nonce,
                 fee_limit,
             )?;
             println!("submitted: {body}");
-            println!("REVOKED v7 validator {target} via its recovery committee — bond moved to the unbonding pool, dropped from the committee");
+            match recovery_op {
+                RecoveryOp::Revoke => println!("REVOKED v7 validator {target} via its recovery committee — bond moved to the unbonding pool, dropped from the committee"),
+                RecoveryOp::Freeze { until_quanto } => println!("FROZE (emergency pause) v7 validator {target} until quanto {until_quanto} — excluded from the committee + fees, bond untouched (KM#9)"),
+                RecoveryOp::Unfreeze => println!("UNFROZE v7 validator {target} — restored to the committee + fees (KM#9)"),
+                RecoveryOp::SetExpiry { until_quanto } => println!("SET a mandatory consensus-key rotation deadline of quanto {until_quanto} on v7 validator {target} (KM#9) — it must rotate before then or be dropped"),
+            }
         }
         Command::V7Unjail { rpc, keypair, consensus_address, nonce, fee_limit } => {
             let operator = qchain_crypto::read_keypair_file(&keypair)?;

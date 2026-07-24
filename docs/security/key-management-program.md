@@ -23,7 +23,7 @@ documentado como pendiente con su razón, no forzado.
 | 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | **HECHO** (v8.6.32 — `ProposeConsensusKeyRotation` operator + `AcceptConsensusKeyRotation` con PoP de la clave nueva) |
 | 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | **HECHO** (v8.6.33 — binding de chain_id + anti-equivocación de checkpoints + rate-limit) |
 | 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | **HECHO** (v8.6.34 — cifrado en reposo del keypair, opt-in, node-local) |
-| 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | pendiente |
+| 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | **HECHO** (v8.6.35 — freeze/unfreeze reversible + SetExpiry por comité M-de-N + audit trail encadenado por hash) |
 | 10 | Pruebas multinodo + adversariales del ciclo de vida de claves | 10 | pendiente |
 
 ## #1 — Separar la clave de consenso de la clave de red (HECHO, v8.6.29)
@@ -449,12 +449,87 @@ keystore.json --passphrase-file pass.txt`, apuntar el daemon con
 `--keystore-passphrase-file` (o el nodo con `keystore_passphrase_path`), verificar que
 arranca, y recién ahí borrar el `keypair.json` plano.
 
-## #9–#10 — pendientes
+## #9 — Emergency freeze + expiración + audit trail (HECHO, v8.6.35)
 
-Se implementan en orden de prioridad. Notas de diseño resumidas:
+**PROBLEMA.** KM#4 dio un REVOKE **terminal** por el comité de recuperación (salida
+dura, estado `Revoked`, irreversible por el operador comprometido). Faltaban tres
+cosas del pedido del auditor: (A) una **pausa REVERSIBLE** de emergencia (un
+`EmergencyFreezeValidator` que se pueda LEVANTAR cuando el susto pasa, sin quemar el
+bono), (B) una **expiración/rotación obligatoria** que el comité de recuperación
+pueda imponer (deadline de rotación de la clave de consenso), y (C) un **audit trail
+tamper-evident** encadenado por hash de los eventos de gestión de claves.
 
-- **#9 Emergency freeze + expiración.** `EmergencyFreezeValidator` (por la recovery
-  key / guardianes) + expiración/rotación obligatoria de claves + audit trail con
-  logs encadenados por hash.
+**DISEÑO.** El `RecoveryOp` de KM#4 (que era sólo `Revoke`) se generaliza a cuatro:
+`Revoke` | `Freeze { until_quanto }` | `Unfreeze` | `SetExpiry { until_quanto }`. Los
+tres nuevos usan la **MISMA autorización M-de-N offline** que el revoke (el comité de
+recuperación firma `RECOVERY_AUTH_V1 ‖ consensus_address ‖ op_tag ‖ nonce`; el tag Y
+el parámetro `until_quanto` van AUTENTICADOS en el mensaje → una aprobación de un
+op/param no autoriza otro), permissionless (un relayer envía las M firmas).
+
+- **FREEZE / UNFREEZE (pausa reversible).** `ValidatorV7Entry` gana un campo
+  `frozen_until_quanto` (default 0 = nunca congelado → byte-idéntico). `Freeze` lo
+  fija (rechaza `until_quanto==0` y estados `Revoked`/`Removed`); `Unfreeze` lo pone
+  en 0. **NO hay movimiento de dinero** (el bono queda escrowado, el estado
+  `Active`/`BondedPending` sin cambio). La exclusión del comité + de los fees es
+  AUTOMÁTICA: `is_frozen(q)` se OR-ea dentro de `consensus_key_disabled(q)`, el
+  **ÚNICO gate** que ya consultan `active_committee` (el comité de consenso) Y
+  `fees_v7::is_eligible` (el reparto de fees) — la misma decisión de exclusión que
+  usa un revoke/expiry, sin cablear ningún sitio nuevo (la elección segura sobre un
+  singleton aparte). La pausa es **acotada en el tiempo**: al pasar `frozen_until_quanto`
+  el validador se re-habilita solo (auto-unfreeze), o el comité lo levanta antes.
+- **SET-EXPIRY (rotación obligatoria).** `SetExpiry` fija
+  `consensus_key_expiry_quanto` (el mismo campo de #20): en/después de ese quanto la
+  clave queda `consensus_key_disabled` → excluida del comité; el operador DEBE rotar
+  antes (con la rotación de KM#6) o cae fuera. El guardián impone el deadline.
+- **AUDIT TRAIL ENCADENADO POR HASH.** Un singleton NUEVO perezoso
+  `VALIDATOR_KM_AUDIT_LOG_ID = [25]` guarda un `KmAuditLog { head_hash, count,
+  entries }`. Cada `RecoverOp` (freeze/unfreeze/set-expiry/revoke) APENDA una entrada
+  `{ seq, prev_hash, event, consensus_address, quanto, detail, entry_hash }` con
+  `entry_hash = SHA3-256(KM_AUDIT_V1 ‖ prev_hash ‖ seq ‖ event ‖ addr ‖ quanto ‖
+  detail)` y `head_hash` compromete TODA la historia. Determinista (estado
+  comprometido) → ya es tamper-evident por consenso; el encadenamiento agrega un
+  COMPROMISO COMPACTO que un light-client/auditor externo recomputa y verifica sin
+  confiar en el nodo, y tamper-evidencia aunque el log se EXPORTE fuera de banda. La
+  cola retenida está acotada (`MAX_KM_AUDIT_ENTRIES=256`; el `head_hash` sigue
+  comprometiendo las entradas podadas).
+
+**MIGRACIÓN (V3→V4, tolerante).** El registro pasa de **V3** (los campos de #20) a
+**V4** (append de `frozen_until_quanto` por entrada). `decode_registry` prueba
+V4→V3→V2→V1 (newest-first; borsh rechaza bytes de cola → un V3 más corto no
+cross-decodea como V4). Un V3/V2/V1 migra a V4 defaulteando `frozen_until_quanto=0`
+(= nunca congelado → **byte-idéntico en COMPORTAMIENTO**). Cutover coordinado al
+actualizar el binario (mismo patrón que la V3 de #20); `schema_version` del registro
+pasa a **4**.
+
+**CAMBIOS.** (1) `qchain-crypto`: dominio `KM_AUDIT_V1`. (2) `qchain-execution` ids:
+`VALIDATOR_KM_AUDIT_LOG_ID=[25]`. (3) `qchain-execution` validator_v7: campo
+`frozen_until_quanto` + `is_frozen`; `RecoveryOp` de 1→4 variantes (tag+param en
+`recovery_message`); tipos `KmAuditEntry`/`KmAuditLog` + `km_audit_entry_hash` +
+`append`/`verify` + `read/write_km_audit_log` + `km_audit_log`; `recover_revoke`→
+`recover_op` (dispatch por op, audit append, accounts[6]=audit log pinneado);
+`ValidatorV7EntryV3`/`ValidatorV7RegistryV3` (decodifican un V3 histórico). (4)
+`qchain-node` rpc: ruta `/validator_v7_km_audit` (dump + `verifies`) + `frozen_until_quanto`/
+`frozen_now` en `/validator_v7_registry`. (5) `qchain-cli`: `v7-recovery-sign`/
+`v7-recover-op` generalizados con `--op revoke|freeze|unfreeze|set-expiry` +
+`--until-quanto`.
+
+**VERIFICADO.** qchain-execution **257 tests** (+6 KM#9: freeze↔unfreeze por M-de-N
+sin mover el bono, estado intacto, out del comité+fees mientras frozen y auto-unfreeze
+al deadline; freeze exige quórum de firmantes distintos; una aprobación está atada a
+op+param+nonce — no autoriza otro op/param ni un replay del nonce viejo; `SetExpiry`
+impone el deadline de rotación → out del comité; el audit trail encadena y verifica,
+un campo alterado rompe `verify`; un registro V3 migra a V4 con `frozen` defaulteado,
+behavior-idéntico). clippy limpio execution/node/cli/crypto; workspace `--offline` OK;
+lock sólo qchain→8.6.35. DST **no afectado** (el cambio vive 100% en
+execution/node/cli/crypto — consenso/simulación intactos).
+
+**DESPLIEGUE.** Cutover coordinado al actualizar el binario (el registro migra V3→V4
+tolerante; byte-idéntico en comportamiento hasta que se USE un freeze/expiry). Para
+congelar de emergencia: cada firmante de recuperación corre `v7-recovery-sign --op
+freeze --until-quanto Q` OFFLINE, un relayer junta las M firmas y envía `v7-recover-op
+--op freeze --until-quanto Q --approvals ...`; se levanta con `--op unfreeze`.
+
+## #10 — pendiente
+
 - **#10 Pruebas multinodo + adversariales** del ciclo completo (rotación,
   revocación, freeze, recuperación) bajo pérdida de certs y actores bizantinos.

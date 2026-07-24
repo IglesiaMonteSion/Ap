@@ -3241,6 +3241,7 @@ mod tests {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            frozen_until_quanto: 0,
         };
         // va/vb already Active; vc is BondedPending with its activation quanto
         // already arrived (0) — the close must flip it to Active AND pay it,
@@ -3343,6 +3344,7 @@ mod tests {
             consensus_key_expiry_quanto: 0,
             consensus_key_revoked: false,
             retired_consensus_keys: Vec::new(),
+            frozen_until_quanto: 0,
         };
         let registry = ValidatorV7Registry { validators: vec![mk(va), mk(vb), mk(vc)] };
         let mut reg = Account::new_wallet(STAKING_PROGRAM_ID);

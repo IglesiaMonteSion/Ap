@@ -131,3 +131,16 @@ pub const KEY_ROTATION_ACCEPT_V1: &[u8] = b"qchain-v7-key-rotation-accept-v1";
 /// es el KDF vetteado, y el expand SHA3-prefijo es la construcción que el
 /// proyecto ya ships (checkpoints, MAC de sesión del firmante remoto).
 pub const KEYSTORE_HKDF_V2: &[u8] = b"qchain-keystore-hkdf-v2";
+
+/// **Audit trail encadenado por hash de eventos de gestión de claves** (programa
+/// de gestión de claves, KM#9). Cada evento sensible del ciclo de vida de claves
+/// de un validador (freeze/unfreeze de emergencia, expiración/rotación obligatoria,
+/// revoke por recuperación) se APENDA a un log ON-CHAIN encadenado por hash: cada
+/// entrada compromete la anterior con
+/// `entry_hash = SHA3-256(KM_AUDIT_V1 ‖ prev_hash ‖ seq ‖ event ‖ addr ‖ quanto ‖ detail)`,
+/// y el `head_hash` del log compromete TODA la historia. Como el log vive en el
+/// estado comprometido (determinista), ya es tamper-evident por consenso; el
+/// encadenamiento por hash agrega un COMPROMISO COMPACTO (el `head_hash`) que un
+/// light-client / auditor externo puede verificar contra el log completo sin
+/// confiar en el nodo, y tamper-evidencia aunque el log se EXPORTE fuera de banda.
+pub const KM_AUDIT_V1: &[u8] = b"qchain-km-audit-v1";

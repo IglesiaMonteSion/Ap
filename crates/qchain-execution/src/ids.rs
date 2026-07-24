@@ -205,6 +205,19 @@ pub const VALIDATOR_KEY_TIMELOCK_REGISTRY_ID: Pubkey = Pubkey::new([23u8; 32]);
 /// brick-safe. Lazily created. Carries no funds.
 pub const VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID: Pubkey = Pubkey::new([24u8; 32]);
 
+/// **audit trail encadenado por hash de gestión de claves** (programa de gestión
+/// de claves, KM#9). Guarda un log ON-CHAIN, encadenado por hash, de cada evento
+/// sensible del ciclo de vida de claves de un validador: freeze/unfreeze de
+/// emergencia (por el comité de recuperación), expiración/rotación obligatoria, y
+/// revoke por recuperación. Cada entrada compromete la anterior con SHA3 (dominio
+/// `KM_AUDIT_V1`) y el `head_hash` del log compromete TODA la historia →
+/// tamper-evident aunque el log se exporte fuera de banda, verificable por un
+/// auditor externo. Vive en su PROPIO account (no en cada entrada de validador) →
+/// puramente ADITIVO: un v7 existente no tiene log hasta el primer evento — cero
+/// migración del formato del registro, sin cambio de `chain_id`, brick-safe.
+/// Creado perezosamente. No lleva fondos.
+pub const VALIDATOR_KM_AUDIT_LOG_ID: Pubkey = Pubkey::new([25u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

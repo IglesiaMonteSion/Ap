@@ -245,6 +245,7 @@ pub fn seed_genesis(ledger: &mut Ledger, config: &NodeConfig) -> anyhow::Result<
                 consensus_key_expiry_quanto: 0,
                 consensus_key_revoked: false,
                 retired_consensus_keys: Vec::new(),
+                frozen_until_quanto: 0,
             });
         }
         let escrow_total = VALIDATOR_BOND_ATOMS.saturating_mul(founders.len() as u64);

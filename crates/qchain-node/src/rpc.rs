@@ -381,6 +381,7 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limi
         .route("/validator_v7_recovery", get(validator_v7_recovery))
         .route("/validator_v7_pending_keys", get(validator_v7_pending_keys))
         .route("/validator_v7_consensus_rotations", get(validator_v7_consensus_rotations))
+        .route("/validator_v7_km_audit", get(validator_v7_km_audit))
         .route("/treasury", get(treasury))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
@@ -1019,6 +1020,57 @@ async fn validator_v7_recovery(State(engine): State<Arc<Engine>>) -> Result<Json
     Ok(Json(json!({ "committees": committees })))
 }
 
+/// (KM#9) The hash-chained KM audit trail: the on-chain, tamper-evident log of
+/// key-management events (freeze/unfreeze/set-expiry/revoke) per validator, each
+/// entry chained to the previous by hash. Reports the `head_hash` (commits to ALL
+/// history, including pruned entries), the total `count`, whether the retained
+/// suffix `verifies`, and the retained tail of entries. A light-client/auditor can
+/// recompute each entry hash and confirm the chain independently. Read-only.
+async fn validator_v7_km_audit(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::VALIDATOR_KM_AUDIT_LOG_ID;
+    use qchain_execution::validator_v7::KmAuditLog;
+    let Some(acct) = engine.get_account(&VALIDATOR_KM_AUDIT_LOG_ID).await else {
+        return Ok(Json(json!({ "count": 0, "head_hash": hex::encode([0u8; 32]), "verifies": true, "entries": [] })));
+    };
+    if acct.data.is_empty() {
+        return Ok(Json(json!({ "count": 0, "head_hash": hex::encode([0u8; 32]), "verifies": true, "entries": [] })));
+    }
+    let log = KmAuditLog::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("km audit log decode: {e}")))?;
+    let event_name = |e: u8| -> &'static str {
+        match e {
+            qchain_execution::validator_v7::KM_AUDIT_FREEZE => "freeze",
+            qchain_execution::validator_v7::KM_AUDIT_UNFREEZE => "unfreeze",
+            qchain_execution::validator_v7::KM_AUDIT_SET_EXPIRY => "set_expiry",
+            qchain_execution::validator_v7::KM_AUDIT_REVOKE => "revoke",
+            _ => "unknown",
+        }
+    };
+    let entries: Vec<serde_json::Value> = log
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "seq": e.seq,
+                "event": event_name(e.event),
+                "event_code": e.event,
+                "consensus_address": e.consensus_address.to_string(),
+                "quanto": e.quanto,
+                "detail": e.detail,
+                "prev_hash": hex::encode(e.prev_hash),
+                "entry_hash": hex::encode(e.entry_hash),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "count": log.count,
+        "head_hash": hex::encode(log.head_hash),
+        "verifies": log.verify().is_ok(),
+        "retained": log.entries.len(),
+        "entries": entries,
+    })))
+}
+
 /// (KM#5) The v7 key-timelock registry: pending, timelocked cold-key changes of
 /// validators (operator/withdrawal/recovery), each with its `ready_quanto`.
 async fn validator_v7_pending_keys(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -1162,6 +1214,9 @@ async fn validator_v7_registry(State(engine): State<Arc<Engine>>) -> Result<Json
                 "consensus_key_revoked": v.consensus_key_revoked,
                 "consensus_key_expiry_quanto": v.consensus_key_expiry_quanto,
                 "consensus_key_disabled": v.consensus_key_disabled(current_quanto),
+                // KM#9: emergency-freeze status.
+                "frozen_until_quanto": v.frozen_until_quanto,
+                "frozen_now": v.is_frozen(current_quanto),
                 "retired_consensus_keys": v.retired_consensus_keys.iter().map(|r| json!({
                     "address": r.address.to_string(),
                     "slash_until_quanto": r.slash_until_quanto,

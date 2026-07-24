@@ -146,7 +146,7 @@ impl Singleton {
             // role-separated V2 (task #3) plus the #20 advanced key-role fields
             // (rotation/revocation/expiration) appended; the treasury is V2
             // (single-authority → multisig, task #222).
-            Singleton::ValidatorRegistry => 3,
+            Singleton::ValidatorRegistry => 4,
             Singleton::Treasury => 2,
             _ => 1,
         }
@@ -289,7 +289,7 @@ mod tests {
             assert_eq!(m.version_of(s), Some(s.current_version()), "{}", s.name());
         }
         // The two genuine layout-change singletons are v2, the rest v1.
-        assert_eq!(m.version_of(Singleton::ValidatorRegistry), Some(3));
+        assert_eq!(m.version_of(Singleton::ValidatorRegistry), Some(4));
         assert_eq!(m.version_of(Singleton::Treasury), Some(2));
         assert_eq!(m.version_of(Singleton::EconomicParams), Some(1));
     }

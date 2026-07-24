@@ -219,7 +219,7 @@ fn main() -> anyhow::Result<()> {
     let store = open_store(&dir, &config.storage_engine)?;
     let after = store.get(&reg_id).ok_or_else(|| anyhow::anyhow!("registry account vanished after write"))?;
     let ok = after.data == new_bytes
-        && matches!(detect_registry_schema(&after.data), Some(qchain_execution::validator_v7::RegistrySchema::V3Current))
+        && matches!(detect_registry_schema(&after.data), Some(qchain_execution::validator_v7::RegistrySchema::V4Current))
         && decode_registry(&after.data).is_some();
     if !ok {
         drop(store);
