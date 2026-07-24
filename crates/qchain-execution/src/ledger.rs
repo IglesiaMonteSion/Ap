@@ -4358,6 +4358,69 @@ mod tests {
         assert!(fee_after > fee_before * 5, "the new on-chain rate must actually be what gets charged");
     }
 
+    /// Roadmap #15 (invariantes formalizados): las invariantes ESTRUCTURALES de
+    /// `crate::invariants` — nonce monótono y expiración — se sostienen contra el
+    /// LEDGER REAL, no sólo en aislamiento. Aplica dos transferencias reales,
+    /// verifica que el nonce del pagador sube (nunca baja) y que `check_nonce_monotonic`
+    /// lo confirma; que un REPLAY (mismo nonce ya usado) es rechazado por el ledger
+    /// (el nonce no retrocede); y que una tx CADUCADA es rechazada por el ledger Y
+    /// que `check_not_expired` coincide con esa decisión.
+    #[test]
+    fn formalized_nonce_and_expiration_invariants_hold_against_the_real_ledger() {
+        use crate::invariants::{check_nonce_monotonic, check_not_expired};
+        use std::collections::HashMap;
+
+        let mut ledger = new_test_ledger();
+        let validator = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        ledger.credit(alice.pubkey(), 1_000_000_000);
+
+        fn transfer(alice: &Keypair, bob: Pubkey, nonce: u64, valid_until: u64) -> Transaction {
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), bob],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 1 }).unwrap(),
+            };
+            Transaction::new_signed_full(alice, nonce, [0u8; 32], 50_000_000, 0, valid_until, vec![ix]).unwrap()
+        }
+        let snap = |l: &Ledger| -> HashMap<Pubkey, Account> {
+            let mut m = HashMap::new();
+            if let Some(a) = l.store.get(&alice.pubkey()) { m.insert(alice.pubkey(), a); }
+            m
+        };
+
+        // Dos transferencias reales (nonce 0, 1), sin expiración. El nonce SUBE.
+        let before = snap(&ledger);
+        ledger.apply_transaction(&transfer(&alice, bob, 0, 0), &validator, 5).unwrap();
+        let mid = snap(&ledger);
+        ledger.apply_transaction(&transfer(&alice, bob, 1, 0), &validator, 6).unwrap();
+        let after = snap(&ledger);
+
+        assert!(check_nonce_monotonic(&before, &mid).is_ok());
+        assert!(check_nonce_monotonic(&mid, &after).is_ok());
+        assert_eq!(after[&alice.pubkey()].nonce, 2, "el nonce del pagador subió exactamente 2");
+
+        // REPLAY: re-aplicar el nonce 0 (ya usado) es rechazado -> el nonce NO
+        // retrocede, y el invariante se sostiene sobre el estado (sin cambio).
+        let pre_replay = snap(&ledger);
+        assert!(ledger.apply_transaction(&transfer(&alice, bob, 0, 0), &validator, 7).is_err(), "un replay de nonce se rechaza");
+        let post_replay = snap(&ledger);
+        assert!(check_nonce_monotonic(&pre_replay, &post_replay).is_ok());
+        assert_eq!(post_replay[&alice.pubkey()].nonce, 2, "el nonce no retrocede tras un replay rechazado");
+
+        // EXPIRACIÓN: una tx con valid_until_round=10 aplicada en la ronda 11 es
+        // rechazada por el ledger, y `check_not_expired` coincide EXACTO con eso.
+        let expired = transfer(&alice, bob, 2, 10);
+        let ledger_rejects = ledger.apply_transaction(&expired, &validator, 11).is_err();
+        let invariant_flags_expired = check_not_expired(10, 11).is_err();
+        assert!(ledger_rejects && invariant_flags_expired, "ledger y el invariante coinciden: caducada -> rechazada");
+        // Y una en su ventana (ronda 10 == valid_until 10) SÍ aplica; el invariante también la acepta.
+        assert!(check_not_expired(10, 10).is_ok());
+        ledger.apply_transaction(&transfer(&alice, bob, 2, 10), &validator, 10).unwrap();
+        assert_eq!(snap(&ledger)[&alice.pubkey()].nonce, 3);
+    }
+
     /// Real, reproducible throughput measurement - not a literature
     /// estimate (see `project-lessons-learned`'s "benchmark before making
     /// a throughput claim" entry). Measures two things separately: hybrid
