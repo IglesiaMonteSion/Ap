@@ -20,6 +20,11 @@ path = "src/bin/qchain-remote-signer.rs"
 
 [dependencies]
 qchain-crypto = { path = "../qchain-crypto" }
+# #4 (auditoría v8.6.13): el daemon deserializa el Vertex para verificar la
+# AUTORÍA de un peer-vote y rehusar un auto-voto enrutado por SignPeerVote (cierra
+# el bypass de auto-equivocación). Sin ciclo: qchain-remote-signer → qchain-core →
+# qchain-crypto (qchain-core no depende de qchain-remote-signer).
+qchain-core = { path = "../qchain-core" }
 borsh.workspace = true
 anyhow.workspace = true
 clap.workspace = true

@@ -40,7 +40,7 @@ sigue cerrada.
 | EC-03 | Se arregla la instancia, no la CLASE | proceso (este ledger + sweep) | permanente |
 | EC-04 | Crecimiento de recurso sin cota | parcial | cerrada-vigilada (#18) |
 | EC-05 | Aritmética de dinero/ronda/tiempo sin `checked_*` | sí (grep en módulos de valor) | **CERRADA-VIGILADA** (#1 timelock corregido v8.6.18; #5 ya cerrado por #17/#218) |
-| EC-06 | Falta separación de dominio de firma | parcial | cerrada-vigilada (#187) |
+| EC-06 | Falta separación de dominio de firma / guardia con camino hermano no guardado | parcial | **CERRADA-VIGILADA** (#187; #4 SignPeerVote corregido v8.6.20) |
 | EC-07 | No-determinismo / riesgo de fork | proceso (DST) | cerrada-vigilada |
 | EC-08 | La interfaz como frontera de seguridad | parcial (grep de `.version` no comparada) | **CERRADA-VIGILADA** (#7 tx.version corregido v8.6.18; sweep hecho) |
 | EC-09 | Peligros de migración (struct nueva para formato viejo; gate ≠ runtime) | sí | **CERRADA-VIGILADA** (#2/#3 corregidos v8.6.18; sweep hecho) |
@@ -196,13 +196,30 @@ sigue cerrada.
 
 - **Clase:** una firma válida para un propósito reutilizable en otro.
 - **Instancias:** #187 (dominios `TX_SIG_V1`/`VERTEX_VOTE_V1`/`VALIDATOR_POP_V1`);
-  allowlist del firmante remoto (#193). Vigilar: #4 (SignPeerVote no usa la
-  guardia anti-doble-firma; el firmante remoto no autentica cliente).
+  allowlist del firmante remoto (#193).
+  - v8.6.13 #4 (CONFIRMADO leyendo el código → CORREGIDO en v8.6.20): la
+    `DoubleSignGuard` sólo cubría `SignOwnVote`; `SignPeerVote` alcanzaba la MISMA
+    primitiva `sign_vertex_vote` SIN guardia → un nodo comprometido enrutaba su
+    segundo vértice propio por ahí y auto-equivocaba (slasheable). Sub-patrón:
+    **guardia efectiva en un camino, pero un camino HERMANO no guardado llega a la
+    misma primitiva** — y `SignPeerVote` confiaba en la autoría por el NOMBRE del
+    camino ('peer') en vez de PROBARLA. **Fix:** `SignPeerVote` recibe los bytes
+    del vértice; el daemon recomputa el digest y rehúsa si `author == su clave`
+    (un auto-voto debe ir por el camino guardado). Test:
+    `sign_peer_vote_refuses_our_own_vertex_closing_the_self_equivocation_bypass`.
+    **Diferido (follow-up):** autenticar la IDENTIDAD del cliente (token/mTLS) para
+    bind no-loopback — el default loopback + el rehúso de auto-equivocación/valor
+    ya acotan al socket-reacher.
 - **Regla:** todo contenido firmado lleva dominio + tipo + chain_id + versión +
   nonce/caducidad según corresponda; el firmante remoto aplica allowlist por
-  identidad de cliente + anti-replay.
+  identidad de cliente + anti-replay. **Y toda guardia sobre una primitiva de
+  firma cubre TODOS los caminos que la alcanzan (no un solo camino): si un camino
+  asume 'esto es de otro' (peer), debe PROBARLO recomputando/verificando la
+  autoría, no confiar en el nombre del camino.**
 - **Pregunta recurrente:** *¿cada firma nueva tiene dominio único? ¿el firmante
-  remoto puede firmar algo fuera de una allowlist estricta autenticada?*
+  remoto puede firmar algo fuera de una allowlist estricta autenticada? ¿alguna
+  guardia (anti-doble-firma, anti-replay) tiene un camino HERMANO sin guardar que
+  llegue a la misma primitiva?*
 
 ## EC-07 — No-determinismo / riesgo de fork
 

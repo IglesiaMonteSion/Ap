@@ -20,7 +20,7 @@ es el que entregó el operador; acá se registra el trabajo.
 | 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | ✅ **CORREGIDO (v8.6.18)** — owner check + dirección canónica + saturating timelock + 2 tests de exploit + sweep EC-01 limpio |
 | 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryState::decode_any_version` único, compartido gate+runtime |
 | 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryOpV0`/`PendingOpV0` históricos exactos + conversión + test |
-| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | por verificar |
+| 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | ✅ **CORREGIDO (v8.6.20)** — `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación; client-auth (bind no-loopback) diferido como follow-up documentado |
 | 5 | Medio | Mezcla de aritmética de expiración/timelock de ops de tesorería sin `checked_*` / invariante | EC-05 | P1 | ✅ **YA CERRADO** (v8.6.18 verificado) — `saturating_add` + `arith::checked` + invariante `expiry>timelock` desde #17/#218 |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
 | 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18)** — `CURRENT_TX_VERSION` re-verificado en `apply` + test |
@@ -133,12 +133,50 @@ tipos V0, que SON el layout pre-#17 byte-a-byte); no se pudo linkear un test de
 integración de reinicio en el sandbox (ENOSPC, documentado en #20), pero la
 migración está cubierta por este unit test + `decode_any_version`.
 
-## #4 — Firmante remoto: guardia y autenticación (Alto)
+## #4 — Firmante remoto: guardia y autenticación (Alto) — ✅ CORREGIDO (v8.6.20)
 
-Ver EC-06. `SignPeerVote` debe pasar por la misma guardia anti-doble-firma
-persistida (fsync) que el auto-voto; el daemon debe autenticar la identidad del
-cliente (no basta alcanzar su dirección de red). Allowlist estricta ya existe
-(#193) — verificar que cubre este camino.
+**Confirmado leyendo el código** (`crates/qchain-remote-signer/src/lib.rs`): la
+`DoubleSignGuard` sólo cubría `SignOwnVote`; `SignPeerVote { digest }` firmaba
+**cualquier** digest sin verificar autoría → un proceso de nodo COMPROMETIDO
+enrutaba su SEGUNDO vértice propio de una ronda por `SignPeerVote` y obtenía una
+firma de voto sobre él = evidencia de **auto-equivocación slasheable**,
+derrotando la promesa central del firmante remoto ('NUNCA un auto-voto en
+conflicto'). La guardia era inútil porque el camino hermano no guardado alcanzaba
+la misma primitiva `sign_vertex_vote`.
+
+**Fix (el núcleo de seguridad):** `SignPeerVote` lleva ahora los **BYTES borsh del
+vértice** además del digest. El daemon deserializa el `Vertex`, **recomputa su
+digest** (debe coincidir con el pedido — un digest arbitrario no atado al vértice
+se rehúsa) y **REHÚSA si `vertex.author == su propia clave`** — un auto-voto DEBE
+ir por `SignOwnVote`, que sí está guardado. Así un nodo comprometido no puede
+auto-equivocar por ningún camino del firmante remoto. El trait
+`Signer::sign_peer_vote(vertex_bytes, digest)` cambió en `qchain-crypto` (el
+firmante EN-PROCESO ignora los bytes: el candado `voted_for` del engine ya cubre
+y la clave local ya está expuesta si el proceso cae); `qchain-remote-signer` gana
+dep `qchain-core` (sin ciclo: remote-signer→core→crypto) para deserializar el
+`Vertex`; `qchain-node::cast_vote` pasa el vértice (ambos call sites ya lo tenían).
+**Test de exploit:** `sign_peer_vote_refuses_our_own_vertex_closing_the_self_equivocation_bypass`
+(un vértice propio por `SignPeerVote` → RECHAZADO; uno de otro validador →
+FIRMADO; digest que no ata al vértice → RECHAZADO; bytes malformados → RECHAZADO
+sin panic). remote-signer 5/5, node 66, clippy limpio.
+
+**Despliegue:** cambia el protocolo del socket del firmante remoto (`SignPeerVote`
+lleva `vertex_bytes`) → cutover COORDINADO cliente+daemon (opt-in; NO en la red
+viva del usuario — el firmante remoto es default in-process, byte-idéntico).
+
+**Barrido de clase:** los únicos `impl Signer` son `Keypair` y `RemoteSigner`; el
+único llamador de `sign_peer_vote` es `engine::cast_vote` (ahora pasa el vértice).
+`SignRaw` ya tiene allowlist estricta `P2P_AUTH_V1` (#193-B), `SignCheckpoint` es
+estructurada (dominio propio), `SignOwnVote` guardado. Sweep EC-06 sin otro camino
+de firma sin verificar.
+
+**Follow-up DIFERIDO (documentado, no requerido para cerrar la auto-equivocación):**
+autenticación de la IDENTIDAD del cliente (token pre-compartido / mTLS) para el
+caso de bind NO-loopback. El daemon bindea loopback por defecto, y tras este fix
+quien alcanza el socket sólo puede obtener peer-votes sobre vértices de OTROS
+validadores + transcripts de handshake (`P2P_AUTH_V1`) — nunca auto-equivocación
+ni valor. El peor caso de un socket-reacher queda acotado sin el token; el token
+es defensa-en-profundidad para un despliegue con firmante en host separado.
 
 ## #5 — Aritmética expiración/timelock (Medio) — ✅ YA CERRADO (verificado v8.6.18)
 

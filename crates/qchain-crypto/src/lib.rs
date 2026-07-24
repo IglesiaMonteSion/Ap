@@ -410,8 +410,20 @@ pub trait Signer: Send + Sync {
     /// sobre el candado `voted_for` del engine.
     fn sign_own_vote(&self, round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
     /// Firma un voto sobre el vértice de OTRO validador (`VERTEX_VOTE_V1 ‖
-    /// digest`). No es una auto-equivocación → sin guardia.
-    fn sign_peer_vote(&self, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
+    /// digest`). No es una auto-equivocación → sin guardia local. En el firmante
+    /// REMOTO (#193) el daemon recibe además los BYTES borsh del vértice
+    /// (`vertex_bytes`) para VERIFICAR la autoría: recomputa el digest (debe
+    /// coincidir con `digest`) y REHÚSA si el vértice es PROPIO — un auto-voto
+    /// DEBE ir por `sign_own_vote`, que sí está guardado. Sin esto, un nodo
+    /// comprometido podía enrutar su SEGUNDO vértice propio de una ronda por este
+    /// camino y auto-equivocar (slasheable), derrotando la promesa central del
+    /// firmante remoto ("NUNCA un auto-voto en conflicto"). Los bytes son OPACOS
+    /// aquí (este crate no depende de `qchain-core`, evitando el ciclo
+    /// core→crypto); sólo el daemon los deserializa. El firmante en-proceso los
+    /// ignora (no tiene guardia: el candado `voted_for` del engine ya cubre la
+    /// equivocación, y si el proceso está comprometido la clave local ya está
+    /// expuesta).
+    fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
     /// Firma exactamente estos bytes (el llamador ya los enmarcó/domainó — p.ej.
     /// el transcript del handshake autenticado, que ya lleva su propio dominio).
     /// Sin guardia (no es un voto de consenso).
@@ -437,7 +449,12 @@ impl Signer for Keypair {
     fn sign_own_vote(&self, _round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         sign_vertex_vote(self, digest)
     }
-    fn sign_peer_vote(&self, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+    fn sign_peer_vote(&self, _vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        // El firmante en-proceso no verifica autoría (no tiene guardia): el
+        // candado `voted_for` del engine ya evita la doble-firma, y si el proceso
+        // del nodo está comprometido la clave local ya está expuesta, así que un
+        // chequeo de autoría acá no agrega nada. La autoría SÍ se verifica en el
+        // firmante remoto, donde la clave vive fuera del proceso.
         sign_vertex_vote(self, digest)
     }
     fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {

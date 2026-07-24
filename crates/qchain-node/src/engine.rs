@@ -3570,7 +3570,7 @@ impl Engine {
                     vertex.batch_digests.iter().all(|(_, d)| state.batches.contains_key(d))
                 };
                 if have_all_batches {
-                    self.cast_vote(digest, from).await;
+                    self.cast_vote(&vertex, from).await;
                 } else {
                     let mut state = self.state.lock().await;
                     let r = state.next_round;
@@ -3832,12 +3832,24 @@ impl Engine {
     /// must have already made the voting decision (`voted_for`) and confirmed
     /// the vertex's worker batches are locally available (the availability
     /// gate).
-    async fn cast_vote(&self, digest: Digest, to: ValidatorId) {
+    async fn cast_vote(&self, vertex: &Vertex, to: ValidatorId) {
+        let digest = vertex.digest();
         // #187: el voto va etiquetado por dominio (`VERTEX_VOTE_V1 ‖ digest`).
         // #193: firmado por el `signer` (in-process o remoto/HSM). Es un voto
-        // sobre el vértice de OTRO validador → `sign_peer_vote` (sin guardia
-        // anti-doble-firma; esa sólo aplica al auto-voto del proposer).
-        let sig = match self.signer.sign_peer_vote(&digest) {
+        // sobre el vértice de OTRO validador → `sign_peer_vote`. Auditoría v8.6.13
+        // #4: le pasamos los BYTES del vértice además del digest para que el
+        // firmante REMOTO verifique la autoría y rehúse un auto-voto enrutado por
+        // aquí (cierra el bypass de auto-equivocación); el firmante en-proceso los
+        // ignora. Serializar un `Vertex` en memoria no puede fallar en la práctica,
+        // pero si lo hiciera no firmamos (best-effort, se reintenta en el tick).
+        let vertex_bytes = match borsh::to_vec(vertex) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("failed to serialize vertex for vote: {e}");
+                return;
+            }
+        };
+        let sig = match self.signer.sign_peer_vote(&vertex_bytes, &digest) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to sign vote: {e}");
@@ -3862,7 +3874,9 @@ impl Engine {
     /// are present, casts the previously-withheld vote and removes it from the
     /// pending set. A no-op in steady state (nothing deferred).
     pub async fn try_cast_available_votes(&self) {
-        let ready: Vec<(Digest, ValidatorId)> = {
+        // Collect the full `Vertex` (not just its digest): audit v8.6.13 #4 needs
+        // the vertex bytes so a remote signer can verify authorship.
+        let ready: Vec<(Vertex, ValidatorId)> = {
             let state = self.state.lock().await;
             if state.pending_availability_votes.is_empty() {
                 return;
@@ -3871,15 +3885,15 @@ impl Engine {
                 .pending_availability_votes
                 .iter()
                 .filter(|(_, (v, _, _))| v.batch_digests.iter().all(|(_, d)| state.batches.contains_key(d)))
-                .map(|(&d, (_, from, _))| (d, *from))
+                .map(|(_, (v, from, _))| (v.clone(), *from))
                 .collect()
         };
-        for (digest, to) in ready {
+        for (vertex, to) in ready {
             {
                 let mut state = self.state.lock().await;
-                state.pending_availability_votes.remove(&digest);
+                state.pending_availability_votes.remove(&vertex.digest());
             }
-            self.cast_vote(digest, to).await;
+            self.cast_vote(&vertex, to).await;
         }
     }
 

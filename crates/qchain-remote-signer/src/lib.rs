@@ -54,9 +54,14 @@ pub enum SignerRequest {
     /// Auto-voto del proposer sobre su PROPIO vértice de la ronda `round` —
     /// sujeto a la guardia anti-doble-firma.
     SignOwnVote { round: u64, digest: [u8; 32] },
-    /// Voto sobre el vértice de OTRO validador — sin guardia (no es
-    /// auto-equivocación).
-    SignPeerVote { digest: [u8; 32] },
+    /// Voto sobre el vértice de OTRO validador. Lleva los BYTES borsh del vértice
+    /// además del digest: el daemon deserializa el vértice, recomputa su digest
+    /// (debe coincidir con `digest`) y REHÚSA si el autor es NUESTRA propia clave
+    /// — un auto-voto DEBE ir por `SignOwnVote`, que sí está guardado. Cierra el
+    /// bypass de auto-equivocación por SignPeerVote (#4, auditoría v8.6.13): sin
+    /// esto un nodo comprometido podía enrutar su SEGUNDO vértice propio de una
+    /// ronda por aquí y firmar evidencia de auto-equivocación (slasheable).
+    SignPeerVote { vertex_bytes: Vec<u8>, digest: [u8; 32] },
     /// Firmar exactamente estos bytes (transcript del handshake P2P, ya domainado
     /// por el llamador) — sin guardia.
     SignRaw { msg: Vec<u8> },
@@ -187,8 +192,8 @@ impl qchain_crypto::Signer for RemoteSigner {
     fn sign_own_vote(&self, round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignOwnVote { round, digest: *digest })?)
     }
-    fn sign_peer_vote(&self, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
-        Self::signature_from(self.request(&SignerRequest::SignPeerVote { digest: *digest })?)
+    fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignPeerVote { vertex_bytes: vertex_bytes.to_vec(), digest: *digest })?)
     }
     fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignRaw { msg: msg.to_vec() })?)
@@ -363,10 +368,40 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 }
             }
         }
-        SignerRequest::SignPeerVote { digest } => match qchain_crypto::sign_vertex_vote(keypair, digest) {
-            Ok(sig) => SignerResponse::Signature(sig),
-            Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
-        },
+        SignerRequest::SignPeerVote { vertex_bytes, digest } => {
+            // GUARDIA DE AUTORÍA (#4, auditoría v8.6.13 — cierra el bypass de
+            // auto-equivocación): un voto de "peer" DEBE ser sobre el vértice de
+            // OTRO validador. Deserializamos el vértice, recomputamos su digest
+            // (debe coincidir con el pedido — si no, un digest arbitrario firmado
+            // no atado al vértice), y REHUSAMOS si el autor es NUESTRA propia clave
+            // — un auto-voto DEBE ir por `SignOwnVote`, que sí está guardado por la
+            // `DoubleSignGuard`. Sin esto, un proceso de nodo comprometido podía
+            // enrutar su SEGUNDO vértice propio de una ronda por aquí y obtener una
+            // firma de voto sobre él → evidencia de auto-equivocación slasheable,
+            // derrotando la promesa central del firmante remoto.
+            let vertex = match qchain_core::dag::Vertex::try_from_slice(vertex_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    let reason = format!("refusing SignPeerVote: malformed vertex bytes: {e}");
+                    tracing::error!("signer: {reason}");
+                    return SignerResponse::Refused(reason);
+                }
+            };
+            if &vertex.digest() != digest {
+                let reason = "refusing SignPeerVote: the vertex digest does not match the requested digest (a peer-vote must attest the given vertex, not an arbitrary digest)".to_string();
+                tracing::error!("signer: {reason}");
+                return SignerResponse::Refused(reason);
+            }
+            if vertex.author == keypair.public_key_bundle().to_address() {
+                let reason = "DOUBLE-SIGN BLOCKED: refusing to peer-sign OUR OWN vertex — an own-authored vertex must be signed via SignOwnVote (double-sign guarded)".to_string();
+                tracing::error!("signer: {reason}");
+                return SignerResponse::Refused(reason);
+            }
+            match qchain_crypto::sign_vertex_vote(keypair, digest) {
+                Ok(sig) => SignerResponse::Signature(sig),
+                Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+            }
+        }
         SignerRequest::SignRaw { msg } => {
             // #193-B (D1) — ALLOWLIST estricta (endurecido tras auditoría). El
             // firmante de consenso es un firmante de BLOQUES, jamás de valor.
@@ -431,8 +466,17 @@ mod tests {
         assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 4, digest: d1 }, &kp, &g), SignerResponse::Refused(_)));
         // Ronda mayor (6) con cualquier digest → OK.
         assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 6, digest: d2 }, &kp, &g), SignerResponse::Signature(_)));
-        // Un VOTO DE PEER con un digest cualquiera para una ronda vieja → OK (sin guardia).
-        assert!(matches!(respond(&SignerRequest::SignPeerVote { digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
+        // Un VOTO DE PEER sobre el vértice de OTRO validador → OK (sin guardia).
+        let peer_v = qchain_core::dag::Vertex {
+            round: 3,
+            author: Keypair::generate().unwrap().public_key_bundle().to_address(),
+            batch_digests: vec![],
+            parents: vec![],
+        };
+        assert!(matches!(
+            respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
+            SignerResponse::Signature(_)
+        ));
         // SignRaw de un transcript de handshake (dominio P2P) → OK.
         let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript"].concat();
         assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
@@ -519,9 +563,68 @@ mod tests {
         let digest = [42u8; 32];
         let sig = client.sign_own_vote(1, &digest).unwrap();
         assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &digest, &sig), "la firma del firmante remoto verifica bajo el dominio de voto");
-        // Un peer-vote también funciona.
-        let sig2 = client.sign_peer_vote(&[43u8; 32]).unwrap();
-        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &[43u8; 32], &sig2));
+        // Un peer-vote sobre el vértice de OTRO validador también funciona.
+        let peer_v = qchain_core::dag::Vertex {
+            round: 1,
+            author: Keypair::generate().unwrap().public_key_bundle().to_address(),
+            batch_digests: vec![],
+            parents: vec![],
+        };
+        let pd = peer_v.digest();
+        let sig2 = client.sign_peer_vote(&borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &pd, &sig2));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// #4 (auditoría v8.6.13) — el firmante remoto verifica la AUTORÍA de un
+    /// peer-vote: un nodo comprometido NO puede enrutar su PROPIO segundo vértice
+    /// por `SignPeerVote` para auto-equivocar (el bypass que dejaba abierto que la
+    /// `DoubleSignGuard` sólo cubriera `SignOwnVote`). El daemon deserializa el
+    /// vértice, recomputa el digest, y rehúsa si el autor es la propia clave o si
+    /// el digest no ata al vértice; un vértice de OTRO validador se firma normal.
+    #[test]
+    fn sign_peer_vote_refuses_our_own_vertex_closing_the_self_equivocation_bypass() {
+        let tmp = std::env::temp_dir().join(format!("qrs-peerauthor-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let my_addr = kp.public_key_bundle().to_address();
+        let g = guard(&tmp);
+
+        // Un vértice PROPIO (autor == nuestra clave) enrutado por SignPeerVote → RECHAZADO.
+        let own_v = qchain_core::dag::Vertex { round: 7, author: my_addr, batch_digests: vec![], parents: vec![] };
+        assert!(
+            matches!(
+                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&own_v).unwrap(), digest: own_v.digest() }, &kp, &g),
+                SignerResponse::Refused(_)
+            ),
+            "a compromised node must NOT be able to peer-sign its OWN vertex (self-equivocation bypass)"
+        );
+        // Un vértice de OTRO validador → FIRMADO.
+        let peer_v = qchain_core::dag::Vertex { round: 7, author: Keypair::generate().unwrap().public_key_bundle().to_address(), batch_digests: vec![], parents: vec![] };
+        assert!(
+            matches!(
+                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
+                SignerResponse::Signature(_)
+            ),
+            "a vote over another validator's vertex must be signed"
+        );
+        // Un digest que NO ata al vértice pasado → RECHAZADO (no se firma un digest arbitrario).
+        assert!(
+            matches!(
+                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: [9u8; 32] }, &kp, &g),
+                SignerResponse::Refused(_)
+            ),
+            "the requested digest must match the passed vertex; an arbitrary digest is refused"
+        );
+        // Bytes de vértice malformados → RECHAZADO (sin panic).
+        assert!(
+            matches!(
+                respond(&SignerRequest::SignPeerVote { vertex_bytes: vec![0xff; 3], digest: [9u8; 32] }, &kp, &g),
+                SignerResponse::Refused(_)
+            ),
+            "malformed vertex bytes must be refused, not panic"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
