@@ -52,7 +52,8 @@
 //!
 //! Defensa en profundidad, ADEMÁS de lo previo: la `DoubleSignGuard` (peor caso
 //! "no hay auto-equivocación"), la verificación de AUTORÍA de `SignPeerVote`
-//! (#4.1) y la allowlist estricta de `SignRaw` (sólo el transcript de handshake).
+//! (#4.1) y `SignNetworkHandshake` TIPADO (sólo un transcript P2P_AUTH_V1; ya no
+//! existe un `sign_raw` de bytes arbitrarios — auditoría #2).
 //! El daemon **bindea loopback por defecto** (o un UDS local); en mainnet el
 //! endpoint debe ser loopback/UDS **y** llevar token (fail-stop en `config.rs`).
 
@@ -64,8 +65,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Versión del protocolo del socket. v2 agregó el handshake de auth (#4.2); v3
-/// agregó el nonce del cliente (handshake mutuo) + el binding de canal por-frame.
-pub const PROTO_VERSION: u8 = 3;
+/// agregó el nonce del cliente (handshake mutuo) + el binding de canal por-frame;
+/// v4 reemplazó `SignRaw` por `SignNetworkHandshake` tipado (auditoría #2).
+pub const PROTO_VERSION: u8 = 4;
 /// Dominio del prefix-MAC del challenge-response (separación de dominio).
 pub const RS_AUTH_DOMAIN: &[u8] = b"qchain-remote-signer-auth-v1";
 /// Dominio de la derivación de la clave de sesión (binding de canal, #4.2 v3).
@@ -99,14 +101,15 @@ pub enum SignerRequest {
     /// esto un nodo comprometido podía enrutar su SEGUNDO vértice propio de una
     /// ronda por aquí y firmar evidencia de auto-equivocación (slasheable).
     SignPeerVote { vertex_bytes: Vec<u8>, digest: [u8; 32] },
-    /// Firmar exactamente estos bytes (transcript del handshake P2P, ya domainado
-    /// por el llamador) — sin guardia.
-    SignRaw { msg: Vec<u8> },
+    /// Firmar el **transcript de un handshake P2P** (`P2P_AUTH_V1 ‖ …`). TIPADO
+    /// (auditoría #2): reemplaza al viejo `SignRaw`; el daemon EXIGE el dominio
+    /// `P2P_AUTH_V1` y rechaza todo lo demás, así que la clave del validador NUNCA
+    /// firma bytes arbitrarios / tx / retiros por este camino.
+    SignNetworkHandshake { transcript: Vec<u8> },
     /// Firmar un checkpoint de estado (`STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖
     /// root`, tarea #212) — una atestación de state-sync, no un voto. Sin guardia:
     /// un validador honesto sólo firma su root REAL determinista por ronda, y el
-    /// dominio la separa de un voto/tx. Estructurada (no `SignRaw`), así el
-    /// allowlist estricto de `SignRaw` (sólo `P2P_AUTH_V1`) queda intacto.
+    /// dominio la separa de un voto/tx.
     SignCheckpoint { chain_id: [u8; 32], round: u64, merkle_root: [u8; 32] },
 }
 
@@ -512,8 +515,8 @@ impl qchain_crypto::Signer for RemoteSigner {
     fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignPeerVote { vertex_bytes: vertex_bytes.to_vec(), digest: *digest })?)
     }
-    fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
-        Self::signature_from(self.request(&SignerRequest::SignRaw { msg: msg.to_vec() })?)
+    fn sign_network_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignNetworkHandshake { transcript: transcript.to_vec() })?)
     }
     fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignCheckpoint { chain_id: *chain_id, round, merkle_root: *merkle_root })?)
@@ -763,25 +766,23 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
             }
         }
-        SignerRequest::SignRaw { msg } => {
-            // #193-B (D1) — ALLOWLIST estricta (endurecido tras auditoría). El
+        SignerRequest::SignNetworkHandshake { transcript } => {
+            // #193-B (D1) + auditoría #2 — TIPADO con allowlist estricta. El
             // firmante de consenso es un firmante de BLOQUES, jamás de valor.
-            // `sign_raw` existe ÚNICAMENTE para el transcript del handshake P2P,
-            // que se firma como `P2P_AUTH_V1 ‖ transcript` (#176). En vez de una
-            // BLACKLIST (negar sólo `TX_SIG_V1`), que quedaría débil ante un tipo
-            // de tx / dominio / protocolo NUEVO agregado después, se exige que el
+            // Firmar-bytes existe ÚNICAMENTE para el transcript del handshake P2P,
+            // que se firma como `P2P_AUTH_V1 ‖ transcript` (#176). Se EXIGE que el
             // mensaje empiece EXACTAMENTE por el dominio del handshake — todo lo
             // demás (una tx `TX_SIG_V1`, un voto, cualquier bytes arbitrario) se
-            // RECHAZA por defecto. Así la clave de consenso remota no puede
-            // autorizar una transferencia de valor NI ningún objeto futuro,
-            // aunque el proceso del nodo esté comprometido: puede equivocar
-            // (slasheable) pero nunca gastar.
-            if !msg.starts_with(qchain_crypto::domains::P2P_AUTH_V1) {
-                let reason = "refusing SignRaw: only a P2P_AUTH_V1-domained handshake transcript is signable via sign_raw; the consensus signer never signs value/other objects (#193-B allowlist)".to_string();
+            // RECHAZA. Así la clave de consenso remota no puede autorizar una
+            // transferencia de valor NI ningún objeto futuro, aunque el proceso
+            // del nodo esté comprometido: puede equivocar (slasheable) pero nunca
+            // gastar. El método `sign_raw` de bytes arbitrarios ya NO existe.
+            if !transcript.starts_with(qchain_crypto::domains::P2P_AUTH_V1) {
+                let reason = "refusing SignNetworkHandshake: only a P2P_AUTH_V1-domained handshake transcript is signable; the consensus signer never signs value/other objects".to_string();
                 tracing::error!("signer: {reason}");
                 return SignerResponse::Refused(reason);
             }
-            match keypair.sign(msg) {
+            match keypair.sign(transcript) {
                 Ok(sig) => SignerResponse::Signature(sig),
                 Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
             }
@@ -840,7 +841,7 @@ mod tests {
         ));
         // SignRaw de un transcript de handshake (dominio P2P) → OK.
         let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript"].concat();
-        assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignNetworkHandshake { transcript: hs }, &kp, &g), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -850,7 +851,7 @@ mod tests {
     /// a P2P-handshake (`qchain-p2p-auth-v1`) or any other non-tx raw message is
     /// still signed normally.
     #[test]
-    fn sign_raw_refuses_a_tx_domained_message_but_signs_others() {
+    fn sign_network_handshake_refuses_a_tx_domained_message_but_signs_the_p2p_transcript() {
         let tmp = std::env::temp_dir().join(format!("qrs-txoracle-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let kp = Keypair::generate().unwrap();
@@ -860,7 +861,7 @@ mod tests {
         let mut tx_msg = qchain_crypto::domains::TX_SIG_V1.to_vec();
         tx_msg.extend_from_slice(b"...borsh(Message) would follow...");
         assert!(
-            matches!(respond(&SignerRequest::SignRaw { msg: tx_msg }, &kp, &g), SignerResponse::Refused(_)),
+            matches!(respond(&SignerRequest::SignNetworkHandshake { transcript: tx_msg }, &kp, &g), SignerResponse::Refused(_)),
             "the consensus signer must refuse to sign a TX_SIG_V1-domained message (no value oracle)"
         );
         // ALLOWLIST: anything that is NOT a handshake transcript is refused too —
@@ -872,13 +873,13 @@ mod tests {
             b"qchain-some-future-protocol-v1 ...".to_vec(),
         ] {
             assert!(
-                matches!(respond(&SignerRequest::SignRaw { msg: bad }, &kp, &g), SignerResponse::Refused(_)),
+                matches!(respond(&SignerRequest::SignNetworkHandshake { transcript: bad }, &kp, &g), SignerResponse::Refused(_)),
                 "the consensus signer only signs raw bytes that are a P2P_AUTH_V1 handshake transcript"
             );
         }
         // The real handshake transcript (the ONLY permitted raw domain) is signed.
         let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript..."].concat();
-        assert!(matches!(respond(&SignerRequest::SignRaw { msg: hs }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignNetworkHandshake { transcript: hs }, &kp, &g), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -272,7 +272,7 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
         }
 
         let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
-        let sig_c = auth.signer.sign_raw(&t_client)?;
+        let sig_c = auth.signer.sign_network_handshake(&t_client)?;
         write_frame(stream, &HandshakeFinal { signature: sig_c }).await?;
 
         // Only after the transcript (which binds kem_pk/kem_ct) verified do we
@@ -319,7 +319,7 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
         let server_id = bundle_s.to_address();
         let nonce_s = fresh_nonce()?;
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
-        let sig_s = auth.signer.sign_raw(&t_server)?;
+        let sig_s = auth.signer.sign_network_handshake(&t_server)?;
         let kem_ct_field = if auth.encrypt { Some(kem_ct.clone()) } else { None };
         write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, kem_ct: kem_ct_field, signature: sig_s }).await?;
 

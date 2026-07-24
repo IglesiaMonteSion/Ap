@@ -424,10 +424,16 @@ pub trait Signer: Send + Sync {
     /// equivocación, y si el proceso está comprometido la clave local ya está
     /// expuesta).
     fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
-    /// Firma exactamente estos bytes (el llamador ya los enmarcó/domainó — p.ej.
-    /// el transcript del handshake autenticado, que ya lleva su propio dominio).
-    /// Sin guardia (no es un voto de consenso).
-    fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature>;
+    /// Firma el **transcript de un handshake P2P** (`P2P_AUTH_V1 ‖ …`). Es una
+    /// operación TIPADA, no un `sign_raw` de bytes arbitrarios (auditoría #2, punto
+    /// 2): la implementación EXIGE que el mensaje empiece por el dominio
+    /// [`domains::P2P_AUTH_V1`] y RECHAZA cualquier otra cosa — así un bug en otro
+    /// módulo NO puede convertir la clave del validador en una clave universal que
+    /// firme tx, retiros o bytes libres. El único uso legítimo de firmar-bytes de
+    /// la clave del validador es probar su identidad en el handshake de red; todo
+    /// lo demás va por un método tipado (`sign_own_vote`/`sign_peer_vote`/
+    /// `sign_checkpoint`). Sin guardia (no es un voto de consenso).
+    fn sign_network_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature>;
     /// Firma un **checkpoint de estado** (`STATE_CHECKPOINT_V1 ‖ chain_id ‖ round ‖
     /// root`, tarea #212) para atestar el state root de esta red en una ronda. No
     /// es un voto de consenso (dominio distinto) → sin guardia anti-doble-firma; un
@@ -457,8 +463,14 @@ impl Signer for Keypair {
         // firmante remoto, donde la clave vive fuera del proceso.
         sign_vertex_vote(self, digest)
     }
-    fn sign_raw(&self, msg: &[u8]) -> anyhow::Result<MultiSignature> {
-        self.sign(msg)
+    fn sign_network_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature> {
+        // TIPADO (auditoría #2): sólo un transcript del handshake P2P (dominio
+        // P2P_AUTH_V1). Todo lo demás se rechaza → la clave del validador jamás
+        // firma bytes arbitrarios / tx / retiros aunque un caller se equivoque.
+        if !transcript.starts_with(domains::P2P_AUTH_V1) {
+            anyhow::bail!("sign_network_handshake: message is not a P2P_AUTH_V1 handshake transcript (the validator key never signs arbitrary bytes)");
+        }
+        self.sign(transcript)
     }
     fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         sign_state_checkpoint(self, chain_id, round, merkle_root)
@@ -652,6 +664,32 @@ mod tests {
         let msg = b"hello qchain";
         let sig = kp.sign(msg).unwrap();
         assert!(verify(&kp.public_key_bundle(), msg, &sig));
+    }
+
+    /// Auditoría #2 — la interfaz TIPADA del validador: `sign_network_handshake`
+    /// SÓLO firma un transcript con el dominio `P2P_AUTH_V1`; una tx, un voto, o
+    /// bytes arbitrarios se RECHAZAN. No existe un `sign_raw` de bytes libres → la
+    /// clave del validador no puede convertirse en una clave universal.
+    #[test]
+    fn sign_network_handshake_only_signs_a_p2p_transcript_never_arbitrary_bytes() {
+        let kp = Keypair::generate().unwrap();
+        // Un transcript P2P real (empieza por el dominio) se firma y verifica.
+        let ok = [domains::P2P_AUTH_V1, b" role/network/ids/nonces/kem"].concat();
+        let sig = kp.sign_network_handshake(&ok).expect("a P2P transcript signs");
+        assert!(verify(&kp.public_key_bundle(), &ok, &sig));
+        // Todo lo demás se rechaza: bytes libres, dominio de tx, dominio de voto.
+        for bad in [
+            b"arbitrary bytes".to_vec(),
+            [domains::TX_SIG_V1, b" ...a value transfer..."].concat(),
+            [domains::VERTEX_VOTE_V1, &[0u8; 32]].concat(),
+            b"qchain-some-future-protocol-v1 ...".to_vec(),
+            Vec::new(),
+        ] {
+            assert!(
+                kp.sign_network_handshake(&bad).is_err(),
+                "the validator key must refuse to sign non-P2P bytes: {bad:?}"
+            );
+        }
     }
 
     #[test]
