@@ -533,3 +533,35 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del verify de certificados (roadmap #14, superficie "certs").
+    //! Un `Certificate` decodificado de bytes ARBITRARIOS de un peer se pasa a
+    //! `verify_certificate` — su bucle sobre `cert.signatures` (dedup + verify de
+    //! voto domain-tagged + `saturating_add` de stake) nunca debe panicar/colgar,
+    //! sin importar cuántas firmas basura traiga ni de qué validadores desconocidos.
+    use super::*;
+    use proptest::prelude::*;
+    use qchain_crypto::Keypair;
+
+    fn small_set() -> ValidatorSet {
+        let mut infos = Vec::new();
+        for _ in 0..3 {
+            let kp = Keypair::generate().unwrap();
+            infos.push(ValidatorInfo { id: kp.pubkey(), pubkey_bundle: kp.public_key_bundle(), stake: 1 });
+        }
+        ValidatorSet::new(infos)
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_certificate_verify_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let vs = small_set();
+            if let Ok(cert) = borsh::from_slice::<Certificate>(&bytes) {
+                // Nunca panica; devuelve un bool (casi siempre false para basura).
+                let _ = verify_certificate(&cert, &vs);
+            }
+        }
+    }
+}

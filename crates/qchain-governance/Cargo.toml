@@ -8,3 +8,6 @@ qchain-core = { path = "../qchain-core" }
 qchain-crypto = { path = "../qchain-crypto" }
 serde.workspace = true
 borsh.workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -106,3 +106,22 @@ pub struct Envelope {
     pub from: ValidatorId,
     pub message: NetMessage,
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del borde de wire P2P (roadmap #14, superficie "P2P"). Un
+    //! peer envía `[u32 LE len][Borsh(Envelope)]`; el receptor decodifica el
+    //! `Envelope` (y su `NetMessage` interno) DIRECTO de bytes que controla un
+    //! atacante. Deserializar bytes ARBITRARIOS nunca debe panicar/colgar ni al
+    //! re-serializar. Complementa el fuzzing coverage-guided de `fuzz/`.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_p2p_wire(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            if let Ok(env) = borsh::from_slice::<Envelope>(&bytes) { let _ = borsh::to_vec(&env); }
+            if let Ok(m) = borsh::from_slice::<NetMessage>(&bytes) { let _ = borsh::to_vec(&m); }
+        }
+    }
+}

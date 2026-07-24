@@ -1068,7 +1068,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1643,7 +1643,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1940,7 +1940,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-cli"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2339,8 +2339,10 @@ dependencies = [
 
 [[package]]
 name = "qchain-consensus"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
+ "borsh",
+ "proptest",
  "qchain-core",
  "qchain-crypto",
  "sha3",
@@ -2348,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2363,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2381,10 +2383,11 @@ dependencies = [
 
 [[package]]
 name = "qchain-execution"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
+ "proptest",
  "qchain-core",
  "qchain-crypto",
  "qchain-governance",
@@ -2399,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-faucet"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2419,9 +2422,10 @@ dependencies = [
 
 [[package]]
 name = "qchain-governance"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "borsh",
+ "proptest",
  "qchain-core",
  "qchain-crypto",
  "serde",
@@ -2429,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-indexer"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2447,12 +2451,13 @@ dependencies = [
 
 [[package]]
 name = "qchain-network"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
  "chacha20poly1305",
  "getrandom 0.2.17",
+ "proptest",
  "qchain-core",
  "qchain-crypto",
  "sha3",
@@ -2463,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-node"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2471,6 +2476,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "proptest",
  "qchain-consensus",
  "qchain-core",
  "qchain-crypto",
@@ -2493,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-remote-signer"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2505,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-simulation"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "qchain-consensus",
  "qchain-core",
@@ -2515,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-stark"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "hex",
  "qchain-core",
@@ -2529,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-storage"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2544,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-wallet"
-version = "8.6.9"
+version = "8.6.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2876,7 +2882,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3315,7 +3321,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4202,7 +4208,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

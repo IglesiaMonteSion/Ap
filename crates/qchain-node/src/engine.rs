@@ -5795,3 +5795,28 @@ mod tests {
         assert_eq!(decide_batch_admission(&mut state, from, &now_wanted), BatchAdmission::Persist, "a referenced batch is admitted regardless of the speculative cap");
     }
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del borde de deserialización de state-sync y RPC (roadmap #14,
+    //! superficies "snapshots" + "RPC"). Un nodo que se sincroniza deserializa
+    //! `SnapshotMeta`/`SnapshotPage`/`StateSnapshot` (JSON) DIRECTO de la respuesta
+    //! de un peer fuente posiblemente malicioso; y `/tx`//`/simulate` deserializan
+    //! una `Transaction` (JSON) del cuerpo de un POST sin autenticar. Deserializar
+    //! bytes ARBITRARIOS nunca debe panicar/colgar. Complementa el fuzzing de `fuzz/`.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_snapshot_and_rpc(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            // state-sync (JSON de un peer fuente).
+            let _ = serde_json::from_slice::<SnapshotMeta>(&bytes);
+            let _ = serde_json::from_slice::<SnapshotPage>(&bytes);
+            let _ = serde_json::from_slice::<SnapshotAccount>(&bytes);
+            let _ = serde_json::from_slice::<StateSnapshot>(&bytes);
+            // RPC (JSON del cuerpo de /tx y /simulate).
+            let _ = serde_json::from_slice::<qchain_core::Transaction>(&bytes);
+        }
+    }
+}

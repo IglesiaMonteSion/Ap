@@ -184,6 +184,13 @@ jobs:
         run: cargo +nightly fuzz run transaction_deserialize -- -max_total_time=120
       - name: Fuzz message_deserialize (120s)
         run: cargo +nightly fuzz run message_deserialize -- -max_total_time=120
+      # roadmap #14 — superficies P2P / gobernanza / WASM+decodificadores on-chain.
+      - name: Fuzz network_envelope_deserialize (120s)
+        run: cargo +nightly fuzz run network_envelope_deserialize -- -max_total_time=120
+      - name: Fuzz governance_proposal_deserialize (120s)
+        run: cargo +nightly fuzz run governance_proposal_deserialize -- -max_total_time=120
+      - name: Fuzz execution_decoders (120s)
+        run: cargo +nightly fuzz run execution_decoders -- -max_total_time=120
 
   sanitizers:
     name: Sanitizers (ASan/UBSan sobre los deserializadores, nightly/manual)

@@ -399,3 +399,24 @@ mod tests {
         assert_eq!(sample_action().risk_tier(), RiskTier::Registry);
     }
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del borde de decodificación de gobernanza (roadmap #14,
+    //! superficie "gobernanza"). Una `Proposal` y su `ProposalAction` se decodifican
+    //! de la `data` de una cuenta on-chain (Borsh) — bytes que en última instancia
+    //! provienen de una tx de un usuario. Deserializar bytes ARBITRARIOS nunca debe
+    //! panicar/colgar ni al re-serializar.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_governance(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            if let Ok(p) = borsh::from_slice::<Proposal>(&bytes) { let _ = borsh::to_vec(&p); }
+            let _ = borsh::from_slice::<ProposalAction>(&bytes);
+            let _ = borsh::from_slice::<VoteChoice>(&bytes);
+            let _ = borsh::from_slice::<RiskTier>(&bytes);
+        }
+    }
+}

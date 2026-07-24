@@ -201,3 +201,27 @@ mod tests {
         assert_ne!(c.digest(), d.digest());
     }
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del borde de wire del DAG (roadmap #14, superficie "certs").
+    //! Un `Batch`/`Vertex`/`Certificate` entra a un nodo honesto DIRECTO desde un
+    //! peer (gossip/re-sync) por Borsh, y por JSON en el snapshot/RPC. Deserializar
+    //! bytes ARBITRARIOS nunca debe panicar/colgar, y computar `digest()` sobre lo
+    //! que decodifique tampoco — es la invariante que el fuzzing coverage-guided de
+    //! `fuzz/` profundiza, aquí corrida en CADA CI sobre inputs generados.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_dag_wire(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            // Borsh (el camino P2P real de gossip/re-sync). El camino JSON de
+            // estos mismos tipos (snapshot/RPC) se ejercita en qchain-node, donde
+            // serde_json está disponible.
+            if let Ok(b) = borsh::from_slice::<Batch>(&bytes) { let _ = b.digest(); let _ = borsh::to_vec(&b); }
+            if let Ok(v) = borsh::from_slice::<Vertex>(&bytes) { let _ = v.digest(); let _ = borsh::to_vec(&v); }
+            if let Ok(c) = borsh::from_slice::<Certificate>(&bytes) { let _ = c.digest(); let _ = borsh::to_vec(&c); }
+        }
+    }
+}

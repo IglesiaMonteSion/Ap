@@ -1,14 +1,19 @@
-# Fuzzing harness (task #200, QCH-S12). Un crate SEPARADO del workspace principal
-# (está en el `exclude` del Cargo.toml raíz) porque cargo-fuzz necesita nightly +
-# libFuzzer y su propio target. Correlo con:
+# Fuzzing harness (task #200 + roadmap #14, QCH-S12). Un crate SEPARADO del
+# workspace principal (está en el `exclude` del Cargo.toml raíz) porque cargo-fuzz
+# necesita nightly + libFuzzer y su propio target. Correlo con:
 #
 #   cargo install cargo-fuzz            # una vez
-#   cargo +nightly fuzz run transaction_deserialize   # fuzz continuo del borde de wire
-#   cargo +nightly fuzz run message_deserialize
+#   cargo +nightly fuzz run transaction_deserialize    # borde de wire de tx
+#   cargo +nightly fuzz run message_deserialize        # Message firmable
+#   cargo +nightly fuzz run network_envelope_deserialize   # #14: P2P (Envelope/NetMessage)
+#   cargo +nightly fuzz run governance_proposal_deserialize # #14: gobernanza (Proposal)
+#   cargo +nightly fuzz run execution_decoders             # #14: decodificadores on-chain + WASM
 #
-# El objetivo: ningún byte arbitrario del wire debe panicar/OOM el deserializador
-# ni el verify. El fuzzing continuo (correrlo por horas/CI-cron) es el complemento
-# de los property tests de proptest (que corren en cada CI sobre inputs generados).
+# El objetivo: ningún byte arbitrario del wire/estado debe panicar/OOM el
+# deserializador ni el verify. El fuzzing continuo (correrlo por horas/CI-cron) es
+# el complemento coverage-guided de los property tests de proptest (que corren en
+# cada CI sobre inputs generados, en los mismos tipos y con las mismas llamadas
+# `from_slice`/`read_or_legacy`/`decode_registry`).
 [package]
 name = "qchain-fuzz"
 version = "0.0.0"
@@ -22,6 +27,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 borsh = { version = "1", features = ["derive"] }
 qchain-core = { path = "../crates/qchain-core" }
+qchain-network = { path = "../crates/qchain-network" }
+qchain-governance = { path = "../crates/qchain-governance" }
+qchain-execution = { path = "../crates/qchain-execution" }
 
 [[bin]]
 name = "transaction_deserialize"
@@ -33,6 +41,34 @@ bench = false
 [[bin]]
 name = "message_deserialize"
 path = "fuzz_targets/message_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+# roadmap #14 — superficie P2P: el Envelope y su NetMessage interno que un peer
+# envía por el wire (Borsh).
+[[bin]]
+name = "network_envelope_deserialize"
+path = "fuzz_targets/network_envelope_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+# roadmap #14 — superficie gobernanza: la Proposal decodificada de la data de una
+# cuenta on-chain (Borsh).
+[[bin]]
+name = "governance_proposal_deserialize"
+path = "fuzz_targets/governance_proposal_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+# roadmap #14 — superficies WASM + gobernanza: TODOS los decodificadores de estado
+# on-chain e instrucciones (WasmProgramData, decode_registry, *::read_or_legacy,
+# StakingInstruction/GovernanceInstruction/…).
+[[bin]]
+name = "execution_decoders"
+path = "fuzz_targets/execution_decoders.rs"
 test = false
 doc = false
 bench = false

@@ -555,3 +555,23 @@ mod tests {
         assert!(res.is_err(), "a None-expected dial must be refused even against an authorized member");
     }
 }
+
+#[cfg(test)]
+mod fuzz_proptests {
+    //! Property tests del handshake P2P PRE-AUTENTICACIÓN (roadmap #14). Los frames
+    //! del handshake (`HandshakeInit`/`Resp`/`Final`) son lo PRIMERO que un nodo
+    //! con auth lee de una conexión entrante, ANTES de verificar identidad — la
+    //! superficie más expuesta. Un `read_frame` decodifica bytes arbitrarios de un
+    //! atacante (tope `HANDSHAKE_FRAME_CAP`); deserializarlos nunca debe panicar.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_handshake_frames(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let _ = borsh::from_slice::<HandshakeInit>(&bytes);
+            let _ = borsh::from_slice::<HandshakeResp>(&bytes);
+            let _ = borsh::from_slice::<HandshakeFinal>(&bytes);
+        }
+    }
+}

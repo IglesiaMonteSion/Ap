@@ -16,5 +16,6 @@ wasmtime.workspace = true
 sha3.workspace = true
 
 [dev-dependencies]
+proptest = "1"
 wat.workspace = true
 qchain-stark = { path = "../qchain-stark" }
