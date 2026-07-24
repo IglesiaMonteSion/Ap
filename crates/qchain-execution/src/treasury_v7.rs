@@ -387,6 +387,19 @@ pub enum TreasuryV7Instruction {
     Execute { op_id: u64 },
     /// Cancel a pending operation. accounts=[signer, treasury].
     Cancel { op_id: u64 },
+    /// **Prune expired pending ops and PERSIST the cleanup** — audit v8.6.13 #9.
+    /// Permissionless (anyone pays the tx fee). accounts=[caller, treasury].
+    /// Every treasury instruction already prunes expired ops in `preamble`, but a
+    /// FAILED instruction (e.g. Approve/Execute/Cancel of a non-existent `op_id`)
+    /// discards its working-set changes in the transactional model, so the prune
+    /// isn't persisted until the next SUCCESSFUL mutation. This op ALWAYS succeeds
+    /// when it names the canonical treasury, giving anyone a way to force the
+    /// cleanup (freeing state bytes + slots against `MAX_TREASURY_PENDING`). It
+    /// only removes ops the deterministic expiry rule already marks dead — it
+    /// never moves funds or changes authority, so no signer is required.
+    /// Added at the END of the enum → existing variants keep their borsh
+    /// discriminants (byte-identical); coordinated deploy (all nodes together).
+    PruneExpired,
 }
 
 pub struct TreasuryV7Program;
@@ -437,9 +450,27 @@ fn prune_expired(state: &mut TreasuryState, current_round: Round) {
         return;
     }
     let expiry = state.op_expiry_rounds;
-    state
-        .pending
-        .retain(|p| current_round <= p.proposed_round.saturating_add(expiry));
+    let timelock = state.timelock_rounds;
+    state.pending.retain(|p| {
+        if p.threshold_reached_round > 0 {
+            // Audit v8.6.13 #5: an op that ALREADY reached quorum must NOT expire
+            // before it can execute. Its deadline is the EXECUTION deadline —
+            // measured from when it becomes READY (`threshold_reached_round +
+            // timelock`) plus a full expiry window to actually be executed — NEVER
+            // from `proposed_round` (which, if quorum was reached late, could
+            // expire it before the timelock even elapses → approved-but-
+            // unexecutable, the exact scenario the auditor flagged). This
+            // separates the APPROVAL deadline (`proposed_round + expiry`, below)
+            // from the EXECUTION deadline (`ready_round + expiry`, here), so
+            // completing the quorum always guarantees a window to execute.
+            let ready = p.threshold_reached_round.saturating_add(timelock);
+            current_round <= ready.saturating_add(expiry)
+        } else {
+            // Not yet approved: the proposal expires if quorum isn't reached in
+            // time (the APPROVAL deadline).
+            current_round <= p.proposed_round.saturating_add(expiry)
+        }
+    });
 }
 
 fn write_state(accounts: &mut HashMap<Pubkey, Account>, state: &TreasuryState) -> Result<(), ExecError> {
@@ -463,7 +494,24 @@ impl TreasuryV7Program {
             TreasuryV7Instruction::Approve { op_id } => Self::approve(accounts, instruction, payer, current_round, op_id),
             TreasuryV7Instruction::Execute { op_id } => Self::execute_op(accounts, instruction, payer, current_round, op_id),
             TreasuryV7Instruction::Cancel { op_id } => Self::cancel(accounts, instruction, payer, current_round, op_id),
+            TreasuryV7Instruction::PruneExpired => Self::prune(accounts, instruction, payer, current_round),
         }
+    }
+
+    /// #9: persist the expired-op cleanup that `preamble` computes. Every other
+    /// treasury instruction prunes in `preamble`, but its cleanup is only
+    /// persisted if the instruction returns Ok (the transactional model discards
+    /// a failed instruction's working-set changes). This op does nothing but
+    /// prune-and-persist, so it ALWAYS succeeds when it names the canonical
+    /// treasury — anyone can force the cleanup. No signer required (it only
+    /// removes ops the deterministic expiry rule already marks dead; it never
+    /// moves funds or changes authority — the `preamble` already pins
+    /// `accounts[1] == TREASURY` and `accounts[0] == payer`).
+    fn prune(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round) -> Result<(), ExecError> {
+        // `preamble` loads the state and prunes expired ops; writing it back
+        // persists the cleanup (the whole point of this instruction).
+        let state = Self::preamble(accounts, ix, payer, current_round)?;
+        write_state(accounts, &state)
     }
 
     /// Shared preamble: accounts[0] is the acting account (must be the payer =
@@ -778,6 +826,88 @@ mod tests {
 
     fn exec(accounts: &mut HashMap<Pubkey, Account>, instr: &TreasuryV7Instruction, accts: Vec<Pubkey>, payer: Pubkey, round: Round) -> Result<(), ExecError> {
         TreasuryV7Program::execute(accounts, &ix(instr, accts), &payer, round)
+    }
+
+    /// Audit v8.6.13 #9: `preamble` prunes expired ops, but a FAILED instruction
+    /// (e.g. Approve of a non-existent `op_id`) discards its working-set changes
+    /// in the transactional model, so the prune is NOT persisted until the next
+    /// SUCCESSFUL mutation. `PruneExpired` always succeeds and persists the
+    /// cleanup — and is permissionless (even a non-signer can force it).
+    #[test]
+    fn prune_expired_persists_the_cleanup_a_failed_instruction_would_drop() {
+        let signers: Vec<Pubkey> = (1..=5).map(pk).collect();
+        // op_expiry_rounds 10 > timelock 5 (the #17 invariant).
+        let state = TreasuryState {
+            signers: signers.clone(), threshold: 3,
+            timelock_rounds: 5, max_per_release: 0, max_per_window: 0, window_rounds: 0,
+            window_start_round: 0, released_in_window: 0, next_op_id: 0, pending: Vec::new(),
+            policy_threshold: 3, signers_threshold: 3, op_expiry_rounds: 10,
+        };
+        let mut a = HashMap::new();
+        a.insert(TREASURY_ACCOUNT_ID, genesis_treasury_account_multisig(state, 100_000));
+        let t = TREASURY_ACCOUNT_ID;
+
+        // Propose at round 100 → expires at 110.
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 10_000, destination: pk(9) } }, vec![signers[0], t], signers[0], 100).unwrap();
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1, "op is pending");
+
+        // At round 200 the op is long expired. A FAILED Approve of a non-existent
+        // op_id errors → its working-set changes (incl. the preamble's prune) are
+        // DISCARDED, so the expired op is STILL there (the #9 finding).
+        assert!(exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 999 }, vec![signers[1], t], signers[1], 200).is_err());
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1, "a failed instruction does NOT persist the prune (#9)");
+
+        // PruneExpired ALWAYS succeeds and persists the cleanup → op gone.
+        exec(&mut a, &TreasuryV7Instruction::PruneExpired, vec![signers[1], t], signers[1], 200).unwrap();
+        assert_eq!(read_state(&a).unwrap().pending.len(), 0, "PruneExpired persists the cleanup");
+
+        // Permissionless: even a NON-signer can force the cleanup (it only removes
+        // ops the deterministic expiry rule already marks dead).
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 10_000, destination: pk(9) } }, vec![signers[0], t], signers[0], 300).unwrap();
+        let outsider = pk(200);
+        exec(&mut a, &TreasuryV7Instruction::PruneExpired, vec![outsider, t], outsider, 400).unwrap();
+        assert_eq!(read_state(&a).unwrap().pending.len(), 0, "a non-signer can force the cleanup");
+
+        // But a live (non-expired) op is NOT pruned.
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 10_000, destination: pk(9) } }, vec![signers[0], t], signers[0], 500).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::PruneExpired, vec![outsider, t], outsider, 505).unwrap();
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1, "a still-valid op survives the prune");
+    }
+
+    /// Audit v8.6.13 #5: an op that reaches quorum LATE must not expire before it
+    /// can execute. Expiry used to be measured from `proposed_round`, so an op
+    /// whose `ready_round` (threshold_reached_round + timelock) fell PAST the
+    /// approval deadline (proposed_round + expiry) was pruned before its timelock
+    /// elapsed — approved but unexecutable. The fix measures a quorum-reached op's
+    /// deadline from `ready_round + expiry` (the EXECUTION deadline), separate from
+    /// the pre-quorum APPROVAL deadline.
+    #[test]
+    fn a_late_quorum_op_survives_the_approval_deadline_and_still_executes() {
+        let signers: Vec<Pubkey> = (1..=5).map(pk).collect();
+        // proposed@100, approval deadline = proposed+expiry = 150, timelock 40.
+        let state = TreasuryState {
+            signers: signers.clone(), threshold: 3,
+            timelock_rounds: 40, max_per_release: 0, max_per_window: 0, window_rounds: 0,
+            window_start_round: 0, released_in_window: 0, next_op_id: 0, pending: Vec::new(),
+            policy_threshold: 3, signers_threshold: 3, op_expiry_rounds: 50,
+        };
+        let mut a = HashMap::new();
+        a.insert(TREASURY_ACCOUNT_ID, genesis_treasury_account_multisig(state, 100_000));
+        let dest = pk(9);
+        let t = TREASURY_ACCOUNT_ID;
+        // Propose@100 (1/3), approve@148 (2/3), approve@149 (3/3 → ready@189 > 150).
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 30_000, destination: dest } }, vec![signers[0], t], signers[0], 100).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 0 }, vec![signers[1], t], signers[1], 148).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 0 }, vec![signers[2], t], signers[2], 149).unwrap();
+        // Past the APPROVAL deadline (150) the quorum-reached op is STILL alive
+        // (before the fix it was pruned at 150, before its timelock elapsed).
+        exec(&mut a, &TreasuryV7Instruction::PruneExpired, vec![signers[0], t], signers[0], 160).unwrap();
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1, "a quorum-reached op survives the approval deadline (#5)");
+        // Still timelocked before ready@189.
+        assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 0 }, vec![signers[0], t, dest], signers[0], 188), Err(ExecError::Unauthorized(_))));
+        // Executes at 189 — the op was NOT lost to expiry.
+        exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 0 }, vec![signers[0], t, dest], signers[0], 189).unwrap();
+        assert_eq!(a.get(&dest).map(|x| x.balance).unwrap_or(0), 30_000, "the late-quorum release executed");
     }
 
     #[test]

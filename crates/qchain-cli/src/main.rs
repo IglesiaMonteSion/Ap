@@ -645,6 +645,19 @@ enum Command {
         #[arg(long, default_value_t = 50_000_000)]
         fee_limit: u64,
     },
+    /// v7 treasury: prune expired pending operations and PERSIST the cleanup
+    /// (audit #9). Permissionless — any signer/account can trigger it; it only
+    /// removes ops the deterministic expiry rule already marks dead.
+    TreasuryPrune {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 50_000_000)]
+        fee_limit: u64,
+    },
     /// v7 treasury: print the full on-chain multisig state (signers, threshold,
     /// timelock, limits, window usage, and every pending operation with approvals).
     TreasuryStatus {
@@ -2054,6 +2067,14 @@ fn main() -> anyhow::Result<()> {
             let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("cancelled treasury op {op_id}.");
+        }
+        Command::TreasuryPrune { rpc, keypair, nonce, fee_limit } => {
+            use qchain_execution::treasury_v7::TreasuryV7Instruction;
+            let signer = qchain_crypto::read_keypair_file(&keypair)?;
+            let data = borsh::to_vec(&TreasuryV7Instruction::PruneExpired)?;
+            let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("pruned expired treasury operations (cleanup persisted).");
         }
         Command::TreasuryStatus { rpc } => {
             let body = reqwest::blocking::get(format!("{}/treasury", rpc.trim_end_matches('/')))?.text()?;

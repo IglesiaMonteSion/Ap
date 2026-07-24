@@ -178,12 +178,20 @@ sigue cerrada.
   silenciosamente (o panic-halt determinista en release con overflow-checks).
 - **Instancias:** #132 (fee add panic), #218 (módulo `arith`), v8.6.13 #1
   (`passed_round + timelock` → panic con `passed_round` ≈ u64::MAX; CORREGIDO
-  v8.6.18 con `saturating_add`), #5 (aritmética expiración/timelock de tesorería —
-  **ya cerrado**: `prune_expired`/`ready_round`/ventana usan `saturating_add`, los
-  movimientos de fondos usan `arith::sub_u64/add_u64` checked, y el invariante
-  `op_expiry_rounds > timelock_rounds` se valida en génesis y en `SetPolicy`;
-  verificado por barrido — sin `+`/`-`/`*` crudo sobre round/amount/expiry en el
-  módulo). **Barrido QSEP-1 proactivo (v8.6.23):** corrido el `qsep-sweep.sh`
+  v8.6.18 con `saturating_add`), #5 (expiración/timelock de tesorería: la
+  aritmética cruda quedó cerrada en v8.6.18 —`saturating_add` + `arith` checked—,
+  **PERO el LADO SEMÁNTICO se sobre-declaró cerrado**: la verificación punto-por-
+  punto de v8.6.24 encontró que el invariante `op_expiry_rounds > timelock_rounds`
+  NO cerraba el escenario real del auditor —una op que alcanza quorum TARDE
+  (`ready_round = threshold_reached_round + timelock` cae PASADO `proposed_round +
+  expiry`) se podaba antes de poder ejecutarse: aprobada pero inejecutable—.
+  **CERRADO de verdad en v8.6.24:** `prune_expired` separa el deadline de
+  APROBACIÓN (`proposed+expiry`, pre-quorum) del de EJECUCIÓN (`ready+expiry`, post-
+  quorum) → una op con quorum SIEMPRE tiene ventana para ejecutar (test
+  `a_late_quorum_op_survives_the_approval_deadline_and_still_executes`). **Lección
+  meta (EC-11/EC-03):** un invariante NECESARIO no es SUFICIENTE — marcar "cerrado"
+  por un invariante sin un test del escenario exacto del auditor es sesgo de test
+  al camino feliz. **Barrido QSEP-1 proactivo (v8.6.23):** corrido el `qsep-sweep.sh`
   sobre TODO el árbol post-audit; de los 10 candidatos EC-05, 9 eran tests y el
   ÚNICO de producción era `fees_v7::distribute_fee_pool` (`paid = reward * n` +
   `remainder = pool - paid`) — provablemente sin desborde (`reward*n =

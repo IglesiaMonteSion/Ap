@@ -853,6 +853,24 @@ impl NodeConfig {
         // 5. remote signer (consensus key out of process).
         if self.remote_signer.is_none() {
             missing.push("remote_signer: set \"host:port\" of a qchain-remote-signer/HSM so the block-signing key is NOT in the node process".into());
+        } else if let Some(ep) = &self.remote_signer {
+            // Audit v8.6.13 #4: the signer socket is an UNAUTHENTICATED signing
+            // oracle — no client mTLS / session challenge yet — so anyone who
+            // reaches it can request consensus votes / handshake sigs (= compromise
+            // of the validator's consensus identity). A mainnet validator must
+            // reach it over LOOPBACK (same machine) ONLY; a public or even
+            // private-LAN endpoint is rejected fail-closed. (Cross-host signing
+            // needs the mTLS/UDS client-auth that is the documented follow-up.)
+            let host_is_loopback = ep
+                .rsplit_once(':')
+                .and_then(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().ok())
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+            if !host_is_loopback {
+                missing.push(format!(
+                    "remote_signer: {ep} must be a LOOPBACK endpoint (e.g. 127.0.0.1:9200) on mainnet — the signer socket is unauthenticated (no client mTLS yet), so a public/LAN address is an open signing oracle for the consensus key"
+                ));
+            }
         }
         // 6. validator RPC on a private network.
         if !is_private_or_loopback(self.rpc_addr.ip()) {
@@ -1374,6 +1392,10 @@ mod tests {
             ("authenticated_transport", Box::new(|c: &mut NodeConfig| c.authenticated_transport = false)),
             ("encrypted_transport", Box::new(|c: &mut NodeConfig| c.encrypted_transport = false)),
             ("remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = None)),
+            // Audit v8.6.13 #4: a public/LAN signer endpoint is an unauthenticated
+            // signing oracle — mainnet must reject it (loopback only until mTLS).
+            ("public remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = Some("8.8.8.8:9200".into()))),
+            ("LAN remote_signer", Box::new(|c: &mut NodeConfig| c.remote_signer = Some("192.168.1.10:9200".into()))),
             ("public rpc_addr", Box::new(|c: &mut NodeConfig| c.rpc_addr = "8.8.8.8:28001".parse().unwrap())),
             ("trust_anchor", Box::new(|c: &mut NodeConfig| c.require_state_sync_trust_anchor = false)),
             ("rpc_rate_limit", Box::new(|c: &mut NodeConfig| c.rpc_rate_limit_per_10s = None)),
