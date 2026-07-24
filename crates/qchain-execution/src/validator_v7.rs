@@ -1625,4 +1625,182 @@ mod tests {
         assert_eq!(detect_registry_schema(&[0xFFu8; 9]), None);
         assert!(matches!(plan_registry_migration(&[0xFFu8; 9]), RegistryMigration::Corrupt));
     }
+
+    /// #20: a prior (V2, pre-#20) registry migrates to V3 on read with the #20
+    /// fields DEFAULTED (byte-identical behavior), and the schema/plan report V2
+    /// as a migratable prior. A V3 registry round-trips; a V2 one doesn't
+    /// cross-decode as V3.
+    #[test]
+    fn a_pre20_v2_registry_migrates_to_v3_with_defaulted_key_role_fields() {
+        let v = Keypair::generate().unwrap();
+        let (op, wd) = (Pubkey::new([9u8; 32]), Pubkey::new([8u8; 32]));
+        // Build a genuine V2 (pre-#20) registry via the crate-internal mirror.
+        let v2 = ValidatorV7RegistryV2 {
+            validators: vec![ValidatorV7EntryV2 {
+                address: v.pubkey(),
+                operator_address: op,
+                withdrawal_address: wd,
+                moniker: "prior".to_string(),
+                pubkey_bundle: v.public_key_bundle(),
+                p2p_address: "1.2.3.4:9000".to_string(),
+                bond: VALIDATOR_BOND_ATOMS,
+                state: ValidatorV7State::Active,
+                registered_quanto: 2,
+                activation_quanto: 3,
+                exit_requested_quanto: 0,
+                bond_release_quanto: 0,
+                participation_credits: 5,
+                participation_opportunities: 5,
+            }],
+        };
+        let bytes = borsh::to_vec(&v2).unwrap();
+        assert_eq!(detect_registry_schema(&bytes), Some(RegistrySchema::V2Prior));
+        assert_eq!(RegistrySchema::V2Prior.version(), 2);
+        // A V2 registry must NOT clean-decode as the current V3 (fewer bytes → EOF).
+        assert!(ValidatorV7Registry::try_from_slice(&bytes).is_err(), "V2 must not decode as V3");
+        let migrated = decode_registry(&bytes).expect("V2 migrates, never None");
+        let e = &migrated.validators[0];
+        assert_eq!(e.operator_address, op, "cold operator preserved");
+        assert_eq!(e.withdrawal_address, wd, "cold withdrawal preserved");
+        assert_eq!(e.participation_credits, 5);
+        // #20 defaults applied → behavior-identical (never disabled).
+        assert_eq!(e.consensus_key_expiry_quanto, 0);
+        assert!(!e.consensus_key_revoked);
+        assert!(e.retired_consensus_keys.is_empty());
+        assert!(!e.consensus_key_disabled(1_000_000), "a migrated V2 entry is never disabled");
+        // plan_registry_migration classifies V2 as Migrated; re-planning the V3 is a no-op.
+        let new_bytes = match plan_registry_migration(&bytes) {
+            RegistryMigration::Migrated { validators, new_bytes } => { assert_eq!(validators, 1); new_bytes }
+            _ => panic!("a V2 registry must plan as Migrated"),
+        };
+        assert_eq!(detect_registry_schema(&new_bytes), Some(RegistrySchema::V3Current));
+        assert!(matches!(plan_registry_migration(&new_bytes), RegistryMigration::AlreadyCurrent { validators: 1 }));
+    }
+
+    /// #20: the cold OPERATOR can rotate the operator + withdrawal keys in place
+    /// (keeping the bond/activation); a non-operator is rejected; a rotation that
+    /// collides with another live validator's identity is rejected.
+    #[test]
+    fn cold_key_rotation_is_operator_authorized_and_collision_checked() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let consensus = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &consensus, None, "node-x").unwrap();
+        let caddr = consensus.pubkey();
+        let bond_before = registry_of(&accounts).validators[0].bond;
+
+        // A NON-operator can't rotate the withdrawal.
+        let stranger = Keypair::generate().unwrap();
+        let bad = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: stranger.pubkey() }, vec![stranger.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &bad, &stranger.pubkey()).is_err(), "non-operator rejected");
+
+        // The operator rotates the withdrawal to a fresh cold address.
+        let new_wd = Pubkey::new([77u8; 32]);
+        let ok = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: new_wd }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        ValidatorV7Program::execute(&mut accounts, &ok, &op.pubkey()).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].withdrawal_address, new_wd);
+        assert_eq!(registry_of(&accounts).validators[0].bond, bond_before, "bond untouched by rotation");
+
+        // The operator rotates the operator key; the OLD operator can no longer act.
+        let new_op = Keypair::generate().unwrap();
+        let rot = ix(&ValidatorV7Instruction::RotateOperator { consensus_address: caddr, new_operator: new_op.pubkey() }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        ValidatorV7Program::execute(&mut accounts, &rot, &op.pubkey()).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].operator_address, new_op.pubkey());
+        // Old operator now unauthorized; new operator authorized.
+        let by_old = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([1u8; 32]) }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &by_old, &op.pubkey()).is_err(), "rotated-out operator can't act");
+        let by_new = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([2u8; 32]) }, vec![new_op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        ValidatorV7Program::execute(&mut accounts, &by_new, &new_op.pubkey()).unwrap();
+    }
+
+    /// #20: rotating the CONSENSUS key keeps the bond/activation, requires a fresh
+    /// PoP by the NEW key, records the OLD key as slashable through the window, and
+    /// clears any revocation/expiry; a bad PoP is rejected; the rotated-out key is
+    /// still slashable via `find_slashable`.
+    #[test]
+    fn consensus_key_rotation_keeps_bond_and_old_key_stays_slashable() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let consensus = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &consensus, None, "node-r").unwrap();
+        let old_addr = consensus.pubkey();
+        let activation_before = registry_of(&accounts).validators[0].activation_quanto;
+
+        let new_consensus = Keypair::generate().unwrap();
+        // A BAD pop (signed over the wrong operator) is rejected.
+        let wrong = qchain_crypto::sign_domain(&new_consensus, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&Pubkey::new([5u8; 32]), &op.pubkey(), "node-r")).unwrap();
+        let bad = ix(&ValidatorV7Instruction::RotateConsensusKey { consensus_address: old_addr, new_bundle: new_consensus.public_key_bundle(), new_p2p_address: "5.6.7.8:9000".into(), new_pop: wrong }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &bad, &op.pubkey()).is_err(), "bad PoP rejected");
+
+        // A GOOD pop (operator == payer, withdrawal defaulted to operator, correct moniker).
+        let good = qchain_crypto::sign_domain(&new_consensus, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&op.pubkey(), &op.pubkey(), "node-r")).unwrap();
+        let rot = ix(&ValidatorV7Instruction::RotateConsensusKey { consensus_address: old_addr, new_bundle: new_consensus.public_key_bundle(), new_p2p_address: "5.6.7.8:9000".into(), new_pop: good }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &rot, &op.pubkey()).unwrap();
+
+        let reg = registry_of(&accounts);
+        let e = &reg.validators[0];
+        assert_eq!(e.address, new_consensus.pubkey(), "live address is the new key");
+        assert_eq!(e.bond, VALIDATOR_BOND_ATOMS, "bond preserved across rotation");
+        assert_eq!(e.activation_quanto, activation_before, "activation preserved");
+        assert_eq!(e.p2p_address, "5.6.7.8:9000");
+        // The OLD key is retired-but-slashable, and still findable for slashing.
+        assert!(e.retired_consensus_keys.iter().any(|r| r.address == old_addr), "old key retired");
+        assert_eq!(reg.find(&old_addr), None, "old key is no longer the live address");
+        assert_eq!(reg.find_slashable(&old_addr, 0), Some(0), "old key still slashable within window");
+        // Past the slash window the retired key is no longer slashable.
+        let window_end = e.retired_consensus_keys[0].slash_until_quanto;
+        assert_eq!(reg.find_slashable(&old_addr, window_end + 1), None, "old key not slashable past its window");
+    }
+
+    /// #20: REVOKING or EXPIRING the consensus key excludes the validator from BOTH
+    /// the active committee and fee eligibility; `RotateConsensusKey` clears it.
+    #[test]
+    fn revoke_and_expiry_exclude_from_committee_and_fees() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let consensus = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &consensus, None, "node-e").unwrap();
+        let caddr = consensus.pubkey();
+        // Activate it (and set activation_quanto 0) so it's committee/fee-eligible
+        // at quanto 0 to begin with.
+        {
+            let mut reg = registry_of(&accounts);
+            reg.validators[0].state = ValidatorV7State::Active;
+            reg.validators[0].activation_quanto = 0;
+            write_registry(&mut accounts, &reg).unwrap();
+        }
+        let reg = registry_of(&accounts);
+        assert_eq!(active_committee(&reg, 0).len(), 1, "eligible before");
+        assert!(crate::fees_v7::is_eligible(&reg.validators[0], 0), "fee-eligible before");
+
+        // REVOKE → excluded from both.
+        let rev = ix(&ValidatorV7Instruction::RevokeConsensusKey { consensus_address: caddr }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &rev, &op.pubkey()).unwrap();
+        let reg = registry_of(&accounts);
+        assert!(reg.validators[0].consensus_key_revoked);
+        assert_eq!(active_committee(&reg, 0).len(), 0, "revoked → out of committee");
+        assert!(!crate::fees_v7::is_eligible(&reg.validators[0], 0), "revoked → out of fees");
+        // The revoked key stays the live address (still slashable in-epoch).
+        assert_eq!(reg.find(&caddr), Some(0));
+
+        // Rotating in a fresh key clears the revocation.
+        let nk = Keypair::generate().unwrap();
+        let pop = qchain_crypto::sign_domain(&nk, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&op.pubkey(), &op.pubkey(), "node-e")).unwrap();
+        let rot = ix(&ValidatorV7Instruction::RotateConsensusKey { consensus_address: caddr, new_bundle: nk.public_key_bundle(), new_p2p_address: "9.9.9.9:9000".into(), new_pop: pop }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &rot, &op.pubkey()).unwrap();
+        let reg = registry_of(&accounts);
+        assert!(!reg.validators[0].consensus_key_revoked, "rotation cleared revocation");
+        assert_eq!(active_committee(&reg, 0).len(), 1, "back in committee after rotation");
+
+        // EXPIRY at quanto 100 → disabled at/after 100, fine before.
+        let exp = ix(&ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address: nk.pubkey(), expiry_quanto: 100 }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        ValidatorV7Program::execute(&mut accounts, &exp, &op.pubkey()).unwrap();
+        let reg = registry_of(&accounts);
+        assert_eq!(active_committee(&reg, 99).len(), 1, "not yet expired at quanto 99");
+        assert_eq!(active_committee(&reg, 100).len(), 0, "expired at quanto 100");
+        assert!(!crate::fees_v7::is_eligible(&reg.validators[0], 100), "expired → out of fees");
+    }
 }
