@@ -17,7 +17,7 @@ es el que entregó el operador; acá se registra el trabajo.
 
 | # | Sev | Título | Clase(s) | Prioridad | Estado |
 |---|-----|--------|----------|-----------|--------|
-| 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | CONFIRMADO — en corrección |
+| 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | ✅ **CORREGIDO (v8.6.18)** — owner check + dirección canónica + saturating timelock + 2 tests de exploit + sweep EC-01 limpio |
 | 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | por verificar |
 | 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | por verificar |
 | 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | por verificar |
@@ -39,7 +39,18 @@ es el que entregó el operador; acá se registra el trabajo.
 
 ---
 
-## #1 — Falsificación de propuesta de gobernanza (Crítico) — CONFIRMADO
+## #1 — Falsificación de propuesta de gobernanza (Crítico) — ✅ CORREGIDO (v8.6.18)
+
+**Estado:** cerrado. `read_proposal` exige `owner == GOVERNANCE_PROGRAM_ID`;
+`CreateProposal` exige la dirección canónica `derive_proposal_address(proposer,
+id)`; el time-lock usa `saturating_add` (fail-closed). Dos tests de exploit
+(`a_forged_passed_proposal_in_a_non_governance_account_cannot_be_executed`,
+`create_proposal_requires_the_canonical_address`) + barrido EC-01 limpio (todos
+los demás lectores privilegiados usan un id de singleton fijo o pinnean el owner).
+El CLI deriva la dirección canónica en sus 8 comandos `propose-*`. 235 tests de
+execution en verde, clippy limpio. Byte-idéntico para toda propuesta legítima; el
+enforcement de dirección canónica en `CreateProposal` es un cambio coordinado
+node+CLI (la wallet nunca crea propuestas). Detalle en LESSONS-LEDGER EC-01.
 
 **Verificado leyendo el código** (`crates/qchain-execution/src/governance.rs`):
 - `read_proposal` (línea 102) hace `Proposal::read_or_legacy(&account.data)` y
@@ -77,9 +88,17 @@ es el que entregó el operador; acá se registra el trabajo.
 `Proposal` "Passed" y confirmar que `Execute` la RECHAZA; y una propuesta con
 `passed_round ≈ u64::MAX` no hace panic.
 
-**Barrido de clase (EC-01):** listar cada lector de cuenta privilegiada
-(gobernanza/tesorería/registro v7/emergencia/params/staking) y demostrar
-owner+dirección+magic+versión en cada uno.
+**Barrido de clase (EC-01):** hecho — ver LESSONS-LEDGER EC-01. Sweep limpio.
+
+**Límite honesto (magic/version diferido):** el owner check + dirección canónica
+cierran la falsificación POR CONSTRUCCIÓN (un atacante no puede producir una
+cuenta governance-owned con datos arbitrarios, y la dirección es determinista).
+Un `magic|version` antepuesto en la struct `Proposal` es defensa-en-profundidad
+adicional pero cambia el FORMATO persistido de una cuenta viva → requiere su
+propia migración tolerante + fixtures binarios reales (la clase EC-09 que este
+mismo audit ataca en #2/#3). Se difiere a un incremento propio para NO introducir
+un bug de migración nuevo dentro del fix crítico — la regla "si no hay una
+optimización segura mejor no se hace nada".
 
 ## #2 — Gate de arranque de tesorería ≠ decodificador de runtime (Crítico)
 

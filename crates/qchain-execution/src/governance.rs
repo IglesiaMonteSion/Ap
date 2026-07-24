@@ -99,8 +99,48 @@ fn borsh_err(e: impl std::fmt::Display) -> ExecError {
     ExecError::ProgramError(e.to_string())
 }
 
+/// Domain separator for the canonical governance-proposal address. Bumping this
+/// would change every future proposal address; keep it stable.
+pub(crate) const PROPOSAL_ADDRESS_DOMAIN: &[u8] = b"qchain-governance-proposal-v1";
+
+/// The canonical address of a governance proposal, derived deterministically
+/// from `(proposer, id)`. `CreateProposal` REQUIRES the new proposal account to
+/// live here (an attacker can't squat a chosen address, and the address is
+/// auditable/reproducible off-chain). The CLI derives the same value via
+/// `qchain_execution::governance::derive_proposal_address`. SHA3-256,
+/// domain-separated (same construction as `wasm::derive_pda`).
+pub fn derive_proposal_address(proposer: &Pubkey, id: ProposalId) -> Pubkey {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(PROPOSAL_ADDRESS_DOMAIN);
+    h.update(proposer.to_bytes());
+    h.update(id.to_le_bytes());
+    Pubkey::new(h.finalize().into())
+}
+
+/// Read a governance proposal account, ENFORCING that it is genuinely a proposal
+/// account before trusting its bytes (audit v8.6.13 #1 / LESSONS-LEDGER EC-01).
+///
+/// Without the owner check, ANY account whose `data` merely decodes as a
+/// `Proposal` was accepted — and a signer can write arbitrary bytes into their
+/// OWN (system-owned) account via the WASM `host_set_data` boundary
+/// (`ledger.rs`), so an attacker could forge a `Passed` proposal in their own
+/// wallet account and have `Execute` apply it WITHOUT any vote. Requiring
+/// `owner == GOVERNANCE_PROGRAM_ID` closes this: a proposal account is only ever
+/// created governance-owned by `CreateProposal` (with a fresh `Voting`
+/// proposal), and a WASM contract can NEVER set an account's owner to the
+/// governance program (only to its own `program_id`, via a verified PDA claim).
+/// Byte-identical for every legitimately-created proposal (all are
+/// governance-owned). The canonical-address check is enforced at CREATE time
+/// (new proposals), not here, so proposals created before this change — at
+/// arbitrary addresses — still read.
 fn read_proposal(accounts: &HashMap<Pubkey, Account>, pk: &Pubkey) -> Result<Proposal, ExecError> {
     let account = accounts.get(pk).ok_or(ExecError::AccountNotFound(*pk))?;
+    if account.owner != GOVERNANCE_PROGRAM_ID {
+        return Err(ExecError::Unauthorized(
+            "proposal account must be owned by the governance program (a forged proposal in a non-governance account is rejected)".into(),
+        ));
+    }
     // `read_or_legacy` so a proposal account created before the anti-spam deposit
     // field existed (roadmap #16) still decodes — as a zero-deposit proposal.
     Proposal::read_or_legacy(&account.data)
@@ -173,6 +213,17 @@ impl NativeProgram for GovernanceProgram {
                 if proposer != *payer {
                     return Err(ExecError::Unauthorized(
                         "CreateProposal's proposer account must be the transaction payer".into(),
+                    ));
+                }
+                // The proposal account MUST live at its canonical address
+                // (audit v8.6.13 #1 / EC-01): `derive_proposal_address(proposer, id)`.
+                // This makes the address deterministic + auditable and prevents an
+                // attacker from squatting an arbitrary address; combined with the
+                // owner check in `read_proposal`, forgery is closed by construction.
+                let canonical = derive_proposal_address(&proposer, id);
+                if proposal_pk != canonical {
+                    return Err(ExecError::ProgramError(
+                        "CreateProposal accounts[1] must be the canonical proposal address derive_proposal_address(proposer, id)".into(),
                     ));
                 }
                 if accounts.contains_key(&proposal_pk) {
@@ -430,7 +481,11 @@ impl NativeProgram for GovernanceProgram {
                 let passed_round = proposal.passed_round.ok_or_else(|| {
                     ExecError::ProgramError("passed proposal is missing passed_round".into())
                 })?;
-                if current_round < passed_round + rule.timelock_rounds {
+                // Checked arithmetic (EC-05): `passed_round + timelock` could
+                // otherwise panic-halt the network in release (overflow-checks).
+                // `saturating_add` fails CLOSED — if it saturated, the timelock is
+                // treated as never-elapsed and Execute stays blocked.
+                if current_round < passed_round.saturating_add(rule.timelock_rounds) {
                     return Err(ExecError::ProgramError(
                         "the mandatory review time-lock has not elapsed yet".into(),
                     ));
@@ -996,7 +1051,11 @@ mod tests {
     use crate::staking::StakingProgram;
     use qchain_crypto::{ALGORITHM_ED25519, ALGORITHM_ML_DSA_65};
 
-    const PROPOSAL_PK: Pubkey = Pubkey::new([30u8; 32]);
+    // The primary test proposal's canonical address: proposer [1;32], id 1
+    // (audit v8.6.13 #1 — CreateProposal now requires the canonical address).
+    fn proposal_pk() -> Pubkey {
+        derive_proposal_address(&Pubkey::new([1u8; 32]), 1)
+    }
     const STAKE_PK: Pubkey = Pubkey::new([31u8; 32]);
     const OTHER_STAKE_PK: Pubkey = Pubkey::new([32u8; 32]);
 
@@ -1047,6 +1106,107 @@ mod tests {
             vec![6u8],
             "CloseProposal must stay discriminant 6 (appended, no shift)"
         );
+    }
+
+    #[test]
+    fn a_forged_passed_proposal_in_a_non_governance_account_cannot_be_executed() {
+        // EXPLOIT TEST — audit v8.6.13 #1 / LESSONS-LEDGER EC-01. Reproduces the
+        // exact forgery: an attacker uses the WASM `host_set_data` boundary
+        // (ledger.rs) to write forged `Passed` proposal bytes into their OWN
+        // (system-owned) account, then calls `Execute` naming it. The owner check
+        // in `read_proposal` must REJECT it — WITHOUT the check, `Execute` applies
+        // the action with NO vote (governance forged). Fails without the fix.
+        let attacker = Pubkey::new([7u8; 32]);
+        let mut forged = Proposal::new(
+            1,
+            attacker,
+            ProposalAction::SetBaseFeePerByte(999),
+            0,
+            1_000_000,
+            0,
+        );
+        forged.status = ProposalStatus::Passed;
+        forged.passed_round = Some(1);
+        // System-owned wallet with forged data — what host_set_data lets a signer
+        // write to their own account.
+        let forged_account = Account {
+            data: borsh::to_vec(&forged).unwrap(),
+            ..Account::new_wallet(Pubkey::system_program_id())
+        };
+        let attacker_addr = Pubkey::new([8u8; 32]);
+        let mut accounts = HashMap::from([
+            (attacker_addr, forged_account),
+            (PARAMS_ACCOUNT_ID, params_account()),
+        ]);
+        let params_before = accounts[&PARAMS_ACCOUNT_ID].data.clone();
+
+        let execute_ix = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![
+                attacker_addr,
+                PARAMS_ACCOUNT_ID,
+                crate::ids::EMERGENCY_ACCOUNT_ID,
+            ],
+            data: borsh::to_vec(&GovernanceInstruction::Execute).unwrap(),
+        };
+        let result = GovernanceProgram.process(&mut accounts, &execute_ix, &attacker, 100);
+        assert!(
+            matches!(result, Err(ExecError::Unauthorized(_))),
+            "a forged proposal in a non-governance account must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            accounts[&PARAMS_ACCOUNT_ID].data, params_before,
+            "a forged Execute must not mutate the real params singleton"
+        );
+    }
+
+    #[test]
+    fn create_proposal_requires_the_canonical_address() {
+        // Audit v8.6.13 #1 / EC-01. A proposal must live at
+        // derive_proposal_address(proposer, id); an arbitrary address is rejected.
+        let proposer = Pubkey::new([1u8; 32]);
+        let mut accounts = HashMap::from([
+            (proposer, wallet(0)),
+            (STAKING_STATS_ID, stats_account(1_000)),
+            (PARAMS_ACCOUNT_ID, params_account()),
+        ]);
+        let wrong = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![
+                proposer,
+                Pubkey::new([44u8; 32]),
+                STAKING_STATS_ID,
+                PARAMS_ACCOUNT_ID,
+            ],
+            data: borsh::to_vec(&GovernanceInstruction::CreateProposal {
+                id: 1,
+                action: ProposalAction::SetBaseFeePerByte(500),
+            })
+            .unwrap(),
+        };
+        assert!(
+            GovernanceProgram
+                .process(&mut accounts, &wrong, &proposer, 1)
+                .is_err(),
+            "a non-canonical proposal address must be rejected"
+        );
+        let ok = Instruction {
+            program_id: GOVERNANCE_PROGRAM_ID,
+            accounts: vec![
+                proposer,
+                derive_proposal_address(&proposer, 1),
+                STAKING_STATS_ID,
+                PARAMS_ACCOUNT_ID,
+            ],
+            data: borsh::to_vec(&GovernanceInstruction::CreateProposal {
+                id: 1,
+                action: ProposalAction::SetBaseFeePerByte(500),
+            })
+            .unwrap(),
+        };
+        GovernanceProgram
+            .process(&mut accounts, &ok, &proposer, 1)
+            .expect("the canonical address is accepted");
     }
 
     fn wallet(balance: u64) -> Account {
@@ -1118,9 +1278,13 @@ mod tests {
         // #16). Seed a default params account (deposit = 0) if the test didn't,
         // so every existing test stays byte-identical (no deposit charged).
         accounts.entry(PARAMS_ACCOUNT_ID).or_insert_with(params_account);
+        // The proposal lives at its canonical address for the ACTUAL proposer
+        // (audit v8.6.13 #1). For the common [1;32] proposer this equals
+        // proposal_pk().
+        let ppk = derive_proposal_address(&proposer, 1);
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![proposer, PROPOSAL_PK, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
+            accounts: vec![proposer, ppk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
             data: borsh::to_vec(&GovernanceInstruction::CreateProposal { id: 1, action }).unwrap(),
         };
         GovernanceProgram
@@ -1137,7 +1301,7 @@ mod tests {
     ) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, stake_pk],
+            accounts: vec![proposal_pk(), stake_pk],
             data: borsh::to_vec(&GovernanceInstruction::Vote { choice }).unwrap(),
         };
         GovernanceProgram.process(accounts, &ix, &voter, round)
@@ -1150,7 +1314,7 @@ mod tests {
     ) -> Result<(), ExecError> {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
-            accounts: vec![PROPOSAL_PK, STAKING_STATS_ID],
+            accounts: vec![proposal_pk(), STAKING_STATS_ID],
             data: borsh::to_vec(&GovernanceInstruction::Finalize).unwrap(),
         };
         GovernanceProgram.process(accounts, &ix, &caller, round)
@@ -1164,7 +1328,7 @@ mod tests {
         let ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![
-                PROPOSAL_PK,
+                proposal_pk(),
                 REGISTRY_ACCOUNT_ID,
                 crate::ids::EMERGENCY_ACCOUNT_ID,
             ],
@@ -1202,7 +1366,7 @@ mod tests {
             rule.voting_period_rounds,
         )
         .unwrap();
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(
             proposal.status,
             ProposalStatus::Passed,
@@ -1229,7 +1393,7 @@ mod tests {
         assert!(registry.iter().any(
             |e| e.id == qchain_crypto::ALGORITHM_SLH_DSA && e.status == AlgorithmStatus::Active
         ));
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Executed);
     }
 
@@ -1261,7 +1425,7 @@ mod tests {
             rule.voting_period_rounds,
         )
         .unwrap();
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Rejected);
 
         assert!(execute(
@@ -1330,7 +1494,7 @@ mod tests {
 
         // A second proposal retires it, created right after the deprecate
         // proposal executed.
-        let retire_proposal_pk = Pubkey::new([40u8; 32]);
+        let retire_proposal_pk = derive_proposal_address(&proposer, 2);
         let retire_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![proposer, retire_proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID],
@@ -1499,7 +1663,7 @@ mod tests {
         );
         vote(&mut accounts, staker, STAKE_PK, VoteChoice::Yes, 1).unwrap();
 
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(
             proposal.yes_stake, 5_000,
             "voting power must come from the real delegated amount"
@@ -1549,10 +1713,13 @@ mod tests {
         // `early` delegated at round 5 — BEFORE the proposal opens at round 10.
         delegate(&mut accounts, early, early_stake, 6_000, 5);
 
-        // Proposal created at round 10 (its per-voter snapshot boundary).
+        // Proposal created at round 10 (its per-voter snapshot boundary). The
+        // proposer is the standard [1;32] so the proposal lives at proposal_pk()
+        // (the vote/finalize helpers target that canonical address); who proposes
+        // is incidental to this test (it checks per-voter creation-round eligibility).
         create_proposal(
             &mut accounts,
-            early,
+            Pubkey::new([1u8; 32]),
             ProposalAction::ActivateAlgorithm(new_slh_dsa_entry()),
             10,
         );
@@ -1569,7 +1736,7 @@ mod tests {
 
         // The earlier position votes normally (created_round 5 <= 10).
         vote(&mut accounts, early, early_stake, VoteChoice::Yes, 16).unwrap();
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(
             proposal.yes_stake, 6_000,
             "a position that predates the proposal votes with its full weight"
@@ -1701,7 +1868,7 @@ mod tests {
         );
         let finalize_round = rule.voting_period_rounds;
         finalize(&mut accounts, proposer, finalize_round).unwrap();
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(
             proposal.status,
             ProposalStatus::Passed,
@@ -1711,7 +1878,7 @@ mod tests {
         let execute_ix = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![
-                PROPOSAL_PK,
+                proposal_pk(),
                 PARAMS_ACCOUNT_ID,
                 crate::ids::EMERGENCY_ACCOUNT_ID,
             ],
@@ -1745,7 +1912,7 @@ mod tests {
             "unrelated params must be untouched"
         );
         assert_eq!(
-            read_proposal(&accounts, &PROPOSAL_PK).unwrap().status,
+            read_proposal(&accounts, &proposal_pk()).unwrap().status,
             ProposalStatus::Executed
         );
     }
@@ -1798,7 +1965,7 @@ mod tests {
         let exec = Instruction {
             program_id: GOVERNANCE_PROGRAM_ID,
             accounts: vec![
-                PROPOSAL_PK,
+                proposal_pk(),
                 PARAMS_ACCOUNT_ID,
                 crate::ids::EMERGENCY_ACCOUNT_ID,
             ],
@@ -1975,7 +2142,7 @@ mod tests {
 
         let rule = quorum_rule(qchain_governance::RiskTier::Economic);
         finalize(&mut accounts, proposer, rule.voting_period_rounds).unwrap();
-        let proposal = read_proposal(&accounts, &PROPOSAL_PK).unwrap();
+        let proposal = read_proposal(&accounts, &proposal_pk()).unwrap();
         assert_eq!(
             proposal.status,
             ProposalStatus::Rejected,
@@ -1993,8 +2160,9 @@ mod tests {
     fn governance_deposit_is_charged_then_refunded_or_burned_and_close_prunes() {
         let proposer = Pubkey::new([1u8; 32]);
         let voter = Pubkey::new([2u8; 32]);
-        let p_genuine = Pubkey::new([40u8; 32]);
-        let p_spam = Pubkey::new([41u8; 32]);
+        // Canonical proposal addresses (audit v8.6.13 #1) — ids 1/2/3 below.
+        let p_genuine = derive_proposal_address(&proposer, 1);
+        let p_spam = derive_proposal_address(&proposer, 2);
         let deposit = 5_000_000u64;
         let start_balance = 100_000_000u64;
 
@@ -2071,7 +2239,7 @@ mod tests {
         assert!(close(&mut accounts, p_genuine, proposer, crate::ids::BURN_ADDRESS, voting_ends + 10).is_err(), "within the retention window → rejected");
         assert!(close(&mut accounts, p_genuine, proposer, Pubkey::new([7u8; 32]), closeable).is_err(), "a non-canonical burn address → rejected");
         // A still-Voting proposal cannot be closed (create a throwaway one).
-        let p_open = Pubkey::new([42u8; 32]);
+        let p_open = derive_proposal_address(&proposer, 3);
         create(&mut accounts, p_open, 3);
         assert!(close(&mut accounts, p_open, proposer, crate::ids::BURN_ADDRESS, closeable).is_err(), "a still-open proposal cannot be closed");
 

@@ -2061,7 +2061,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeActivate { rpc, keypair, proposal_id, algorithm_id, name, pubkey_len, max_sig_len, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let entry = RegistryEntry {
                 id: AlgorithmId(algorithm_id),
                 name,
@@ -2078,7 +2078,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeDeprecate { rpc, keypair, proposal_id, algorithm_id, retirement_round, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::DeprecateAlgorithm { id: AlgorithmId(algorithm_id), retirement_round };
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2087,7 +2087,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeRetire { rpc, keypair, proposal_id, algorithm_id, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::RetireAlgorithm { id: AlgorithmId(algorithm_id) };
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2096,7 +2096,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeSetBaseFee { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::SetBaseFeePerByte(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2105,7 +2105,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeSetDustThreshold { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::SetDustThreshold(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2114,7 +2114,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeSetGasPrice { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::SetGasPricePerFuel(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2123,7 +2123,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeSetStakingCommission { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::SetStakingCommissionBps(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;
@@ -2132,7 +2132,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProposeSetEmissionApr { rpc, keypair, proposal_id, value, nonce, fee_limit } => {
             let proposer = qchain_crypto::read_keypair_file(&keypair)?;
-            let proposal_pk = Keypair::generate()?.pubkey();
+            let proposal_pk = qchain_execution::governance::derive_proposal_address(&proposer.pubkey(), proposal_id);
             let action = ProposalAction::SetEmissionApr(value);
             let data = borsh::to_vec(&GovernanceInstruction::CreateProposal { id: proposal_id, action })?;
             let body = submit_instruction(&rpc, &proposer, GOVERNANCE_PROGRAM_ID, vec![proposer.pubkey(), proposal_pk, STAKING_STATS_ID, PARAMS_ACCOUNT_ID], data, nonce, fee_limit)?;

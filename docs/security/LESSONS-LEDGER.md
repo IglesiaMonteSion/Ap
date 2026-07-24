@@ -35,7 +35,7 @@ sigue cerrada.
 
 | ID | Clase | Enforcement automatizable | Estado |
 |---|---|---|---|
-| EC-01 | Autenticidad de cuenta privilegiada no forzada | parcial (grep de lecturas sin owner-check) | **ABIERTA** (audit v8.6.13 #1) |
+| EC-01 | Autenticidad de cuenta privilegiada no forzada | parcial (grep de lecturas sin owner-check) | **CERRADA-VIGILADA** (v8.6.13 #1 corregido v8.6.18; sweep limpio) |
 | EC-02 | Detección de versión por "trial-borsh" | sí (grep de decoders en cascada / structs `*V0`) | **ABIERTA** (#2/#3/#7) |
 | EC-03 | Se arregla la instancia, no la CLASE | proceso (este ledger + sweep) | permanente |
 | EC-04 | Crecimiento de recurso sin cota | parcial | cerrada-vigilada (#18) |
@@ -63,15 +63,36 @@ sigue cerrada.
   toda cuenta privilegiada. Cada lector nuevo escrito sin esa disciplina reabre
   la clase.
 - **Instancias:**
-  - v8.6.13 #1 (CONFIRMADO): `governance::read_proposal` decodifica cualquier
-    cuenta como `Proposal` sin owner/dirección/magic → propuesta falsificada
-    ejecutable sin votación. `CreateProposal` acepta una dirección arbitraria no
-    canónica (governance.rs:178).
+  - v8.6.13 #1 (CONFIRMADO leyendo el código + exploit reproducido → CORREGIDO en
+    v8.6.18): `governance::read_proposal` decodificaba cualquier cuenta como
+    `Proposal` sin owner/dirección/magic. **Exploit end-to-end verificado:** un
+    firmante escribe bytes de una `Proposal` "Passed" en su PROPIA cuenta
+    (system-owned) vía el borde WASM `host_set_data` (ledger.rs:2762) y llama
+    `Execute` → aplicaba la acción SIN votación. **Fix:** `read_proposal` exige
+    `owner == GOVERNANCE_PROGRAM_ID` (una cuenta program-owned por gobernanza sólo
+    la crea `CreateProposal` con una propuesta `Voting`; el borde WASM NUNCA puede
+    poner owner=gobernanza); `CreateProposal` exige la dirección canónica
+    `derive_proposal_address(proposer,id)` = SHA3-256(dominio‖proposer‖id);
+    `passed_round + timelock` → `saturating_add` (EC-05, fail-closed). Byte-idéntico
+    para toda propuesta legítima (todas son governance-owned). Tests de explotación:
+    `a_forged_passed_proposal_in_a_non_governance_account_cannot_be_executed`,
+    `create_proposal_requires_the_canonical_address`.
   - Precedentes parciales del MISMO patrón (arreglados sólo para su sitio):
     Finalize/Execute pinnean los singletons destino (v2.0.4); reward pool en
     Delegate/Undelegate/ClaimReward (#172); lista `RESERVED` de singletons en
     Stake v7 (#210/audit v6.3.25); cuenta de tesorería (#222). Ninguno cerró la
     clase para el lector de la PROPIA cuenta de propuesta.
+- **Barrido de la clase (v8.6.18, QSEP-1 §13):** enumerados TODOS los lectores de
+  cuenta privilegiada. La cuenta de propuesta era el ÚNICO caso con dirección
+  **provista por el usuario** (`accounts[1]`) leída por forma sin owner-check.
+  Todos los demás usan un **id de singleton FIJO** (canónico por construcción, y
+  program-owned → el borde WASM no puede reescribir su `data`): treasury
+  `read_state`→`TREASURY_ACCOUNT_ID`; params `PARAMS_ACCOUNT_ID`; crypto-registry
+  `REGISTRY_ACCOUNT_ID`; validator-v7 `decode_registry`→`VALIDATOR_REGISTRY_ACCOUNT_ID`
+  (todos los handlers #20 pinnean `registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID`);
+  emergency `EMERGENCY_ACCOUNT_ID`; staking global/stats/pool por id fijo. El único
+  otro lector de una cuenta de dirección user-supplied es `Vote`, que ya pinnea
+  `owner == STAKING_PROGRAM_ID` (governance.rs:246). **Sweep limpio.**
 - **Regla que lo cierra (invariante universal):** antes de leer o mutar una
   cuenta con significado privilegiado, verificar en UN helper canónico:
   `owner == PROGRAMA_ESPERADO` **Y** `address == derive_canónica(...)` **Y**
