@@ -52,6 +52,18 @@ struct Cli {
     /// privado + firewall + token — no aplica a UDS).
     #[arg(long, default_value_t = false)]
     allow_non_loopback: bool,
+    /// (KM#7) `chain_id` (hex de 64 chars) de la red para la que ESTE firmante
+    /// puede firmar. Cuando se pasa, un pedido que nombre otro chain_id
+    /// (SignCheckpoint/SignNetworkKeyCert) se rechaza — impide usar el firmante para
+    /// atestar la red equivocada. Es el mismo `chain_id` que imprime el nodo/genesis.
+    #[arg(long)]
+    chain_id: Option<String>,
+    /// (KM#7) Rate-limit: máximo de pedidos de FIRMA por ventana. Sin él, sin tope.
+    #[arg(long)]
+    max_signs_per_window: Option<u32>,
+    /// (KM#7) Largo de la ventana del rate-limit en segundos (default 10).
+    #[arg(long, default_value_t = 10)]
+    rate_window_secs: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -102,11 +114,24 @@ fn main() -> anyhow::Result<()> {
         SignerListener::Tcp(l)
     };
 
+    // (KM#7) Política del firmante: binding de chain_id + rate-limit.
+    let expected_chain_id = match &cli.chain_id {
+        Some(hex_id) => Some(parse_hex32(hex_id.trim()).with_context(|| format!("invalid --chain-id: {hex_id}"))?),
+        None => None,
+    };
+    let rate_limit = cli.max_signs_per_window.map(|max_signs| qchain_remote_signer::RateLimit {
+        max_signs,
+        window: std::time::Duration::from_secs(cli.rate_window_secs),
+    });
+    let policy = qchain_remote_signer::SignerPolicy { expected_chain_id, rate_limit };
+
     tracing::info!(
-        "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}]",
+        "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}] [chain binding: {}] [rate limit: {}]",
         bundle.to_address(),
         cli.listen,
-        if auth_token.is_some() { "TOKEN required" } else { "NONE — dev/loopback only" }
+        if auth_token.is_some() { "TOKEN required" } else { "NONE — dev/loopback only" },
+        if expected_chain_id.is_some() { "ON" } else { "off" },
+        match &rate_limit { Some(rl) => format!("{}/{}s", rl.max_signs, cli.rate_window_secs), None => "off".to_string() },
     );
     if auth_token.is_none() {
         tracing::warn!(
@@ -114,7 +139,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    qchain_remote_signer::serve(keypair, listener, guard, auth_token);
+    qchain_remote_signer::serve(keypair, listener, guard, auth_token, policy);
     Ok(())
 }
 
@@ -124,6 +149,21 @@ fn trim_token(bytes: &[u8]) -> Vec<u8> {
     let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
     let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
     bytes[start..end].to_vec()
+}
+
+/// (KM#7) Parsea un `chain_id` de EXACTAMENTE 64 chars hex a `[u8; 32]` (sin
+/// dependencia `hex` nueva — es un parseo trivial de 32 bytes).
+fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
+    if s.len() != 64 {
+        anyhow::bail!("expected 64 hex chars (32 bytes), got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = (s.as_bytes()[2 * i] as char).to_digit(16).ok_or_else(|| anyhow::anyhow!("non-hex character"))?;
+        let lo = (s.as_bytes()[2 * i + 1] as char).to_digit(16).ok_or_else(|| anyhow::anyhow!("non-hex character"))?;
+        *byte = (hi * 16 + lo) as u8;
+    }
+    Ok(out)
 }
 
 /// Bindea un socket Unix con permisos estrictos: el directorio a 0700 y el socket

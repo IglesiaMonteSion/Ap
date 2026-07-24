@@ -21,7 +21,7 @@ documentado como pendiente con su razón, no forzado.
 | 4 | Recovery key offline (revoca/reemplaza/congela) | 4 | **HECHO** (v8.6.30 — REVOKE por comité M-de-N offline) |
 | 5 | Timelocks on-chain de cambios de clave | 5 | **HECHO** (v8.6.31 — operator ~24h / withdrawal ~72h / recovery ~7d) |
 | 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | **HECHO** (v8.6.32 — `ProposeConsensusKeyRotation` operator + `AcceptConsensusKeyRotation` con PoP de la clave nueva) |
-| 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | pendiente |
+| 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | **HECHO** (v8.6.33 — binding de chain_id + anti-equivocación de checkpoints + rate-limit) |
 | 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | pendiente |
 | 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | pendiente |
 | 10 | Pruebas multinodo + adversariales del ciclo de vida de claves | 10 | pendiente |
@@ -306,14 +306,78 @@ quedó `retired_consensus_keys` slasheable (`slash_until_quanto=6`), pendiente l
 **root byte-idéntico en ambos nodos** (`81820de5…`) → SIN FORK; un
 `CancelConsensusKeyRotation` limpió una pendiente nueva en ambos con root byte-idéntico.
 
-## #7–#10 — pendientes
+## #7 — El firmante remoto valida POLÍTICA (HECHO, v8.6.33)
+
+**PROBLEMA.** El daemon del firmante remoto ya tenía allowlist de dominios (sólo
+firma objetos tipados: votos, handshake P2P, checkpoints, cert de red — nunca
+`sign_raw` de bytes arbitrarios) + la `DoubleSignGuard` de auto-votos. Pero seguía
+siendo un oráculo "ciego dentro de su allowlist": firmaba CUALQUIER pedido bien
+formado de un tipo permitido, sin validar POLÍTICA — no chequeaba para qué RED
+firmaba, no acotaba dos roots de estado en conflicto, y no tenía rate-limit.
+
+**DISEÑO (`SignerPolicy`, sólo del lado del SERVIDOR — no cambia el wire; el
+`PROTO_VERSION` queda en 5, un cliente viejo interopera, el daemon sólo puede
+RECHAZAR más):**
+
+- **Binding de chain_id.** El daemon se configura con `--chain-id <hex>`; rechaza
+  cualquier pedido que nombre un `chain_id` DISTINTO. Los únicos pedidos que llevan
+  un chain_id explícito son `SignCheckpoint` (atestación de state-sync, #212) y
+  `SignNetworkKeyCert` (cert de delegación de red, #1); los votos/handshake están
+  atados a la red por su estructura (un vértice referencia certs de SU red). Impide
+  usar el firmante para atestar la red equivocada (un nodo comprometido/mal-cableado
+  que intente firmar un checkpoint de otra cadena es rechazado).
+- **Anti-equivocación de CHECKPOINTS de estado** (SIEMPRE activa, como el double-sign
+  de votos — es una propiedad de seguridad, no un flag). La `DoubleSignGuard`
+  persistente se extendió a los checkpoints: rehúsa firmar DOS roots distintos para
+  la misma ronda de checkpoint (equivocación de estado), rehúsa una ronda regresiva,
+  y es idempotente en la misma (ronda, root). El firmante NO conoce el root "correcto"
+  (no corre el ledger), pero SÍ puede negarse a atestar dos historias en conflicto —
+  cerrando que un nodo comprometido use el firmante para engañar a un light-client /
+  peer que se sincroniza con un fork forjado. Se persiste con la misma durabilidad que
+  la guardia de votos (fsync + rename atómico). El `guard.bin` V1 (pre-KM#7) MIGRA
+  tolerante a V2 (brick-safe).
+- **Rate-limit.** `--max-signs-per-window N` + `--rate-window-secs W` (ventana
+  deslizante, default 10 s): a lo sumo N pedidos de FIRMA por ventana (`GetBundle`,
+  una lectura pública, no cuenta). Acota a un nodo comprometido que intente moler el
+  firmante (grindear rondas / DoSear el HSM). Node-LOCAL, usa el reloj real (como los
+  timeouts del socket) — el núcleo `allow_at(now)` es testeable con instantes
+  sintéticos.
+- **nonce / anti-replay:** YA cubierto — el challenge-response con nonce fresco por
+  conexión (#4.2) + el MAC de sesión con `seq` monótono por dirección dan anti-replay
+  en el canal, y las guardias anti-equivocación (votos + checkpoints) hacen que un
+  pedido re-enviado para una ronda ya firmada sea idempotente o rechazado.
+
+**CAMBIOS:** `qchain-remote-signer` lib (`SignerPolicy`/`RateLimit`/`RateLimiter`;
+`GuardState` V2 con campos de checkpoint + migración V1→V2; `check_and_record_checkpoint`;
+`respond_with_policy` que aplica rate-limit + binding de chain_id antes de `respond`;
+`serve`/`handle_conn` cablean la política; la guardia de checkpoints vive dentro de
+`respond`, siempre activa); el daemon (`--chain-id`/`--max-signs-per-window`/
+`--rate-window-secs`, sin dep `hex` nueva — parseo de 32 bytes inline).
+
+**Verificado.** qchain-remote-signer **14 tests** (+4: binding de chain_id rechaza un
+checkpoint/cert de la red equivocada y firma la propia; la anti-equivocación de
+checkpoints bloquea un root en conflicto y persiste entre reinicios; el rate-limit
+acota por ventana y se recupera, y `GetBundle` no cuenta; un `guard.bin` V1 migra a V2
+sin perder la memoria de votos). clippy limpio remote-signer/node; sin cambio de wire
+(`PROTO_VERSION` 5). **EN VIVO (validador con `remote_signer` + `state_checkpoints`):**
+con `--chain-id` CORRECTO el nodo firmó votos (avanzó rondas), una transferencia
+ejecutó, y `/snapshot/meta` sirvió un **checkpoint firmado** (SignCheckpoint pasó la
+política); tras reiniciar el daemon con un `--chain-id` EQUIVOCADO, el pedido de
+checkpoint fue **RECHAZADO** en vivo (daemon: "refusing to sign: request names a
+chain_id different from this signer's configured network"; nodo: "could not self-sign
+snapshot at round 366: remote signer refused") → `/snapshot/meta` sin checkpoint,
+mientras los votos (sin chain_id) siguieron fluyendo → el nodo mantiene el consenso pero
+NO puede atestar estado para la red equivocada.
+
+**DESPLIEGUE.** El firmante remoto es OPT-IN (default in-process) → nada en la red viva.
+Quien lo use pasa `--chain-id`/`--max-signs-per-window` al daemon; sin ellos el
+comportamiento es idéntico al previo (política permisiva), pero la anti-equivocación de
+checkpoints es SIEMPRE activa.
+
+## #8–#10 — pendientes
 
 Se implementan en orden de prioridad. Notas de diseño resumidas:
 
-- **#7 El firmante remoto valida política.** Además de la allowlist de dominios,
-  el daemon valida chain_id/round/height/nonce, mantiene su propio estado
-  anti-equivocación persistente, y aplica rate-limit — deja de ser un oráculo de
-  firma "ciego dentro de su allowlist".
 - **#8 Keystore V2.** `Argon2id → HKDF-SHA3 → XChaCha20-Poly1305`, derivación HKDF
   jerárquica de sub-claves por rol, y un contador monotónico anti-rollback en el
   archivo.

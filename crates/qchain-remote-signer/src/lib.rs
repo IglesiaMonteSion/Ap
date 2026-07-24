@@ -59,10 +59,11 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_crypto::{Keypair, MultiSignature, PublicKeyBundle};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Versión del protocolo del socket. v2 agregó el handshake de auth (#4.2); v3
 /// agregó el nonce del cliente (handshake mutuo) + el binding de canal por-frame;
@@ -535,6 +536,89 @@ impl qchain_crypto::Signer for RemoteSigner {
 
 // ============================ GUARDIA ============================
 
+// ======================= POLÍTICA DEL FIRMANTE (KM#7) =======================
+
+/// Límite de tasa de firmas: a lo sumo `max_signs` pedidos de FIRMA por `window`
+/// (ventana deslizante). Acota a un nodo comprometido que intente moler el firmante
+/// (p.ej. grindear rondas o DoSear el HSM).
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimit {
+    pub max_signs: u32,
+    pub window: Duration,
+}
+
+/// Política que el daemon del firmante aplica ADEMÁS de la allowlist de dominios y
+/// la guardia anti-doble-firma (KM#7 — "el firmante valida política, deja de ser un
+/// oráculo ciego dentro de su allowlist"):
+///
+/// - **chain_id binding:** rechaza cualquier pedido que nombre un `chain_id`
+///   DISTINTO del configurado (`SignCheckpoint`/`SignNetworkKeyCert`, los únicos que
+///   llevan un chain_id explícito; los votos/handshake están atados a la red por su
+///   estructura). Impide que un nodo comprometido/mal-cableado use este firmante para
+///   atestar la red equivocada.
+/// - **rate-limit:** ver `RateLimit`.
+///
+/// El resto de la política del auditor ya está cubierto: **round/height + anti-
+/// equivocación persistente** por la `DoubleSignGuard` (votos propios Y ahora también
+/// checkpoints de estado), y **nonce/anti-replay** por el challenge-response con nonce
+/// fresco por conexión (#4.2) + el MAC de sesión con `seq` monótono por dirección.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignerPolicy {
+    /// Si está seteado, sólo se firma para ESTE `chain_id` (los pedidos que nombran
+    /// otro se rechazan). `None` = sin binding de red (sólo dev).
+    pub expected_chain_id: Option<[u8; 32]>,
+    /// Si está seteado, límite de tasa de firmas por ventana. `None` = sin límite.
+    pub rate_limit: Option<RateLimit>,
+}
+
+impl SignerPolicy {
+    /// Política permisiva (dev): sin binding de red ni rate-limit.
+    pub fn permissive() -> Self {
+        Self::default()
+    }
+}
+
+/// Limitador de tasa de ventana deslizante (node-LOCAL, no consenso — usa el reloj
+/// real, igual que los timeouts del socket). Guarda los instantes de los pedidos de
+/// firma recientes dentro de la ventana; `allow_at` poda los que ya salieron de la
+/// ventana y admite si quedan menos de `max_signs`.
+pub struct RateLimiter {
+    limit: Option<RateLimit>,
+    recent: VecDeque<Instant>,
+}
+
+impl RateLimiter {
+    pub fn new(limit: Option<RateLimit>) -> Self {
+        Self { limit, recent: VecDeque::new() }
+    }
+    /// Un limitador sin tope (para dev/tests).
+    pub fn unlimited() -> Self {
+        Self::new(None)
+    }
+    /// ¿Se admite un pedido de firma en el instante `now`? (núcleo testeable sin
+    /// dormir: los tests pasan instantes sintéticos `base + offset`).
+    pub fn allow_at(&mut self, now: Instant) -> bool {
+        let Some(rl) = self.limit else { return true };
+        // Poda los instantes que ya salieron de la ventana.
+        while let Some(&front) = self.recent.front() {
+            if now.duration_since(front) >= rl.window {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.recent.len() as u32 >= rl.max_signs {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
+    /// Admite un pedido de firma AHORA (reloj real).
+    pub fn allow(&mut self) -> bool {
+        self.allow_at(Instant::now())
+    }
+}
+
 /// Guardia anti-doble-firma PERSISTIDA (persist-before-sign, estilo tmkms). Sólo
 /// aplica a los AUTO-VOTOS (`SignOwnVote`): un validador propone UN vértice por
 /// ronda, así que firmar un segundo vértice PROPIO distinto para la misma ronda
@@ -553,24 +637,68 @@ pub struct DoubleSignGuard {
 struct GuardState {
     last_own_round: u64,
     last_own_digest: [u8; 32],
+    /// KM#7 — anti-equivocación de CHECKPOINTS de estado. `checkpoint_seen=false`
+    /// hasta que se firma el primer checkpoint (round 0 es un round válido, así que
+    /// no se puede usar "round 0" como centinela).
+    last_checkpoint_round: u64,
+    last_checkpoint_root: [u8; 32],
+    checkpoint_seen: bool,
+}
+
+/// Layout V1 del estado de la guardia (pre-KM#7: sólo votos propios). Se lee para
+/// MIGRAR tolerante un guard.bin ya existente (defaulteando los campos de checkpoint)
+/// — brick-safe, igual que los decodificadores versionados del resto del proyecto.
+#[derive(BorshDeserialize)]
+struct GuardStateV1 {
+    last_own_round: u64,
+    last_own_digest: [u8; 32],
+}
+
+impl GuardState {
+    fn empty() -> Self {
+        GuardState {
+            last_own_round: 0,
+            last_own_digest: [0u8; 32],
+            last_checkpoint_round: 0,
+            last_checkpoint_root: [0u8; 32],
+            checkpoint_seen: false,
+        }
+    }
 }
 
 impl DoubleSignGuard {
     /// Carga el estado persistido (si existe). Un archivo corrupto/ilegible es
     /// FATAL a propósito: preferimos no arrancar el firmante a arrancar sin la
-    /// memoria de qué se firmó (que permitiría una doble-firma).
+    /// memoria de qué se firmó (que permitiría una doble-firma). Un guard.bin V1
+    /// (pre-KM#7) MIGRA tolerante a V2 defaulteando los campos de checkpoint (borsh
+    /// es estricto con los bytes de cola → un V2 no cross-decodifica como V1 ni al
+    /// revés, sin ambigüedad).
     pub fn load(path: impl Into<std::path::PathBuf>) -> anyhow::Result<Self> {
         let path = path.into();
         let state = match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Some(
-                borsh::from_slice::<GuardState>(&bytes)
-                    .map_err(|e| anyhow::anyhow!("double-sign guard file {} is corrupt: {e}", path.display()))?,
-            ),
-            Ok(_) => None,          // vacío
+            Ok(bytes) if !bytes.is_empty() => Some(Self::decode_state(&bytes).map_err(|e| {
+                anyhow::anyhow!("double-sign guard file {} is corrupt: {e}", path.display())
+            })?),
+            Ok(_) => None, // vacío
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(anyhow::anyhow!("cannot read double-sign guard file {}: {e}", path.display())),
         };
         Ok(DoubleSignGuard { path, state })
+    }
+
+    fn decode_state(bytes: &[u8]) -> anyhow::Result<GuardState> {
+        // V2 (actual) primero; si no, migrar un V1 legacy defaulteando checkpoint.
+        if let Ok(st) = borsh::from_slice::<GuardState>(bytes) {
+            return Ok(st);
+        }
+        let v1 = borsh::from_slice::<GuardStateV1>(bytes)?;
+        Ok(GuardState {
+            last_own_round: v1.last_own_round,
+            last_own_digest: v1.last_own_digest,
+            last_checkpoint_round: 0,
+            last_checkpoint_root: [0u8; 32],
+            checkpoint_seen: false,
+        })
     }
 
     /// Chequea+registra un auto-voto. Devuelve `Ok(())` si se permite (habiéndolo
@@ -595,7 +723,48 @@ impl DoubleSignGuard {
             }
         }
         // Ronda nueva (mayor o primera): persistir ANTES de permitir la firma.
-        let next = GuardState { last_own_round: round, last_own_digest: *digest };
+        // Se parte del estado actual para PRESERVAR los campos de checkpoint.
+        let mut next = self.state.unwrap_or_else(GuardState::empty);
+        next.last_own_round = round;
+        next.last_own_digest = *digest;
+        self.persist(&next).map_err(|e| format!("cannot persist double-sign guard: {e}"))?;
+        self.state = Some(next);
+        Ok(())
+    }
+
+    /// (KM#7) Chequea+registra la firma de un CHECKPOINT de estado
+    /// (`chain_id, round, root`). Anti-equivocación de estado: un firmante honesto
+    /// firma el root REAL determinista por ronda, así que firmar DOS roots distintos
+    /// para la misma ronda de checkpoint es equivocación de estado — un nodo
+    /// comprometido podría usar el firmante para atestar dos historias en conflicto y
+    /// engañar a un light-client / peer que se sincroniza. Reglas (espejan la guardia
+    /// de auto-votos): ronda regresiva → rechazada; misma ronda con root DISTINTO →
+    /// rechazada; misma (ronda, root) → idempotente (retry legítimo); ronda mayor →
+    /// persiste ANTES de permitir la firma. El firmante NO conoce el root "correcto"
+    /// (no corre el ledger), pero SÍ puede negarse a atestar dos roots en conflicto.
+    pub fn check_and_record_checkpoint(&mut self, round: u64, root: &[u8; 32]) -> Result<(), String> {
+        if let Some(st) = self.state {
+            if st.checkpoint_seen {
+                if round < st.last_checkpoint_round {
+                    return Err(format!(
+                        "refusing to sign checkpoint for round {round}: already signed a higher checkpoint round {}",
+                        st.last_checkpoint_round
+                    ));
+                }
+                if round == st.last_checkpoint_round {
+                    if &st.last_checkpoint_root != root {
+                        return Err(format!(
+                            "STATE-EQUIVOCATION BLOCKED: already signed a DIFFERENT state root for checkpoint round {round}"
+                        ));
+                    }
+                    return Ok(()); // misma (ronda, root) → idempotente
+                }
+            }
+        }
+        let mut next = self.state.unwrap_or_else(GuardState::empty);
+        next.last_checkpoint_round = round;
+        next.last_checkpoint_root = *root;
+        next.checkpoint_seen = true;
         self.persist(&next).map_err(|e| format!("cannot persist double-sign guard: {e}"))?;
         self.state = Some(next);
         Ok(())
@@ -652,14 +821,18 @@ pub fn serve(
     listener: SignerListener,
     guard: Arc<Mutex<DoubleSignGuard>>,
     auth_token: Option<Vec<u8>>,
+    policy: SignerPolicy,
 ) {
+    // El rate-limiter se comparte entre TODAS las conexiones (un nodo comprometido
+    // podría abrir muchas conexiones para esquivar un límite por-conexión).
+    let limiter = Arc::new(Mutex::new(RateLimiter::new(policy.rate_limit)));
     loop {
         match listener.accept() {
             Ok(mut s) => {
                 s.configure(IO_TIMEOUT);
                 let peer = s.peer_desc();
                 tracing::info!("signer: connection from {peer}");
-                if let Err(e) = handle_conn(&mut s, &keypair, &guard, auth_token.as_deref()) {
+                if let Err(e) = handle_conn(&mut s, &keypair, &guard, auth_token.as_deref(), &policy, &limiter) {
                     tracing::warn!("signer: connection from {peer} ended: {e}");
                 }
             }
@@ -676,6 +849,8 @@ fn handle_conn(
     keypair: &Keypair,
     guard: &Arc<Mutex<DoubleSignGuard>>,
     auth_token: Option<&[u8]>,
+    policy: &SignerPolicy,
+    limiter: &Arc<Mutex<RateLimiter>>,
 ) -> anyhow::Result<()> {
     // #4.2 — Handshake de auth MUTUO PRIMERO: el servidor habla (en claro). Si
     // corremos con token, el cliente debe probar que lo conoce ANTES de que
@@ -719,7 +894,7 @@ fn handle_conn(
         };
         let req = borsh::from_slice::<SignerRequest>(&req_bytes)
             .map_err(|e| anyhow::anyhow!("malformed request: {e}"))?;
-        let resp = respond(&req, keypair, guard);
+        let resp = respond_with_policy(&req, keypair, guard, policy, limiter);
         send_frame(stream, &borsh::to_vec(&resp)?, sess.as_mut(), DIR_S2C)?;
     }
 }
@@ -800,11 +975,20 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
         SignerRequest::SignCheckpoint { chain_id, round, merkle_root } => {
             // #212 — atestación de state-sync bajo el dominio STATE_CHECKPOINT_V1,
             // NO un voto ni valor. Es una firma sobre un (chain_id, round, root)
-            // público y determinista, sin poder de gasto — segura de servir. No
-            // toca el allowlist de `sign_raw` (es una request estructurada aparte).
-            match qchain_crypto::sign_state_checkpoint(keypair, chain_id, *round, merkle_root) {
-                Ok(sig) => SignerResponse::Signature(sig),
-                Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+            // público y determinista, sin poder de gasto. KM#7: ANTI-EQUIVOCACIÓN
+            // DE ESTADO — la guardia persistente rehúsa firmar dos roots distintos
+            // para la misma ronda de checkpoint (siempre activa, como el double-sign
+            // de votos). El binding de chain_id lo aplica `respond_with_policy`.
+            let mut g = guard.lock().expect("guard mutex poisoned");
+            match g.check_and_record_checkpoint(*round, merkle_root) {
+                Ok(()) => match qchain_crypto::sign_state_checkpoint(keypair, chain_id, *round, merkle_root) {
+                    Ok(sig) => SignerResponse::Signature(sig),
+                    Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+                },
+                Err(reason) => {
+                    tracing::error!("signer: {reason}");
+                    SignerResponse::Refused(reason)
+                }
             }
         }
         SignerRequest::SignNetworkKeyCert { chain_id, validator_id, network_addr } => {
@@ -817,6 +1001,45 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
             }
         }
     }
+}
+
+/// (KM#7) Aplica la POLÍTICA configurable ANTES de `respond`: (1) rate-limit de
+/// TODA firma (GetBundle es una lectura pública inofensiva, no cuenta); (2) binding
+/// de `chain_id` en los pedidos que lo nombran (`SignCheckpoint`/`SignNetworkKeyCert`).
+/// Si pasa, delega en `respond` (que aplica la allowlist de dominios + las guardias
+/// anti-equivocación de votos y checkpoints, siempre activas). Con `SignerPolicy`
+/// permisiva + `RateLimiter::unlimited` el comportamiento es idéntico a llamar
+/// `respond` directo.
+pub fn respond_with_policy(
+    req: &SignerRequest,
+    keypair: &Keypair,
+    guard: &Arc<Mutex<DoubleSignGuard>>,
+    policy: &SignerPolicy,
+    limiter: &Arc<Mutex<RateLimiter>>,
+) -> SignerResponse {
+    // (1) Rate-limit: cada pedido de FIRMA cuenta (GetBundle no). Se chequea ANTES
+    // de cualquier cripto/estado para acotar a un nodo comprometido barato.
+    if !matches!(req, SignerRequest::GetBundle) && !limiter.lock().expect("limiter mutex poisoned").allow() {
+        let reason = "rate limit exceeded: too many sign requests in the window".to_string();
+        tracing::warn!("signer: {reason}");
+        return SignerResponse::Refused(reason);
+    }
+    // (2) Binding de chain_id: sólo firmamos para NUESTRA red configurada.
+    if let Some(expected) = policy.expected_chain_id {
+        let named = match req {
+            SignerRequest::SignCheckpoint { chain_id, .. } => Some(chain_id),
+            SignerRequest::SignNetworkKeyCert { chain_id, .. } => Some(chain_id),
+            _ => None,
+        };
+        if let Some(chain_id) = named {
+            if chain_id != &expected {
+                let reason = "refusing to sign: request names a chain_id different from this signer's configured network".to_string();
+                tracing::warn!("signer: {reason}");
+                return SignerResponse::Refused(reason);
+            }
+        }
+    }
+    respond(req, keypair, guard)
 }
 
 #[cfg(test)]
@@ -978,7 +1201,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let g = guard(&tmp);
-        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, None));
+        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, None, SignerPolicy::permissive()));
 
         let client = RemoteSigner::connect(&addr).unwrap();
         assert_eq!(client.bundle().to_address(), expected_bundle.to_address());
@@ -1140,7 +1363,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let g = guard(&tmp);
         let tok_srv = token.clone();
-        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, Some(tok_srv)));
+        std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, Some(tok_srv), SignerPolicy::permissive()));
 
         // (a) Token CORRECTO → autentica, obtiene bundle y firma un voto que verifica.
         let ok = RemoteSigner::connect_with_token(&addr, Some(token.clone())).unwrap();
@@ -1180,7 +1403,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let g = guard(&tmp);
         let tok_srv = token.clone();
-        std::thread::spawn(move || serve(kp, SignerListener::Unix(listener), g, Some(tok_srv)));
+        std::thread::spawn(move || serve(kp, SignerListener::Unix(listener), g, Some(tok_srv), SignerPolicy::permissive()));
 
         let endpoint = format!("unix:{}", sock.display());
         let client = RemoteSigner::connect_with_token(&endpoint, Some(token)).unwrap();
@@ -1198,6 +1421,146 @@ mod tests {
         assert_eq!(unix_endpoint_path(&endpoint), Some(sock.to_str().unwrap()));
         assert_eq!(unix_endpoint_path("127.0.0.1:9200"), None);
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─────────────────────────── KM#7: política del firmante ───────────────────
+
+    /// (KM#7) Binding de chain_id: con una política que fija la red A, un pedido que
+    /// nombra la red B (`SignCheckpoint`/`SignNetworkKeyCert`) se RECHAZA; el mismo
+    /// pedido con la red A se firma. Impide usar el firmante para atestar la red
+    /// equivocada. Los votos/handshake (sin chain_id) no se ven afectados.
+    #[test]
+    fn chain_id_binding_rejects_a_wrong_network_request() {
+        let tmp = std::env::temp_dir().join(format!("qrs-chainid-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let g = guard(&tmp);
+        let chain_a = [0xAAu8; 32];
+        let chain_b = [0xBBu8; 32];
+        let policy = SignerPolicy { expected_chain_id: Some(chain_a), rate_limit: None };
+        let limiter = Arc::new(Mutex::new(RateLimiter::unlimited()));
+
+        // Checkpoint de la red EQUIVOCADA → rechazado (sin firmar).
+        let bad_ckpt = SignerRequest::SignCheckpoint { chain_id: chain_b, round: 1, merkle_root: [1u8; 32] };
+        assert!(matches!(respond_with_policy(&bad_ckpt, &kp, &g, &policy, &limiter), SignerResponse::Refused(_)), "wrong-network checkpoint rejected");
+        // Cert de red de la red EQUIVOCADA → rechazado.
+        let bad_cert = SignerRequest::SignNetworkKeyCert { chain_id: chain_b, validator_id: [2u8; 32], network_addr: [3u8; 32] };
+        assert!(matches!(respond_with_policy(&bad_cert, &kp, &g, &policy, &limiter), SignerResponse::Refused(_)), "wrong-network cert rejected");
+        // El mismo checkpoint de NUESTRA red → firmado.
+        let ok_ckpt = SignerRequest::SignCheckpoint { chain_id: chain_a, round: 1, merkle_root: [1u8; 32] };
+        assert!(matches!(respond_with_policy(&ok_ckpt, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)), "own-network checkpoint signed");
+        // Un voto propio (sin chain_id) sigue firmándose bajo la política.
+        let vote = SignerRequest::SignOwnVote { round: 1, digest: [7u8; 32] };
+        assert!(matches!(respond_with_policy(&vote, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)), "votes unaffected by chain binding");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// (KM#7) Anti-equivocación de CHECKPOINTS de estado (siempre activa): un root
+    /// distinto para la MISMA ronda de checkpoint se rechaza; una ronda regresiva se
+    /// rechaza; la misma (ronda, root) es idempotente; una ronda mayor firma. Persiste
+    /// entre reinicios del daemon (un compromiso no puede "olvidar" que ya atestó).
+    #[test]
+    fn checkpoint_anti_equivocation_blocks_a_conflicting_root_and_persists() {
+        let tmp = std::env::temp_dir().join(format!("qrs-ckpt-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let cid = [0u8; 32];
+        let r1 = [1u8; 32];
+        let r2 = [2u8; 32];
+        {
+            let g = guard(&tmp);
+            // Checkpoint (ronda 5, root r1) → OK.
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 5, merkle_root: r1 }, &kp, &g), SignerResponse::Signature(_)));
+            // Re-firma idéntica (5, r1) → idempotente OK.
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 5, merkle_root: r1 }, &kp, &g), SignerResponse::Signature(_)));
+            // Root DISTINTO para la misma ronda 5 → RECHAZADO (equivocación de estado).
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 5, merkle_root: r2 }, &kp, &g), SignerResponse::Refused(_)));
+            // Ronda regresiva (4) → RECHAZADO.
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 4, merkle_root: r1 }, &kp, &g), SignerResponse::Refused(_)));
+            // Ronda mayor (6) con cualquier root → OK.
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 6, merkle_root: r2 }, &kp, &g), SignerResponse::Signature(_)));
+            // La guardia de checkpoints NO interfiere con la de votos (campos separados).
+            assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 3, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
+        }
+        // Reinicio del daemon: el estado persiste → un root en conflicto para la ronda
+        // 6 (ya atestada con r2) sigue rechazado.
+        {
+            let g2 = guard(&tmp);
+            assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 6, merkle_root: r1 }, &kp, &g2), SignerResponse::Refused(_)), "checkpoint equivocation memory survives a restart");
+            // El voto de la ronda 3 también persistió → un digest distinto para 3 se rechaza.
+            assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 3, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)), "own-vote memory survives too");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// (KM#7) Rate-limit por ventana deslizante: núcleo `allow_at` con instantes
+    /// sintéticos — admite hasta `max_signs` en la ventana, rechaza el excedente, y se
+    /// recupera cuando los viejos salen de la ventana. Y por el camino de `respond_with_policy`
+    /// un cuarto pedido de firma se rechaza mientras `GetBundle` no cuenta.
+    #[test]
+    fn rate_limiter_bounds_signs_per_window_and_recovers() {
+        let base = Instant::now();
+        let mut rl = RateLimiter::new(Some(RateLimit { max_signs: 3, window: Duration::from_secs(10) }));
+        // 3 admitidos en la ventana.
+        assert!(rl.allow_at(base));
+        assert!(rl.allow_at(base + Duration::from_secs(1)));
+        assert!(rl.allow_at(base + Duration::from_secs(2)));
+        // El 4º en la misma ventana → rechazado.
+        assert!(!rl.allow_at(base + Duration::from_secs(3)));
+        // Tras la ventana (el más viejo, base, salió) → admitido de nuevo.
+        assert!(rl.allow_at(base + Duration::from_secs(11)));
+        // Un limitador ilimitado siempre admite.
+        let mut unl = RateLimiter::unlimited();
+        for i in 0..1000 {
+            assert!(unl.allow_at(base + Duration::from_millis(i)));
+        }
+
+        // Camino end-to-end por `respond_with_policy`: 2 firmas OK, la 3ª rechazada;
+        // `GetBundle` (lectura pública) NO cuenta contra el límite.
+        let tmp = std::env::temp_dir().join(format!("qrs-rl-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let g = guard(&tmp);
+        let policy = SignerPolicy { expected_chain_id: None, rate_limit: Some(RateLimit { max_signs: 2, window: Duration::from_secs(600) }) };
+        let limiter = Arc::new(Mutex::new(RateLimiter::new(policy.rate_limit)));
+        // GetBundle no cuenta (varias veces).
+        for _ in 0..5 {
+            assert!(matches!(respond_with_policy(&SignerRequest::GetBundle, &kp, &g, &policy, &limiter), SignerResponse::Bundle(_)));
+        }
+        // 2 firmas de votos (rondas distintas) OK.
+        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { round: 1, digest: [1u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
+        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { round: 2, digest: [2u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
+        // La 3ª firma en la ventana → rechazada por rate-limit (no por la guardia).
+        let r = respond_with_policy(&SignerRequest::SignOwnVote { round: 3, digest: [3u8; 32] }, &kp, &g, &policy, &limiter);
+        match r {
+            SignerResponse::Refused(reason) => assert!(reason.contains("rate limit"), "refused for rate limit, got: {reason}"),
+            other => panic!("expected rate-limit Refused, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// (KM#7) Migración brick-safe: un guard.bin V1 (pre-KM#7, sólo votos) se lee y
+    /// MIGRA a V2 defaulteando los campos de checkpoint, sin perder la memoria de votos.
+    #[test]
+    fn a_v1_guard_file_migrates_to_v2_preserving_the_own_vote_memory() {
+        let tmp = std::env::temp_dir().join(format!("qrs-v1mig-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("guard.bin");
+        // Escribir un blob V1 a mano (last_own_round=7, digest=[5;32]).
+        #[derive(BorshSerialize)]
+        struct V1 { last_own_round: u64, last_own_digest: [u8; 32] }
+        std::fs::write(&path, borsh::to_vec(&V1 { last_own_round: 7, last_own_digest: [5u8; 32] }).unwrap()).unwrap();
+
+        let kp = Keypair::generate().unwrap();
+        let g = Arc::new(Mutex::new(DoubleSignGuard::load(&path).unwrap()));
+        // La memoria de votos V1 sobrevivió: un voto de la ronda 7 con un digest
+        // DISTINTO se rechaza (doble-firma), pero la ronda 8 firma.
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 7, digest: [9u8; 32] }, &kp, &g), SignerResponse::Refused(_)), "V1 own-vote memory preserved after migration");
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 8, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
+        // Y los campos de checkpoint arrancaron por defecto → un primer checkpoint firma.
+        assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: [0u8; 32], round: 1, merkle_root: [1u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
