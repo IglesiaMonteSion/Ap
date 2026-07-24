@@ -39,8 +39,8 @@ use crate::economics_v7::{
 use crate::error::ExecError;
 use crate::ids::{
     STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID,
-    VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID,
-    VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID,
+    VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID,
+    VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::{Account, EquivocationEvidence, Instruction};
@@ -286,6 +286,58 @@ impl KeyTimelockRegistry {
     fn purge(&mut self, addr: &Pubkey) {
         self.pending.retain(|p| &p.consensus_address != addr);
     }
+}
+
+// ── KM#6: two-phase CONSENSUS-key rotation ──────────────────────────────────
+//
+// A consensus-key rotation is a two-party handshake: the cold OPERATOR PROPOSES a
+// new consensus key (phase 1), and the NEW key ACCEPTS by proving possession
+// (phase 2, domain `KEY_ROTATION_ACCEPT_V1`). Only on acceptance does the rotation
+// take effect (old key → retired-but-slashable, new key → live `address`, at the
+// next epoch boundary via the standard committee derivation). This makes rotating
+// to an unpossessed key impossible, lets the acceptance be signed on a machine
+// SEPARATE (air-gapped) from the operator, and makes a rotation a two-party
+// agreement (the new-key holder must consent). The one-phase `RotateConsensusKey`
+// (an atomic operator+new-key co-sign in one tx) stays available; two-phase is the
+// recommended path when the new key is held air-gapped.
+
+/// (KM#6) A pending, proposed-but-not-yet-accepted consensus-key rotation.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct PendingConsensusRotation {
+    /// The validator being rotated (its CURRENT live consensus address).
+    pub consensus_address: Pubkey,
+    /// The proposed NEW consensus key bundle.
+    pub new_bundle: PublicKeyBundle,
+    pub new_p2p_address: String,
+    pub proposed_quanto: u64,
+}
+
+/// (KM#6) The consensus-rotation registry singleton
+/// (`VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID.data`). Additive: absent/empty on a
+/// network with no pending rotations.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct ConsensusRotationRegistry {
+    pub pending: Vec<PendingConsensusRotation>,
+}
+
+impl ConsensusRotationRegistry {
+    fn find(&self, addr: &Pubkey) -> Option<usize> {
+        self.pending.iter().position(|p| &p.consensus_address == addr)
+    }
+    fn purge(&mut self, addr: &Pubkey) {
+        self.pending.retain(|p| &p.consensus_address != addr);
+    }
+}
+
+/// (KM#6) The preimage the NEW consensus key signs OFFLINE to ACCEPT a rotation
+/// (domain `KEY_ROTATION_ACCEPT_V1`): binds the target validator and the new key's
+/// own address, so the acceptance proves possession of exactly the proposed new key
+/// and can't be reused for a different validator or a different new key.
+pub fn rotation_accept_message(consensus_address: &Pubkey, new_bundle_address: &Pubkey) -> Vec<u8> {
+    let mut m = Vec::with_capacity(64);
+    m.extend_from_slice(&consensus_address.0);
+    m.extend_from_slice(&new_bundle_address.0);
+    m
 }
 
 /// One validator's on-chain record (SPEC §7). The bond is always
@@ -635,6 +687,18 @@ pub enum ValidatorV7Instruction {
     /// authorized) — abort a legitimate proposal before it applies. accounts =
     /// [operator(payer), REGISTRY, KEY_TIMELOCK_REGISTRY].
     CancelPendingKeyChange { consensus_address: Pubkey, kind: KeyChangeKind },
+    /// (KM#6) PHASE 1 — the cold OPERATOR PROPOSES a two-phase consensus-key rotation
+    /// to `new_bundle`/`new_p2p_address`. No effect until the NEW key ACCEPTS. accounts
+    /// = [operator(payer), REGISTRY, CONSENSUS_ROTATION_REGISTRY].
+    ProposeConsensusKeyRotation { consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String },
+    /// (KM#6) PHASE 2 — ACCEPT a proposed consensus-key rotation. PERMISSIONLESS: the
+    /// `accept_pop` (NEW key over `KEY_ROTATION_ACCEPT_V1 ‖ consensus_address ‖
+    /// new_bundle_address`) is the authorization. accounts = [payer, REGISTRY,
+    /// CONSENSUS_ROTATION_REGISTRY, STAKING_GLOBAL].
+    AcceptConsensusKeyRotation { consensus_address: Pubkey, accept_pop: MultiSignature },
+    /// (KM#6) Cancel a still-pending proposed consensus-key rotation (operator-
+    /// authorized). accounts = [operator(payer), REGISTRY, CONSENSUS_ROTATION_REGISTRY].
+    CancelConsensusKeyRotation { consensus_address: Pubkey },
 }
 
 pub struct ValidatorV7Program;
@@ -1017,6 +1081,27 @@ fn write_key_timelock_registry(accounts: &mut HashMap<Pubkey, Account>, r: &KeyT
     Ok(())
 }
 
+/// (KM#6) Read the consensus-rotation registry singleton, LAZILY DEFAULTED like the
+/// other KM singletons: absent OR empty → empty; present-but-undecodable → fail-loud.
+fn read_consensus_rotation_registry(accounts: &HashMap<Pubkey, Account>) -> ConsensusRotationRegistry {
+    match accounts.get(&VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID) {
+        None => ConsensusRotationRegistry::default(),
+        Some(a) if a.data.is_empty() => ConsensusRotationRegistry::default(),
+        Some(a) => ConsensusRotationRegistry::try_from_slice(&a.data).unwrap_or_else(|_| {
+            panic!(
+                "VALIDATOR_CONSENSUS_ROTATION_REGISTRY (v7) is present but does not decode — refusing \
+                 to run on a corrupt consensus-rotation registry (restore from a good backup / re-sync)"
+            )
+        }),
+    }
+}
+
+fn write_consensus_rotation_registry(accounts: &mut HashMap<Pubkey, Account>, r: &ConsensusRotationRegistry) -> Result<(), ExecError> {
+    let acct = accounts.entry(VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
+    acct.data = borsh::to_vec(r).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+    Ok(())
+}
+
 fn current_quanto(accounts: &HashMap<Pubkey, Account>) -> u64 {
     crate::staking_v7::global_state(accounts).current_quanto
 }
@@ -1056,6 +1141,9 @@ impl ValidatorV7Program {
             ValidatorV7Instruction::RecoverRevoke { consensus_address, op, approvals } => Self::recover_revoke(accounts, instruction, payer, consensus_address, op, approvals),
             ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address, kind } => Self::apply_pending_key_change(accounts, instruction, payer, consensus_address, kind),
             ValidatorV7Instruction::CancelPendingKeyChange { consensus_address, kind } => Self::cancel_pending_key_change(accounts, instruction, payer, consensus_address, kind),
+            ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address, new_bundle, new_p2p_address } => Self::propose_consensus_key_rotation(accounts, instruction, payer, consensus_address, new_bundle, new_p2p_address),
+            ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address, accept_pop } => Self::accept_consensus_key_rotation(accounts, instruction, payer, consensus_address, accept_pop),
+            ValidatorV7Instruction::CancelConsensusKeyRotation { consensus_address } => Self::cancel_consensus_key_rotation(accounts, instruction, payer, consensus_address),
         }
     }
 
@@ -1296,6 +1384,12 @@ impl ValidatorV7Program {
             tl.purge(&consensus_address);
             write_key_timelock_registry(accounts, &tl)?;
         }
+        // (KM#6) Likewise drop any pending two-phase consensus-key rotation.
+        let mut cr = read_consensus_rotation_registry(accounts);
+        if cr.find(&consensus_address).is_some() {
+            cr.purge(&consensus_address);
+            write_consensus_rotation_registry(accounts, &cr)?;
+        }
         // Bump the recovery nonce so this collected authorization can't be replayed.
         rec.entries[ridx].nonce = nonce.saturating_add(1);
         write_recovery_registry(accounts, &rec)?;
@@ -1385,36 +1479,27 @@ impl ValidatorV7Program {
         Self::propose_key_change(accounts, ix, consensus_address, PendingKeyChange::Withdrawal(new_withdrawal))
     }
 
-    fn rotate_consensus_key(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String, new_pop: MultiSignature) -> Result<(), ExecError> {
-        let global_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RotateConsensusKey requires accounts[2]".into()))?;
-        if global_pk != STAKING_GLOBAL_ID {
-            return Err(ExecError::Unauthorized("RotateConsensusKey must name the canonical global account".into()));
-        }
+    /// Shared apply logic for a consensus-key rotation (one-phase `RotateConsensusKey`
+    /// and two-phase `AcceptConsensusKeyRotation`): validate the new key isn't the
+    /// current one and doesn't collide, retire the OLD key (slashable through the
+    /// evidence window), install the new bundle/address/p2p, and clear any
+    /// revocation/expiry. Takes effect at the next epoch via the standard committee
+    /// derivation. Mutates `reg`; the caller persists it.
+    fn apply_consensus_rotation(reg: &mut ValidatorV7Registry, idx: usize, new_bundle: PublicKeyBundle, new_p2p_address: String, q: u64) -> Result<(), ExecError> {
         if !(1..=128).contains(&new_p2p_address.len()) {
             return Err(ExecError::ProgramError("p2p address length out of range".into()));
         }
-        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateConsensusKey")?;
         let new_addr = new_bundle.to_address();
         let old_addr = reg.validators[idx].address;
         if new_addr == old_addr {
             return Err(ExecError::ProgramError("new consensus key is identical to the current one".into()));
         }
-        // The NEW consensus key must prove possession, bound to THIS validator's
-        // operator/withdrawal/moniker (the same PoP the registration requires), so
-        // nobody can rotate in a key they don't hold, nor replay a PoP elsewhere.
-        let operator = reg.validators[idx].operator_address;
-        let withdrawal = reg.validators[idx].withdrawal_address;
-        let moniker = reg.validators[idx].moniker.clone();
-        if !qchain_crypto::verify_domain(&new_bundle, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&operator, &withdrawal, &moniker), &new_pop) {
-            return Err(ExecError::Unauthorized("new_pop does not prove possession of the new consensus key for this operator/withdrawal/moniker".into()));
-        }
         // The new consensus address must not collide with another LIVE validator's
         // identity (its own slot is excepted via `except = old consensus address`).
-        let in_use = reg.addresses_in_use(Some(&consensus_address));
+        let in_use = reg.addresses_in_use(Some(&old_addr));
         if in_use.contains(&new_addr) {
             return Err(ExecError::ProgramError("new consensus key is already registered to another validator".into()));
         }
-        let q = current_quanto(accounts);
         let e = &mut reg.validators[idx];
         // Keep the OLD key slashable through the evidence window: an equivocation by
         // the rotated-out key (e.g. a leaked key still in the current epoch's fixed
@@ -1426,7 +1511,141 @@ impl ValidatorV7Program {
         // A fresh key clears any revocation/expiry that excluded the validator.
         e.consensus_key_revoked = false;
         e.consensus_key_expiry_quanto = 0;
+        Ok(())
+    }
+
+    /// (#20) ONE-PHASE consensus-key rotation: the operator co-signs (in one tx) the
+    /// new key's PoP over `VALIDATOR_POP_V1 ‖ operator ‖ withdrawal ‖ moniker`. Stays
+    /// available; KM#6's two-phase flow is preferred when the new key is air-gapped.
+    fn rotate_consensus_key(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String, new_pop: MultiSignature) -> Result<(), ExecError> {
+        let global_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RotateConsensusKey requires accounts[2]".into()))?;
+        if global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("RotateConsensusKey must name the canonical global account".into()));
+        }
+        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateConsensusKey")?;
+        // The NEW consensus key must prove possession, bound to THIS validator's
+        // operator/withdrawal/moniker (the same PoP the registration requires), so
+        // nobody can rotate in a key they don't hold, nor replay a PoP elsewhere.
+        let operator = reg.validators[idx].operator_address;
+        let withdrawal = reg.validators[idx].withdrawal_address;
+        let moniker = reg.validators[idx].moniker.clone();
+        if !qchain_crypto::verify_domain(&new_bundle, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&operator, &withdrawal, &moniker), &new_pop) {
+            return Err(ExecError::Unauthorized("new_pop does not prove possession of the new consensus key for this operator/withdrawal/moniker".into()));
+        }
+        let q = current_quanto(accounts);
+        Self::apply_consensus_rotation(&mut reg, idx, new_bundle, new_p2p_address, q)?;
         write_registry(accounts, &reg)?;
+        // Any pending TWO-PHASE rotation for this validator is now stale (its live
+        // consensus address changed) — drop it so a leftover can't apply later.
+        let mut cr = read_consensus_rotation_registry(accounts);
+        if cr.find(&consensus_address).is_some() {
+            cr.purge(&consensus_address);
+            write_consensus_rotation_registry(accounts, &cr)?;
+        }
+        Ok(())
+    }
+
+    /// (KM#6) PHASE 1 — the cold OPERATOR PROPOSES a consensus-key rotation to
+    /// `new_bundle`. Records a pending rotation; NO effect until the NEW key ACCEPTS
+    /// (phase 2). Validated upfront so a doomed proposal isn't queued. accounts =
+    /// [operator(payer), REGISTRY, CONSENSUS_ROTATION_REGISTRY, STAKING_GLOBAL].
+    /// STAKING_GLOBAL is pinned (accounts[3]) so `proposed_quanto` is the REAL
+    /// current quanto — the staleness guard in accept compares it against the slot's
+    /// `registered_quanto`, so a bogus 0 would make the guard reject every valid
+    /// acceptance for a validator registered after quanto 0 (the same pin KM#5 uses).
+    fn propose_consensus_key_rotation(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String) -> Result<(), ExecError> {
+        let rot_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("ProposeConsensusKeyRotation requires accounts[2]".into()))?;
+        let global_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("ProposeConsensusKeyRotation requires accounts[3] (staking global)".into()))?;
+        if rot_pk != VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID || global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("ProposeConsensusKeyRotation must name the canonical consensus-rotation registry and staking global".into()));
+        }
+        if !(1..=128).contains(&new_p2p_address.len()) {
+            return Err(ExecError::ProgramError("p2p address length out of range".into()));
+        }
+        let (reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "ProposeConsensusKeyRotation")?;
+        if matches!(reg.validators[idx].state, ValidatorV7State::Revoked) {
+            return Err(ExecError::ProgramError("validator is revoked".into()));
+        }
+        let new_addr = new_bundle.to_address();
+        if new_addr == reg.validators[idx].address {
+            return Err(ExecError::ProgramError("new consensus key is identical to the current one".into()));
+        }
+        if reg.addresses_in_use(Some(&consensus_address)).contains(&new_addr) {
+            return Err(ExecError::ProgramError("new consensus key is already registered to another validator".into()));
+        }
+        let q = current_quanto(accounts);
+        let entry = PendingConsensusRotation { consensus_address, new_bundle, new_p2p_address, proposed_quanto: q };
+        let mut cr = read_consensus_rotation_registry(accounts);
+        match cr.find(&consensus_address) {
+            // Re-proposing REPLACES the pending rotation (a fresh new key / p2p).
+            Some(i) => cr.pending[i] = entry,
+            None => {
+                if cr.pending.len() >= MAX_V7_VALIDATORS {
+                    return Err(ExecError::ProgramError("consensus-rotation registry is full".into()));
+                }
+                cr.pending.push(entry);
+            }
+        }
+        write_consensus_rotation_registry(accounts, &cr)?;
+        Ok(())
+    }
+
+    /// (KM#6) PHASE 2 — ACCEPT a proposed consensus-key rotation. PERMISSIONLESS: the
+    /// `accept_pop` (a signature by the NEW consensus key over `KEY_ROTATION_ACCEPT_V1
+    /// ‖ consensus_address ‖ new_bundle_address`) IS the authorization — the payer is
+    /// a fee relayer. Only on a valid acceptance does the rotation apply (old key →
+    /// retired-slashable, new key → live, next epoch). accounts = [payer, REGISTRY,
+    /// CONSENSUS_ROTATION_REGISTRY, STAKING_GLOBAL].
+    fn accept_consensus_key_rotation(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, accept_pop: MultiSignature) -> Result<(), ExecError> {
+        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("AcceptConsensusKeyRotation requires accounts[1]".into()))?;
+        let rot_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("AcceptConsensusKeyRotation requires accounts[2]".into()))?;
+        let global_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("AcceptConsensusKeyRotation requires accounts[3]".into()))?;
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID
+            || rot_pk != VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID
+            || global_pk != STAKING_GLOBAL_ID
+        {
+            return Err(ExecError::Unauthorized("AcceptConsensusKeyRotation must name the canonical accounts".into()));
+        }
+        let mut cr = read_consensus_rotation_registry(accounts);
+        let ci = cr.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("no pending consensus-key rotation for this validator".into()))?;
+        let new_bundle = cr.pending[ci].new_bundle.clone();
+        let new_p2p = cr.pending[ci].new_p2p_address.clone();
+        let proposed_quanto = cr.pending[ci].proposed_quanto;
+        let new_addr = new_bundle.to_address();
+        // The NEW key must ACCEPT by proving possession over the accept domain, bound
+        // to this validator + this exact new key.
+        if !qchain_crypto::verify_domain(&new_bundle, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &rotation_accept_message(&consensus_address, &new_addr), &accept_pop) {
+            return Err(ExecError::Unauthorized("accept_pop does not prove possession of the proposed new consensus key".into()));
+        }
+        let mut reg = read_registry(accounts);
+        let idx = reg.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
+        if matches!(reg.validators[idx].state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
+            return Err(ExecError::ProgramError("validator is not in a state that can rotate its consensus key".into()));
+        }
+        // Staleness guard: the slot must not have been re-registered after the proposal.
+        if reg.validators[idx].registered_quanto > proposed_quanto {
+            return Err(ExecError::ProgramError("pending rotation predates the validator's current registration — stale".into()));
+        }
+        let q = current_quanto(accounts);
+        Self::apply_consensus_rotation(&mut reg, idx, new_bundle, new_p2p, q)?;
+        write_registry(accounts, &reg)?;
+        cr.pending.remove(ci);
+        write_consensus_rotation_registry(accounts, &cr)?;
+        Ok(())
+    }
+
+    /// (KM#6) Cancel a still-pending proposed consensus-key rotation (operator-
+    /// authorized). accounts = [operator(payer), REGISTRY, CONSENSUS_ROTATION_REGISTRY].
+    fn cancel_consensus_key_rotation(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey) -> Result<(), ExecError> {
+        let _ = Self::require_operator(accounts, ix, payer, &consensus_address, "CancelConsensusKeyRotation")?;
+        let rot_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("CancelConsensusKeyRotation requires accounts[2]".into()))?;
+        if rot_pk != VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID {
+            return Err(ExecError::Unauthorized("CancelConsensusKeyRotation must name the canonical consensus-rotation registry".into()));
+        }
+        let mut cr = read_consensus_rotation_registry(accounts);
+        let ci = cr.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("no pending consensus-key rotation for this validator".into()))?;
+        cr.pending.remove(ci);
+        write_consensus_rotation_registry(accounts, &cr)?;
         Ok(())
     }
 
@@ -2042,13 +2261,17 @@ mod tests {
     fn validator_v7_instruction_encoding_is_stable() {
         // Pin the borsh discriminants so a CLI/relayer encoder can't silently drift.
         let cons = Pubkey::new([9u8; 32]);
-        let cases: [(ValidatorV7Instruction, u8); 6] = [
+        let kp = Keypair::generate().unwrap();
+        let cases: [(ValidatorV7Instruction, u8); 9] = [
             (ValidatorV7Instruction::BeginExit { consensus_address: cons }, 1),
             (ValidatorV7Instruction::Unjail { consensus_address: cons }, 4),
             (ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: cons, config: RecoveryConfig::default() }, 10),
             (ValidatorV7Instruction::RecoverRevoke { consensus_address: cons, op: RecoveryOp::Revoke, approvals: vec![] }, 11),
             (ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::Operator }, 12),
             (ValidatorV7Instruction::CancelPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::RecoveryCommittee }, 13),
+            (ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address: cons, new_bundle: kp.public_key_bundle(), new_p2p_address: "1.2.3.4:9000".into() }, 14),
+            (ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: cons, accept_pop: qchain_crypto::sign_domain(&kp, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &rotation_accept_message(&cons, &kp.pubkey())).unwrap() }, 15),
+            (ValidatorV7Instruction::CancelConsensusKeyRotation { consensus_address: cons }, 16),
         ];
         for (instr, disc) in cases {
             let bytes = borsh::to_vec(&instr).unwrap();
@@ -2612,6 +2835,138 @@ mod tests {
         // Past the slash window the retired key is no longer slashable.
         let window_end = e.retired_consensus_keys[0].slash_until_quanto;
         assert_eq!(reg.find_slashable(&old_addr, window_end + 1), None, "old key not slashable past its window");
+    }
+
+    // ─── KM#6: two-phase consensus-key rotation ───────────────────────────────
+
+    /// Helper: OPERATOR proposes a rotation to `new_key`. STAKING_GLOBAL is pinned so
+    /// `proposed_quanto` is the real current quanto (the accept staleness guard needs it).
+    fn propose_rot(accounts: &mut HashMap<Pubkey, Account>, op: &Keypair, caddr: Pubkey, new_key: &Keypair) -> Result<(), ExecError> {
+        let data = ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address: caddr, new_bundle: new_key.public_key_bundle(), new_p2p_address: "9.9.9.9:9000".into() };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID]), &op.pubkey())
+    }
+    /// Helper: the NEW key signs the accept PoP OFFLINE, and `relayer` submits it.
+    fn accept_rot(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, caddr: Pubkey, new_key: &Keypair) -> Result<(), ExecError> {
+        let pop = qchain_crypto::sign_domain(new_key, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &rotation_accept_message(&caddr, &new_key.pubkey())).unwrap();
+        let data = ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: caddr, accept_pop: pop };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID]), &relayer.pubkey())
+    }
+    fn pending_rotations(accounts: &HashMap<Pubkey, Account>) -> ConsensusRotationRegistry {
+        read_consensus_rotation_registry(accounts)
+    }
+
+    /// The two-party handshake: the operator PROPOSES (phase 1, no effect), then the
+    /// NEW key ACCEPTS with its PoP (phase 2, permissionless) → rotation applies. The
+    /// bond/activation are preserved and the old key stays retired-but-slashable.
+    #[test]
+    fn two_phase_consensus_rotation_proposes_then_accepts_with_the_new_key_pop() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        // Register at a NON-ZERO quanto so `registered_quanto` > 0. If `propose` failed
+        // to read the real quanto (e.g. missing STAKING_GLOBAL, stamping 0), the accept
+        // staleness guard `registered_quanto > proposed_quanto` would wrongly reject the
+        // valid acceptance — this makes the test catch that class.
+        set_quanto(&mut accounts, 5);
+        register_full(&mut accounts, &op, &cons, None, "tp-node").unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].registered_quanto, 5, "registered at quanto 5");
+        let old_addr = cons.pubkey();
+        let activation_before = registry_of(&accounts).validators[0].activation_quanto;
+        let new_key = Keypair::generate().unwrap();
+
+        // Phase 1: operator proposes. Pending recorded; the LIVE key is unchanged.
+        propose_rot(&mut accounts, &op, old_addr, &new_key).unwrap();
+        assert_eq!(pending_rotations(&accounts).pending[0].proposed_quanto, 5, "propose stamps the real quanto (not 0)");
+        assert_eq!(pending_rotations(&accounts).pending.len(), 1, "one pending rotation");
+        assert_eq!(registry_of(&accounts).validators[0].address, old_addr, "not rotated until accepted");
+
+        // Phase 2: a STRANGER relayer submits the NEW key's acceptance (permissionless).
+        let relayer = Keypair::generate().unwrap();
+        accept_rot(&mut accounts, &relayer, old_addr, &new_key).unwrap();
+
+        let reg = registry_of(&accounts);
+        let e = &reg.validators[0];
+        assert_eq!(e.address, new_key.pubkey(), "live address is the new key after accept");
+        assert_eq!(e.bond, VALIDATOR_BOND_ATOMS, "bond preserved");
+        assert_eq!(e.activation_quanto, activation_before, "activation preserved");
+        assert_eq!(e.p2p_address, "9.9.9.9:9000");
+        assert!(e.retired_consensus_keys.iter().any(|r| r.address == old_addr), "old key retired-but-slashable");
+        assert_eq!(reg.find_slashable(&old_addr, 0), Some(0), "old key still slashable within window");
+        assert!(pending_rotations(&accounts).pending.is_empty(), "pending cleared after accept");
+    }
+
+    /// The acceptance MUST be the NEW key's PoP over the ACCEPT domain: a signature by
+    /// another key, over the wrong domain, or for another validator does NOT accept.
+    #[test]
+    fn consensus_rotation_accept_requires_the_new_keys_pop_over_the_accept_domain() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "acc-node").unwrap();
+        let caddr = cons.pubkey();
+        let new_key = Keypair::generate().unwrap();
+        propose_rot(&mut accounts, &op, caddr, &new_key).unwrap();
+        let relayer = Keypair::generate().unwrap();
+
+        // (a) A PoP by a DIFFERENT key (not the proposed new key) → rejected.
+        let other = Keypair::generate().unwrap();
+        let wrong_key_pop = qchain_crypto::sign_domain(&other, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &rotation_accept_message(&caddr, &new_key.pubkey())).unwrap();
+        let bad1 = ix(&ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: caddr, accept_pop: wrong_key_pop }, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &bad1, &relayer.pubkey()).is_err(), "PoP by the wrong key rejected");
+
+        // (b) The new key signs the WRONG domain (registration PoP, not accept) → rejected.
+        let wrong_domain = qchain_crypto::sign_domain(&new_key, qchain_crypto::domains::VALIDATOR_POP_V1, &rotation_accept_message(&caddr, &new_key.pubkey())).unwrap();
+        let bad2 = ix(&ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: caddr, accept_pop: wrong_domain }, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &bad2, &relayer.pubkey()).is_err(), "PoP over the wrong domain rejected");
+
+        // (c) The new key signs for a DIFFERENT validator address → rejected.
+        let wrong_target = qchain_crypto::sign_domain(&new_key, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &rotation_accept_message(&Pubkey::new([7u8; 32]), &new_key.pubkey())).unwrap();
+        let bad3 = ix(&ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: caddr, accept_pop: wrong_target }, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &bad3, &relayer.pubkey()).is_err(), "PoP bound to another validator rejected");
+
+        // None of them rotated anything; the correct acceptance still works.
+        assert_eq!(registry_of(&accounts).validators[0].address, caddr, "no rotation from bad accepts");
+        assert_eq!(pending_rotations(&accounts).pending.len(), 1, "pending survives bad accepts");
+        accept_rot(&mut accounts, &relayer, caddr, &new_key).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].address, new_key.pubkey(), "the correct accept rotates");
+    }
+
+    /// Only the operator can PROPOSE; the operator can CANCEL a pending rotation; a
+    /// one-phase `RotateConsensusKey` PURGES a leftover two-phase proposal.
+    #[test]
+    fn consensus_rotation_propose_is_operator_only_cancellable_and_purged_on_one_phase() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "pc-node").unwrap();
+        let caddr = cons.pubkey();
+        let new_key = Keypair::generate().unwrap();
+
+        // A NON-operator can't propose.
+        let stranger = Keypair::generate().unwrap();
+        assert!(propose_rot(&mut accounts, &stranger, caddr, &new_key).is_err(), "only the operator can propose");
+
+        // The operator proposes, then CANCELS → accept then fails (nothing pending).
+        propose_rot(&mut accounts, &op, caddr, &new_key).unwrap();
+        let cancel = ix(&ValidatorV7Instruction::CancelConsensusKeyRotation { consensus_address: caddr }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID]);
+        ValidatorV7Program::execute(&mut accounts, &cancel, &op.pubkey()).unwrap();
+        assert!(pending_rotations(&accounts).pending.is_empty(), "cancelled");
+        let relayer = Keypair::generate().unwrap();
+        assert!(accept_rot(&mut accounts, &relayer, caddr, &new_key).is_err(), "nothing to accept after cancel");
+
+        // Propose again, then do a ONE-PHASE rotation to a THIRD key → the stale
+        // two-phase proposal is purged (its live address changed).
+        propose_rot(&mut accounts, &op, caddr, &new_key).unwrap();
+        assert_eq!(pending_rotations(&accounts).pending.len(), 1);
+        let third = Keypair::generate().unwrap();
+        let good = qchain_crypto::sign_domain(&third, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&op.pubkey(), &op.pubkey(), "pc-node")).unwrap();
+        let one_phase = ix(&ValidatorV7Instruction::RotateConsensusKey { consensus_address: caddr, new_bundle: third.public_key_bundle(), new_p2p_address: "3.3.3.3:9000".into(), new_pop: good }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &one_phase, &op.pubkey()).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].address, third.pubkey(), "one-phase rotated to the third key");
+        assert!(pending_rotations(&accounts).pending.is_empty(), "stale two-phase proposal purged by the one-phase rotation");
     }
 
     /// #20: REVOKING or EXPIRING the consensus key excludes the validator from BOTH

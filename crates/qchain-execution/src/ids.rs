@@ -192,6 +192,19 @@ pub const VALIDATOR_RECOVERY_REGISTRY_ID: Pubkey = Pubkey::new([22u8; 32]);
 /// chain_id change, brick-safe on a live network. Lazily created. Carries no funds.
 pub const VALIDATOR_KEY_TIMELOCK_REGISTRY_ID: Pubkey = Pubkey::new([23u8; 32]);
 
+/// Singleton account (owned by `STAKING_PROGRAM_ID`) whose `data` is the v7
+/// **consensus-key rotation registry** (programa de gestión de claves, KM#6). Holds
+/// the PENDING two-phase consensus-key rotations of validators: the cold operator
+/// PROPOSES a new consensus key (phase 1), and the NEW key ACCEPTS by proving
+/// possession (phase 2, domain `KEY_ROTATION_ACCEPT_V1`) before the rotation takes
+/// effect — so a rotation to an unpossessed key is impossible, the acceptance can
+/// be signed on a machine separate (air-gapped) from the operator, and the rotation
+/// is a two-party agreement. Held in its OWN account (not on each validator entry)
+/// so it is purely ADDITIVE: an existing v7 network has no pending rotations until a
+/// validator first proposes one — no registry-format migration, no chain_id change,
+/// brick-safe. Lazily created. Carries no funds.
+pub const VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID: Pubkey = Pubkey::new([24u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

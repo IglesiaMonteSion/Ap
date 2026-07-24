@@ -13,8 +13,8 @@ use qchain_execution::{
     BURN_ADDRESS, EconomicParams, EMERGENCY_ACCOUNT_ID, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
-use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
-use qchain_execution::validator_v7::{KeyChangeKind, RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
+use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
+use qchain_execution::validator_v7::{rotation_accept_message, KeyChangeKind, RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
 
@@ -579,6 +579,71 @@ enum Command {
         /// Which pending change: operator | withdrawal | recovery.
         #[arg(long)]
         kind: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#6): PHASE 1 — the operator PROPOSES a two-phase consensus-key rotation
+    /// to a fresh key. No effect until the NEW key ACCEPTS (v7-accept-consensus-rotation).
+    V7ProposeConsensusRotation {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The operator (cold) keypair — the payer/authorizer.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's CURRENT consensus address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// The NEW consensus keypair (its public bundle is proposed; the private key is only needed to SIGN the acceptance, separately).
+        #[arg(long)]
+        new_consensus_keypair: PathBuf,
+        /// Public P2P address for the new key (e.g. 1.2.3.4:9000).
+        #[arg(long)]
+        new_p2p_address: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#6): PHASE 2 sign — the NEW consensus key ACCEPTS the rotation OFFLINE
+    /// (no network). Prints the acceptance PoP hex to hand to a relayer.
+    V7ConsensusRotationSign {
+        /// The NEW consensus keypair (the one being rotated IN).
+        #[arg(long)]
+        new_consensus_keypair: PathBuf,
+        /// The validator's CURRENT consensus address (base58) — the one being rotated.
+        #[arg(long)]
+        consensus_address: String,
+    },
+    /// v7 (KM#6): PHASE 2 submit — a relayer submits the NEW key's acceptance PoP.
+    /// PERMISSIONLESS. Only a valid acceptance completes the rotation.
+    V7AcceptConsensusRotation {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// Any keypair (fee relayer).
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's CURRENT consensus address (base58).
+        #[arg(long)]
+        consensus_address: String,
+        /// The acceptance PoP hex from `v7-consensus-rotation-sign`.
+        #[arg(long)]
+        accept_pop: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#6): cancel a still-pending proposed consensus-key rotation (operator).
+    V7CancelConsensusRotation {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's consensus address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -2142,6 +2207,48 @@ fn main() -> anyhow::Result<()> {
             let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
             println!("cancelled the pending {kind} key change of v7 validator {target}");
+        }
+        Command::V7ProposeConsensusRotation { rpc, keypair, consensus_address, new_consensus_keypair, new_p2p_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let new_kp = qchain_crypto::read_keypair_file(&new_consensus_keypair)?;
+            let new_bundle = new_kp.public_key_bundle();
+            let data = borsh::to_vec(&ValidatorV7Instruction::ProposeConsensusKeyRotation { consensus_address: target, new_bundle: new_bundle.clone(), new_p2p_address })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("PROPOSED rotating the consensus key of v7 validator {target} → {} (KM#6 two-phase; the NEW key must ACCEPT: `v7-consensus-rotation-sign` OFFLINE, then a relayer `v7-accept-consensus-rotation`)", new_bundle.to_address());
+        }
+        Command::V7ConsensusRotationSign { new_consensus_keypair, consensus_address } => {
+            let new_kp = qchain_crypto::read_keypair_file(&new_consensus_keypair)?;
+            let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let new_addr = new_kp.pubkey();
+            let msg = rotation_accept_message(&target, &new_addr);
+            let pop = qchain_crypto::sign_domain(&new_kp, qchain_crypto::domains::KEY_ROTATION_ACCEPT_V1, &msg)?;
+            println!("consensus-rotation acceptance PoP (hex) — give this to the relayer for `v7-accept-consensus-rotation --accept-pop`:");
+            println!("{}", hex::encode(borsh::to_vec(&pop)?));
+        }
+        Command::V7AcceptConsensusRotation { rpc, keypair, consensus_address, accept_pop, nonce, fee_limit } => {
+            let payer = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let pop: qchain_crypto::MultiSignature = borsh::from_slice(&hex::decode(accept_pop.trim()).map_err(|e| anyhow::anyhow!("invalid --accept-pop hex: {e}"))?).map_err(|e| anyhow::anyhow!("invalid --accept-pop: {e}"))?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::AcceptConsensusKeyRotation { consensus_address: target, accept_pop: pop })?;
+            let body = submit_instruction(&rpc, &payer, VALIDATOR_V7_PROGRAM_ID, vec![payer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("submitted the NEW key's acceptance for the consensus-key rotation of v7 validator {target} (applies if the PoP is valid; takes effect next epoch)");
+        }
+        Command::V7CancelConsensusRotation { rpc, keypair, consensus_address, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let data = borsh::to_vec(&ValidatorV7Instruction::CancelConsensusKeyRotation { consensus_address: target })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("cancelled the pending consensus-key rotation of v7 validator {target}");
         }
         Command::V7RotateConsensusKey { rpc, keypair, consensus_address, new_consensus_keypair, new_p2p_address, nonce, fee_limit } => {
             let operator = qchain_crypto::read_keypair_file(&keypair)?;

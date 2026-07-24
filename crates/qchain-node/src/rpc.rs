@@ -380,6 +380,7 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limi
         .route("/validator_v7_registry", get(validator_v7_registry))
         .route("/validator_v7_recovery", get(validator_v7_recovery))
         .route("/validator_v7_pending_keys", get(validator_v7_pending_keys))
+        .route("/validator_v7_consensus_rotations", get(validator_v7_consensus_rotations))
         .route("/treasury", get(treasury))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
@@ -1049,6 +1050,34 @@ async fn validator_v7_pending_keys(State(engine): State<Arc<Engine>>) -> Result<
                 "value": value,
                 "proposed_quanto": p.proposed_quanto,
                 "ready_quanto": p.ready_quanto,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "pending": pending })))
+}
+
+/// (KM#6) The v7 consensus-rotation registry: pending two-phase consensus-key
+/// rotations awaiting acceptance by the proposed new key.
+async fn validator_v7_consensus_rotations(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID;
+    use qchain_execution::validator_v7::ConsensusRotationRegistry;
+    let Some(acct) = engine.get_account(&VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID).await else {
+        return Ok(Json(json!({ "pending": [] })));
+    };
+    if acct.data.is_empty() {
+        return Ok(Json(json!({ "pending": [] })));
+    }
+    let cr = ConsensusRotationRegistry::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("consensus-rotation registry decode: {e}")))?;
+    let pending: Vec<serde_json::Value> = cr
+        .pending
+        .iter()
+        .map(|p| {
+            json!({
+                "consensus_address": p.consensus_address.to_string(),
+                "new_consensus_address": p.new_bundle.to_address().to_string(),
+                "new_p2p_address": p.new_p2p_address,
+                "proposed_quanto": p.proposed_quanto,
             })
         })
         .collect();

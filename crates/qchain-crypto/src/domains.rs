@@ -101,3 +101,18 @@ pub const NETWORK_KEY_CERT_V1: &[u8] = b"qchain-network-key-cert-v1";
 /// (que sube en cada revoke) es la defensa anti-replay dentro de la red — misma
 /// postura que `VALIDATOR_POP_V1`, que tampoco liga `chain_id`.
 pub const RECOVERY_AUTH_V1: &[u8] = b"qchain-v7-recovery-auth-v1";
+
+/// **Aceptación de una ROTACIÓN de clave de consenso en dos fases** (programa de
+/// gestión de claves, KM#6). Una rotación de la clave de CONSENSO se hace en DOS
+/// fases: la clave FRÍA de operador PROPONE la nueva clave (fase 1), y la NUEVA
+/// clave de consenso ACEPTA firmando OFFLINE `KEY_ROTATION_ACCEPT_V1 ‖
+/// consensus_address ‖ new_bundle_address` (fase 2). Sólo cuando la nueva clave
+/// acepta (probando posesión) la rotación toma efecto — así una rotación a una
+/// clave que no se posee es imposible, la aceptación puede firmarse en una máquina
+/// SEPARADA (air-gapped) del operador, y la rotación es un acuerdo de dos partes
+/// (el operador propone, el nuevo dueño acepta). El dominio separa esta aceptación
+/// del PoP de registro (`VALIDATOR_POP_V1`, que liga operator/withdrawal/moniker) y
+/// de un voto/tx: una firma de aceptación NUNCA vale como PoP de registro ni al
+/// revés. Objeto tipado de largo fijo (32+32); no liga `chain_id`, misma postura
+/// que `VALIDATOR_POP_V1`.
+pub const KEY_ROTATION_ACCEPT_V1: &[u8] = b"qchain-v7-key-rotation-accept-v1";

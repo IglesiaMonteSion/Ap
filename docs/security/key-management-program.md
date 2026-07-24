@@ -20,7 +20,7 @@ documentado como pendiente con su razón, no forzado.
 | 3 | Autenticar el firmante remoto (UDS/token/canal) | 3 | **HECHO** (v8.6.26/27) |
 | 4 | Recovery key offline (revoca/reemplaza/congela) | 4 | **HECHO** (v8.6.30 — REVOKE por comité M-de-N offline) |
 | 5 | Timelocks on-chain de cambios de clave | 5 | **HECHO** (v8.6.31 — operator ~24h / withdrawal ~72h / recovery ~7d) |
-| 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | pendiente |
+| 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | **HECHO** (v8.6.32 — `ProposeConsensusKeyRotation` operator + `AcceptConsensusKeyRotation` con PoP de la clave nueva) |
 | 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | pendiente |
 | 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | pendiente |
 | 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | pendiente |
@@ -232,13 +232,84 @@ recuperación vacío); aplicar TRAS la ventana cambió la withdrawal con **root
 byte-idéntico en ambos nodos** → SIN FORK; un `CancelPendingKeyChange` limpió el
 pendiente en ambos nodos con root byte-idéntico.
 
-## #6–#10 — pendientes
+## #6 — Rotación de clave de consenso en DOS fases (HECHO, v8.6.32)
+
+**PROBLEMA.** La rotación de clave de consenso de #20 (`RotateConsensusKey`) es de
+UNA sola fase: el operador propone la clave nueva Y adjunta su PoP en la misma tx.
+Es correcto, pero fuerza a que el operador tenga la clave privada nueva a mano al
+firmar la tx — no permite que la aceptación se firme en una máquina SEPARADA
+(air-gapped) del operador, ni modela la rotación como un acuerdo de DOS partes (el
+operador propone, el dueño de la clave nueva acepta).
+
+**DISEÑO (dos fases, singleton SEPARADO `[24]` — sin tocar `ValidatorV7Entry` ni
+ninguna migración; byte-idéntico hasta el primer uso):**
+
+- **Fase 1 — PROPONER** (`ProposeConsensusKeyRotation`, operator-only vía
+  `require_operator`; accounts `[operator, REGISTRY, CONSENSUS_ROTATION_REGISTRY[24],
+  STAKING_GLOBAL]`). La clave FRÍA de operador registra una rotación PENDIENTE (bundle
+  nuevo + p2p nuevo) en el singleton `VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID=[24]`.
+  Se valida upfront (largo p2p 1..=128, no revocado, `new != old`, sin colisión con
+  otro validador vivo) para no encolar una propuesta condenada. **NO tiene efecto** —
+  la clave de consenso VIVA no cambia. Re-proponer REEMPLAZA la pendiente. `STAKING_GLOBAL`
+  se pinnea (accounts[3]) para leer el `proposed_quanto` REAL (ver el fix abajo).
+- **Fase 2 — ACEPTAR** (`AcceptConsensusKeyRotation`, **PERMISSIONLESS**; accounts
+  `[payer(relayer), REGISTRY, CONSENSUS_ROTATION_REGISTRY[24], STAKING_GLOBAL]`). La
+  autorización es el **PoP de la clave NUEVA**: la clave nueva firma OFFLINE
+  `KEY_ROTATION_ACCEPT_V1 ‖ consensus_address ‖ new_bundle_address` (dominio
+  `qchain-v7-key-rotation-accept-v1`, objeto tipado de largo fijo 32+32). El handler
+  verifica esa firma contra el bundle propuesto; sólo entonces aplica la rotación
+  (`apply_consensus_rotation`, el mismo helper que #20): la clave VIEJA queda en
+  `retired_consensus_keys` **SLASHEABLE a través de la ventana de evidencia**, la
+  clave NUEVA pasa a ser la `address` viva, y toma efecto en el **próximo borde de
+  época** por la derivación determinista del comité. El relayer sólo paga el fee.
+- **CANCELAR** (`CancelConsensusKeyRotation`, operator-only) descarta una pendiente.
+- **PoP de la clave nueva ⇒ rotar a una clave no poseída es IMPOSIBLE.** El nonce
+  se omite a propósito: reproducir una aceptación sólo re-produce el resultado que el
+  operador ya pretendía para ese mismo bundle; la defensa anti-re-registro es la
+  **guardia de staleness** (`registered_quanto > proposed_quanto` ⇒ la pendiente
+  predata la registración actual del slot ⇒ rechazada), misma postura que KM#5.
+- **PURGA:** un `RecoverRevoke` (KM#4) o un `RotateConsensusKey` de una sola fase
+  purgan cualquier pendiente de dos fases (su clave viva cambió).
+
+**FIX real encontrado en la verificación en vivo (no en revisión):** el `propose`
+inicial NO incluía `STAKING_GLOBAL` en sus accounts, así que `current_quanto` leía 0
+y estampaba `proposed_quanto=0`. Como la guardia de staleness de `accept` compara
+`registered_quanto > proposed_quanto`, **TODA aceptación válida de un validador
+registrado después del quanto 0 quedaba rechazada** ("pending rotation predates the
+validator's current registration — stale") → la feature quedaba bricked en producción.
+Cerrado pinneando `STAKING_GLOBAL` como accounts[3] del propose (la misma postura que
+el `propose_key_change` de KM#5) → `proposed_quanto` es el quanto real. El test unit
+se endureció para registrar en un quanto NO-CERO (así `registered_quanto > 0`) y
+afirmar `proposed_quanto == 5` — sin el fix, el test falla.
+
+**CAMBIOS:** (1) `qchain-crypto`: dominio `KEY_ROTATION_ACCEPT_V1`; (2) `qchain-execution`
+ids: `VALIDATOR_CONSENSUS_ROTATION_REGISTRY_ID=[24]`; (3) `qchain-execution` validator_v7:
+`PendingConsensusRotation`/`ConsensusRotationRegistry`, `rotation_accept_message`,
+`read/write_consensus_rotation_registry` (perezoso, fail-loud), 3 instrucciones
+(`ProposeConsensusKeyRotation`/`AcceptConsensusKeyRotation`/`CancelConsensusKeyRotation`),
+purga en `recover_revoke`/`rotate_consensus_key`; (4) `qchain-node` rpc: ruta read-only
+`/validator_v7_consensus_rotations`; (5) `qchain-cli`: `v7-propose-consensus-rotation`,
+`v7-consensus-rotation-sign` (OFFLINE, imprime el PoP hex), `v7-accept-consensus-rotation`
+(relayer), `v7-cancel-consensus-rotation`.
+
+**Verificado.** qchain-execution **251 tests** (+3: proponer→aceptar con el PoP de la
+clave nueva conserva bono/activación y la vieja queda slasheable; el accept exige el PoP
+de la clave nueva sobre el dominio correcto — rechaza clave equivocada, dominio
+equivocado, target equivocado; propose operator-only + cancelable + purgado por la
+rotación de una fase). clippy limpio cli/node/execution. **En vivo (2 validadores v7,
+rpq=40):** registrado un validador con clave de consenso separada (`Gnp2fjR3me…`) en el
+quanto 2; PROPUESTA de rotación → pendiente `proposed_quanto=3` (el quanto real, no 0)
+IDÉNTICA en ambos nodos; un accept con PoP de la clave EQUIVOCADA **RECHAZADO** (clave
+vieja retenida, pendiente intacta); el accept VÁLIDO (la clave nueva firma OFFLINE, un
+relayer lo envía) → la `address` viva pasó a la clave nueva (`gd68Mtv85u…`), la vieja
+quedó `retired_consensus_keys` slasheable (`slash_until_quanto=6`), pendiente limpia, y
+**root byte-idéntico en ambos nodos** (`81820de5…`) → SIN FORK; un
+`CancelConsensusKeyRotation` limpió una pendiente nueva en ambos con root byte-idéntico.
+
+## #7–#10 — pendientes
 
 Se implementan en orden de prioridad. Notas de diseño resumidas:
 
-- **#6 Rotación en dos fases.** Propuesta (clave vieja) + aceptación con PoP de la
-  clave nueva (`QCHAIN_KEY_ROTATION_ACCEPT_V1`), para que una rotación a una clave
-  que no se posee sea imposible.
 - **#7 El firmante remoto valida política.** Además de la allowlist de dominios,
   el daemon valida chain_id/round/height/nonce, mantiene su propio estado
   anti-equivocación persistente, y aplica rate-limit — deja de ser un oráculo de
