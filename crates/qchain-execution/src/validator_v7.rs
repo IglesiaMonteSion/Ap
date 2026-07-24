@@ -1458,6 +1458,13 @@ impl ValidatorV7Program {
             return Err(ExecError::Unauthorized("propose key change must name the canonical key-timelock registry and staking global".into()));
         }
         let q = current_quanto(accounts);
+        // (KM#10) No new key-change clock may START while the validator is frozen.
+        {
+            let reg = read_registry(accounts);
+            if let Some(idx) = reg.find(&consensus_address) {
+                Self::require_not_frozen(&reg, idx, q, "proposing a key change")?;
+            }
+        }
         let ready = q.saturating_add(change.window_quantos());
         let kind = change.kind();
         let entry = PendingKeyChangeEntry { consensus_address, proposed_quanto: q, ready_quanto: ready, change };
@@ -1512,6 +1519,10 @@ impl ValidatorV7Program {
         if matches!(reg.validators[vidx].state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
             return Err(ExecError::ProgramError("validator is not in a state that can apply a key change".into()));
         }
+        // (KM#10) THE theft vector: this instruction is PERMISSIONLESS, so without
+        // this gate an attacker who proposed a withdrawal rotation before the freeze
+        // could land it themselves during the emergency pause.
+        Self::require_not_frozen(&reg, vidx, q, "applying a pending key change")?;
         // Staleness guard: if the slot was re-registered AFTER this change was
         // proposed, the pending change belongs to a prior incarnation — reject it so
         // a re-registration can't inherit a stale (e.g. attacker-proposed) change.
@@ -1742,6 +1753,38 @@ impl ValidatorV7Program {
         Ok(())
     }
 
+    /// (KM#10) An emergency FREEZE (KM#9) pauses the validator's **whole bond + key
+    /// surface**, not just its consensus/fee participation.
+    ///
+    /// Found by the KM#10 adversarial pass: gating only `consensus_key_disabled` left
+    /// a real THEFT path open. An attacker holding a compromised cold OPERATOR key
+    /// proposes a timelocked `RotateWithdrawal` to their own address; the recovery
+    /// committee notices and FREEZES the validator — reaching for the REVERSIBLE tool
+    /// before a terminal revoke, believing the situation is paused. But
+    /// `ApplyPendingKeyChange` is PERMISSIONLESS, so once the window elapsed the
+    /// attacker landed the rotation themselves, then `BeginExit` + `WithdrawBond`
+    /// drained the 500 QCH bond to their own address — *despite the active freeze*.
+    ///
+    /// So while frozen we refuse every instruction that MOVES THE BOND or CHANGES A
+    /// KEY. Deliberately still allowed: the recovery committee's own `RecoverOp`
+    /// (its escape hatch — unfreeze/revoke must never be blockable), slashing
+    /// (`ReportEquivocation`, a public good), and ops that only TIGHTEN the consensus
+    /// key (revoke/expiry) since those can't help an attacker. The pause is
+    /// time-bounded and committee-liftable, so this never bricks an honest validator;
+    /// and it grants the committee no new power (it could already `Revoke`).
+    /// Byte-identical for any validator that was never frozen (`is_frozen` is false
+    /// whenever `frozen_until_quanto == 0`).
+    fn require_not_frozen(reg: &ValidatorV7Registry, idx: usize, q: u64, op: &str) -> Result<(), ExecError> {
+        if reg.validators[idx].is_frozen(q) {
+            return Err(ExecError::Unauthorized(format!(
+                "{op} is refused: this validator is emergency-FROZEN until quanto {} (KM#9) — \
+                 while the pause holds, only its recovery committee can act (unfreeze/revoke)",
+                reg.validators[idx].frozen_until_quanto
+            )));
+        }
+        Ok(())
+    }
+
     /// (#20) Shared gate for the operator-authorized key-role instructions: pin the
     /// canonical registry account, read it, find `consensus_address`, and require
     /// the payer to be its cold OPERATOR. Returns the decoded registry + the found
@@ -1844,6 +1887,9 @@ impl ValidatorV7Program {
             return Err(ExecError::Unauthorized("RotateConsensusKey must name the canonical global account".into()));
         }
         let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateConsensusKey")?;
+        // (KM#10) The committee froze THIS key to investigate — a (possibly
+        // compromised) operator must not rotate it out from under the pause.
+        Self::require_not_frozen(&reg, idx, current_quanto(accounts), "RotateConsensusKey")?;
         // The NEW consensus key must prove possession, bound to THIS validator's
         // operator/withdrawal/moniker (the same PoP the registration requires), so
         // nobody can rotate in a key they don't hold, nor replay a PoP elsewhere.
@@ -1887,6 +1933,8 @@ impl ValidatorV7Program {
         if matches!(reg.validators[idx].state, ValidatorV7State::Revoked) {
             return Err(ExecError::ProgramError("validator is revoked".into()));
         }
+        // (KM#10) No key rotation may be started while the committee has it frozen.
+        Self::require_not_frozen(&reg, idx, current_quanto(accounts), "ProposeConsensusKeyRotation")?;
         let new_addr = new_bundle.to_address();
         if new_addr == reg.validators[idx].address {
             return Err(ExecError::ProgramError("new consensus key is identical to the current one".into()));
@@ -1948,6 +1996,9 @@ impl ValidatorV7Program {
             return Err(ExecError::ProgramError("pending rotation predates the validator's current registration — stale".into()));
         }
         let q = current_quanto(accounts);
+        // (KM#10) PERMISSIONLESS like ApplyPendingKeyChange: a pending rotation must
+        // not land while the recovery committee has the validator frozen.
+        Self::require_not_frozen(&reg, idx, q, "AcceptConsensusKeyRotation")?;
         Self::apply_consensus_rotation(&mut reg, idx, new_bundle, new_p2p, q)?;
         write_registry(accounts, &reg)?;
         cr.pending.remove(ci);
@@ -2106,6 +2157,9 @@ impl ValidatorV7Program {
         if !matches!(state, ValidatorV7State::BondedPending | ValidatorV7State::Active | ValidatorV7State::Jailed) {
             return Err(ExecError::ProgramError("validator is not in an exitable state".into()));
         }
+        // (KM#10) A compromised operator must not be able to start draining the bond
+        // while the recovery committee has the validator emergency-frozen.
+        Self::require_not_frozen(&reg, idx, current_quanto(accounts), "BeginExit")?;
         // Move the bond escrow → unbonding pool (still slashable through the window).
         let escrow_bal = accounts.get(&escrow_pk).map(|a| a.balance).unwrap_or(0);
         if escrow_bal < VALIDATOR_BOND_ATOMS {
@@ -2157,6 +2211,9 @@ impl ValidatorV7Program {
             return Err(ExecError::Unauthorized("WithdrawBond accounts[4] must be the validator's recorded withdrawal address".into()));
         }
         let q = current_quanto(accounts);
+        // (KM#10) The bond must not leave while the validator is emergency-frozen —
+        // otherwise the "reversible pause" wouldn't actually pause the drain.
+        Self::require_not_frozen(&reg, idx, q, "WithdrawBond")?;
         if q < reg.validators[idx].bond_release_quanto {
             return Err(ExecError::ProgramError(format!(
                 "bond still unbonding until quanto {} (now {})",
@@ -3595,5 +3652,258 @@ mod tests {
         assert_eq!(active_committee(&reg, 99).len(), 1, "not yet expired at quanto 99");
         assert_eq!(active_committee(&reg, 100).len(), 0, "expired at quanto 100");
         assert!(!crate::fees_v7::is_eligible(&reg.validators[0], 100), "expired → out of fees");
+    }
+
+    // ─── KM#10: adversarial key-lifecycle tests ───────────────────────────────
+
+    /// KM#10 (the exploit that motivated the freeze scope fix): an emergency FREEZE
+    /// must pause the validator's WHOLE key-management + money surface, not just its
+    /// consensus/fee participation.
+    ///
+    /// The attack it closes: an attacker who compromised the cold OPERATOR key
+    /// (1) proposes a timelocked `RotateWithdrawal` to their own address, the
+    /// community notices and the recovery committee (2) FREEZES the validator —
+    /// believing they paused the situation, since freeze is the REVERSIBLE tool you
+    /// reach for before a terminal revoke. If the freeze only gated the committee/fee
+    /// path, the attacker could still (3) apply the withdrawal rotation
+    /// (PERMISSIONLESS!), (4) `BeginExit`, and (5) `WithdrawBond` — draining the
+    /// 500 QCH bond to their own address DESPITE the active emergency freeze.
+    #[test]
+    fn an_emergency_freeze_blocks_the_bond_drain_and_pending_key_changes() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let cold_wd = Keypair::generate().unwrap().pubkey();
+        let attacker = Keypair::generate().unwrap().pubkey();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, Some(cold_wd), "drain-node").unwrap();
+        let c = cons.pubkey();
+
+        // A recovery committee is in place (registered BEFORE any compromise).
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, c, &signers, 2).unwrap();
+        let t0 = current_quanto(&accounts);
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        // (1) The attacker (holding the compromised operator key) proposes redirecting
+        // the withdrawal address to themselves. KM#5 makes it timelocked (~72h).
+        let prop = ix(
+            &ValidatorV7Instruction::RotateWithdrawal { consensus_address: c, new_withdrawal: attacker },
+            vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID],
+        );
+        ValidatorV7Program::execute(&mut accounts, &prop, &op.pubkey()).unwrap();
+        assert_eq!(read_key_timelock_registry(&accounts).pending.len(), 1, "attacker's withdrawal rotation is pending");
+
+        // (2) The committee FREEZES the validator (the reversible emergency pause).
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Freeze { until_quanto: 1_000_000 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        assert!(registry_of(&accounts).validators[0].is_frozen(current_quanto(&accounts)), "frozen");
+
+        // (3) The timelock elapses. Applying the pending change is PERMISSIONLESS —
+        // it must be REFUSED while frozen, or the freeze is worthless.
+        set_quanto(&mut accounts, t0 + KEY_TIMELOCK_WITHDRAWAL_QUANTOS + 1);
+        assert!(
+            apply_key_change(&mut accounts, &relayer, c, KeyChangeKind::Withdrawal).is_err(),
+            "a pending cold-key change must NOT land while the validator is frozen"
+        );
+        assert_eq!(registry_of(&accounts).validators[0].withdrawal_address, cold_wd, "withdrawal address still the honest cold one");
+
+        // (4) The attacker cannot start draining the bond either.
+        let exit = ix(
+            &ValidatorV7Instruction::BeginExit { consensus_address: c },
+            vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+        );
+        assert!(ValidatorV7Program::execute(&mut accounts, &exit, &op.pubkey()).is_err(), "BeginExit must be refused while frozen");
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "bond still escrowed");
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).map(|a| a.balance).unwrap_or(0), 0, "nothing moved to unbonding");
+
+        // …nor propose a NEW key change to restart the clock during the pause.
+        let prop2 = ix(
+            &ValidatorV7Instruction::RotateOperator { consensus_address: c, new_operator: attacker },
+            vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID],
+        );
+        assert!(ValidatorV7Program::execute(&mut accounts, &prop2, &op.pubkey()).is_err(), "proposing a key change while frozen must be refused");
+
+        // (5) And the bond can't be withdrawn out from under the freeze.
+        let wd = ix(
+            &ValidatorV7Instruction::WithdrawBond { consensus_address: c },
+            vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, cold_wd],
+        );
+        assert!(ValidatorV7Program::execute(&mut accounts, &wd, &op.pubkey()).is_err(), "WithdrawBond must be refused while frozen");
+        assert_eq!(accounts.get(&attacker).map(|a| a.balance).unwrap_or(0), 0, "the attacker never receives the bond");
+
+        // The committee's OWN ops keep working while frozen (its escape hatch): it can
+        // escalate to a terminal revoke, or lift the pause.
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Unfreeze, &[&signer_kps[0], &signer_kps[2]], 1).unwrap();
+        assert!(!registry_of(&accounts).validators[0].is_frozen(current_quanto(&accounts)), "unfrozen by the committee");
+        // Once UNFROZEN the honest lifecycle resumes normally (the pause is a pause,
+        // not a brick): the operator can exit again.
+        ValidatorV7Program::execute(&mut accounts, &exit, &op.pubkey()).unwrap();
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "exit works after the pause is lifted");
+    }
+
+    /// KM#10: a BYZANTINE recovery committee can't act outside its mandate. An
+    /// approval is bound to ONE validator, so a committee that legitimately governs
+    /// validator A cannot use its signatures against validator B — even when the two
+    /// share the same signer set and the same nonce.
+    #[test]
+    fn a_recovery_approval_is_bound_to_one_validator_and_cannot_cross_over() {
+        let mut accounts = HashMap::new();
+        let (op_a, cons_a) = (Keypair::generate().unwrap(), Keypair::generate().unwrap());
+        let (op_b, cons_b) = (Keypair::generate().unwrap(), Keypair::generate().unwrap());
+        accounts.insert(op_a.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        accounts.insert(op_b.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op_a, &cons_a, None, "node-a").unwrap();
+        register_full(&mut accounts, &op_b, &cons_b, None, "node-b").unwrap();
+        let (a, b) = (cons_a.pubkey(), cons_b.pubkey());
+
+        // The SAME 2-of-3 signer set governs both validators (a shared custodian).
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op_a, a, &signers, 2).unwrap();
+        set_recovery_now(&mut accounts, &op_b, b, &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        // Both are at nonce 0, so ONLY the address in the signed message separates them.
+        assert_eq!(recovery_of(&accounts).entries[0].nonce, 0);
+        assert_eq!(recovery_of(&accounts).entries[1].nonce, 0);
+
+        // Approvals collected to REVOKE validator A…
+        let for_a: Vec<RecoveryApproval> = [0usize, 1].iter().map(|&i| approve_op(&signer_kps[i], a, RecoveryOp::Revoke, 0)).collect();
+        // …must NOT revoke validator B.
+        assert!(recover_op_tx(&mut accounts, &relayer, b, RecoveryOp::Revoke, for_a.clone()).is_err(), "an approval for A cannot act on B");
+        assert_ne!(registry_of(&accounts).validators[1].state, ValidatorV7State::Revoked, "B untouched");
+        // …nor freeze B.
+        let freeze_a: Vec<RecoveryApproval> = [0usize, 1].iter().map(|&i| approve_op(&signer_kps[i], a, RecoveryOp::Freeze { until_quanto: 500 }, 0)).collect();
+        assert!(recover_op_tx(&mut accounts, &relayer, b, RecoveryOp::Freeze { until_quanto: 500 }, freeze_a).is_err(), "a freeze approval for A cannot freeze B");
+        assert_eq!(registry_of(&accounts).validators[1].frozen_until_quanto, 0, "B not frozen");
+        // The approvals DO work on their own target.
+        recover_op_tx(&mut accounts, &relayer, a, RecoveryOp::Revoke, for_a).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked, "A revoked");
+        // Every rejection left the audit trail untouched except for the real op.
+        let log = km_audit_log(&accounts);
+        assert_eq!(log.count, 1, "only the authorized op is journalled");
+        assert_eq!(log.entries[0].consensus_address, a);
+        assert!(log.verify().is_ok());
+    }
+
+    /// KM#10 — the multi-node NO-FORK property at the execution layer: every KM
+    /// instruction is a deterministic function of COMMITTED state, so two nodes that
+    /// hold the same accounts in a DIFFERENT in-memory order must land on a
+    /// byte-identical state after the same key-lifecycle sequence. (`HashMap`
+    /// iteration order differs per process, so this is the property that would break
+    /// first if any handler leaked node-local ordering into the result.)
+    #[test]
+    fn the_whole_key_lifecycle_is_deterministic_across_nodes() {
+        // Deterministic key material so both "nodes" run the identical scenario.
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let relayer = Keypair::generate().unwrap();
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        let cold_wd = Keypair::generate().unwrap().pubkey();
+
+        // The full lifecycle: register → recovery committee → freeze → unfreeze →
+        // mandatory expiry → revoke → withdraw the bond.
+        let run = |seed_order_reversed: bool| -> ([u8; 32], Vec<u8>, Vec<u8>) {
+            let mut accounts = HashMap::new();
+            // Same accounts, inserted in OPPOSITE order between the two runs.
+            let seeds: Vec<(Pubkey, Account)> = vec![
+                (op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id())),
+                (relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id())),
+                (cold_wd, wallet(0, Pubkey::system_program_id())),
+            ];
+            if seed_order_reversed {
+                for (k, v) in seeds.into_iter().rev() { accounts.insert(k, v); }
+            } else {
+                for (k, v) in seeds { accounts.insert(k, v); }
+            }
+            let c = cons.pubkey();
+            register_full(&mut accounts, &op, &cons, Some(cold_wd), "lifecycle").unwrap();
+            set_recovery_now(&mut accounts, &op, c, &signers, 2).unwrap();
+            let t0 = current_quanto(&accounts);
+            // freeze → unfreeze → set a rotation deadline → revoke (nonces 0..3)
+            recover_op(&mut accounts, &relayer, c, RecoveryOp::Freeze { until_quanto: t0 + 50 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+            recover_op(&mut accounts, &relayer, c, RecoveryOp::Unfreeze, &[&signer_kps[1], &signer_kps[2]], 1).unwrap();
+            recover_op(&mut accounts, &relayer, c, RecoveryOp::SetExpiry { until_quanto: t0 + 500 }, &[&signer_kps[0], &signer_kps[2]], 2).unwrap();
+            recover_op(&mut accounts, &relayer, c, RecoveryOp::Revoke, &[&signer_kps[0], &signer_kps[1]], 3).unwrap();
+            // The bond is recoverable (permissionless, to the cold address) after the window.
+            set_quanto(&mut accounts, t0 + 1000);
+            let wd = ix(
+                &ValidatorV7Instruction::WithdrawBond { consensus_address: c },
+                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, cold_wd],
+            );
+            ValidatorV7Program::execute(&mut accounts, &wd, &relayer.pubkey()).unwrap();
+            (
+                crate::invariants_v7::economic_state_root(&accounts),
+                accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data.clone(),
+                accounts.get(&VALIDATOR_KM_AUDIT_LOG_ID).unwrap().data.clone(),
+            )
+        };
+
+        let (root_a, reg_a, audit_a) = run(false);
+        let (root_b, reg_b, audit_b) = run(true);
+        assert_eq!(root_a, root_b, "two nodes must commit the SAME state root after the same key lifecycle (no fork)");
+        assert_eq!(reg_a, reg_b, "the validator registry bytes are identical");
+        assert_eq!(audit_a, audit_b, "the hash-chained audit trail is identical");
+
+        // …and the audit trail is the full, verifiable story of the lifecycle.
+        let log = KmAuditLog::try_from_slice(&audit_a).unwrap();
+        assert!(log.verify().is_ok(), "the chain verifies");
+        assert_eq!(log.count, 4);
+        let events: Vec<u8> = log.entries.iter().map(|e| e.event).collect();
+        assert_eq!(events, vec![KM_AUDIT_FREEZE, KM_AUDIT_UNFREEZE, KM_AUDIT_SET_EXPIRY, KM_AUDIT_REVOKE], "every KM event journalled in order");
+    }
+
+    /// KM#10: the bond is CONSERVED across the whole adversarial lifecycle — the
+    /// 500 QCH is only ever escrowed, moved to the unbonding pool, or paid to the
+    /// recorded cold withdrawal address. Nothing is minted; nothing evaporates; and a
+    /// frozen interval never leaks it to anyone else.
+    #[test]
+    fn the_bond_is_conserved_across_the_adversarial_lifecycle() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let cold_wd = Keypair::generate().unwrap().pubkey();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        let before_total: u64 = accounts.values().map(|a| a.balance).sum();
+        register_full(&mut accounts, &op, &cons, Some(cold_wd), "conserve").unwrap();
+        let c = cons.pubkey();
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, c, &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        let total = |m: &HashMap<Pubkey, Account>| -> u64 { m.values().map(|a| a.balance).sum() };
+        let funded_total = total(&accounts);
+        let t0 = current_quanto(&accounts);
+
+        // Freeze, try every drain the (compromised) operator has, unfreeze, revoke.
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Freeze { until_quanto: t0 + 100 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        let exit = ix(
+            &ValidatorV7Instruction::BeginExit { consensus_address: c },
+            vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID],
+        );
+        assert!(ValidatorV7Program::execute(&mut accounts, &exit, &op.pubkey()).is_err());
+        assert_eq!(total(&accounts), funded_total, "a refused op moves NOTHING");
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Revoke, &[&signer_kps[0], &signer_kps[2]], 1).unwrap();
+        assert_eq!(total(&accounts), funded_total, "a revoke only RELOCATES the bond");
+
+        // After the window the bond lands on the recorded cold address — exactly once.
+        set_quanto(&mut accounts, t0 + 1000);
+        let wd = ix(
+            &ValidatorV7Instruction::WithdrawBond { consensus_address: c },
+            vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, cold_wd],
+        );
+        ValidatorV7Program::execute(&mut accounts, &wd, &relayer.pubkey()).unwrap();
+        assert_eq!(accounts.get(&cold_wd).unwrap().balance, VALIDATOR_BOND_ATOMS, "the bond went to the COLD address");
+        assert_eq!(total(&accounts), funded_total, "supply conserved end to end");
+        // A second withdrawal can't double-pay.
+        assert!(ValidatorV7Program::execute(&mut accounts, &wd, &relayer.pubkey()).is_err(), "no double withdrawal");
+        assert_eq!(total(&accounts), funded_total);
+        // The operator only ever spent the bond itself (600 - 500 left liquid).
+        assert_eq!(accounts.get(&op.pubkey()).unwrap().balance, 100 * UNITS_PER_QCH);
+        assert!(before_total < funded_total, "sanity: the relayer funding is accounted for");
     }
 }

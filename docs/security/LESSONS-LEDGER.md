@@ -50,6 +50,7 @@ sigue cerrada.
 | EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **CERRADA** (#11, v8.6.22) |
 | EC-14 | Parámetro controlado externamente sin topes | sí | **CERRADA** (#10, v8.6.22) |
 | EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **CERRADA-VIGILADA** (#8 Shamir v2: chk 136-bit + id de grupo, corregido v8.6.21) |
+| EC-17 | Control de PAUSA/BLOQUEO gateado en una decisión pero no en toda la superficie que promete detener | no (enumeración manual de instrucciones) | **CERRADA-VIGILADA** (KM#9 freeze → robo del bono; corregido v8.6.36 por la pasada adversarial KM#10) |
 
 ---
 
@@ -471,8 +472,87 @@ sigue cerrada.
 
 ---
 
+## EC-17 — Un control de PAUSA gateado en una decisión, no en toda su superficie
+
+- **Clase:** se agrega un control que se llama (y se documenta) como *pausa /
+  freeze / bloqueo / congelamiento*, pero se lo cablea en **el gate que resultaba
+  cómodo** — el único punto que el autor ya tenía a mano — en vez de en **todas
+  las instrucciones que su modelo de amenazas implica que debe detener**. El
+  control "funciona" en la demo (el efecto visible se ve), pasa sus tests, y deja
+  abierta la parte que de verdad importaba.
+- **Instancia (KM#9 → encontrada por la pasada adversarial KM#10, v8.6.36):** el
+  `EmergencyFreezeValidator` se implementó OR-eando `is_frozen` dentro de
+  `consensus_key_disabled` — elegante, porque ése es el ÚNICO gate que
+  `active_committee` y `fees_v7::is_eligible` ya consultan, así que la exclusión
+  del comité y de los fees salió "gratis" y sin cablear nada. Pero el freeze se
+  vende como *pausa de emergencia ante una clave comprometida*, y esa promesa
+  cubre mucho más que participar en consenso. Quedaron aceptando instrucciones,
+  con el validador congelado: `BeginExit`, `WithdrawBond`, `ApplyPendingKeyChange`
+  (¡PERMISSIONLESS!), `RotateWithdrawal`/`RotateOperator`, y las rotaciones de
+  clave de consenso. **Ataque real, reproducido en test antes de tocar código:**
+  un atacante con la clave fría de operador propone `RotateWithdrawal` a su
+  dirección (timelock de KM#5); el comité lo detecta y **CONGELA** — creyendo que
+  pausó la situación, porque el freeze es justo la herramienta REVERSIBLE que uno
+  usa antes de un revoke terminal —; pasado el timelock el atacante mismo aplica
+  la rotación (nadie se lo impide: es permissionless), hace `BeginExit` y, tras la
+  ventana, `WithdrawBond`: **los 500 QCH del bono salen a la dirección del
+  atacante con el freeze ACTIVO**.
+- **Causa raíz:** confundir *el efecto que el control produce* (queda fuera del
+  comité y de los fees) con *lo que el control promete* (todo lo de este validador
+  queda en pausa). Sub-patrón de EC-06 (guardia efectiva en un camino, camino
+  hermano sin guardar), pero a nivel de FEATURE completa en vez de una primitiva.
+- **Invariante que la cierra:** un control de pausa se define por la LISTA
+  EXPLÍCITA de instrucciones que rechaza, y esa lista se deriva del modelo de
+  amenazas (¿qué puede hacer el atacante que motivó la pausa?), no de dónde era
+  cómodo poner el `if`. En qchain: mientras un validador está frozen se rechaza
+  **toda instrucción que mueva su bono o cambie una clave suya**
+  (`require_not_frozen`), y se dejan pasar a propósito, documentadas, sólo las
+  que no pueden ayudar a un atacante: el `RecoverOp` del propio comité (su
+  escape hatch — bloquearlo haría la pausa irreversible), el slashing por
+  equivocación (bien público), y las que sólo ENDURECEN la clave de consenso.
+- **Detección automática:** no mecanizable con un grep. Se cierra con
+  ENUMERACIÓN: por cada control de pausa/bloqueo, listar cada handler del módulo
+  y marcar explícitamente permitido/rechazado con su razón (la tabla vive junto
+  al `require_not_frozen`).
+- **Barrido de la clase (v8.6.36, enumeración manual de TODO control de
+  pausa/bloqueo del repo):**
+  - **`is_frozen` / freeze de emergencia (KM#9)** — era el hueco. **CERRADO** con
+    `require_not_frozen` en los 7 handlers de dinero/identidad.
+  - **`Revoked` (KM#4, salida terminal)** — su promesa es "esta identidad ya no
+    cambia y el bono sólo puede volver a la `withdrawal_address` congelada al
+    revocar". Verificado: `apply_pending_key_change` rechaza `Revoked|Removed`,
+    así que aunque el operador comprometido PROPONGA una rotación después del
+    revoke, **nunca puede aterrizarla**; y `RecoverRevoke` además PURGA los
+    pendientes. `begin_exit`/`withdraw_bond` sí aceptan `Revoked` **a propósito**
+    (es la salida dura: el bono vuelve a la dirección fría fija). **Cubierto.**
+  - **`Jailed` (inactividad)** — NO es una respuesta a compromiso sino una
+    penalidad de liveness; deja pasar dinero/claves a propósito, porque el
+    operador honesto debe poder arreglar el nodo, `Unjail` o rotar. Alcance
+    correcto y documentado. **Sin acción.**
+  - **`RevokeConsensusKey` / `SetConsensusKeyExpiry` (#20)** — iniciados por el
+    OPERADOR (que no está comprometido: revoca su propia clave caliente
+    filtrada); bloquear su bono/rotación le impediría **recuperarse**, que es
+    justo lo que debe hacer. Sólo APRIETAN. **Sin acción.**
+  - **`EmergencyPause` de gobernanza (guardianes M-de-N, #213)** — su promesa
+    está acotada y escrita: bloquea **todo `Execute`** de propuestas; verificado
+    que el gate está en el `Execute` (no en un camino lateral) y que el account
+    de emergencia va pinneado, así que no se saltea omitiéndolo. Nunca prometió
+    congelar emisión ni transferencias. **Cubierto.**
+  - **`DoubleSignGuard` / `RollbackGuard` (firmante remoto, KM#7/#8)** — no son
+    pausas sobre una superficie sino **allowlists explícitas** (KM#2 dejó la
+    interfaz TIPADA: sólo firma objetos permitidos). Ya cumplen la forma que EC-17
+    exige. **Sin acción.**
+- **Pregunta recurrente (toda auditoría la responde):** *para cada control que se
+  llame pausa, freeze, lock o bloqueo — ¿qué instrucciones se siguen aceptando
+  mientras está activo, y alguna de ellas mueve dinero, cambia una clave, o
+  avanza un timelock? ¿Y hay alguna que quede bloqueada y no debería (el escape
+  hatch de quien puede levantarlo)?*
+
+---
+
 ## Registro de auditorías
 
 | Auditoría | Archivo | Hallazgos | Estado |
 |---|---|---|---|
 | Externa v8.6.13 | [`audits/2026-audit-v8.6.13.md`](./audits/2026-audit-v8.6.13.md) | 2C/2A/4M/3B | en corrección (P0 primero) |
+| KM#10 (adversarial, interna) | este ledger, EC-17 | 1 ALTO (robo del bono con freeze activo) | **CERRADO** (v8.6.36) |

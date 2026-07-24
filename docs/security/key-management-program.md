@@ -24,7 +24,9 @@ documentado como pendiente con su razón, no forzado.
 | 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | **HECHO** (v8.6.33 — binding de chain_id + anti-equivocación de checkpoints + rate-limit) |
 | 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | **HECHO** (v8.6.34 — cifrado en reposo del keypair, opt-in, node-local) |
 | 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | **HECHO** (v8.6.35 — freeze/unfreeze reversible + SetExpiry por comité M-de-N + audit trail encadenado por hash) |
-| 10 | Pruebas multinodo + adversariales del ciclo de vida de claves | 10 | pendiente |
+| 10 | Pruebas multinodo + adversariales del ciclo de vida de claves | 10 | **HECHO** (v8.6.36 — harness multinodo `deploy/km-lifecycle-test.sh` + gate `require_not_frozen`, clase EC-17) |
+
+**El programa KM (#1–#10) queda COMPLETO.**
 
 ## #1 — Separar la clave de consenso de la clave de red (HECHO, v8.6.29)
 
@@ -529,7 +531,132 @@ congelar de emergencia: cada firmante de recuperación corre `v7-recovery-sign -
 freeze --until-quanto Q` OFFLINE, un relayer junta las M firmas y envía `v7-recover-op
 --op freeze --until-quanto Q --approvals ...`; se levanta con `--op unfreeze`.
 
-## #10 — pendiente
+## #10 — Pruebas multinodo + adversariales del ciclo de vida (HECHO, v8.6.36)
 
-- **#10 Pruebas multinodo + adversariales** del ciclo completo (rotación,
-  revocación, freeze, recuperación) bajo pérdida de certs y actores bizantinos.
+**Problema.** Los nueve puntos anteriores se verificaron cada uno *en aislamiento*
+(unit tests + una verificación en vivo del flujo propio). Lo que faltaba —y es
+exactamente lo que pedía el auditor— era ejercitar el **ciclo de vida COMPLETO de
+claves** (rotación → revocación → freeze → recuperación) **entre varios nodos**, con
+un **actor adversario** que intenta aprovechar la ventana de cada transición, más
+pérdida de disponibilidad de un nodo. Un programa de gestión de claves no se cierra
+probando cada pieza sola: se cierra probando que las piezas **compuestas** no dejan
+un hueco entre ellas.
+
+### El hallazgo real (ALTO) — un freeze que no frenaba el robo
+
+La prueba adversarial encontró un **vector de robo real, no teórico**, en la
+composición de KM#5 (timelocks) con KM#9 (freeze):
+
+1. El atacante roba la clave de operador (el escenario que KM#4/#5/#9 modelan).
+2. Propone `RotateWithdrawal` hacia su propia dirección. El timelock de KM#5 lo
+   deja **pendiente** ~72 h — esa es la ventana de reacción, y funciona.
+3. El comité de recuperación reacciona dentro de la ventana y **congela** el
+   validador (KM#9): sale del comité de consenso y del reparto de fees.
+4. **Pasa la ventana** y el atacante llama `ApplyPendingKeyChange`, que es
+   **permissionless a propósito** (el operador ya autorizó al proponer; el que
+   aplica es un relayer). El freeze **no lo miraba** → el cambio de clave fría
+   **aterrizaba igual** → `withdrawal_address` pasaba a ser la del atacante →
+   `BeginExit` + `WithdrawBond` drenaban el bono a su cuenta.
+
+O sea: el freeze excluía al validador del **consenso** pero no del **dinero**.
+`is_frozen` se había OR-eado dentro de `consensus_key_disabled`, que es el gate que
+consultan `active_committee` y `fees_v7::is_eligible` — la elección correcta *para
+esa decisión*—, pero el ciclo de vida de claves y el bono nunca consultan ese gate.
+El test del exploit se escribió PRIMERO y **falló** (probando que el vector era
+real), y recién entonces se cerró.
+
+### El cierre — `require_not_frozen`, definido por la superficie, no por el `if`
+
+Regla nueva: mientras la pausa esté vigente, un validador congelado **no puede
+mover su bono ni cambiar ninguna de sus claves**. Se implementa con un único
+helper (`ValidatorV7Program::require_not_frozen`) cableado en los **7** handlers
+que tocan dinero o identidad, cada uno de los cuales ya pinnea `STAKING_GLOBAL`
+(la lección de KM#6: sin ese pin, `current_quanto` lee 0 y el gate no vería el
+freeze):
+
+| Instrucción | Congelado |
+|---|---|
+| `ProposeKeyChange` (operator/withdrawal/recovery) | **RECHAZA** |
+| `ApplyPendingKeyChange` (permissionless) | **RECHAZA** ← el vector de robo |
+| `BeginExit` | **RECHAZA** |
+| `WithdrawBond` | **RECHAZA** |
+| `RotateConsensusKey` (una fase) | **RECHAZA** |
+| `ProposeConsensusKeyRotation` (dos fases) | **RECHAZA** |
+| `AcceptConsensusKeyRotation` (dos fases) | **RECHAZA** |
+| `RecoverOp` (revoke/freeze/unfreeze/set-expiry) | **PERMITE** — es la vía de escape del comité |
+| `ReportEquivocation` (slashing) | **PERMITE** — bien público; un congelado sigue slasheable |
+| `Unjail` / `SetConsensusKeyExpiry` / `RevokeConsensusKey` | **PERMITE** — sólo aprietan, y el freeze ya excluye |
+
+Las dos exenciones son deliberadas: si el `RecoverOp` se bloqueara a sí mismo, un
+freeze sería **irreversible** (nadie podría descongelar) y la pausa reversible de
+KM#9 dejaría de existir; y el slashing por evidencia debe seguir disponible para
+cualquiera, congelado o no. `CancelPendingKeyChange` también queda permitido (sólo
+DESCARTA un pendiente — nunca puede mover valor).
+
+**Byte-idéntico** para cualquier validador que nunca se congeló
+(`frozen_until_quanto == 0` ⇒ `is_frozen` es `false` ⇒ el gate es un no-op), así que
+la red viva no cambia hasta que se USE un freeze.
+
+### El harness multinodo adversarial (`deploy/km-lifecycle-test.sh`)
+
+Script nuevo, ejecutable, que levanta un testnet **real de 2 validadores**
+(`economics_v7`, redb, quantos cortos) y corre el ciclo de vida completo con un
+atacante, comparando el **`root` de estado de AMBOS nodos en cada paso** (la prueba
+de no-fork que el DST no puede dar, porque `qchain-simulation` modela consenso, no
+ejecución):
+
+1. Registra un validador con **3 claves distintas** (consenso ≠ operador ≠ retiro),
+   bono 500 QCH.
+2. El operador arma un **comité de recuperación 2-de-3** y lo aplica **a través
+   del timelock de KM#5** (7 quantos).
+3. El **atacante** (con la clave de operador robada) propone `RotateWithdrawal`
+   hacia su dirección → queda pendiente.
+4. El comité **CONGELA** por M-de-N offline (KM#9).
+5. **Ataques mientras está congelado**: `ApplyPendingKeyChange` tras vencer el
+   timelock, y `BeginExit` — ambos deben ser **RECHAZADOS on-chain**.
+6. Se **mata (kill -9) y reinicia** el nodo 2: debe re-derivar el estado FROZEN
+   desde disco y re-converger.
+7. El comité **DESCONGELA**; el validador vuelve al comité de consenso.
+8. Se verifica el **audit trail encadenado**: `head_hash` idéntico en los dos nodos
+   y `verifies: true`.
+
+**RESULTADO EN VIVO: 23 de 23 aserciones OK, 0 fallos.** Incluye:
+`PASS pending cold-key change did NOT land while frozen`,
+`PASS BeginExit REFUSED while frozen (state Active)`,
+`PASS bond still 500 QCH, fully escrowed`,
+`PASS the restarted node re-derived the FROZEN state from disk`,
+`PASS both nodes agree on head_hash d99bd87c63f85de4…`,
+y **root byte-idéntico en los dos nodos en cada uno de los pasos del ciclo** → sin
+fork bajo un ciclo de vida de claves completo con un adversario dentro.
+
+### Tests
+
+4 tests nuevos en `qchain-execution::validator_v7` (261 en total):
+
+- `an_emergency_freeze_blocks_the_bond_drain_and_pending_key_changes` — el exploit
+  exacto, ahora test de regresión (falla sin el gate).
+- `a_recovery_approval_is_bound_to_one_validator_and_cannot_cross_over` — una
+  aprobación firmada para el validador A no autoriza la misma operación sobre B
+  (el `consensus_address` va autenticado en el mensaje).
+- `the_whole_key_lifecycle_is_deterministic_across_nodes` — dos ledgers
+  independientes que aplican la MISMA secuencia (registro → rotación de consenso
+  en dos fases → freeze → unfreeze → revoke) terminan con el mismo
+  `economic_state_root` (read-order-independent) → determinista, sin fork.
+- `the_bond_is_conserved_across_the_adversarial_lifecycle` — el bono ni se acuña ni
+  se destruye a través de todo el ciclo con el atacante dentro.
+
+### Lección registrada
+
+Clase nueva **EC-17** en [`LESSONS-LEDGER.md`](LESSONS-LEDGER.md): *un control de
+PAUSA gateado en una decisión, no en toda su superficie*. La pregunta recurrente que
+toda auditoría futura debe volver a responder: **«¿qué instrucciones RECHAZA esta
+pausa, y esa lista sale del modelo de amenazas o de dónde quedaba cómodo el `if`?»**
+Un control de emergencia se define por la **lista explícita de operaciones que
+rehúsa**, derivada del modelo de amenazas — nunca por el gate que ya existía cerca.
+
+**DESPLIEGUE.** Cutover coordinado al actualizar el binario (cambia la semántica de
+ejecución: 7 instrucciones ahora pueden rechazar). **Byte-idéntico mientras ningún
+validador esté congelado** — y como KM#9 se desplegó junto con esto, no hay ningún
+freeze vivo en la red. El harness es tooling de test: no se despliega, se corre con
+`./deploy/km-lifecycle-test.sh` antes de un release que toque el ciclo de vida de
+claves.

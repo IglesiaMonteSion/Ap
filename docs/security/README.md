@@ -23,6 +23,8 @@ requisito de QSEP-1 a lo que YA existe en el repo, honestamente marcado
 | Manifiesto de génesis | [`../GENESIS-MANIFEST.md`](../GENESIS-MANIFEST.md) |
 | Política de bug bounty | [`/SECURITY.md`](../../SECURITY.md) |
 | Revisión IA en PRs / runtime | [`../AI-SECURITY-REVIEW.md`](../AI-SECURITY-REVIEW.md), [`../AI-RUNTIME-WATCHDOG.md`](../AI-RUNTIME-WATCHDOG.md) |
+| Programa de gestión de claves (KM #1–#10, **COMPLETO**) | [`key-management-program.md`](./key-management-program.md) + harness adversarial `deploy/km-lifecycle-test.sh` |
+| Memoria de clases de error (EC-01…EC-17) | [`LESSONS-LEDGER.md`](./LESSONS-LEDGER.md) + `deploy/qsep-sweep.sh` |
 | Modelo de amenazas | [`threat-model.md`](./threat-model.md) |
 | Supuestos de seguridad | [`security-assumptions.md`](./security-assumptions.md) |
 | Respuesta a incidentes | [`incident-response.md`](./incident-response.md) |
