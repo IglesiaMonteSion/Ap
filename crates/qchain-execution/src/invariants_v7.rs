@@ -76,6 +76,16 @@ pub struct SupplyTally {
     pub genesis: u128,
     pub minted: u128,
     pub fee_burned: u128,
+    /// Burned by the DUST SWEEP — a value sink that lives OUTSIDE the fee path
+    /// (`Ledger` tracks it separately: `fee_burned + dust_burned == total_burned`).
+    /// It belongs in the equation for the same reason the fee burn does: a
+    /// sub-threshold residue is destroyed, not moved. Omitting it made the
+    /// formalized invariant inapplicable to the real ledger — it would report a
+    /// false violation on any network that ever swept dust, even though the ledger
+    /// was perfectly conserved. Found auditing the COMPOSITION of the economic
+    /// features (the reference model `EconWorld` never sweeps dust, so its own
+    /// tests could not surface it).
+    pub dust_burned: u128,
     pub slashed: u128,
 }
 
@@ -87,6 +97,7 @@ impl SupplyTally {
         self.genesis
             .saturating_add(self.minted)
             .saturating_sub(self.fee_burned)
+            .saturating_sub(self.dust_burned)
             .saturating_sub(self.slashed)
     }
 }

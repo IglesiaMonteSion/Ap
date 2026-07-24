@@ -5,7 +5,7 @@ archivo es la memoria de **clases** de error (no de instancias sueltas): cada
 vez que aparece un bug de seguridad, se clasifica aquí, se registra su causa
 raíz, la regla que lo cierra, cómo se detecta automáticamente, y **la pregunta
 que toda auditoría futura DEBE volver a responder**. Ninguna auditoría se cierra
-sin recorrer las 17 clases de abajo y demostrar (con test o grep) que cada una
+sin recorrer las 18 clases de abajo y demostrar (con test o grep) que cada una
 sigue cerrada.
 
 > Regla operativa (QSEP-1 §13, obligatoria): un hallazgo NO está resuelto cuando
@@ -52,6 +52,7 @@ sigue cerrada.
 | EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **CERRADA-VIGILADA** (#8 Shamir v2: chk 136-bit + id de grupo, corregido v8.6.21) |
 | EC-16 | Endpoint/socket privilegiado sin autenticar; "acotado" tratado como "eliminado" | parcial (grep de listeners sin auth) | **CERRADA-VIGILADA** (#4.2 socket del firmante remoto, corregido v8.6.26/27) |
 | EC-17 | Control de PAUSA/BLOQUEO gateado en una decisión pero no en toda la superficie que promete detener | no (enumeración manual de instrucciones) | **CERRADA-VIGILADA** (KM#9 freeze → robo del bono; corregido v8.6.36 por la pasada adversarial KM#10) |
+| EC-18 | Protección cableada a una identidad HARDCODEADA mientras el valor se rutea a una CONFIGURABLE | sí (grep: constante usada donde existe un campo de config homónimo) | **CERRADA-VIGILADA** (barrido de polvo vs. `admin_fee_wallet`; corregido v8.6.37) |
 
 ---
 
@@ -551,9 +552,43 @@ sigue cerrada.
 
 ---
 
+## EC-18 — Protección cableada a una identidad HARDCODEADA mientras el valor se rutea a una CONFIGURABLE
+
+- **Clase:** una feature se vuelve CONFIGURABLE (un `Pubkey`/id pasa de constante a
+  campo de config), y el ruteo del valor se actualiza a leer el campo… pero una
+  PROTECCIÓN escrita antes sigue comparando contra la CONSTANTE. Las dos coinciden
+  por defecto, así que todo test y toda red que no configure nada pasan — y la
+  protección deja de cubrir exactamente a quien la configuró.
+- **Instancia (v8.6.37, hallada auditando la COMPOSICIÓN de la economía v7):** la
+  exclusión del barrido de polvo listaba la constante `ADMIN_FEE_WALLET`, mientras
+  `route_fee_v7` acredita el 10% administrativo a `self.admin_fee_wallet` (el campo
+  configurable de #222). Un operador que configuró otra wallet admin tenía el fee
+  ruteado a una dirección y la protección puesta en otra: si un contrato la nombraba
+  en `ix.accounts` mientras su acumulado estaba bajo `dust_threshold`, el barrido lo
+  **QUEMABA**. Reproducido con el fix revertido: `was 250000, now 0`.
+- **Causa raíz:** al hacer configurable una dirección se actualizó el camino del
+  DINERO pero no se enumeraron los demás sitios que la nombraban por constante. Es
+  el primo de EC-17: allá la lista de instrucciones era incompleta, acá lo es la
+  lista de identidades.
+- **Invariante que la cierra:** un conjunto de protección debe derivarse de la MISMA
+  fuente que el ruteo del valor (el campo de config), nunca de una constante
+  homónima. Si algo es configurable, TODO sitio que lo nombre lee la config.
+- **Barrido de la clase (v8.6.37):** único caso con divergencia real. Se agregó
+  además `EMISSION_RESERVE_ID` al conjunto (bajo hard-cap recibe el 45% que el
+  modelo inflacionario quema): hoy es program-owned y el owner-check ya lo salta,
+  pero `Ledger::credit` crea una cuenta ausente como SYSTEM-OWNED, así que la
+  protección era emergente, no explícita.
+- **Pregunta recurrente de auditoría:** *para cada dirección/id que pasó de
+  constante a configurable: ¿qué sitios la siguen nombrando por la constante, y
+  alguno de ellos es una protección (exclusión, allowlist, pin de cuenta)? Listar
+  cada sitio.*
+
+---
+
 ## Registro de auditorías
 
 | Auditoría | Archivo | Hallazgos | Estado |
 |---|---|---|---|
 | Externa v8.6.13 | [`audits/2026-audit-v8.6.13.md`](./audits/2026-audit-v8.6.13.md) | 2C/2A/4M/3B | en corrección (P0 primero) |
+| Composición económica v7 (interna) | [`audits/2026-economic-composition.md`](./audits/2026-economic-composition.md) | 1 real (quema del acumulado admin) + 2 latentes + 1 doc | **CERRADO** (v8.6.37) |
 | KM#10 (adversarial, interna) | [`audits/2026-km10-adversarial.md`](./audits/2026-km10-adversarial.md) | 1 ALTO (robo del bono con freeze activo) + 2 de enumeración/doc | **CERRADO** (v8.6.36) |

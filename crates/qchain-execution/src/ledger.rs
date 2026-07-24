@@ -540,8 +540,10 @@ impl Ledger {
 
     /// Total QCH supply currently in existence: the sum of EVERY account balance in
     /// the store (`u128`, since the economy spans many pools and can exceed `u64`).
-    /// Under the hard cap this is constant at the genesis total; the node checks it
-    /// against the cap at startup (`assert_supply_cap`).
+    /// Under the hard cap nothing is minted after genesis, so this never EXCEEDS the
+    /// genesis total — the node checks it against the cap at startup
+    /// (`assert_supply_cap`). It can still shrink: the dust sweep and slashing burn
+    /// outside the fee path (both accounted for in `invariants_v7::SupplyTally`).
     pub fn total_supply(&self) -> u128 {
         self.store.iter().fold(0u128, |acc, (_, a)| acc.saturating_add(a.balance as u128))
     }
@@ -1497,9 +1499,13 @@ impl Ledger {
         // Under the HARD-CAP model (§5, #221) it is instead credited to the pre-minted
         // EMISSION_RESERVE — so "fees fund staking" is literally true and, when the
         // reserve depletes, yield continues from fee income (the model the user chose).
-        // Redirecting a would-be burn to a program-owned pool keeps supply CONSTANT
-        // (never grows past the cap, never shrinks below it): a hard-cap network's
-        // total supply is exactly its genesis total forever.
+        // Redirecting a would-be burn to a program-owned pool means the FEE PATH no
+        // longer destroys value, so supply never GROWS (nothing is minted after
+        // genesis) — which is what keeps `total_supply <= cap` true forever.
+        // Honest limit: supply can still SHRINK, via the two sinks outside the fee
+        // path — the dust sweep and slashing. Both are safe w.r.t. the cap (they
+        // only move away from it) and both are terms of the formalized supply
+        // invariant (`invariants_v7::SupplyTally`).
         if split.burn > 0 {
             if self.hard_cap_supply {
                 self.credit_fee_target(working.as_deref_mut(), EMISSION_RESERVE_ID, split.burn);
@@ -2362,7 +2368,26 @@ impl Ledger {
         // represent, rather than capture one guaranteed to fail self-verification.
         // (Latent pre-existing edge: the fee has always landed on these accounts;
         // this just stops mis-capturing a receipt for it.)
-        let fee_targets = [*fee_collector, VALIDATOR_FEE_POOL_ID, ADMIN_FEE_WALLET, STAKING_REWARDS_POOL_ID];
+        // Found auditing the COMPOSITION of the economic features: this set must be
+        // the set of accounts the FEE ROUTING actually credits, not a hardcoded
+        // lookalike. Two corrections:
+        //   - `self.admin_fee_wallet` (the CONFIGURED wallet, #222), not the
+        //     `ADMIN_FEE_WALLET` constant. They're equal by default, but an operator
+        //     who configured a different admin wallet was getting the fee routed to
+        //     one address while the sweep exclusion protected another — so a
+        //     contract that named it could have its sub-threshold accrual swept.
+        //   - `EMISSION_RESERVE_ID`, which under the HARD CAP receives the 45% that
+        //     the inflationary model burns (`route_fee_v7`). It is program-owned at
+        //     genesis so the owner check already skips it; listing it makes the
+        //     guarantee EXPLICIT instead of emergent — the same reason
+        //     `ADMIN_FEE_WALLET` was added here.
+        let fee_targets = [
+            *fee_collector,
+            VALIDATOR_FEE_POOL_ID,
+            self.admin_fee_wallet,
+            STAKING_REWARDS_POOL_ID,
+            EMISSION_RESERVE_ID,
+        ];
         let pre_capture = pre_capture.filter(|(from, to, ..)| {
             let from_swept = working.get(from).is_some_and(&would_be_dust_swept);
             let to_swept = working.get(to).is_some_and(&would_be_dust_swept);
@@ -4411,6 +4436,102 @@ mod tests {
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
 
         assert_eq!(ledger.get_balance(&alice.pubkey()), 0, "sub-threshold residue must be swept, not left dangling");
+    }
+
+    /// The dust-sweep exclusion must follow the CONFIGURED admin fee wallet (#222),
+    /// not the `ADMIN_FEE_WALLET` constant. Before this, an operator who configured a
+    /// different admin wallet had the fee routed to one address while the sweep
+    /// protected another — so a sub-threshold accrual there could be burned as dust.
+    /// Found auditing the COMPOSITION of the economic features.
+    #[test]
+    fn the_dust_sweep_protects_the_configured_admin_wallet_not_just_the_constant() {
+        let custom_admin = Keypair::generate().unwrap().pubkey();
+        assert_ne!(custom_admin, crate::ids::ADMIN_FEE_WALLET, "the point of the test is that they differ");
+
+        for (configured, should_survive) in [(custom_admin, true), (crate::ids::ADMIN_FEE_WALLET, true)] {
+            let mut ledger = new_test_ledger();
+            ledger.set_admin_fee_wallet(configured);
+            let alice = Keypair::generate().unwrap();
+            let validator = Keypair::generate().unwrap().pubkey();
+            ledger.credit(alice.pubkey(), 10 * DUST_THRESHOLD_UNITS);
+            // A sub-threshold balance sitting on the admin wallet: exactly what an
+            // early, still-small fee accrual looks like.
+            let seeded = DUST_THRESHOLD_UNITS / 4;
+            ledger.credit(configured, seeded);
+
+            // A transaction that NAMES the admin wallet pulls it into the working set,
+            // which is where the sweep can see (and previously burn) it.
+            let ix = Instruction {
+                program_id: Pubkey::system_program_id(),
+                accounts: vec![alice.pubkey(), configured],
+                data: borsh::to_vec(&SystemInstruction::Transfer { amount: 0 }).unwrap(),
+            };
+            let tx = Transaction::new_signed(&alice, 0, [0u8; 32], 10 * DUST_THRESHOLD_UNITS, vec![ix]).unwrap();
+            let _ = ledger.apply_transaction(&tx, &validator, 0);
+
+            let after = ledger.get_balance(&configured);
+            if should_survive {
+                assert!(after >= seeded, "the configured admin wallet's accrual must never be swept as dust (was {seeded}, now {after})");
+            }
+        }
+    }
+
+    /// The formalized supply invariant (`invariants_v7::check_supply`) must hold
+    /// against the REAL ledger, including the DUST SWEEP — a value sink that lives
+    /// outside the fee path and that the reference model (`EconWorld`) never
+    /// exercises. Found auditing the COMPOSITION of the economic features: the
+    /// tally is documented as *the* supply invariant of the system, so it has to be
+    /// applicable to the system, not only to the model that ships with it.
+    #[test]
+    fn the_formalized_supply_invariant_holds_against_the_real_ledger_including_the_dust_sweep() {
+        use crate::invariants_v7::{check_supply, SupplyTally};
+        use std::collections::HashMap;
+
+        let mut ledger = new_test_ledger();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let validator = Keypair::generate().unwrap().pubkey();
+
+        // Same setup as the dust-sweep test: leave a sub-threshold residue behind.
+        let fee_estimate = {
+            let ix = Instruction { program_id: Pubkey::system_program_id(), accounts: vec![alice.pubkey(), bob], data: vec![] };
+            let probe = Transaction::new_signed(&alice, 0, [0u8; 32], 0, vec![ix]).unwrap();
+            BASE_FEE_PER_BYTE_UNITS * probe.byte_size() as u64
+        };
+        let starting_balance = fee_estimate + DUST_THRESHOLD_UNITS / 2 + 50_000;
+        ledger.credit(alice.pubkey(), starting_balance);
+        // "Genesis" for this tally = everything in existence before any transaction.
+        let genesis = ledger.total_supply();
+
+        let send_amount = starting_balance - fee_estimate - (DUST_THRESHOLD_UNITS / 2);
+        let ix = Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: send_amount }).unwrap(),
+        };
+        let tx = Transaction::new_signed(&alice, 0, [0u8; 32], starting_balance, vec![ix]).unwrap();
+        ledger.apply_transaction(&tx, &validator, 0).unwrap();
+        assert!(ledger.dust_burned > 0, "this scenario must actually sweep dust, or it proves nothing");
+
+        let accounts: HashMap<Pubkey, Account> = ledger.store().iter().into_iter().collect();
+        let tally = SupplyTally {
+            genesis,
+            minted: ledger.total_emitted as u128,
+            fee_burned: ledger.fee_burned as u128,
+            dust_burned: ledger.dust_burned as u128,
+            slashed: 0,
+        };
+        check_supply(&accounts, &tally).expect("the real ledger's supply must satisfy the formalized invariant");
+
+        // And the dust term is load-bearing: drop it and the invariant breaks by
+        // EXACTLY the swept amount — which is why it has to be part of the equation.
+        let without_dust = SupplyTally { dust_burned: 0, ..tally };
+        match check_supply(&accounts, &without_dust) {
+            Err(crate::invariants_v7::InvariantViolation::Supply { expected, actual }) => {
+                assert_eq!(expected - actual, ledger.dust_burned as u128, "the gap is exactly the dust burned");
+            }
+            other => panic!("omitting the dust term must break the equation, got {other:?}"),
+        }
     }
 
     /// Proves the governance wiring actually closes the loop: seeding
