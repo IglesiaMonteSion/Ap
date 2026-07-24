@@ -167,22 +167,35 @@ impl ConnTracker {
         Some(notify)
     }
 
-    /// Temporarily ban an IP (abuse detected). Bounded and GC'd so it can't OOM.
+    /// Temporarily ban an IP (abuse detected). `MAX_BANNED` is a HARD ceiling
+    /// (task #18): GC expired entries, then insert only if there is room or the
+    /// key already exists (refreshing an existing ban never grows the map). If
+    /// still full of live bans, the ban is skipped rather than letting the map
+    /// exceed the cap — harmless, since a ban is only minted by sustained abuse
+    /// on a live inbound connection (globally capped), so the map can never
+    /// realistically stay full, and a skipped ban is simply re-caught.
     pub fn ban_ip(&self, ip: IpAddr) {
         let now = Instant::now();
         let mut inner = self.lock();
         if inner.banned_ips.len() >= MAX_BANNED {
             inner.banned_ips.retain(|_, &mut until| now < until);
+            if inner.banned_ips.len() >= MAX_BANNED && !inner.banned_ips.contains_key(&ip) {
+                return; // fail-closed: never exceed the ceiling
+            }
         }
         inner.banned_ips.insert(ip, now + self.limits.ban);
     }
 
-    /// Temporarily ban a validator identity (abuse detected).
+    /// Temporarily ban a validator identity (abuse detected). Same hard-ceiling
+    /// fail-closed discipline as `ban_ip` (task #18).
     pub fn ban_id(&self, id: ValidatorId) {
         let now = Instant::now();
         let mut inner = self.lock();
         if inner.banned_ids.len() >= MAX_BANNED {
             inner.banned_ids.retain(|_, &mut until| now < until);
+            if inner.banned_ids.len() >= MAX_BANNED && !inner.banned_ids.contains_key(&id) {
+                return; // fail-closed: never exceed the ceiling
+            }
         }
         inner.banned_ids.insert(id, now + self.limits.ban);
     }

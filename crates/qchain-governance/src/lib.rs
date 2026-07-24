@@ -213,6 +213,20 @@ struct ProposalV0 {
     passed_round: Option<Round>,
 }
 
+/// Formal ceiling on the number of distinct stake accounts that may vote on a
+/// single proposal — the bound on the otherwise-unbounded `voted_stake_accounts`
+/// Vec (task #18), the one growth term of a proposal's on-chain blob (each vote
+/// appends a 32-byte pubkey; the blob is also re-serialized and O(n)-scanned for
+/// the anti-double-vote dedup on every subsequent vote). Deliberately generous:
+/// far above any realistic governance turnout for this network's scale, so it
+/// never rejects a legitimate voter (a network that never reaches it is
+/// byte-identical), while capping the worst case — a whale splitting into many
+/// tiny stake accounts to inflate one proposal's blob (each vote costs a fee +
+/// a funded stake account, so filling this is expensive and bounded). The blob
+/// is additionally reclaimed by `CloseProposal` once the proposal is terminal
+/// (task #16). Enforced at the execution `Vote` boundary via `at_vote_capacity`.
+pub const MAX_PROPOSAL_VOTES: usize = 100_000;
+
 impl Proposal {
     pub fn new(id: ProposalId, proposer: Pubkey, action: ProposalAction, created_round: Round, snapshot_total_staked: u64, deposit: u64) -> Self {
         let rule = quorum_rule(action.risk_tier());
@@ -291,6 +305,15 @@ impl Proposal {
     /// `Vote` handler (`qchain-execution::governance`) BEFORE it calls this,
     /// since only the ledger knows a position's creation round; this pure crate
     /// just tallies the `weight` it's handed.
+    /// Whether this proposal has reached the formal `MAX_PROPOSAL_VOTES` ceiling
+    /// on distinct voters (task #18). The execution `Vote` handler checks this
+    /// before `record_vote` and rejects a vote that would grow the blob past the
+    /// bound (a distinct error from "already voted"). Unreachable at realistic
+    /// turnout — a network below the cap is byte-identical.
+    pub fn at_vote_capacity(&self) -> bool {
+        self.voted_stake_accounts.len() >= MAX_PROPOSAL_VOTES
+    }
+
     pub fn record_vote(&mut self, stake_account: Pubkey, choice: VoteChoice, weight: u64) -> bool {
         if self.voted_stake_accounts.contains(&stake_account) {
             return false;
@@ -542,6 +565,22 @@ mod tests {
         // Zero snapshot → never reaches the floor.
         let empty = Proposal::new(3, Pubkey::system_program_id(), economic_action(), 0, 0, 1);
         assert!(!empty.reached_participation_floor());
+    }
+
+    /// Task #18: the voter blob has a formal ceiling. `at_vote_capacity` is
+    /// false below `MAX_PROPOSAL_VOTES` and true at it — the execution `Vote`
+    /// handler uses it to reject a vote that would grow the blob past the bound.
+    #[test]
+    fn a_proposal_at_the_voter_ceiling_reports_capacity() {
+        let mut p = Proposal::new(1, Pubkey::system_program_id(), economic_action(), 0, 100, 0);
+        assert!(!p.at_vote_capacity(), "an empty proposal is nowhere near capacity");
+        // One below the cap is still open.
+        p.voted_stake_accounts = vec![Pubkey::new([1u8; 32]); MAX_PROPOSAL_VOTES - 1];
+        assert!(!p.at_vote_capacity());
+        // At the cap it reports full — the next vote is rejected at the boundary.
+        p.voted_stake_accounts.push(Pubkey::new([2u8; 32]));
+        assert_eq!(p.voted_stake_accounts.len(), MAX_PROPOSAL_VOTES);
+        assert!(p.at_vote_capacity());
     }
 }
 

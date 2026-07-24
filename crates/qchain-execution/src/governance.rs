@@ -291,6 +291,18 @@ impl NativeProgram for GovernanceProgram {
                         "this stake position was opened after the proposal was created — stake delegated after a proposal opens cannot vote on it (per-voter creation-time snapshot)".into(),
                     ));
                 }
+                // Formal bound on the proposal's voter blob (task #18): a vote
+                // beyond `MAX_PROPOSAL_VOTES` distinct voters is rejected so the
+                // on-chain `voted_stake_accounts` Vec can't grow without bound.
+                // Generous ceiling — unreachable at realistic turnout, so a
+                // network below it is byte-identical; only a blob-inflation
+                // attack (a whale splitting into that many tiny stake accounts)
+                // ever hits it.
+                if proposal.at_vote_capacity() {
+                    return Err(ExecError::ProgramError(
+                        "this proposal has reached the maximum number of voters".into(),
+                    ));
+                }
                 if !proposal.record_vote(stake_pk, choice, stake_data.amount) {
                     return Err(ExecError::ProgramError(
                         "this stake account already voted on this proposal".into(),

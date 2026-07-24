@@ -200,6 +200,51 @@ impl ValidatorSchedule {
     pub fn base(&self) -> &ValidatorSet {
         self.committees.get(&0).expect("epoch 0 committee always present")
     }
+
+    /// Number of installed committees (for tests / the resource-limits bound).
+    pub fn installed_epoch_count(&self) -> usize {
+        self.committees.len()
+    }
+
+    /// Drop the committees of epochs whose *entire round range* is below
+    /// `floor_round` — the round-window bound on the otherwise-unbounded
+    /// `committees` map (task #18). A rotating schedule installs one committee
+    /// per epoch for the node's whole life; without this the map (and its
+    /// on-disk `committee_log` mirror) grows forever.
+    ///
+    /// **Why it's safe.** `floor_round` is the DAG garbage-collection floor
+    /// (`gc_floor`): certificates below it are pruned and never re-requested or
+    /// re-verified (`request_missing_parents` skips parents below `gc_floor`,
+    /// and `extend_order` never re-resolves pruned rounds), so `for_round(r)` is
+    /// only ever queried for `r >= floor_round`. We keep the committee *in
+    /// effect at* `floor_round` (the highest installed epoch `<=` its epoch, the
+    /// "anchor") and every epoch above it, so every still-resolvable round
+    /// inherits the exact same committee it did before the prune — `for_round`
+    /// is unchanged on `[floor_round, ∞)`. Epoch 0 is always retained (the
+    /// bootstrap invariant `for_round`/`base` rely on). A `single`
+    /// (fixed-membership) schedule installs only epoch 0, so this is a no-op for
+    /// a non-rotating network. Idempotent.
+    /// Returns the **anchor epoch** — the lowest epoch still retained above
+    /// epoch 0 (the committee in effect at `floor_round`). The node deletes
+    /// on-disk `committee_log` entries for epochs in `(0, anchor)` to keep the
+    /// disk mirror in exact lock-step with this in-memory prune.
+    pub fn prune_epochs_below(&mut self, floor_round: Round) -> u64 {
+        if self.epoch_rounds == 0 {
+            return 0;
+        }
+        let floor_epoch = floor_round / self.epoch_rounds;
+        // The committee in effect at `floor_epoch` (highest installed epoch <=
+        // it). Everything strictly below the anchor — except epoch 0 — is no
+        // longer inherited by any resolvable round and can be dropped.
+        let anchor = self
+            .committees
+            .range(..=floor_epoch)
+            .next_back()
+            .map(|(&e, _)| e)
+            .unwrap_or(0);
+        self.committees.retain(|&e, _| e == 0 || e >= anchor);
+        anchor
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +314,51 @@ mod tests {
         let mut s = ValidatorSchedule::new(5, a);
         s.install_epoch(1, set(99));
         assert_eq!(s.base().ids_sorted(), a_ids, "base() stays the genesis committee");
+    }
+
+    #[test]
+    fn prune_epochs_below_bounds_the_map_without_changing_resolvable_rounds() {
+        // epoch length 5. Distinct committees at epochs 0,1,2,3,4.
+        let (c0, c1, c2, c3, c4) = (set(10), set(20), set(30), set(40), set(50));
+        let (i0, i1, i2, i3, i4) =
+            (c0.ids_sorted(), c1.ids_sorted(), c2.ids_sorted(), c3.ids_sorted(), c4.ids_sorted());
+        let mut s = ValidatorSchedule::new(5, c0);
+        s.install_epoch(1, c1);
+        s.install_epoch(2, c2);
+        s.install_epoch(3, c3);
+        s.install_epoch(4, c4);
+        assert_eq!(s.installed_epoch_count(), 5);
+
+        // gc_floor at round 16 → epoch 3. The anchor (committee in effect at
+        // epoch 3) is epoch 3 itself. Epochs 1,2 are dropped; 0 kept (bootstrap),
+        // 3,4 kept.
+        let anchor = s.prune_epochs_below(16);
+        assert_eq!(anchor, 3, "committee in effect at round 16 (epoch 3) is the anchor");
+        assert_eq!(s.installed_epoch_count(), 3, "epochs 1 and 2 dropped; 0, 3, 4 kept");
+        assert!(s.has_epoch(0) && s.has_epoch(3) && s.has_epoch(4));
+        assert!(!s.has_epoch(1) && !s.has_epoch(2));
+
+        // for_round is UNCHANGED for every still-resolvable round (>= gc_floor).
+        assert_eq!(s.for_round(15).ids_sorted(), i3, "epoch 3 round still resolves to C3");
+        assert_eq!(s.for_round(19).ids_sorted(), i3);
+        assert_eq!(s.for_round(20).ids_sorted(), i4, "epoch 4 still C4");
+        assert_eq!(s.for_round(999).ids_sorted(), i4, "epochs above 4 inherit C4");
+        assert_eq!(s.base().ids_sorted(), i0, "bootstrap committee preserved");
+        // The dropped epochs are unrelated to the retained ones (proves distinct).
+        assert_ne!(i1, i3);
+        assert_ne!(i2, i4);
+
+        // Idempotent, and pruning below an inherited (no-entry) epoch keeps the
+        // committee that epoch inherits: gc_floor at round 27 → epoch 5, which
+        // has no entry and inherits epoch 4 (the anchor) → 4 is kept.
+        s.prune_epochs_below(27);
+        assert!(s.has_epoch(0) && s.has_epoch(4));
+        assert_eq!(s.for_round(30).ids_sorted(), i4, "epoch 6 still inherits C4 after prune");
+
+        // A single (fixed-membership) schedule is untouched by a prune.
+        let mut single = ValidatorSchedule::single(set(7));
+        single.prune_epochs_below(1_000_000);
+        assert_eq!(single.installed_epoch_count(), 1);
+        assert_eq!(single.for_round(999).total_stake(), 7);
     }
 }

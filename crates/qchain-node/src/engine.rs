@@ -260,6 +260,27 @@ pub fn deserialize_committee(bytes: &[u8]) -> Option<ValidatorSet> {
     let entries: Vec<PersistedValidator> = borsh::from_slice(bytes).ok()?;
     Some(ValidatorSet::new(entries.into_iter().map(|p| ValidatorInfo { id: p.id, pubkey_bundle: p.pubkey_bundle, stake: p.stake }).collect()))
 }
+
+/// Delete on-disk `committee_log` entries for epochs in the half-open range
+/// `(0, anchor)` — task #18's bound on the otherwise-unbounded per-epoch
+/// committee log. Keys are the epoch number in big-endian, so a byte range
+/// `[1, anchor)` selects exactly the dropped epochs while preserving epoch 0
+/// (the bootstrap committee) and the anchor onward. Best-effort: a failed
+/// delete just leaves a dead key to be re-pruned next time. Kept in lock-step
+/// with `ValidatorSchedule::prune_epochs_below`.
+pub fn prune_committee_log_below(db: &sled::Db, anchor: u64) {
+    if anchor <= 1 {
+        return;
+    }
+    let lo = 1u64.to_be_bytes();
+    let hi = anchor.to_be_bytes(); // end-exclusive → keeps the `anchor` epoch
+    let keys: Vec<sled::IVec> = db.range(lo..hi).keys().filter_map(|k| k.ok()).collect();
+    for k in keys {
+        if let Err(e) = db.remove(&k) {
+            tracing::warn!("failed to prune committee_log epoch key: {e}");
+        }
+    }
+}
 use qchain_core::{Batch, Certificate, Digest, EquivocationEvidence, Round, Transaction, ValidatorId, Vertex, WorkerId};
 use qchain_crypto::{MultiSignature, Pubkey};
 use qchain_execution::{Ledger, TransferReceipt};
@@ -4185,6 +4206,40 @@ impl Engine {
                 state.consensus.forget_seen(&removed);
             }
             state.consensus.set_gc_floor(gc_floor);
+
+            // Bound the per-epoch validator schedule + its on-disk `committee_log`
+            // mirror by the same `gc_floor` (task #18). A rotating schedule
+            // installs one committee per epoch for the node's whole life; without
+            // this both the in-memory `committees` map and the `committee_log`
+            // sled tree grow forever (rotation-only; a `single` schedule has just
+            // epoch 0, so this is inert for a non-rotating network — the user's
+            // default). Only epochs whose entire round range is below `gc_floor`
+            // are dropped, and those rounds are never re-resolved or re-requested
+            // (their certs are already pruned above), so `for_round` is unchanged
+            // on every still-resolvable round and a restart rebuilds the identical
+            // schedule from the retained committees. See
+            // `ValidatorSchedule::prune_epochs_below`.
+            if self.committee_log.is_some() {
+                let anchor = {
+                    let mut w = self.validator_schedule.write().expect("schedule lock not poisoned");
+                    let before = w.installed_epoch_count();
+                    let mut sched = (**w).clone();
+                    let anchor = sched.prune_epochs_below(gc_floor);
+                    if sched.installed_epoch_count() != before {
+                        *w = std::sync::Arc::new(sched);
+                    }
+                    anchor
+                };
+                // Delete the on-disk committee_log entries for the dropped epochs
+                // `(0, anchor)` — epoch 0 (bootstrap) and the anchor onward stay,
+                // exactly matching the in-memory prune so a reboot reloads the
+                // same set. Best-effort: a failed delete just leaves a dead key.
+                if anchor > 1 {
+                    if let Some(db) = &self.committee_log {
+                        prune_committee_log_below(db, anchor);
+                    }
+                }
+            }
         }
     }
 
@@ -5703,6 +5758,45 @@ mod tests {
         assert_eq!(db.len(), 30, "pruning a log already at max must not remove anything");
         prune_log_to_last(Some(&db), 1000);
         assert_eq!(db.len(), 30, "pruning below the current size must not remove anything");
+    }
+
+    /// Task #18: the on-disk `committee_log` is bounded in lock-step with the
+    /// in-memory `ValidatorSchedule` prune. Deleting epochs `(0, anchor)` must
+    /// keep epoch 0 (bootstrap) and the anchor onward, exactly matching what a
+    /// reboot needs to rebuild the schedule.
+    #[test]
+    fn prune_committee_log_below_drops_only_epochs_between_zero_and_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sled::open(dir.path().join("committees")).unwrap();
+        // Persist committees for epochs 0..=5, keyed by epoch big-endian, exactly
+        // as the engine's rotation ratchet does.
+        for e in 0u64..=5 {
+            let kp = Keypair::generate().unwrap();
+            let set = qchain_consensus::ValidatorSet::new(vec![qchain_consensus::ValidatorInfo {
+                id: kp.pubkey(),
+                pubkey_bundle: kp.public_key_bundle(),
+                stake: (e + 1) * 10,
+            }]);
+            db.insert(e.to_be_bytes(), serialize_committee(&set)).unwrap();
+        }
+        assert_eq!(db.len(), 6);
+
+        // Anchor = 3 → drop epochs 1,2; keep 0,3,4,5.
+        prune_committee_log_below(&db, 3);
+        let surviving: Vec<u64> =
+            db.iter().keys().map(|k| u64::from_be_bytes(k.unwrap().as_ref().try_into().unwrap())).collect();
+        assert_eq!(surviving, vec![0, 3, 4, 5], "keep epoch 0 and the anchor onward");
+        // Every surviving entry still decodes (the on-disk mirror stays valid).
+        for e in &surviving {
+            let bytes = db.get(e.to_be_bytes()).unwrap().unwrap();
+            assert!(deserialize_committee(&bytes).is_some());
+        }
+
+        // anchor <= 1 is a no-op (nothing below epoch 1 to drop but epoch 0).
+        prune_committee_log_below(&db, 1);
+        assert_eq!(db.len(), 4, "anchor 1 must not remove anything");
+        prune_committee_log_below(&db, 0);
+        assert_eq!(db.len(), 4, "anchor 0 must not remove anything");
     }
 
     /// The exact live-confirmed attack `payer_can_afford_admission` closes
