@@ -166,8 +166,32 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(rs) as Arc<dyn qchain_crypto::Signer>
         }
         None => {
-            let kp = qchain_crypto::read_keypair_file(&config.keypair_path)?;
-            Arc::new(kp) as Arc<dyn qchain_crypto::Signer>
+            // (KM#8) Auto-detecta un keystore V2 cifrado vs un keypair.json en
+            // texto plano. Si es un keystore, exige la passphrase de
+            // `keystore_passphrase_path` y aplica la guardia anti-rollback.
+            if qchain_crypto::keystore::is_keystore_file(&config.keypair_path) {
+                let pass_path = config.keystore_passphrase_path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "keypair_path {} is an encrypted keystore but keystore_passphrase_path is not set",
+                        config.keypair_path.display()
+                    )
+                })?;
+                let pass_bytes = std::fs::read(pass_path)
+                    .with_context(|| format!("cannot read keystore_passphrase_path {pass_path}"))?;
+                let pass = pass_bytes.iter().position(|b| *b == b'\n' || *b == b'\r').map(|i| &pass_bytes[..i]).unwrap_or(&pass_bytes[..]);
+                if pass.is_empty() {
+                    anyhow::bail!("keystore_passphrase_path {pass_path} is empty");
+                }
+                let counter = qchain_crypto::keystore::keystore_counter(&config.keypair_path)?;
+                let guard_path = format!("{}.rollback-guard", config.keypair_path.display());
+                let mut rollback = qchain_crypto::RollbackGuard::load(std::path::Path::new(&guard_path))?;
+                rollback.check_and_record(counter).with_context(|| "keystore rollback guard refused this keystore")?;
+                let kp = qchain_crypto::read_keypair_or_keystore(&config.keypair_path, Some(pass))?;
+                Arc::new(kp) as Arc<dyn qchain_crypto::Signer>
+            } else {
+                let kp = qchain_crypto::read_keypair_file(&config.keypair_path)?;
+                Arc::new(kp) as Arc<dyn qchain_crypto::Signer>
+            }
         }
     };
     let self_id = signer.bundle().to_address();

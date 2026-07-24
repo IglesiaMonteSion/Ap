@@ -30,9 +30,17 @@ use std::sync::{Arc, Mutex};
 #[derive(Parser)]
 #[command(name = "qchain-remote-signer", about = "Firmante remoto/HSM de la clave de validador de qchain (#193 + #4.2)")]
 struct Cli {
-    /// Ruta al keypair.json del validador (la clave que firma bloques).
+    /// Ruta al keypair del validador (la clave que firma bloques). Puede ser un
+    /// `keypair.json` en texto plano O un **keystore V2 cifrado** (KM#8) — el
+    /// daemon auto-detecta el formato. Si es un keystore, hace falta
+    /// `--keystore-passphrase-file`.
     #[arg(long)]
     keypair: String,
+    /// (KM#8) Archivo con la passphrase para descifrar un keystore V2. Sólo se
+    /// usa si `--keypair` es un keystore cifrado; para un `keypair.json` en texto
+    /// plano se ignora. El operador lo protege 0600 (igual que el token de auth).
+    #[arg(long)]
+    keystore_passphrase_file: Option<String>,
     /// Dónde escuchar. `host:puerto` (TCP, por defecto loopback) o `unix:/ruta`
     /// (socket Unix). Ej: 127.0.0.1:9200  |  unix:/run/qchain/signer.sock
     #[arg(long, default_value = "127.0.0.1:9200")]
@@ -70,7 +78,35 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    let keypair = qchain_crypto::read_keypair_file(std::path::Path::new(&cli.keypair))
+    // (KM#8) Cargar el keypair auto-detectando keystore V2 cifrado vs texto
+    // plano. Si es un keystore, se exige la passphrase y se aplica la guardia
+    // anti-rollback (rechaza cargar una copia vieja con contador menor).
+    let keypair_path = std::path::Path::new(&cli.keypair);
+    let keystore_encrypted = qchain_crypto::keystore::is_keystore_file(keypair_path);
+    let passphrase = match &cli.keystore_passphrase_file {
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("cannot read keystore passphrase file {path}"))?;
+            let trimmed = trim_token(&bytes);
+            if trimmed.is_empty() {
+                anyhow::bail!("keystore passphrase file {path} is empty");
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    if keystore_encrypted {
+        // Guardia anti-rollback: rechaza un keystore cuyo contador sea menor que
+        // el más alto ya visto (una copia vieja re-insertada tras una rotación).
+        let counter = qchain_crypto::keystore::keystore_counter(keypair_path)
+            .with_context(|| format!("cannot read keystore counter from {}", cli.keypair))?;
+        let rollback_guard_path = format!("{}.rollback-guard", cli.keypair);
+        let mut rollback = qchain_crypto::RollbackGuard::load(std::path::Path::new(&rollback_guard_path))
+            .with_context(|| format!("cannot load keystore rollback guard from {rollback_guard_path}"))?;
+        rollback
+            .check_and_record(counter)
+            .with_context(|| "keystore rollback guard refused this keystore")?;
+    }
+    let keypair = qchain_crypto::read_keypair_or_keystore(keypair_path, passphrase.as_deref())
         .with_context(|| format!("cannot read validator keypair from {}", cli.keypair))?;
     let bundle = keypair.public_key_bundle();
 
@@ -126,12 +162,13 @@ fn main() -> anyhow::Result<()> {
     let policy = qchain_remote_signer::SignerPolicy { expected_chain_id, rate_limit };
 
     tracing::info!(
-        "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}] [chain binding: {}] [rate limit: {}]",
+        "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}] [chain binding: {}] [rate limit: {}] [key at rest: {}]",
         bundle.to_address(),
         cli.listen,
         if auth_token.is_some() { "TOKEN required" } else { "NONE — dev/loopback only" },
         if expected_chain_id.is_some() { "ON" } else { "off" },
         match &rate_limit { Some(rl) => format!("{}/{}s", rl.max_signs, cli.rate_window_secs), None => "off".to_string() },
+        if keystore_encrypted { "ENCRYPTED keystore v2 (KM#8)" } else { "plaintext keypair.json" },
     );
     if auth_token.is_none() {
         tracing::warn!(

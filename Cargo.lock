@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-cli"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-consensus"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "borsh",
  "proptest",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-core"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2365,12 +2365,15 @@ dependencies = [
 
 [[package]]
 name = "qchain-crypto"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
+ "argon2",
  "borsh",
  "bs58",
+ "chacha20poly1305",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "hex",
  "ml-dsa",
  "oqs",
@@ -2383,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-execution"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2402,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-faucet"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "axum",
@@ -2422,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-governance"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "borsh",
  "proptest",
@@ -2433,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-indexer"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "axum",
@@ -2451,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-network"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2468,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-node"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "axum",
@@ -2499,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-remote-signer"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2514,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-simulation"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "qchain-consensus",
  "qchain-core",
@@ -2524,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-stark"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "hex",
  "qchain-core",
@@ -2538,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-storage"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "anyhow",
  "borsh",
@@ -2553,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "qchain-wallet"
-version = "8.6.33"
+version = "8.6.34"
 dependencies = [
  "aes-gcm",
  "anyhow",

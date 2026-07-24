@@ -116,3 +116,18 @@ pub const RECOVERY_AUTH_V1: &[u8] = b"qchain-v7-recovery-auth-v1";
 /// revés. Objeto tipado de largo fijo (32+32); no liga `chain_id`, misma postura
 /// que `VALIDATOR_POP_V1`.
 pub const KEY_ROTATION_ACCEPT_V1: &[u8] = b"qchain-v7-key-rotation-accept-v1";
+
+/// **Derivación de sub-claves del keystore V2** (programa de gestión de claves,
+/// KM#8 — keystore cifrado en reposo). El keystore deriva la clave maestra con
+/// **Argon2id** (memory-hard, la fase de EXTRACT: su salida ya es un PRK
+/// uniforme), y luego **expande** sub-claves domain-separadas con SHA3-256:
+/// `SHA3-256(KEYSTORE_HKDF_V2 ‖ master ‖ label_len_le ‖ label)`. SHA3 es
+/// resistente a extensión de longitud (postura prefix-MAC de FIPS 202 / base de
+/// KMAC), así que un prefijo de dominio + master + label es un PRF-expand sólido
+/// para un PRK uniforme — el MISMO patrón que ya usa `generate_from_seed` para
+/// separar las semillas ed25519/ML-DSA. La sub-clave `b"enc"` cifra el keystore
+/// (XChaCha20-Poly1305); las etiquetas `b"role/..."` derivan claves por ROL de
+/// forma jerárquica sin volver a correr Argon2. No es cripto inventada: Argon2id
+/// es el KDF vetteado, y el expand SHA3-prefijo es la construcción que el
+/// proyecto ya ships (checkpoints, MAC de sesión del firmante remoto).
+pub const KEYSTORE_HKDF_V2: &[u8] = b"qchain-keystore-hkdf-v2";

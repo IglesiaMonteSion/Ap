@@ -153,6 +153,43 @@ enum Command {
         #[arg(short, long)]
         keypair: PathBuf,
     },
+    /// (KM#8) Cifrar un `keypair.json` en texto plano a un **keystore V2**
+    /// cifrado en reposo (Argon2id → HKDF-SHA3 → XChaCha20-Poly1305). El nodo /
+    /// firmante remoto lo cargan con su passphrase. NO borra el keypair original
+    /// — verificá que el keystore descifra (`keystore-inspect`) antes de borrarlo.
+    KeystoreEncrypt {
+        /// Ruta al `keypair.json` en texto plano a cifrar.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// Ruta de salida del keystore cifrado.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Archivo con la passphrase (0600). Si se omite, se pide por stdin.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Contador monotónico anti-rollback (subilo en cada re-cifrado). Default 1.
+        #[arg(long, default_value_t = 1)]
+        counter: u64,
+        /// Memoria de Argon2 en KiB (default 19456 = 19 MiB, OWASP-2023).
+        #[arg(long, default_value_t = qchain_crypto::keystore::DEFAULT_M_COST_KIB)]
+        m_cost_kib: u32,
+        /// Pasadas de Argon2 (default 2).
+        #[arg(long, default_value_t = qchain_crypto::keystore::DEFAULT_T_COST)]
+        t_cost: u32,
+        /// Lanes de Argon2 (default 1).
+        #[arg(long, default_value_t = qchain_crypto::keystore::DEFAULT_P_COST)]
+        p_cost: u32,
+    },
+    /// (KM#8) Inspeccionar/verificar un keystore V2: imprime params/counter (sin
+    /// secretos) y, con la passphrase, confirma que descifra a su dirección.
+    KeystoreInspect {
+        /// Ruta al keystore V2.
+        #[arg(short, long)]
+        keystore: PathBuf,
+        /// Archivo con la passphrase para VERIFICAR el descifrado (opcional).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
     /// Query an account's balance from a node.
     Balance {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
@@ -1766,6 +1803,38 @@ fn parse_vote_choice(s: &str) -> anyhow::Result<VoteChoice> {
     }
 }
 
+/// (KM#8) Lee la passphrase del keystore de un archivo (recomendado, 0600) o de
+/// stdin. `confirm` pide una segunda vez (sólo en stdin, al cifrar) para evitar
+/// un typo que deje un keystore irrecuperable.
+fn read_passphrase(file: Option<&std::path::Path>, confirm: bool) -> anyhow::Result<String> {
+    use std::io::BufRead;
+    if let Some(path) = file {
+        let raw = std::fs::read_to_string(path)?;
+        let pass = raw.trim_end_matches(['\n', '\r']).to_string();
+        if pass.is_empty() {
+            anyhow::bail!("passphrase file {} is empty", path.display());
+        }
+        return Ok(pass);
+    }
+    let stdin = std::io::stdin();
+    eprint!("keystore passphrase: ");
+    let mut pass = String::new();
+    stdin.lock().read_line(&mut pass)?;
+    let pass = pass.trim_end_matches(['\n', '\r']).to_string();
+    if pass.is_empty() {
+        anyhow::bail!("empty passphrase");
+    }
+    if confirm {
+        eprint!("confirm passphrase: ");
+        let mut again = String::new();
+        stdin.lock().read_line(&mut again)?;
+        if again.trim_end_matches(['\n', '\r']) != pass {
+            anyhow::bail!("passphrases do not match");
+        }
+    }
+    Ok(pass)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -1785,6 +1854,40 @@ fn main() -> anyhow::Result<()> {
         Command::Bundle { keypair } => {
             let kp = qchain_crypto::read_keypair_file(&keypair)?;
             println!("{}", serde_json::to_string(&kp.public_key_bundle())?);
+        }
+        Command::KeystoreEncrypt { keypair, out, passphrase_file, counter, m_cost_kib, t_cost, p_cost } => {
+            let kp = qchain_crypto::read_keypair_file(&keypair)?;
+            let addr = kp.pubkey();
+            let pass = read_passphrase(passphrase_file.as_deref(), true)?;
+            let params = qchain_crypto::keystore::KeystoreParams { m_cost_kib, t_cost, p_cost };
+            let ks = qchain_crypto::keystore::encrypt_keystore(&kp, pass.as_bytes(), params, counter)?;
+            qchain_crypto::keystore::write_keystore_file(&ks, &out)?;
+            // Verificación en el acto: descifrar y confirmar que da la MISMA
+            // dirección — nunca entregamos un keystore que no descifra.
+            let back = qchain_crypto::keystore::decrypt_keystore(&ks, pass.as_bytes())?;
+            if back.pubkey() != addr {
+                anyhow::bail!("keystore verification failed: decrypted address does not match");
+            }
+            println!("wrote encrypted keystore v2 to {}", out.display());
+            println!("address: {addr}");
+            println!("argon2id: m={m_cost_kib} KiB t={t_cost} p={p_cost}, counter={counter}");
+            println!("verified: decrypts back to the same address");
+            println!("NOTE: the original plaintext {} is UNCHANGED — delete it only after you have securely stored the passphrase.", keypair.display());
+        }
+        Command::KeystoreInspect { keystore, passphrase_file } => {
+            let ks = qchain_crypto::keystore::read_keystore_file(&keystore)?;
+            println!("keystore v2: {}", keystore.display());
+            println!("  kdf: {} (m={} KiB t={} p={})", ks.kdf, ks.m_cost_kib, ks.t_cost, ks.p_cost);
+            println!("  anti-rollback counter: {}", ks.counter);
+            println!("  salt: {} bytes, nonce: {} bytes, ct: {} bytes", ks.salt.len(), ks.nonce.len(), ks.ct.len());
+            match passphrase_file {
+                Some(pf) => {
+                    let pass = read_passphrase(Some(&pf), false)?;
+                    let kp = qchain_crypto::keystore::decrypt_keystore(&ks, pass.as_bytes())?;
+                    println!("  DECRYPTS OK → address: {}", kp.pubkey());
+                }
+                None => println!("  (pass --passphrase-file to verify decryption)"),
+            }
         }
         Command::Balance { rpc, address } => {
             let pk: Pubkey = address.parse()?;

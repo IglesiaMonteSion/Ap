@@ -427,6 +427,18 @@ pub struct NodeConfig {
     #[serde(default)]
     pub remote_signer_auth_token_path: Option<String>,
 
+    /// **(KM#8) Passphrase para descifrar un keystore V2 en reposo.** Cuando
+    /// `keypair_path` apunta a un **keystore V2 cifrado** (Argon2id → HKDF-SHA3 →
+    /// XChaCha20-Poly1305, hecho con `qchain keystore-encrypt`) en vez de un
+    /// `keypair.json` en texto plano, este archivo (0600) trae la passphrase para
+    /// descifrarlo al arrancar. Sólo aplica a la clave EN-PROCESO (cuando
+    /// `remote_signer` es `None`); con firmante remoto, el daemon tiene su propio
+    /// `--keystore-passphrase-file`. `None` (el default, y lo que resuelve todo
+    /// config existente) = el `keypair_path` es texto plano, byte-idéntico al
+    /// comportamiento previo. Node-LOCAL, NO se pliega en `chain_id`.
+    #[serde(default)]
+    pub keystore_passphrase_path: Option<String>,
+
     /// **Clave de RED (P2P) SEPARADA de la clave de consenso (auditoría #1 del
     /// programa de gestión de claves).** Ruta a un keypair distinto que firma el
     /// handshake P2P por-conexión. Al arrancar, la clave de CONSENSO emite UNA sola
@@ -1088,6 +1100,7 @@ mod tests {
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             remote_signer_auth_token_path: None,
+            keystore_passphrase_path: None,
             network_keypair_path: None,
             mainnet: false,
             network_profile: None,

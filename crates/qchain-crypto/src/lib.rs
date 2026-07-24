@@ -31,8 +31,16 @@
 
 pub mod domains;
 pub mod kem;
+// KM#8 — Keystore V2 (cifrado en reposo del keypair). Node-only: la wallet del
+// navegador (wasm32) tiene su propio cifrado en JS, y este módulo trae argon2 +
+// chacha20poly1305 que no queremos en el binario wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod keystore;
 pub mod registry;
 pub mod slh_dsa;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use keystore::{read_keypair_or_keystore, KeystoreV2, RollbackGuard};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, VerifyingKey};
@@ -618,13 +626,17 @@ fn decode_length_prefixed(mut bytes: &[u8], count: usize) -> anyhow::Result<Vec<
     Ok(fields)
 }
 
-/// Keypair file layout: JSON array of bytes, length-prefixed fields -
+/// Canonical byte blob for a keypair: length-prefixed fields -
 /// ed25519 keypair [64 bytes], ML-DSA-65 secret key, ML-DSA-65 public key,
 /// combo id [2 bytes LE], then (only if the combo includes SLH-DSA)
 /// SLH-DSA secret key, SLH-DSA public key - fully self-contained, since
 /// liboqs can't re-derive a public key from its secret key alone for
-/// either PQC scheme.
-pub fn write_keypair_file(keypair: &Keypair, path: &std::path::Path) -> anyhow::Result<()> {
+/// either PQC scheme. This is the single source of truth for keypair
+/// serialization: `write_keypair_file` wraps it in JSON, and the KM#8
+/// encrypted keystore (`keystore::encrypt_keystore`) encrypts it directly,
+/// so an encrypted keystore decrypts back to the EXACT same bytes that
+/// `keypair_from_canonical_bytes` decodes - no parallel encoding.
+pub fn keypair_to_canonical_bytes(keypair: &Keypair) -> Vec<u8> {
     let ed_bytes = keypair.ed25519.to_keypair_bytes();
     let combo_bytes = keypair.combo.0.to_le_bytes();
     let mut fields: Vec<&[u8]> = vec![&ed_bytes, &keypair.mldsa_sk, &keypair.mldsa_pk, &combo_bytes];
@@ -632,7 +644,44 @@ pub fn write_keypair_file(keypair: &Keypair, path: &std::path::Path) -> anyhow::
         fields.push(slh_dsa.secret_key_bytes());
         fields.push(slh_dsa.public_key_bytes());
     }
-    let encoded = encode_length_prefixed(&fields);
+    encode_length_prefixed(&fields)
+}
+
+/// Decode the canonical keypair blob produced by `keypair_to_canonical_bytes`.
+pub fn keypair_from_canonical_bytes(encoded: &[u8]) -> anyhow::Result<Keypair> {
+    // Decode the always-present 4 fields first to learn the combo, then
+    // (only if it needs SLH-DSA) decode again from the same in-memory
+    // bytes with the extra 2 fields included.
+    let fields = decode_length_prefixed(encoded, 4)?;
+    let ed_bytes: [u8; 64] = fields[0]
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid ed25519 keypair length"))?;
+    let ed25519 = SigningKey::from_keypair_bytes(&ed_bytes).map_err(|e| anyhow::anyhow!("invalid ed25519 bytes: {e}"))?;
+    let combo_bytes: [u8; 2] = fields[3].as_slice().try_into().map_err(|_| anyhow::anyhow!("invalid combo id length"))?;
+    let combo = AlgorithmId(u16::from_le_bytes(combo_bytes));
+    let required = combo_components(combo).ok_or_else(|| anyhow::anyhow!("unknown combo id in keypair file: {combo:?}"))?;
+    let slh_dsa = if required.contains(&ALGORITHM_SLH_DSA) {
+        let all_fields = decode_length_prefixed(encoded, 6)?;
+        Some(SlhDsaKeypair::from_raw_parts(all_fields[5].clone(), all_fields[4].clone()))
+    } else {
+        None
+    };
+    Ok(Keypair {
+        combo,
+        ed25519,
+        mldsa_sk: fields[1].clone(),
+        mldsa_pk: fields[2].clone(),
+        slh_dsa,
+    })
+}
+
+/// Keypair file layout: JSON array of bytes wrapping the canonical blob
+/// (`keypair_to_canonical_bytes`). This stores the RAW secret keys in
+/// PLAINTEXT (0600) - for encryption at rest, use the KM#8 keystore
+/// (`keystore::encrypt_keystore` + `read_keypair_or_keystore`).
+pub fn write_keypair_file(keypair: &Keypair, path: &std::path::Path) -> anyhow::Result<()> {
+    let encoded = keypair_to_canonical_bytes(keypair);
     let bytes = serde_json::to_vec(&encoded)?;
     // This file holds the RAW secret keys (Ed25519 + ML-DSA-65 + optional
     // SLH-DSA). `std::fs::write` would create it 0644 (world-readable under the
@@ -666,31 +715,7 @@ pub fn write_keypair_file(keypair: &Keypair, path: &std::path::Path) -> anyhow::
 pub fn read_keypair_file(path: &std::path::Path) -> anyhow::Result<Keypair> {
     let contents = std::fs::read(path)?;
     let encoded: Vec<u8> = serde_json::from_slice(&contents)?;
-    // Decode the always-present 4 fields first to learn the combo, then
-    // (only if it needs SLH-DSA) decode again from the same in-memory
-    // bytes with the extra 2 fields included.
-    let fields = decode_length_prefixed(&encoded, 4)?;
-    let ed_bytes: [u8; 64] = fields[0]
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid ed25519 keypair length"))?;
-    let ed25519 = SigningKey::from_keypair_bytes(&ed_bytes).map_err(|e| anyhow::anyhow!("invalid ed25519 bytes: {e}"))?;
-    let combo_bytes: [u8; 2] = fields[3].as_slice().try_into().map_err(|_| anyhow::anyhow!("invalid combo id length"))?;
-    let combo = AlgorithmId(u16::from_le_bytes(combo_bytes));
-    let required = combo_components(combo).ok_or_else(|| anyhow::anyhow!("unknown combo id in keypair file: {combo:?}"))?;
-    let slh_dsa = if required.contains(&ALGORITHM_SLH_DSA) {
-        let all_fields = decode_length_prefixed(&encoded, 6)?;
-        Some(SlhDsaKeypair::from_raw_parts(all_fields[5].clone(), all_fields[4].clone()))
-    } else {
-        None
-    };
-    Ok(Keypair {
-        combo,
-        ed25519,
-        mldsa_sk: fields[1].clone(),
-        mldsa_pk: fields[2].clone(),
-        slh_dsa,
-    })
+    keypair_from_canonical_bytes(&encoded)
 }
 
 #[cfg(test)]

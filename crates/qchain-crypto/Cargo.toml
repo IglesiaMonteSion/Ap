@@ -27,6 +27,15 @@ oqs = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ml-dsa = { version = "0.1", default-features = false, features = ["alloc"], optional = true }
 
+# KM#8 — Keystore V2 (cifrado en reposo del keypair del validador/operador),
+# NODE-ONLY (no wasm32: la wallet del navegador cifra en JS). Cero third-party
+# nuevo — argon2 y chacha20poly1305 ya están en el lock (los usan
+# qchain-wallet/qchain-wasm y qchain-network); getrandom ya está transitivo.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+argon2 = "0.5"
+chacha20poly1305.workspace = true
+getrandom = "0.2"
+
 [dev-dependencies]
 # Native cross-check of the pure backend against liboqs (tests/wasm_feasibility.rs);
 # default features here (incl. getrandom) are fine on the native test target.

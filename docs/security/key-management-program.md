@@ -22,7 +22,7 @@ documentado como pendiente con su razón, no forzado.
 | 5 | Timelocks on-chain de cambios de clave | 5 | **HECHO** (v8.6.31 — operator ~24h / withdrawal ~72h / recovery ~7d) |
 | 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | **HECHO** (v8.6.32 — `ProposeConsensusKeyRotation` operator + `AcceptConsensusKeyRotation` con PoP de la clave nueva) |
 | 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | **HECHO** (v8.6.33 — binding de chain_id + anti-equivocación de checkpoints + rate-limit) |
-| 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | pendiente |
+| 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | **HECHO** (v8.6.34 — cifrado en reposo del keypair, opt-in, node-local) |
 | 9 | `EmergencyFreezeValidator` + expiración/rotación obligatoria + audit trail | 9 | pendiente |
 | 10 | Pruebas multinodo + adversariales del ciclo de vida de claves | 10 | pendiente |
 
@@ -374,13 +374,85 @@ Quien lo use pasa `--chain-id`/`--max-signs-per-window` al daemon; sin ellos el
 comportamiento es idéntico al previo (política permisiva), pero la anti-equivocación de
 checkpoints es SIEMPRE activa.
 
-## #8–#10 — pendientes
+## #8 — Keystore V2: cifrado en reposo del keypair (HECHO, v8.6.34)
+
+**PROBLEMA:** el `keypair.json` del validador/operador guardaba las claves secretas
+(Ed25519 + ML-DSA-65 + opcional SLH-DSA) en **texto plano** (0600). Un volcado de
+disco / backup / lectura por un co-tenant / core dump exponía la clave que firma
+bloques directamente. Los permisos 0600 acotan al mismo usuario, pero no cifran.
+
+**DISEÑO — la cadena que el auditor pidió (`Argon2id → HKDF-SHA3 → XChaCha20-Poly1305`),
+NODE-ONLY y OPT-IN:**
+
+- **Argon2id** (memory-hard, GPU/ASIC-resistente, RustCrypto vetteado — el MISMO que
+  la wallet ya usa): deriva la clave MAESTRA de la passphrase + un salt aleatorio de
+  16 B. Es la fase de EXTRACT (su salida es un PRK uniforme). Los params (m/t/p) se
+  **validan AL LEER** contra un rango documentado (`m∈[8 KiB,1 GiB]`, `t∈[1,24]`,
+  `p∈[1,16]`) **ANTES** de asignar memoria → un keystore hostil con m de varios GiB
+  no puede colgar/OOMear al cargador (la lección #10 de la wallet).
+- **HKDF-SHA3** (expand domain-separada, **cero third-party nuevo**): expande
+  sub-claves con `SHA3-256(KEYSTORE_HKDF_V2 ‖ master ‖ len(label) ‖ label)`. SHA3 es
+  resistente a extensión de longitud (postura prefix-MAC de FIPS 202 / base de KMAC),
+  así que es un PRF-expand sólido para un PRK uniforme — el MISMO patrón que
+  `generate_from_seed` ya usa. `b"enc"` cifra el keystore; `derive_role_subkey(master,
+  "consensus"/"operator"/…)` da claves por ROL de forma **jerárquica** sin re-correr
+  Argon2. No es cripto inventada: Argon2id es el KDF vetteado, y el expand SHA3-prefijo
+  es la construcción que el proyecto ya ships.
+- **XChaCha20-Poly1305** (AEAD, RustCrypto, ya en el lock por `qchain-network`): cifra
+  el **blob canónico del keypair** (`keypair_to_canonical_bytes` — la MISMA
+  serialización que `write_keypair_file`, así un keystore descifra a los MISMOS bytes)
+  con la sub-clave `enc` y un **nonce aleatorio de 24 B** (sin riesgo de reúso aunque
+  se re-cifre con la misma passphrase).
+
+**ANTI-ROLLBACK:** un `counter` monotónico va **AUTENTICADO en el AAD** del AEAD (junto
+con magic/version/params/salt/nonce) — bajarlo (rollback) o hacer downgrade de los
+params de Argon2 rompe el tag. Además una **`RollbackGuard` persistida** (fsync + rename
+atómico, como la `DoubleSignGuard`) rechaza cargar un keystore cuyo contador sea MENOR
+que el más alto ya visto → un atacante que guardó una copia vieja del archivo no puede
+re-insertarla tras una rotación.
+
+**AUTO-DETECT / COMPAT:** `read_keypair_or_keystore(path, passphrase)` distingue un
+keystore V2 (objeto JSON con `magic`) de un `keypair.json` en texto plano (array JSON) —
+un keypair plano sigue cargando sin passphrase (byte-idéntico al comportamiento previo).
+
+**CAMBIOS:** (1) `qchain-crypto`: dominio `KEYSTORE_HKDF_V2`; módulo nuevo `keystore`
+(`#[cfg(not(target_arch="wasm32"))]` — la wallet del navegador cifra en JS, y así
+argon2/chacha no entran al binario wasm) con `KeystoreV2`/`KeystoreParams`,
+`encrypt_keystore`/`decrypt_keystore`, `derive_subkey`/`derive_role_subkey`,
+`read_keypair_or_keystore`, `RollbackGuard`; `keypair_to/from_canonical_bytes`
+extraídos como fuente única. (2) `qchain-cli`: `keystore-encrypt` (cifra un keypair.json
++ verifica en el acto que descifra a la misma dirección) y `keystore-inspect`
+(params/counter sin secretos + verificación opcional). (3) `qchain-remote-signer`
+daemon: `--keystore-passphrase-file` (auto-detecta el keystore, aplica la guardia
+anti-rollback). (4) `qchain-node`: config `keystore_passphrase_path` para la clave
+EN-PROCESO (cuando no hay firmante remoto). **CERO third-party nuevo** (argon2 +
+chacha20poly1305 + getrandom ya estaban en el lock).
+
+**VERIFICADO:** qchain-crypto **8 tests** de keystore (round-trip recupera el keypair
+exacto; passphrase equivocada / ciphertext alterado / counter y params alterados en el
+AAD RECHAZADOS; params de Argon2 fuera de rango rechazados ANTES de correr; sub-claves
+domain-separadas/deterministas; plaintext-vs-keystore distinguidos; la guardia rechaza
+un counter menor y persiste el tope entre reinicios) — 32 crypto totales; clippy limpio;
+wasm32 (`pure`) compila con el keystore gated OUT; lock sólo qchain→8.6.34.
+**EN VIVO:** un `keypair.json` cifrado a keystore V2 (`keystore-encrypt` → verifica que
+descifra a la misma dirección; `keystore-inspect` reporta m/t/p/counter); el daemon
+arrancó con el keystore + passphrase (`[key at rest: ENCRYPTED keystore v2 (KM#8)]`), el
+nodo firmó votos a través de él (`consensus signer: REMOTE`), las rondas avanzaron y una
+transferencia real ejecutó (bob = 7 QCH exacto, guardia de doble-firma persistió) → la
+clave cifrada en reposo firma consenso end-to-end; una passphrase EQUIVOCADA hizo que el
+daemon SE NEGARA a arrancar (`keystore decryption failed`); y una copia vieja del keystore
+(counter 2 tras haber visto 3) fue **RECHAZADA por la guardia anti-rollback** en vivo.
+
+**DESPLIEGUE:** OPT-IN, nada en la red viva — un `keypair.json` en texto plano sigue
+cargando. Para cifrar en reposo: `qchain keystore-encrypt --keypair keypair.json --out
+keystore.json --passphrase-file pass.txt`, apuntar el daemon con
+`--keystore-passphrase-file` (o el nodo con `keystore_passphrase_path`), verificar que
+arranca, y recién ahí borrar el `keypair.json` plano.
+
+## #9–#10 — pendientes
 
 Se implementan en orden de prioridad. Notas de diseño resumidas:
 
-- **#8 Keystore V2.** `Argon2id → HKDF-SHA3 → XChaCha20-Poly1305`, derivación HKDF
-  jerárquica de sub-claves por rol, y un contador monotónico anti-rollback en el
-  archivo.
 - **#9 Emergency freeze + expiración.** `EmergencyFreezeValidator` (por la recovery
   key / guardianes) + expiración/rotación obligatoria de claves + audit trail con
   logs encadenados por hash.
