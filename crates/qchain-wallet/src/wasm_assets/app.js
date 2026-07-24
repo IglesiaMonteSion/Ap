@@ -259,24 +259,42 @@ const WIDX=new Map(SLIP39.map((w,i)=>[w,i]));
 // detecta un error de tipeo antes de intentar reconstruir.
 async function shareToWords(payload){
   const chk=new Uint8Array(await crypto.subtle.digest('SHA-256', payload));
-  const full=new Uint8Array(40); full.set(payload,0); full.set(chk.slice(0,3),37);
+  const full=new Uint8Array(payload.length+3); full.set(payload,0); full.set(chk.slice(0,3),payload.length);
   let acc=0,bits=0,out=[];
   for(const b of full){ acc=(acc<<8)|b; bits+=8; while(bits>=10){ bits-=10; out.push(SLIP39[(acc>>bits)&0x3ff]); } }
   return out.join(' ');
 }
 async function wordsToShare(mnemonic){
   const idx=mnemonic.trim().split(/\s+/).map(w=>{ const i=WIDX.get(w.toLowerCase()); if(i===undefined) throw new Error('palabra desconocida: "'+w+'"'); return i; });
-  if(idx.length!==32) throw new Error('cada fragmento son 32 palabras (este tiene '+idx.length+')');
+  // 32 palabras = fragmento v1 (payload 37 B); 48 = v2 (payload 57 B, audit #8).
+  if(idx.length!==32 && idx.length!==48) throw new Error('cada fragmento son 32 o 48 palabras (este tiene '+idx.length+')');
   let acc=0,bits=0,out=[];
   for(const i of idx){ acc=(acc<<10)|i; bits+=10; while(bits>=8){ bits-=8; out.push((acc>>bits)&0xff); } }
-  const full=Uint8Array.from(out), payload=full.slice(0,37), chk=full.slice(37,40);
+  const full=Uint8Array.from(out), payload=full.slice(0,full.length-3), chk=full.slice(full.length-3);
   const d=new Uint8Array(await crypto.subtle.digest('SHA-256', payload));
   if(d[0]!==chk[0]||d[1]!==chk[1]||d[2]!==chk[2]) throw new Error('un fragmento tiene un error de tipeo (checksum)');
   return payload;
 }
 
+// Formato v2 de fragmento (audit #8): [VER=2, K, N, x, group(4), chk(17), y(32)]
+// = 57 B -> 48 palabras. Cierra dos huecos del v1: chk(17)=136 bits del SHA-256
+// de la SEMILLA (un reconstruido MAL se detecta con prob. 1-2^-136; el v1 tenia
+// solo 16 bits = 1/65536 de ACEPTAR una semilla equivocada) + group(4)=id
+// aleatorio del respaldo (detecta mezclar fragmentos de splits DISTINTOS). El v1
+// (37 B / 32 palabras) se sigue leyendo (retro-compatible) con su chk de 16 bits.
+const SHAMIR_VER=2, SH_GROUP=4, SH_CHK=17;
+function shEq(a,b){ if(a.length!==b.length) return false; let d=0; for(let i=0;i<a.length;i++) d|=a[i]^b[i]; return d===0; }
+function parseShare(b){
+  if(b.length===37) return {ver:1, k:b[0], n:b[1], x:b[2], group:null, chk:b.slice(3,5), ys:b.slice(5)};
+  if(b.length===(4+SH_GROUP+SH_CHK+32) && b[0]===SHAMIR_VER){
+    let o=4; const group=b.slice(o,o+SH_GROUP); o+=SH_GROUP; const chk=b.slice(o,o+SH_CHK); o+=SH_CHK;
+    return {ver:2, k:b[1], n:b[2], x:b[3], group, chk, ys:b.slice(o)};
+  }
+  throw new Error('formato de fragmento no reconocido');
+}
 async function shamirSplit(seed, k, n){
   const digest=new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
+  const group=new Uint8Array(SH_GROUP); crypto.getRandomValues(group);
   const shares=[]; for(let x=1;x<=n;x++) shares.push({x, ys:new Uint8Array(32)});
   for(let pos=0;pos<32;pos++){
     const coeffs=new Uint8Array(k); coeffs[0]=seed[pos];
@@ -285,17 +303,26 @@ async function shamirSplit(seed, k, n){
   }
   const out=[];
   for(const sh of shares){
-    const buf=new Uint8Array(37);
-    buf[0]=k; buf[1]=n; buf[2]=sh.x; buf[3]=digest[0]; buf[4]=digest[1]; buf.set(sh.ys,5);
-    out.push(await shareToWords(buf));   // cada fragmento = 32 palabras
+    const buf=new Uint8Array(4+SH_GROUP+SH_CHK+32);
+    let o=0; buf[o++]=SHAMIR_VER; buf[o++]=k; buf[o++]=n; buf[o++]=sh.x;
+    buf.set(group,o); o+=SH_GROUP; buf.set(digest.slice(0,SH_CHK),o); o+=SH_CHK; buf.set(sh.ys,o);
+    out.push(await shareToWords(buf));   // cada fragmento v2 = 48 palabras
   }
   return out;
 }
 async function shamirCombine(mnemonics){
   if(!mnemonics.length) throw new Error('pegá tus fragmentos');
   const parsed=[];
-  for(const m of mnemonics){ const b=await wordsToShare(m); parsed.push({k:b[0], n:b[1], x:b[2], chk:[b[3],b[4]], ys:b.slice(5)}); }
-  const k=parsed[0].k;
+  for(const m of mnemonics){ parsed.push(parseShare(await wordsToShare(m))); }
+  const ref=parsed[0];
+  // Cierra el mezclado SILENCIOSO (audit #8): TODOS del mismo respaldo (misma
+  // version/K/N, y en v2 mismo id de grupo + checksum).
+  for(const p of parsed){
+    if(p.ver!==ref.ver) throw new Error('mezclaste fragmentos de formatos distintos');
+    if(p.k!==ref.k || p.n!==ref.n) throw new Error('mezclaste fragmentos de respaldos distintos (K/N no coinciden)');
+    if(ref.ver===2 && (!shEq(p.group,ref.group) || !shEq(p.chk,ref.chk))) throw new Error('mezclaste fragmentos de respaldos distintos (id de grupo/checksum distinto)');
+  }
+  const k=ref.k;
   const seen=new Set(), use=[];
   for(const p of parsed){ if(!seen.has(p.x)){ seen.add(p.x); use.push(p); } }
   if(use.length<k) throw new Error(`necesit\u00e1s al menos ${k} fragmentos distintos (ten\u00e9s ${use.length})`);
@@ -311,7 +338,10 @@ async function shamirCombine(mnemonics){
     seed[pos]=acc;
   }
   const digest=new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
-  if(digest[0]!==sel[0].chk[0]||digest[1]!==sel[0].chk[1]) throw new Error('los fragmentos no coinciden o faltan algunos');
+  let ok;
+  if(ref.ver===2){ ok=true; for(let i=0;i<SH_CHK;i++){ if(digest[i]!==ref.chk[i]){ ok=false; break; } } }  // 136-bit (audit #8)
+  else { ok=(digest[0]===ref.chk[0] && digest[1]===ref.chk[1]); }                                          // v1: 16-bit (formato viejo)
+  if(!ok) throw new Error('los fragmentos no coinciden o faltan algunos');
   return seed;
 }
 
@@ -937,9 +967,10 @@ $("i-btn").onclick=async()=>{
       let blocks=text.split(/\n\s*\n/).map(s=>s.trim()).filter(Boolean);
       let mnemonics;
       if(blocks.length>1){ mnemonics=blocks; }             // un fragmento por bloque
-      else { const all=text.split(/\s+/).filter(Boolean);   // o todo seguido, en grupos de 32
-        if(all.length%32!==0) throw new Error("revisá: cada fragmento son 32 palabras");
-        mnemonics=[]; for(let i=0;i<all.length;i+=32) mnemonics.push(all.slice(i,i+32).join(" ")); }
+      else { const all=text.split(/\s+/).filter(Boolean);   // o todo seguido, en grupos de 32 (v1) o 48 (v2)
+        const sz=(all.length%48===0)?48:((all.length%32===0)?32:0);
+        if(!sz) throw new Error("revisá: cada fragmento son 32 (viejo) o 48 palabras — o separalos con una línea en blanco");
+        mnemonics=[]; for(let i=0;i<all.length;i+=sz) mnemonics.push(all.slice(i,i+sz).join(" ")); }
       seed=await shamirCombine(mnemonics);
     }else{
       seed=await seedFromSeedMode(msg, p);

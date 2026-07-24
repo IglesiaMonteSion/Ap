@@ -49,7 +49,7 @@ sigue cerrada.
 | EC-12 | Punto ciego del auditor = autor/mismo modelo | proceso (revisión externa) | permanente |
 | EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **ABIERTA** (#11) |
 | EC-14 | Parámetro controlado externamente sin topes | parcial | **ABIERTA** (#10) |
-| EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **ABIERTA** (#8) |
+| EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **CERRADA-VIGILADA** (#8 Shamir v2: chk 136-bit + id de grupo, corregido v8.6.21) |
 
 ---
 
@@ -345,7 +345,21 @@ sigue cerrada.
   de grupo, sin consistencia K/N, o afirmar interoperabilidad con un estándar por
   usar su lista de palabras.
 - **Instancias:** v8.6.13 #8 (Shamir 1/65536 de recuperar una semilla equivocada
-  que pasa la validación).
+  que pasa la validación → CORREGIDO en v8.6.21): el checksum de SEMILLA era de 16
+  bits (`chk0,chk1`) y no había id de grupo → mezclar fragmentos que no encajan
+  (K-N mal / dos respaldos) podía reconstruir una semilla EQUIVOCADA y aceptarla
+  (1/65536), o combinar en silencio fragmentos de splits distintos. **Fix (formato
+  v2, retro-compatible):** cada fragmento pasa a `[VER=2, K, N, x, group(4),
+  chk(17), y(32)]` = 48 palabras — checksum de SEMILLA de **136 bits** (falso-OK
+  2^-136) + **id de grupo aleatorio de 4 bytes** por respaldo; al combinar se exige
+  que TODOS los fragmentos compartan versión/K/N/grupo/chk (cierra el mezclado
+  SILENCIOSO). El v1 (37 B / 32 palabras) se SIGUE leyendo (respaldos ya emitidos)
+  con su chk de 16 bits — límite documentado del formato viejo, no se puede
+  fortalecer retroactivamente. **Verificado (harness node sobre el app.js real,
+  10 aserciones):** round-trip v2 K-de-N; mezclar dos respaldos → RECHAZADO; <K →
+  RECHAZADO; un fragmento CORRUPTO (bit flip con su word-checksum recompuesto, que
+  en v1 pasaría 1/65536) → RECHAZADO por el chk de 136 bits; y un fragmento v1
+  legacy sigue reconstruyendo (backward-compat).
 - **Regla:** usar un estándar auditado, o como mínimo id de grupo de 128 bits +
   checksum ≥128 bits + mismo K/N/id obligatorio + rechazo de x=0 + límites K/N +
   vectores de prueba + recuperación cross-dispositivo. No afirmar compat con un

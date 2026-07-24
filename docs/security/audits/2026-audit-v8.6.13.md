@@ -24,7 +24,7 @@ es el que entregó el operador; acá se registra el trabajo.
 | 5 | Medio | Mezcla de aritmética de expiración/timelock de ops de tesorería sin `checked_*` / invariante | EC-05 | P1 | ✅ **YA CERRADO** (v8.6.18 verificado) — `saturating_add` + `arith::checked` + invariante `expiry>timelock` desde #17/#218 |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
 | 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18)** — `CURRENT_TX_VERSION` re-verificado en `apply` + test |
-| 8 | Medio | Shamir de la wallet: checksum de 16 bits → 1/65536 de reconstruir una semilla equivocada que pasa la validación; sin id de grupo/consistencia K-N fuerte | EC-15 | P1 | por verificar |
+| 8 | Medio | Shamir de la wallet: checksum de 16 bits → 1/65536 de reconstruir una semilla equivocada que pasa la validación; sin id de grupo/consistencia K-N fuerte | EC-15 | P1 | ✅ **CORREGIDO (v8.6.21)** — formato v2: chk de semilla 136-bit + id de grupo 4 B + consistencia K/N/grupo/chk; retro-compatible con el v1; 10 aserciones en harness node |
 | 9 | Bajo | *(ver texto canónico del operador)* | por mapear | P2 | pendiente de mapear |
 | 10 | Bajo | Parámetros Argon2id (m/t/p) leídos del blob de respaldo sin topes → DoS de descifrado | EC-14 | P2 | por verificar |
 | 11 | Bajo | `byte_size()` no cuenta todo el framing borsh del wire → fee/cap inexacto | EC-13 | P2 | por verificar |
@@ -206,11 +206,25 @@ determinista, byte-idéntico en el camino honesto. Test
 `a_transaction_with_an_unsupported_version_is_rejected_at_execution` (tx v2
 válidamente firmada rechazada por el gate de versión). Barrido EC-08 limpio.
 
-## #8 — Shamir de la wallet (Medio)
+## #8 — Shamir de la wallet (Medio) — ✅ CORREGIDO (v8.6.21)
 
-Ver EC-15. Subir el checksum a ≥128 bits, id de grupo de 128 bits, exigir mismo
-K/N/id, rechazar x=0, límites K/N, vectores de prueba; o migrar a un estándar
-auditado. No afirmar interop SLIP-39 si el protocolo difiere.
+Ver EC-15. **Fix (formato v2 de fragmento, retro-compatible)** en el JS de la
+wallet no-custodial (`app.js`, node-local — sin cambio de protocolo/consenso/wire
+ni regen de WASM): cada fragmento pasa de `[K,N,x,chk0,chk1,y(32)]` (37 B / 32
+palabras, checksum de semilla de **16 bits**) a `[VER=2,K,N,x,group(4),chk(17),
+y(32)]` (57 B / 48 palabras) — checksum de semilla de **136 bits** (falso-OK
+2^-136, vs 1/65536 del v1) + **id de grupo aleatorio de 4 bytes** por respaldo. Al
+combinar, TODOS los fragmentos deben compartir versión/K/N/grupo/chk → cierra el
+mezclado SILENCIOSO de fragmentos que no encajan (el vector del hallazgo: una
+semilla equivocada aceptada). El v1 se SIGUE leyendo (respaldos ya emitidos), con
+su chk de 16 bits (límite del formato viejo, no fortalecible retroactivamente).
+**Verificado con un harness node sobre el `app.js` REAL (10 aserciones):** v2
+round-trip K-de-N; mezclar dos respaldos → RECHAZADO; <K → RECHAZADO; un fragmento
+CORRUPTO (bit flip + word-checksum recompuesto, que en v1 pasaría 1/65536) →
+RECHAZADO por el chk de 136 bits; y un fragmento v1 legacy sigue reconstruyendo
+(backward-compat). `node --check` OK; manifiesto de assets regenerado. **Límite
+honesto:** NO se afirma interop SLIP-39 (se usa su lista de palabras, no su
+protocolo — el v2 lo documenta como formato propio).
 
 ## #10 — Argon2 sin topes (Bajo)
 
