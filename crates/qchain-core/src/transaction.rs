@@ -16,6 +16,14 @@ pub struct Instruction {
     pub data: Vec<u8>,
 }
 
+/// The only transaction/message format version this node accepts. It is signed
+/// into every `Message` (so it's authenticated) and RE-VERIFIED at committed
+/// execution (`Ledger::apply_transaction`) — a byzantine proposer must not be
+/// able to smuggle a tx of a different (future/unknown) version into a committed
+/// batch (audit v8.6.13 #7 / LESSONS-LEDGER EC-08). Bump only in a coordinated
+/// format change, widening the accept-set deliberately.
+pub const CURRENT_TX_VERSION: u8 = 1;
+
 /// The signable payload of a transaction. Format per `ARCHITECTURE.md` §2.
 ///
 /// `nonce` (not just a recency anchor) matters more here than in a
@@ -125,7 +133,7 @@ impl Transaction {
     ) -> anyhow::Result<Self> {
         let payer_keys = payer.public_key_bundle();
         let message = Message {
-            version: 1,
+            version: CURRENT_TX_VERSION,
             payer: payer_keys.to_address(),
             payer_keys,
             nonce,

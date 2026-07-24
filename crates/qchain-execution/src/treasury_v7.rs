@@ -569,11 +569,29 @@ impl TreasuryV7Program {
     fn cancel(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round, op_id: u64) -> Result<(), ExecError> {
         let mut state = Self::preamble(accounts, ix, payer, current_round)?;
         Self::require_signer(&state, payer)?;
-        let before = state.pending.len();
-        state.pending.retain(|p| p.id != op_id);
-        if state.pending.len() == before {
-            return Err(ExecError::ProgramError(format!("no pending treasury op {op_id}")));
+        // Only the op's PROPOSER (its first approver) may cancel it (audit v8.6.13
+        // #6 / LESSONS-LEDGER EC-10). Before, ANY single signer could cancel ANY
+        // pending op — so one malicious/compromised signer could paralyze the
+        // multisig by cancelling every proposal (a DoS on treasury governance). A
+        // proposer withdrawing their OWN proposal harms no one; a stale op is
+        // instead reaped by expiry (`op_expiry_rounds`) or dropped wholesale by a
+        // `SetSigners` rotation, so no cross-signer cancel is needed.
+        let op = state
+            .pending
+            .iter()
+            .find(|p| p.id == op_id)
+            .ok_or_else(|| ExecError::ProgramError(format!("no pending treasury op {op_id}")))?;
+        let proposer = op
+            .approvals
+            .first()
+            .copied()
+            .ok_or_else(|| ExecError::ProgramError(format!("treasury op {op_id} has no recorded proposer")))?;
+        if proposer != *payer {
+            return Err(ExecError::Unauthorized(format!(
+                "only the proposer of treasury op {op_id} may cancel it (a signer cannot cancel another's op)"
+            )));
         }
+        state.pending.retain(|p| p.id != op_id);
         write_state(accounts, &state)
     }
 
@@ -1099,6 +1117,29 @@ mod tests {
             other => panic!("expected SetPolicy, got {other:?}"),
         }
         assert_eq!(migrated.pending[1].threshold_reached_round, 44);
+    }
+
+    #[test]
+    fn only_the_proposer_can_cancel_a_pending_op() {
+        // Audit v8.6.13 #6 / EC-10: a single signer must NOT be able to cancel
+        // ANOTHER signer's pending op — that would let one malicious/compromised
+        // signer paralyze the multisig by cancelling every proposal.
+        let (mut a, s) = multisig_world(100_000, 10, 0, 0, 0);
+        let t = TREASURY_ACCOUNT_ID;
+        // signer 0 proposes an op (op_id 0), now pending.
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 1000, destination: pk(9) } }, vec![s[0], t], s[0], 1).unwrap();
+        // signer 1 (a DIFFERENT signer) cannot cancel signer 0's op.
+        assert!(
+            matches!(exec(&mut a, &TreasuryV7Instruction::Cancel { op_id: 0 }, vec![s[1], t], s[1], 2), Err(ExecError::Unauthorized(_))),
+            "a non-proposer signer must not cancel another signer's op"
+        );
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1, "the op survives the unauthorized cancel (DoS closed)");
+        // A non-signer certainly cannot cancel.
+        assert!(exec(&mut a, &TreasuryV7Instruction::Cancel { op_id: 0 }, vec![pk(99), t], pk(99), 2).is_err());
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1);
+        // The proposer (signer 0) CAN withdraw their own op.
+        exec(&mut a, &TreasuryV7Instruction::Cancel { op_id: 0 }, vec![s[0], t], s[0], 2).unwrap();
+        assert!(read_state(&a).unwrap().pending.is_empty(), "the proposer withdrew their op");
     }
 
     #[test]

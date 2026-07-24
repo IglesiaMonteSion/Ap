@@ -21,9 +21,9 @@ es el que entregó el operador; acá se registra el trabajo.
 | 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryState::decode_any_version` único, compartido gate+runtime |
 | 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryOpV0`/`PendingOpV0` históricos exactos + conversión + test |
 | 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | por verificar |
-| 5 | Medio | Mezcla de aritmética de expiración/timelock de ops de tesorería sin `checked_*` / invariante | EC-05 | P1 | por verificar |
-| 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | por verificar |
-| 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | por verificar |
+| 5 | Medio | Mezcla de aritmética de expiración/timelock de ops de tesorería sin `checked_*` / invariante | EC-05 | P1 | ✅ **YA CERRADO** (v8.6.18 verificado) — `saturating_add` + `arith::checked` + invariante `expiry>timelock` desde #17/#218 |
+| 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
+| 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18)** — `CURRENT_TX_VERSION` re-verificado en `apply` + test |
 | 8 | Medio | Shamir de la wallet: checksum de 16 bits → 1/65536 de reconstruir una semilla equivocada que pasa la validación; sin id de grupo/consistencia K-N fuerte | EC-15 | P1 | por verificar |
 | 9 | Bajo | *(ver texto canónico del operador)* | por mapear | P2 | pendiente de mapear |
 | 10 | Bajo | Parámetros Argon2id (m/t/p) leídos del blob de respaldo sin topes → DoS de descifrado | EC-14 | P2 | por verificar |
@@ -140,23 +140,33 @@ persistida (fsync) que el auto-voto; el daemon debe autenticar la identidad del
 cliente (no basta alcanzar su dirección de red). Allowlist estricta ya existe
 (#193) — verificar que cubre este camino.
 
-## #5 — Aritmética expiración/timelock (Medio)
+## #5 — Aritmética expiración/timelock (Medio) — ✅ YA CERRADO (verificado v8.6.18)
 
-Ver EC-05. Invariante `op_expiry_rounds > timelock_rounds` ya existe (#17);
-verificar que TODA la aritmética de `proposed_round + expiry` / `+ timelock` usa
-`checked_*` y que no hay un camino donde una op caduque antes de poder ejecutarse
-legítimamente.
+Verificado en código: `prune_expired` (`current_round <= proposed_round.saturating_add(expiry)`),
+`ready_round` (`threshold_reached_round.saturating_add(timelock)`) y la ventana
+rodante usan `saturating_add`; los movimientos de fondos usan `arith::sub_u64`/
+`add_u64` (checked, rechazan la transición). El invariante `op_expiry_rounds >
+timelock_rounds` se valida en génesis y en `validate_op` de `SetPolicy`. No hay
+`+`/`-`/`*` crudo sobre round/amount/expiry en el módulo (barrido EC-05). Cerrado
+por #17/#218; sin cambio de código necesario.
 
-## #6 — `Cancel` de un solo firmante (Medio)
+## #6 — `Cancel` de un solo firmante (Medio) — ✅ CORREGIDO (v8.6.18)
 
-Ver EC-10. `Cancel` debería exigir el mismo umbral que la clase de op que
-cancela (o al menos que sólo el proponente / un umbral pueda), para que un
-firmante comprometido no pueda paralizar el multisig cancelando todo.
+Confirmado: `cancel` sólo exigía `require_signer` → cualquier firmante cancelaba
+cualquier op. Fix: sólo el PROPONENTE (primer aprobador, `approvals[0]`) puede
+cancelar su op; una op abandonada se reaje por expiración o la descarta un
+`SetSigners`, así que no hace falta cancelación cruzada. Test
+`only_the_proposer_can_cancel_a_pending_op`. Barrido EC-10 limpio.
 
-## #7 — `tx.version` no enforzado en ejecución (Medio)
+## #7 — `tx.version` no enforzado en ejecución (Medio) — ✅ CORREGIDO (v8.6.18)
 
-Ver EC-08. Re-verificar `tx.version` en `apply` comprometido, no sólo en
-admisión/gossip.
+Confirmado: `tx.version` no se chequeaba en ninguna parte (ni admisión ni
+ejecución). Fix: `pub const CURRENT_TX_VERSION: u8 = 1` en `qchain-core` +
+chequeo en `apply_transaction_inner` (el choke point de RPC/simulate/commit). Un
+proposer bizantino no puede colar una tx de versión desconocida en su batch;
+determinista, byte-idéntico en el camino honesto. Test
+`a_transaction_with_an_unsupported_version_is_rejected_at_execution` (tx v2
+válidamente firmada rechazada por el gate de versión). Barrido EC-08 limpio.
 
 ## #8 — Shamir de la wallet (Medio)
 

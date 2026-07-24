@@ -39,12 +39,12 @@ sigue cerrada.
 | EC-02 | Detección de versión por "trial-borsh" | sí (grep de decoders en cascada / structs `*V0`) | **PARCIAL** (#2 gate=runtime corregido v8.6.18; #7 pendiente) |
 | EC-03 | Se arregla la instancia, no la CLASE | proceso (este ledger + sweep) | permanente |
 | EC-04 | Crecimiento de recurso sin cota | parcial | cerrada-vigilada (#18) |
-| EC-05 | Aritmética de dinero/ronda/tiempo sin `checked_*` | sí (grep en módulos de valor) | **ABIERTA** (#1 timelock, #5) |
+| EC-05 | Aritmética de dinero/ronda/tiempo sin `checked_*` | sí (grep en módulos de valor) | **CERRADA-VIGILADA** (#1 timelock corregido v8.6.18; #5 ya cerrado por #17/#218) |
 | EC-06 | Falta separación de dominio de firma | parcial | cerrada-vigilada (#187) |
 | EC-07 | No-determinismo / riesgo de fork | proceso (DST) | cerrada-vigilada |
-| EC-08 | La interfaz como frontera de seguridad | parcial (grep de `.version` no comparada) | **ABIERTA** (#7) |
+| EC-08 | La interfaz como frontera de seguridad | parcial (grep de `.version` no comparada) | **CERRADA-VIGILADA** (#7 tx.version corregido v8.6.18; sweep hecho) |
 | EC-09 | Peligros de migración (struct nueva para formato viejo; gate ≠ runtime) | sí | **CERRADA-VIGILADA** (#2/#3 corregidos v8.6.18; sweep hecho) |
-| EC-10 | Hueco de autorización en flujo privilegiado | parcial | **ABIERTA** (#6 cancel) |
+| EC-10 | Hueco de autorización en flujo privilegiado | parcial | **CERRADA-VIGILADA** (#6 Cancel corregido v8.6.18; sweep hecho) |
 | EC-11 | Sesgo de test al camino feliz / al modelo de amenazas propio | proceso | permanente |
 | EC-12 | Punto ciego del auditor = autor/mismo modelo | proceso (revisión externa) | permanente |
 | EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **ABIERTA** (#11) |
@@ -177,8 +177,13 @@ sigue cerrada.
 - **Clase:** `+`/`-`/`*` sobre fondos/rondas/tiempos/pesos que puede desbordar
   silenciosamente (o panic-halt determinista en release con overflow-checks).
 - **Instancias:** #132 (fee add panic), #218 (módulo `arith`), v8.6.13 #1
-  (`passed_round + timelock` → panic con `passed_round` ≈ u64::MAX), #5 (mezcla
-  expiración/timelock).
+  (`passed_round + timelock` → panic con `passed_round` ≈ u64::MAX; CORREGIDO
+  v8.6.18 con `saturating_add`), #5 (aritmética expiración/timelock de tesorería —
+  **ya cerrado**: `prune_expired`/`ready_round`/ventana usan `saturating_add`, los
+  movimientos de fondos usan `arith::sub_u64/add_u64` checked, y el invariante
+  `op_expiry_rounds > timelock_rounds` se valida en génesis y en `SetPolicy`;
+  verificado por barrido — sin `+`/`-`/`*` crudo sobre round/amount/expiry en el
+  módulo).
 - **Regla:** `checked_add/sub/mul/div` (o `saturating_*` documentado en no-dinero)
   en TODO cálculo de valor/ronda/tiempo; un overflow rechaza la transición.
 - **Detección (sweep):** grep de `+`/`-`/`*` sin `checked_`/`saturating_` en
@@ -214,10 +219,23 @@ sigue cerrada.
 
 - **Clase:** confiar en que wallet/RPC/mempool aplican una regla que el nodo debe
   re-verificar en la ejecución comprometida (un validador bizantino los saltea).
-- **Instancias:** v8.6.13 #7 (`tx.version` no se rechaza en ejecución
-  comprometida).
+- **Instancias:** v8.6.13 #7 (CORREGIDO v8.6.18): `tx.version` iba firmado pero
+  NO se rechazaba en la ejecución comprometida → un proposer bizantino podía
+  colar una tx de versión desconocida/futura en su batch. Fix: `CURRENT_TX_VERSION`
+  en `qchain-core` + chequeo en `apply_transaction_inner` (el choke point único de
+  RPC/simulate/commit-loop). Determinista (versión en la tx comprometida) →
+  byte-idéntico en el camino honesto (toda tx real es v1). Test
+  `a_transaction_with_an_unsupported_version_is_rejected_at_execution` (una tx v2
+  VÁLIDAMENTE FIRMADA es rechazada por el gate de versión, no por firma).
 - **Regla:** toda regla de aceptación se re-verifica en `apply` comprometido, no
   sólo en RPC/gossip/mempool.
+- **Barrido (v8.6.18):** las reglas que afectan estado/consenso se re-verifican
+  en `apply_transaction`: `chain_id` (en `try_commit` antes de aplicar, v5.8.1),
+  expiración `valid_until_round` (#191), `version` (#7), `fee_limit` (#87), nonce y
+  solvencia. Las reglas SÓLO-mempool restantes (`MAX_TRANSACTION_BYTES`,
+  rate-limits, cuota de admisión) son cotas de DoS que no afectan la corrección
+  del estado comprometido (una tx grande igual se cobra por byte) → correctamente
+  no se re-verifican en ejecución. Sweep limpio.
 - **Detección (sweep):** grep de `.version` / campos de política leídos sin una
   comparación de rechazo cercana.
 - **Pregunta recurrente:** *¿qué reglas se validan sólo en RPC/mempool y NO en la
@@ -240,10 +258,22 @@ sigue cerrada.
 
 - **Clase:** una operación ejecutable/cancelable/aprobable sin el umbral/owner/
   proponente requerido.
-- **Instancias:** v8.6.13 #6 (`Cancel` de tesorería por un solo firmante paraliza
-  el multisig); precedente: denominador de quorum de Finalize (v2.0.4).
+- **Instancias:** v8.6.13 #6 (CORREGIDO v8.6.18): `Cancel` de tesorería lo podía
+  ejecutar CUALQUIER firmante sobre CUALQUIER op → un firmante malicioso/
+  comprometido paralizaba el multisig cancelando toda propuesta. Fix: sólo el
+  PROPONENTE (el primer aprobador de la op) puede cancelar la SUYA; una op vieja
+  se reaje por expiración o la descarta un `SetSigners`. Test
+  `only_the_proposer_can_cancel_a_pending_op`. Precedente: denominador de quorum
+  de Finalize (v2.0.4).
 - **Regla:** cada transición privilegiada declara quién puede + qué umbral; una
   aprobación se vincula criptográficamente a una op única e inmutable.
+- **Barrido (v8.6.18):** revisadas todas las transiciones privilegiadas: treasury
+  Propose/Approve exigen firmante (dedup en Approve), Execute permissionless pero
+  re-chequea umbral+timelock+límites, Cancel ahora proponente-only; governance
+  Finalize/Execute permissionless pero gateadas por estado/timelock, Emergency
+  Pause/Unpause exigen guardián, CloseProposal gateada por terminal+retención;
+  validator-v7 Bond/Exit/Withdraw exigen operador (#20); staking owner-checked.
+  Cancel era el único hueco. Sweep limpio.
 - **Pregunta recurrente:** *para cada operación privilegiada: ¿quién puede
   iniciarla/cancelarla/ejecutarla, y se exige el umbral correcto en CADA una?*
 

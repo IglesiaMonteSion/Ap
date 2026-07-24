@@ -1861,6 +1861,24 @@ impl Ledger {
             return Err(ExecError::Expired { valid_until: tx.message.valid_until_round, current: current_round });
         }
 
+        // tx.version is signed but must be RE-VERIFIED at COMMITTED execution
+        // (audit v8.6.13 #7 / EC-08): an admission/RPC/mempool check doesn't bind a
+        // byzantine proposer, who could otherwise slip a tx of an unknown/future
+        // version into their batch. Only the current format is accepted here — the
+        // single choke point for RPC, simulate, and the committed commit loop.
+        // Deterministic (the version is in the committed tx) → every validator
+        // rejects identically, no fork; and byte-identical on the honest path (every
+        // real tx carries CURRENT_TX_VERSION). Ticks the fee (0 bytes) like the
+        // expiration return so it can't pin the base fee under a flood of bad-version
+        // txs; returns before the nonce bump.
+        if tx.message.version != qchain_core::CURRENT_TX_VERSION {
+            self.advance_dynamic_fee(current_round, 0);
+            return Err(ExecError::ProgramError(format!(
+                "unsupported transaction version {} (this node accepts version {})",
+                tx.message.version, qchain_core::CURRENT_TX_VERSION
+            )));
+        }
+
         let params = self.current_params();
         // Charge the EFFECTIVE base fee for this round - the stored
         // `base_fee_per_byte` rolled forward through every empty round since the
@@ -2924,6 +2942,47 @@ mod tests {
         let at_edge = mk(11);
         l.apply_transaction(&at_edge, &proposer, 11).unwrap();
         assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH, "en el borde exacto (<=) ejecuta");
+    }
+
+    /// Audit v8.6.13 #7 / EC-08: `tx.version` is signed but must be RE-VERIFIED at
+    /// COMMITTED execution — a byzantine proposer could otherwise slip a tx of an
+    /// unknown/future version into their batch. A VALIDLY-SIGNED tx whose version
+    /// != CURRENT_TX_VERSION is rejected at apply, deterministically, without
+    /// touching state; a current-version tx executes normally.
+    #[test]
+    fn a_transaction_with_an_unsupported_version_is_rejected_at_execution() {
+        let proposer = Keypair::generate().unwrap().pubkey();
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap().pubkey();
+        let mut l = new_test_ledger();
+        l.credit(alice.pubkey(), 1_000 * qchain_core::UNITS_PER_QCH);
+        let before = l.get_balance(&alice.pubkey());
+
+        let transfer = |amt: u64| Instruction {
+            program_id: Pubkey::system_program_id(),
+            accounts: vec![alice.pubkey(), bob],
+            data: borsh::to_vec(&SystemInstruction::Transfer { amount: amt }).unwrap(),
+        };
+        // Forge a FUTURE version and RE-SIGN so the signature is genuinely valid
+        // over the v2 bytes — the version gate must reject it even though the
+        // signature verifies (proving the rejection is the version check, not a
+        // signature failure — exactly the byzantine-proposer scenario).
+        let mut tx = Transaction::new_signed_full(&alice, 0, [0u8; 32], 50_000_000, 0, 0, vec![transfer(5 * qchain_core::UNITS_PER_QCH)]).unwrap();
+        tx.message.version = 2;
+        let bytes = borsh::to_vec(&tx.message).unwrap();
+        tx.signature = qchain_crypto::sign_domain(&alice, qchain_crypto::domains::TX_SIG_V1, &bytes).unwrap();
+        assert!(tx.verify_signature(), "the forged-version tx is validly signed");
+
+        let res = l.apply_transaction(&tx, &proposer, 1);
+        assert!(matches!(res, Err(ExecError::ProgramError(ref m)) if m.contains("version")), "an unsupported tx version must be rejected, got {res:?}");
+        assert_eq!(l.get_balance(&alice.pubkey()), before, "no state change on a version-rejected tx");
+        assert_eq!(l.get_balance(&bob), 0);
+
+        // The honest path (CURRENT_TX_VERSION) executes normally.
+        let ok = Transaction::new_signed_full(&alice, 0, [0u8; 32], 50_000_000, 0, 0, vec![transfer(5 * qchain_core::UNITS_PER_QCH)]).unwrap();
+        assert_eq!(ok.message.version, qchain_core::CURRENT_TX_VERSION);
+        l.apply_transaction(&ok, &proposer, 1).unwrap();
+        assert_eq!(l.get_balance(&bob), 5 * qchain_core::UNITS_PER_QCH, "a current-version tx executes");
     }
 
     /// QCH-WALLET-001: `simulate` is a DRY-RUN — it reports the real outcome
