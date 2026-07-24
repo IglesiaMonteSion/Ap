@@ -2514,6 +2514,14 @@ impl Engine {
         if tx.message.chain_id != self.chain_id {
             return Err(SubmitError::Rejected("transaction's chain_id does not match this network".into()));
         }
+        // #7 (audit v8.6.13): reject an unknown tx version at ADMISSION too. The
+        // committed-execution check in `apply` is the imprescindible backstop (a
+        // byzantine proposer bypasses RPC/mempool); this is a cheap early-reject
+        // before the ~150µs PQC verify. Byte-identical for honest traffic (all
+        // CURRENT_TX_VERSION).
+        if tx.message.version != qchain_core::CURRENT_TX_VERSION {
+            return Err(SubmitError::Rejected(format!("transaction version {} is not supported (expected {})", tx.message.version, qchain_core::CURRENT_TX_VERSION)));
+        }
         // Tope de tamaño de tx (#192) — barato, antes del verify PQC de ~150µs.
         if tx.byte_size() > MAX_TRANSACTION_BYTES {
             return Err(SubmitError::Rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size())));
@@ -2593,6 +2601,11 @@ impl Engine {
         // never even consumes a concurrency slot.
         if tx.message.chain_id != self.chain_id {
             return Some(qchain_execution::SimOutcome::rejected("transaction's chain_id does not match this network"));
+        }
+        // #7 (audit v8.6.13): reject an unknown tx version at admission (cheap,
+        // before the PQC verify; committed-execution is the backstop).
+        if tx.message.version != qchain_core::CURRENT_TX_VERSION {
+            return Some(qchain_execution::SimOutcome::rejected(format!("transaction version {} is not supported (expected {})", tx.message.version, qchain_core::CURRENT_TX_VERSION)));
         }
         if tx.byte_size() > MAX_TRANSACTION_BYTES {
             return Some(qchain_execution::SimOutcome::rejected(format!("transaction is too large: {} bytes (max {MAX_TRANSACTION_BYTES})", tx.byte_size())));
@@ -3329,6 +3342,13 @@ impl Engine {
                 // reject either way, just cheaper for wrong-network junk).
                 if tx.message.chain_id != self.chain_id {
                     tracing::warn!("dropping gossiped transaction from {from} with a mismatched chain_id");
+                    return;
+                }
+                // #7 (audit v8.6.13): a byzantine peer can gossip a tx of an
+                // unknown version; reject it early (committed execution is the
+                // backstop). Byte-identical for honest traffic (all v1).
+                if tx.message.version != qchain_core::CURRENT_TX_VERSION {
+                    tracing::warn!("dropping gossiped transaction from {from} with unsupported version {}", tx.message.version);
                     return;
                 }
                 // Tope de tamaño de tx (#192) — mismo bound que la admisión RPC,

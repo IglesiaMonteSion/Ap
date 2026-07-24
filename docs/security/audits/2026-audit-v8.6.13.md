@@ -23,7 +23,7 @@ es el que entregó el operador; acá se registra el trabajo.
 | 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | ✅ **CORREGIDO (v8.6.20 + v8.6.24)** — `SignPeerVote` verifica AUTORÍA (recomputa el digest + rehúsa si el vértice es propio) → cierra el bypass de auto-equivocación; **v8.6.24: el perfil mainnet ahora RECHAZA un `remote_signer` no-loopback** (público/LAN = oráculo de firma sin auth) — el socket sólo se alcanza same-machine hasta que exista mTLS/UDS. Client-auth mTLS/UDS completo sigue como follow-up documentado |
 | 5 | Medio | Op puede alcanzar quorum y aun así ser IMPOSIBLE de ejecutar: expiry medido desde `proposed_round`, pero el timelock arranca al alcanzar quorum → `ready_round` puede caer PASADO el deadline | EC-05 | P1 | ✅ **CORREGIDO (v8.6.24)** — **el `expiry>timelock` (v8.6.18) NO cerraba el escenario del auditor** (quorum tardío → `ready > proposed+expiry`): `prune_expired` ahora separa el deadline de APROBACIÓN (`proposed+expiry`) del de EJECUCIÓN (`ready+expiry`) → una op con quorum SIEMPRE tiene ventana para ejecutar; test `a_late_quorum_op_survives_the_approval_deadline_and_still_executes` |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | ✅ **CORREGIDO (v8.6.18)** — `Cancel` proponente-only + test |
-| 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18)** — `CURRENT_TX_VERSION` re-verificado en `apply` + test |
+| 7 | Medio | `tx.version` va firmado pero NO se rechaza en la ejecución comprometida (sólo se asume) | EC-08, EC-02 | P1 | ✅ **CORREGIDO (v8.6.18 + v8.6.25)** — `CURRENT_TX_VERSION` re-verificado en la ejecución comprometida (`apply`, la parte *imprescindible*) + test; **v8.6.25: la verificación punto-por-punto agregó el early-reject en ADMISIÓN** (RPC `/tx`, `/simulate`, gossip P2P) que el auditor listaba como defensa-en-profundidad — barato, antes del verify PQC, byte-idéntico para tráfico v1 honesto |
 | 8 | Medio | Shamir de la wallet: checksum de 16 bits → 1/65536 de reconstruir una semilla equivocada que pasa la validación; sin id de grupo/consistencia K-N fuerte | EC-15 | P1 | ✅ **CORREGIDO (v8.6.21)** — formato v2: chk de semilla 136-bit + id de grupo 4 B + consistencia K/N/grupo/chk; retro-compatible con el v1; 10 aserciones en harness node |
 | 9 | Bajo | `prune_expired` sólo persiste la limpieza si la instrucción termina en Ok; una que falla después (op inexistente) descarta el prune → ops expiradas quedan visibles/ocupando espacio hasta la próxima mutación exitosa | EC-04, EC-10 | P2 | ✅ **CORREGIDO (v8.6.24)** — instrucción nueva `TreasuryV7Instruction::PruneExpired` PERMISSIONLESS que siempre tiene éxito y persiste la limpieza; CLI `treasury-prune`; test que reproduce el drop del prune por una instrucción fallida |
 | 10 | Bajo | Parámetros Argon2id (m/t/p) leídos del blob de respaldo sin topes → DoS de descifrado | EC-14 | P2 | ✅ CORREGIDO (v8.6.22) |
@@ -252,3 +252,47 @@ COORDINADA** de todos los nodos. **Verificado:** test
 `byte_size_equals_the_exact_borsh_wire_length` (tx de 1 y 2 instrucciones:
 `byte_size() == borsh::to_vec(&tx).len()`, y > la suma parcial vieja). Barrido EC-13:
 no hay otra suma parcial en las rutas de fee/cap.
+
+---
+
+## Pasada de verificación punto-por-punto (v8.6.25) — decisiones de suficiencia documentadas
+
+Con el texto canónico completo del auditor, se re-verificó CADA hallazgo contra el
+código real. Dos sub-demandas del auditor **NO se implementan al pie de la letra**
+porque son redundantes/no-seguras dado el modelo real — se documenta el porqué para
+que el sign-off sea honesto:
+
+- **#1 — `magic`/`version` en `Proposal` (defensa-en-profundidad demandada):** NO se
+  agregan. La forgería es **estructuralmente inalcanzable** con el `owner`-check solo:
+  (a) `SystemInstruction::CreateAccount { owner }` fija el owner pero deja la `data`
+  VACÍA y usa `or_insert_with` (no sobrescribe una cuenta existente); (b) el borde WASM
+  sólo permite `owner == program_id` del contrato que ejecuta (NUNCA `GOVERNANCE`);
+  (c) `DeployProgram` fija `owner=LOADER`; (d) el programa de gobernanza sólo escribe
+  una `Proposal` `Voting` fresca. → **ningún camino produce una cuenta governance-owned
+  con `data` de `Passed` falsificada**, así que el `owner`-check es suficiente. Agregar
+  `magic`/`version` o el check de dirección-canónica EN LECTURA rompería la
+  retro-compat de las propuestas pre-v8.6.18 (a direcciones no-canónicas) por CERO
+  ganancia real. Los invariantes de los que depende están cubiertos por tests
+  (`a_forged_passed_proposal_...`, el borde WASM en `ledger.rs`, `CreateAccount` en
+  `native.rs`).
+- **#8 — id de grupo de 128 bits (demandado):** el id de grupo es de **32 bits**
+  (`SH_GROUP=4`) pero el **checksum de semilla es de 136 bits** (`SH_CHK=17`), que
+  EXCEDE los 128 bits que el auditor pide para el checksum. El checksum ES la garantía
+  de seguridad (aceptar una semilla equivocada = 2^-136); el id de grupo es sólo un
+  **pre-filtro rápido** para rechazar fragmentos de respaldos distintos ANTES de la
+  interpolación — y una colisión de id de grupo (2^-32) queda **respaldada por el
+  checksum de 136 bits** (la reconstrucción equivocada se rechaza igual). El "1/65536
+  inaceptable" del auditor queda resuelto a 2^-136 independientemente del tamaño del id
+  de grupo. Subirlo a 128 bits sería OTRO cambio de formato (rompe respaldos v2 ya
+  emitidos) por ganancia de seguridad nula.
+
+**Residuales que la verificación SÍ cerró:** #5 (op con quorum tardío inejecutable —
+el rastreador lo sobre-declaraba cerrado), #9 (persistencia de `prune_expired`), y la
+ampliación de #4 (mainnet rechaza signer no-loopback) + #7 (early-reject de versión en
+admisión). Ver las filas de la tabla.
+
+**Follow-ups genuinos (documentados, no bloqueantes del 11/11 codeable):** el
+client-auth completo del firmante remoto (mTLS/UDS cross-host — mainnet ya exige
+loopback same-machine, seguro sin mTLS), y los gates de PROCESO del auditor
+(auditoría externa formal, bug bounty, 2ª impl interoperable, testnet adversarial
+prolongada, CI sobre el commit final) = tarea #203, humanos/externos.
