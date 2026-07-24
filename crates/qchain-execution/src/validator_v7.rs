@@ -1766,12 +1766,40 @@ impl ValidatorV7Program {
     /// drained the 500 QCH bond to their own address — *despite the active freeze*.
     ///
     /// So while frozen we refuse every instruction that MOVES THE BOND or CHANGES A
-    /// KEY. Deliberately still allowed: the recovery committee's own `RecoverOp`
-    /// (its escape hatch — unfreeze/revoke must never be blockable), slashing
-    /// (`ReportEquivocation`, a public good), and ops that only TIGHTEN the consensus
-    /// key (revoke/expiry) since those can't help an attacker. The pause is
-    /// time-bounded and committee-liftable, so this never bricks an honest validator;
-    /// and it grants the committee no new power (it could already `Revoke`).
+    /// KEY. EC-17 requires the list be EXPLICIT and cover every variant of
+    /// `ValidatorV7Instruction`, so here is all 17 of them:
+    ///
+    /// REFUSED (this gate):
+    ///   `RotateOperator`, `RotateWithdrawal`, `SetRecoveryCommittee` (all three route
+    ///   through `propose_key_change`), `ApplyPendingKeyChange` (THE theft vector —
+    ///   permissionless), `BeginExit`, `WithdrawBond`, `RotateConsensusKey`,
+    ///   `ProposeConsensusKeyRotation`, `AcceptConsensusKeyRotation`.
+    ///
+    /// ALLOWED, each for a stated reason:
+    ///   - `RecoverOp` — the committee's escape hatch. Blocking it would make a freeze
+    ///     IRREVERSIBLE and destroy KM#9's reversible pause.
+    ///   - `ReportEquivocation` — public good; a frozen validator stays slashable.
+    ///   - `Unjail`, `SetConsensusKeyExpiry`, `RevokeConsensusKey` — these only TIGHTEN
+    ///     the consensus key, and the freeze already excludes it anyway.
+    ///   - `CancelPendingKeyChange`, `CancelConsensusKeyRotation` — they only DISCARD a
+    ///     pending change; neither can move value or install a key.
+    ///   - `BondAndRegister` — needs no gate: a frozen entry is live (freeze refuses
+    ///     `Revoked`/`Removed`), so re-registering its consensus key hits "already has
+    ///     an active validator registration", and `addresses_in_use` blocks reusing its
+    ///     operator/withdrawal addresses. Its identity cannot be re-claimed.
+    ///
+    /// COMPOSED STATE — revoked while still frozen: `RecoverOp` is allowed during a
+    /// pause, so the committee can escalate straight to the terminal `Revoke`, which
+    /// does NOT clear `frozen_until_quanto`. The bond then stays PARKED in the
+    /// unbonding pool until the pause lifts (deadline, or the committee unfreezes).
+    /// Deliberate: the committee may have frozen precisely because it distrusts the
+    /// recorded cold address, so the pause must survive the escalation. It can never
+    /// brick the bond — the same committee holds `Unfreeze` and the freeze is
+    /// time-bounded. Pinned by
+    /// `a_validator_revoked_while_frozen_keeps_its_bond_parked_until_the_committee_lifts_the_pause`.
+    ///
+    /// The pause is time-bounded and committee-liftable, so this never bricks an honest
+    /// validator; and it grants the committee no new power (it could already `Revoke`).
     /// Byte-identical for any validator that was never frozen (`is_frozen` is false
     /// whenever `frozen_until_quanto == 0`).
     fn require_not_frozen(reg: &ValidatorV7Registry, idx: usize, q: u64, op: &str) -> Result<(), ExecError> {
@@ -3905,5 +3933,63 @@ mod tests {
         // The operator only ever spent the bond itself (600 - 500 left liquid).
         assert_eq!(accounts.get(&op.pubkey()).unwrap().balance, 100 * UNITS_PER_QCH);
         assert!(before_total < funded_total, "sanity: the relayer funding is accounted for");
+    }
+
+    /// KM#10: pins the one composed state the freeze gate creates — REVOKED **while
+    /// still frozen**. `RecoverOp` is allowed during a freeze (it's the committee's
+    /// escape hatch), so the committee can escalate a frozen validator straight to the
+    /// terminal revoke; `Revoke` does NOT clear `frozen_until_quanto`, so the bond stays
+    /// PARKED in the unbonding pool until the pause is lifted (deadline passes, or the
+    /// committee unfreezes).
+    ///
+    /// This is deliberate, not an oversight: the committee may have frozen precisely
+    /// because it distrusts the recorded cold withdrawal address, so "frozen means
+    /// nothing moves until we say so" must survive the escalation. It can never brick
+    /// the bond — the same committee holds `Unfreeze`, and the freeze is time-bounded.
+    /// The payout destination is immutable throughout (`ApplyPendingKeyChange` refuses
+    /// both `Revoked` and frozen), so lifting the pause can only pay the cold address.
+    #[test]
+    fn a_validator_revoked_while_frozen_keeps_its_bond_parked_until_the_committee_lifts_the_pause() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let cold_wd = Keypair::generate().unwrap().pubkey();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, Some(cold_wd), "parked").unwrap();
+        let c = cons.pubkey();
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, c, &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        let total = |m: &HashMap<Pubkey, Account>| -> u64 { m.values().map(|a| a.balance).sum() };
+        let funded = total(&accounts);
+        let t0 = current_quanto(&accounts);
+
+        // Freeze FAR out, then escalate to a terminal revoke while the pause holds.
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Freeze { until_quanto: t0 + 1_000_000 }, &[&signer_kps[0], &signer_kps[1]], 0).unwrap();
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Revoke, &[&signer_kps[0], &signer_kps[2]], 1).unwrap();
+        let e = registry_of(&accounts).validators[0].clone();
+        assert_eq!(e.state, ValidatorV7State::Revoked, "escalated to the terminal state");
+        assert_eq!(e.frozen_until_quanto, t0 + 1_000_000, "the revoke does NOT lift the pause");
+
+        // Past the bond release window, but the pause still holds → the bond stays put.
+        set_quanto(&mut accounts, t0 + 1000);
+        assert!(registry_of(&accounts).validators[0].is_frozen(current_quanto(&accounts)));
+        let wd = ix(
+            &ValidatorV7Instruction::WithdrawBond { consensus_address: c },
+            vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, cold_wd],
+        );
+        assert!(ValidatorV7Program::execute(&mut accounts, &wd, &relayer.pubkey()).is_err(), "no payout while the pause holds");
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).map(|a| a.balance).unwrap_or(0), VALIDATOR_BOND_ATOMS, "the bond is PARKED, not lost");
+        assert_eq!(accounts.get(&cold_wd).map(|a| a.balance).unwrap_or(0), 0);
+        assert_eq!(total(&accounts), funded, "a refused payout moves nothing");
+
+        // The committee's escape hatch still works on a Revoked entry, and releases it.
+        recover_op(&mut accounts, &relayer, c, RecoveryOp::Unfreeze, &[&signer_kps[1], &signer_kps[2]], 2).unwrap();
+        assert!(!registry_of(&accounts).validators[0].is_frozen(current_quanto(&accounts)));
+        ValidatorV7Program::execute(&mut accounts, &wd, &relayer.pubkey()).unwrap();
+        assert_eq!(accounts.get(&cold_wd).unwrap().balance, VALIDATOR_BOND_ATOMS, "released to the RECORDED cold address");
+        assert_eq!(total(&accounts), funded, "supply conserved across the whole escalation");
     }
 }

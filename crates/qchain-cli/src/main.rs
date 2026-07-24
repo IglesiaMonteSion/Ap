@@ -532,10 +532,10 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         fee_limit: u64,
     },
-    /// v7 (KM#4): OFFLINE — a recovery signer signs an authorization to REVOKE a
-    /// validator's recovery committee. Makes NO network call: run it on an air-gapped
-    /// machine holding a recovery key. `--nonce` is the validator's current recovery
-    /// nonce (from `GET /validator_v7_recovery`). `--op` selects the effect (KM#4/#9):
+    /// v7 (KM#4/#9): OFFLINE — a recovery-committee member signs ONE authorization
+    /// for a recovery op against a validator. Makes NO network call: run it on an
+    /// air-gapped machine holding a recovery key. `--nonce` is the validator's current
+    /// recovery nonce (from `GET /validator_v7_recovery`). `--op` selects the effect:
     /// `revoke` (terminal), `freeze --until-quanto Q` / `unfreeze` (reversible
     /// emergency pause), or `set-expiry --until-quanto Q` (mandatory rotation
     /// deadline). Prints a hex-encoded approval for the relayer to collect

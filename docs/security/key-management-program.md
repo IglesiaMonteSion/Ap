@@ -586,12 +586,28 @@ freeze):
 | `RecoverOp` (revoke/freeze/unfreeze/set-expiry) | **PERMITE** — es la vía de escape del comité |
 | `ReportEquivocation` (slashing) | **PERMITE** — bien público; un congelado sigue slasheable |
 | `Unjail` / `SetConsensusKeyExpiry` / `RevokeConsensusKey` | **PERMITE** — sólo aprietan, y el freeze ya excluye |
+| `CancelPendingKeyChange` / `CancelConsensusKeyRotation` | **PERMITE** — sólo DESCARTAN un pendiente; no mueven valor ni instalan una clave |
+| `BondAndRegister` | **PERMITE, sin gate** — una entrada congelada está viva (el freeze rechaza `Revoked`/`Removed`), así que re-registrar su clave de consenso choca con *"already has an active validator registration"*, y `addresses_in_use` bloquea reusar su operador/retiro: su identidad no se puede reclamar |
 
-Las dos exenciones son deliberadas: si el `RecoverOp` se bloqueara a sí mismo, un
-freeze sería **irreversible** (nadie podría descongelar) y la pausa reversible de
-KM#9 dejaría de existir; y el slashing por evidencia debe seguir disponible para
-cualquiera, congelado o no. `CancelPendingKeyChange` también queda permitido (sólo
-DESCARTA un pendiente — nunca puede mover valor).
+Son las **17** variantes de `ValidatorV7Instruction`, clasificadas una por una —
+que es justo lo que EC-17 exige: la lista es explícita y exhaustiva, no "las que
+me acordé". Las exenciones son deliberadas: si el `RecoverOp` se bloqueara a sí
+mismo, un freeze sería **irreversible** (nadie podría descongelar) y la pausa
+reversible de KM#9 dejaría de existir; y el slashing por evidencia debe seguir
+disponible para cualquiera, congelado o no.
+
+**Estado compuesto — revocado y todavía congelado.** Como `RecoverOp` se permite
+durante la pausa, el comité puede escalar de un freeze directo al `Revoke`
+terminal, y el revoke **no** limpia `frozen_until_quanto`. El bono queda entonces
+**APARCADO** en el pool de unbonding hasta que la pausa se levante (vence el
+deadline, o el comité hace `Unfreeze`). Es deliberado: el comité pudo haber
+congelado precisamente porque desconfía de la dirección fría registrada, así que
+la pausa debe sobrevivir a la escalada. Nunca puede brickear el bono — el mismo
+comité tiene el `Unfreeze` y el freeze es acotado en el tiempo —, y el destino
+del pago es inmutable todo el tiempo (`ApplyPendingKeyChange` rechaza `Revoked`
+**y** congelado), así que levantar la pausa sólo puede pagar a la dirección fría.
+Fijado por el test
+`a_validator_revoked_while_frozen_keeps_its_bond_parked_until_the_committee_lifts_the_pause`.
 
 **Byte-idéntico** para cualquier validador que nunca se congeló
 (`frozen_until_quanto == 0` ⇒ `is_frozen` es `false` ⇒ el gate es un no-op), así que
@@ -631,7 +647,7 @@ fork bajo un ciclo de vida de claves completo con un adversario dentro.
 
 ### Tests
 
-4 tests nuevos en `qchain-execution::validator_v7` (261 en total):
+5 tests nuevos en `qchain-execution::validator_v7` (262 en total):
 
 - `an_emergency_freeze_blocks_the_bond_drain_and_pending_key_changes` — el exploit
   exacto, ahora test de regresión (falla sin el gate).
@@ -644,6 +660,9 @@ fork bajo un ciclo de vida de claves completo con un adversario dentro.
   `economic_state_root` (read-order-independent) → determinista, sin fork.
 - `the_bond_is_conserved_across_the_adversarial_lifecycle` — el bono ni se acuña ni
   se destruye a través de todo el ciclo con el atacante dentro.
+- `a_validator_revoked_while_frozen_keeps_its_bond_parked_until_the_committee_lifts_the_pause`
+  — fija el estado compuesto de arriba: revocado bajo pausa deja el bono aparcado,
+  el `Unfreeze` del comité lo libera a la dirección fría, supply conservado.
 
 ### Lección registrada
 

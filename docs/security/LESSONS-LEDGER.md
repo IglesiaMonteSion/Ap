@@ -5,7 +5,7 @@ archivo es la memoria de **clases** de error (no de instancias sueltas): cada
 vez que aparece un bug de seguridad, se clasifica aquí, se registra su causa
 raíz, la regla que lo cierra, cómo se detecta automáticamente, y **la pregunta
 que toda auditoría futura DEBE volver a responder**. Ninguna auditoría se cierra
-sin recorrer las 15 clases de abajo y demostrar (con test o grep) que cada una
+sin recorrer las 17 clases de abajo y demostrar (con test o grep) que cada una
 sigue cerrada.
 
 > Regla operativa (QSEP-1 §13, obligatoria): un hallazgo NO está resuelto cuando
@@ -50,6 +50,7 @@ sigue cerrada.
 | EC-13 | Tamaño-wire / cobro de fee inexacto | sí | **CERRADA** (#11, v8.6.22) |
 | EC-14 | Parámetro controlado externamente sin topes | sí | **CERRADA** (#10, v8.6.22) |
 | EC-15 | Cripto/recuperación propia con checksum/estándar insuficiente | no (revisión manual) | **CERRADA-VIGILADA** (#8 Shamir v2: chk 136-bit + id de grupo, corregido v8.6.21) |
+| EC-16 | Endpoint/socket privilegiado sin autenticar; "acotado" tratado como "eliminado" | parcial (grep de listeners sin auth) | **CERRADA-VIGILADA** (#4.2 socket del firmante remoto, corregido v8.6.26/27) |
 | EC-17 | Control de PAUSA/BLOQUEO gateado en una decisión pero no en toda la superficie que promete detener | no (enumeración manual de instrucciones) | **CERRADA-VIGILADA** (KM#9 freeze → robo del bono; corregido v8.6.36 por la pasada adversarial KM#10) |
 
 ---
@@ -555,4 +556,4 @@ sigue cerrada.
 | Auditoría | Archivo | Hallazgos | Estado |
 |---|---|---|---|
 | Externa v8.6.13 | [`audits/2026-audit-v8.6.13.md`](./audits/2026-audit-v8.6.13.md) | 2C/2A/4M/3B | en corrección (P0 primero) |
-| KM#10 (adversarial, interna) | este ledger, EC-17 | 1 ALTO (robo del bono con freeze activo) | **CERRADO** (v8.6.36) |
+| KM#10 (adversarial, interna) | [`audits/2026-km10-adversarial.md`](./audits/2026-km10-adversarial.md) | 1 ALTO (robo del bono con freeze activo) + 2 de enumeración/doc | **CERRADO** (v8.6.36) |
