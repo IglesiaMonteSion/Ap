@@ -226,7 +226,24 @@ sigue cerrada.
     `sign_peer_vote_refuses_our_own_vertex_closing_the_self_equivocation_bypass`.
     **Diferido (follow-up):** autenticar la IDENTIDAD del cliente (token/mTLS) para
     bind no-loopback — el default loopback + el rehúso de auto-equivocación/valor
-    ya acotan al socket-reacher.
+    ya acotan al socket-reacher. **CERRADO en v8.6.26/27 (KM#3):** el firmante
+    remoto ahora autentica al cliente por challenge-response (token pre-compartido
+    SHA3 prefix-MAC) + channel-binding por-frame, sobre UDS o loopback; mainnet lo
+    exige. Ver EC-16.
+  - **KM#1 (auditoría del programa de gestión de claves → v8.6.29): una clave con
+    DEMASIADOS roles.** La clave de CONSENSO firmaba también el handshake P2P
+    por-conexión (identidad de red) → una fuga que necesitara sólo la identidad de
+    red exponía la clave que firma bloques/votos. **Fix (separación de roles por
+    delegación):** la clave de consenso emite UNA vez, al arrancar, un certificado
+    TIPADO `NETWORK_KEY_CERT_V1 ‖ chain_id ‖ validator_id ‖ network_addr` que
+    delega la identidad P2P en una `network_key` distinta; el handshake por-conexión
+    lo firma la network_key, nunca la de consenso. Una fuga de la network_key
+    impersona la identidad P2P pero NO firma bloques/votos/certs. El cert es una
+    firma tipada de un objeto de largo fijo (no bytes arbitrarios) con su propio
+    dominio → nunca vale como voto/tx/checkpoint. Node-LOCAL (no cambia chain_id),
+    interopera con un par legacy (que anuncia `network: None`). Tests: handshake
+    de red autentica y revela el id de CONSENSO; cert para otro validador
+    rechazado; interop legacy; el firmante remoto emite el cert vía `SignNetworkKeyCert`.
 - **Regla:** todo contenido firmado lleva dominio + tipo + chain_id + versión +
   nonce/caducidad según corresponda; el firmante remoto aplica allowlist por
   identidad de cliente + anti-replay. **Y toda guardia sobre una primitiva de

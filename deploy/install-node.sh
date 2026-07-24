@@ -64,6 +64,7 @@ AUTENTICADO=0
 # ADEMAS cifrar el transporte autenticado (ML-KEM-768 + ChaCha20-Poly1305).
 # Implica AUTENTICADO. Wire-breaking, no cambia el chain_id. Off por defecto.
 CIFRADO=0
+CLAVE_RED_SEPARADA=0
 # Fondear una direccion ADICIONAL en el genesis (ademas de la wallet de prueba),
 # para arrancar tu propia wallet con un balance grande de una. Solo al CREAR la
 # red (modo "solo"). El monto se da en QCH (se convierte a unidades: 1 QCH = 1e9).
@@ -129,6 +130,14 @@ Opciones:
                          confidencialidad + cierra el relay on-path). Implica
                          --autenticado. Todos los nodos deben usarlo. No cambia
                          el chain_id.
+  --clave-red-separada   Firmar el handshake P2P con una CLAVE DE RED distinta de
+                         la de consenso (KM#1). La clave de consenso emite un
+                         certificado de delegación al arrancar; a partir de ahí
+                         una fuga de la clave de red permite impersonar la
+                         identidad P2P pero NO firmar bloques/votos. Es node-LOCAL
+                         (cada nodo decide; NO cambia el chain_id, interopera con
+                         un nodo legacy). El nodo genera network-keypair.json
+                         (0600) al primer arranque. Recomendado con --autenticado.
   --comprimido           (modo "solo") crear la red con el ÁRBOL COMPRIMIDO
                          (hard fork, ~6x throughput bajo carga, menos RAM/disco).
                          Solo al CREAR la red; todos los nodos deben usarlo. No se
@@ -185,6 +194,7 @@ while [ $# -gt 0 ]; do
     --comprimido|--compressed) COMPRIMIDO=1; shift ;;
     --autenticado|--authenticated) AUTENTICADO=1; shift ;;
     --cifrado|--encrypted) CIFRADO=1; AUTENTICADO=1; shift ;;
+    --clave-red-separada|--separate-network-key) CLAVE_RED_SEPARADA=1; shift ;;
     --economics-v7|--economia-v7) ECONOMICS_V7=1; shift ;;
     --rounds-per-quanto|--rondas-por-cuanto) ROUNDS_PER_QUANTO="${2:-}"; shift 2 ;;
     --fondear) FONDEAR_ADDR="${2:-}"; shift 2 ;;
@@ -587,6 +597,20 @@ fi
 if command -v python3 >/dev/null 2>&1; then
   python3 -c "import json; json.load(open('$QCHAIN_HOME/config.json'))" >/dev/null 2>&1 \
     || error "$QCHAIN_HOME/config.json no es JSON válido - revisá cómo se generó/copió antes de continuar."
+fi
+
+# KM#1 — clave de RED (P2P) separada de la clave de consenso. Node-LOCAL (no
+# cambia el chain_id, interopera con un nodo legacy): fija network_keypair_path
+# en ESTE config; el nodo genera network-keypair.json (0600) al primer arranque.
+if [ "$CLAVE_RED_SEPARADA" -eq 1 ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$QCHAIN_HOME/config.json" <<'PY' || echo "AVISO: no pude fijar network_keypair_path (seguí a mano: agregá \"network_keypair_path\": \"network-keypair.json\" al config.json)."
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["network_keypair_path"] = "network-keypair.json"
+json.dump(c, open(p, "w"), indent=2)
+PY
+  decir "  -> CLAVE DE RED separada de la de consenso (KM#1): el nodo firma el handshake P2P con network-keypair.json"
 fi
 
 # Detrás de un túnel/proxy público (Cloudflare, nginx), el RPC del nodo se

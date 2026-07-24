@@ -443,6 +443,16 @@ pub trait Signer: Send + Sync {
         let _ = (chain_id, round, merkle_root);
         anyhow::bail!("this signer does not support checkpoint signing")
     }
+    /// Firma (con la clave de CONSENSO) el **certificado de delegación de la clave
+    /// de red** (`NETWORK_KEY_CERT_V1 ‖ chain_id ‖ validator_id ‖ network_addr`,
+    /// auditoría #1). Es una firma TIPADA que la clave de consenso emite UNA vez al
+    /// arrancar para delegar la identidad P2P en una `network_key` distinta; a
+    /// partir de ahí la clave de consenso NO firma nada de red. Default: firma con
+    /// la clave local.
+    fn sign_network_key_cert(&self, chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        let _ = (chain_id, validator_id, network_addr);
+        anyhow::bail!("this signer does not support network-key-cert signing")
+    }
 }
 
 /// El `Keypair` en-proceso ES un `Signer` (el default, byte-idéntico a antes de
@@ -475,6 +485,9 @@ impl Signer for Keypair {
     fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         sign_state_checkpoint(self, chain_id, round, merkle_root)
     }
+    fn sign_network_key_cert(&self, chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        sign_network_key_cert(self, chain_id, validator_id, network_addr)
+    }
 }
 
 /// Preimagen canónica de un checkpoint de estado: `chain_id ‖ round(le) ‖ root`
@@ -496,6 +509,32 @@ pub fn sign_state_checkpoint(kp: &Keypair, chain_id: &[u8; 32], round: u64, merk
 /// Verifica una firma de checkpoint de estado (contraparte de [`sign_state_checkpoint`]).
 pub fn verify_state_checkpoint(bundle: &PublicKeyBundle, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32], signature: &MultiSignature) -> bool {
     verify_domain(bundle, domains::STATE_CHECKPOINT_V1, &state_checkpoint_message(chain_id, round, merkle_root), signature)
+}
+
+/// Preimagen canónica del certificado de delegación de la clave de red (auditoría
+/// #1): `chain_id ‖ validator_id ‖ network_addr` (bajo el dominio
+/// [`domains::NETWORK_KEY_CERT_V1`]). Largos fijos (32+32+32) → sin ambigüedad.
+pub fn network_key_cert_message(chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(96);
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(validator_id);
+    m.extend_from_slice(network_addr);
+    m
+}
+
+/// Firma (con la clave de CONSENSO) el certificado que DELEGA la identidad P2P de
+/// `validator_id` en la clave de red `network_addr`, atado a `chain_id` (auditoría
+/// #1). Se firma UNA vez al arrancar; el handshake por-conexión lo firma la clave
+/// de red, nunca ésta.
+pub fn sign_network_key_cert(kp: &Keypair, chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+    sign_domain(kp, domains::NETWORK_KEY_CERT_V1, &network_key_cert_message(chain_id, validator_id, network_addr))
+}
+
+/// Verifica el certificado de delegación de la clave de red: que la clave de
+/// CONSENSO `consensus_bundle` (cuya dirección es `validator_id`) delegó la
+/// identidad P2P en `network_addr` para `chain_id`.
+pub fn verify_network_key_cert(consensus_bundle: &PublicKeyBundle, chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32], signature: &MultiSignature) -> bool {
+    verify_domain(consensus_bundle, domains::NETWORK_KEY_CERT_V1, &network_key_cert_message(chain_id, validator_id, network_addr), signature)
 }
 
 /// Firma la **atestación de un voto/vértice** sobre el digest de un vértice

@@ -246,7 +246,52 @@ async fn main() -> anyhow::Result<()> {
         } else {
             tracing::info!("authenticated P2P transport: ENABLED (per-connection ML-DSA handshake)");
         }
-        Some(Arc::new(qchain_network::AuthState::new_with_encryption(signer.clone(), config.chain_id(), authorized, config.encrypted_transport)))
+        // KM#1 — separate the P2P (network) key from the consensus key. When
+        // `network_keypair_path` is set, load (or generate + write 0600) a distinct
+        // network keypair; have the CONSENSUS signer issue a typed delegation cert
+        // ONCE (NETWORK_KEY_CERT_V1 ‖ chain_id ‖ validator_id ‖ network_addr) that
+        // binds the network key to this validator; from then on the per-connection
+        // handshake is signed by the network key, never the consensus key. A leak of
+        // the network key can impersonate the P2P identity but NOT sign blocks/votes.
+        // `None` (the default) = legacy: the consensus signer signs the handshake.
+        match &config.network_keypair_path {
+            Some(path) => {
+                let net_path = std::path::Path::new(path);
+                let net_kp = if net_path.exists() {
+                    qchain_crypto::read_keypair_file(net_path)
+                        .with_context(|| format!("cannot read network_keypair_path {path}"))?
+                } else {
+                    let kp = qchain_crypto::Keypair::generate().context("cannot generate a network keypair")?;
+                    qchain_crypto::write_keypair_file(&kp, net_path)
+                        .with_context(|| format!("cannot write a fresh network keypair to {path}"))?;
+                    tracing::info!("KM#1: generated a fresh P2P network keypair at {path} (0600)");
+                    kp
+                };
+                let net_kp = Arc::new(net_kp);
+                let network_addr = net_kp.public_key_bundle().to_address();
+                // The consensus key delegates the P2P identity to this network key.
+                let cert = signer
+                    .sign_network_key_cert(&config.chain_id(), &self_id.0, &network_addr.0)
+                    .context("cannot issue the network-key delegation cert with the consensus signer")?;
+                tracing::info!(
+                    "KM#1: P2P network key SEPARATED from the consensus key — network addr {network_addr}, delegation cert issued by the consensus key; a network-key leak cannot sign blocks/votes"
+                );
+                Some(Arc::new(qchain_network::AuthState::new_with_network_key(
+                    signer.clone(),
+                    net_kp,
+                    cert,
+                    config.chain_id(),
+                    authorized,
+                    config.encrypted_transport,
+                )))
+            }
+            None => Some(Arc::new(qchain_network::AuthState::new_with_encryption(
+                signer.clone(),
+                config.chain_id(),
+                authorized,
+                config.encrypted_transport,
+            ))),
+        }
     } else {
         None
     };

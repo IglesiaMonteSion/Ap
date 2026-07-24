@@ -494,6 +494,26 @@ una red sin ella conserva su `chain_id` exacto y las ganancias van a la direcci�
 de consenso (comportamiento previo). Determinista → todos los nodos acreditan la
 misma dirección, sin fork.
 
+**Clave de RED (P2P) separada de la clave de consenso (`network_keypair_path`,
+KM#1).** Con el transporte autenticado, el handshake P2P por-conexión lo firma
+por defecto la clave de CONSENSO — la misma que firma bloques/votos. Separá la
+identidad P2P en una clave distinta: al arrancar, la clave de consenso emite UNA
+vez un certificado de delegación tipado (`qchain-network-key-cert-v1 ‖ chain_id ‖
+validator_id ‖ network_addr`) que ata la `network_key` a tu validador; el cert
+viaja en el handshake y los pares lo verifican contra tu bundle de consenso. A
+partir de ahí la clave de consenso NUNCA firma un handshake por-conexión, así que
+una fuga de la clave de red permite impersonar la identidad P2P del nodo pero **NO
+firmar bloques/votos/certs** (sólo la clave de consenso los firma). **Cómo:**
+agregá `"network_keypair_path": "network-keypair.json"` a tu `config.json` (o
+pasá `--clave-red-separada` a `install-node.sh`) — el nodo GENERA ese keypair
+(0600) al primer arranque. Es **node-LOCAL**: NO se pliega en el `chain_id` (no
+cambia consenso/estado/wire), cada operador lo decide por su cuenta, y un nodo con
+clave de red separada **interopera con un nodo legacy** (que firma el handshake
+con su clave de consenso) durante el rollout — el par legacy anuncia `network:
+None` y su firma se verifica bajo la clave de consenso. Recomendado junto con
+`authenticated_transport`. Funciona igual si la clave de consenso vive en un
+firmante remoto (el daemon emite el cert vía la request tipada `SignNetworkKeyCert`).
+
 **Endurecimiento del contenedor.** Los cuatro servicios systemd corren con
 `--security-opt no-new-privileges` (un proceso dentro del contenedor no puede
 ganar privilegios vía setuid) y `--cap-drop ALL` (se le quitan todas las

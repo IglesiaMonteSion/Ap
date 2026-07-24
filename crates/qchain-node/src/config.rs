@@ -427,6 +427,24 @@ pub struct NodeConfig {
     #[serde(default)]
     pub remote_signer_auth_token_path: Option<String>,
 
+    /// **Clave de RED (P2P) SEPARADA de la clave de consenso (auditoría #1 del
+    /// programa de gestión de claves).** Ruta a un keypair distinto que firma el
+    /// handshake P2P por-conexión. Al arrancar, la clave de CONSENSO emite UNA sola
+    /// vez un certificado de delegación tipado (`NETWORK_KEY_CERT_V1 ‖ chain_id ‖
+    /// validator_id ‖ network_addr`) que ata esta `network_key` a la identidad del
+    /// validador; el cert viaja en el handshake y los pares lo verifican contra el
+    /// bundle de consenso que el nodo anuncia. A partir de ahí la clave de consenso
+    /// NUNCA firma un transcript de handshake — una fuga de la clave de red permite
+    /// impersonar la identidad P2P del nodo pero **NO firmar bloques/votos/certs**
+    /// (que sólo la clave de consenso firma). Si el archivo no existe se GENERA y
+    /// se escribe (0600). `None` (el default, y lo que resuelve todo config
+    /// existente) = legacy: el handshake lo firma la clave de consenso (byte-idéntico
+    /// al comportamiento previo, interopera con un par legacy). Es node-LOCAL: **NO
+    /// se pliega en `chain_id`** (no cambia consenso/estado/wire), y un par con
+    /// clave de red separada interopera con un par legacy durante el rollout.
+    #[serde(default)]
+    pub network_keypair_path: Option<String>,
+
     /// **Postura de MAINNET (obligatorio auth + cifrado P2P).** `false` (el
     /// default, y lo que resuelve todo config existente) no impone nada — un
     /// testnet corre exactamente como antes. `true` hace OBLIGATORIOS al arrancar
@@ -1070,6 +1088,7 @@ mod tests {
             rpc_behind_trusted_proxy: false,
             remote_signer: None,
             remote_signer_auth_token_path: None,
+            network_keypair_path: None,
             mainnet: false,
             network_profile: None,
             state_checkpoints: false,

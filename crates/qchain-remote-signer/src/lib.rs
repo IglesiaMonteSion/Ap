@@ -66,8 +66,9 @@ use std::time::Duration;
 
 /// Versión del protocolo del socket. v2 agregó el handshake de auth (#4.2); v3
 /// agregó el nonce del cliente (handshake mutuo) + el binding de canal por-frame;
-/// v4 reemplazó `SignRaw` por `SignNetworkHandshake` tipado (auditoría #2).
-pub const PROTO_VERSION: u8 = 4;
+/// v4 reemplazó `SignRaw` por `SignNetworkHandshake` tipado (auditoría #2); v5
+/// agregó `SignNetworkKeyCert` (cert de delegación de la clave de red, #1).
+pub const PROTO_VERSION: u8 = 5;
 /// Dominio del prefix-MAC del challenge-response (separación de dominio).
 pub const RS_AUTH_DOMAIN: &[u8] = b"qchain-remote-signer-auth-v1";
 /// Dominio de la derivación de la clave de sesión (binding de canal, #4.2 v3).
@@ -111,6 +112,12 @@ pub enum SignerRequest {
     /// un validador honesto sólo firma su root REAL determinista por ronda, y el
     /// dominio la separa de un voto/tx.
     SignCheckpoint { chain_id: [u8; 32], round: u64, merkle_root: [u8; 32] },
+    /// Firmar (con la clave de CONSENSO) el **certificado de delegación de la
+    /// clave de red** (`NETWORK_KEY_CERT_V1 ‖ chain_id ‖ validator_id ‖
+    /// network_addr`, auditoría #1). TIPADO: se emite UNA vez al arrancar para
+    /// delegar la identidad P2P en una `network_key` distinta; la clave de consenso
+    /// no firma nada de red por-conexión. Sin guardia (no es un voto).
+    SignNetworkKeyCert { chain_id: [u8; 32], validator_id: [u8; 32], network_addr: [u8; 32] },
 }
 
 /// Respuesta del firmante.
@@ -521,6 +528,9 @@ impl qchain_crypto::Signer for RemoteSigner {
     fn sign_checkpoint(&self, chain_id: &[u8; 32], round: u64, merkle_root: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignCheckpoint { chain_id: *chain_id, round, merkle_root: *merkle_root })?)
     }
+    fn sign_network_key_cert(&self, chain_id: &[u8; 32], validator_id: &[u8; 32], network_addr: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignNetworkKeyCert { chain_id: *chain_id, validator_id: *validator_id, network_addr: *network_addr })?)
+    }
 }
 
 // ============================ GUARDIA ============================
@@ -797,6 +807,15 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
             }
         }
+        SignerRequest::SignNetworkKeyCert { chain_id, validator_id, network_addr } => {
+            // Auditoría #1 — certificado TIPADO de delegación de la clave de red
+            // (dominio NETWORK_KEY_CERT_V1). La clave de consenso lo emite UNA vez
+            // para delegar la identidad P2P; no es un voto ni valor. Sin guardia.
+            match qchain_crypto::sign_network_key_cert(keypair, chain_id, validator_id, network_addr) {
+                Ok(sig) => SignerResponse::Signature(sig),
+                Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
+            }
+        }
     }
 }
 
@@ -880,6 +899,47 @@ mod tests {
         // The real handshake transcript (the ONLY permitted raw domain) is signed.
         let hs = [qchain_crypto::domains::P2P_AUTH_V1, b" transcript..."].concat();
         assert!(matches!(respond(&SignerRequest::SignNetworkHandshake { transcript: hs }, &kp, &g), SignerResponse::Signature(_)));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// KM#1 — a remote signer can issue the network-key delegation cert, and the
+    /// signature it returns verifies as a genuine NETWORK_KEY_CERT_V1 cert for the
+    /// exact (chain_id, validator_id, network_addr) tuple. So an operator running a
+    /// remote/HSM consensus signer can still separate the P2P key.
+    #[test]
+    fn sign_network_key_cert_produces_a_cert_that_verifies_for_the_bound_tuple() {
+        let tmp = std::env::temp_dir().join(format!("qrs-netcert-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let consensus = Keypair::generate().unwrap();
+        let network = Keypair::generate().unwrap();
+        let g = guard(&tmp);
+
+        let chain_id = [7u8; 32];
+        let validator_id = consensus.public_key_bundle().to_address();
+        let network_addr = network.public_key_bundle().to_address();
+
+        let resp = respond(
+            &SignerRequest::SignNetworkKeyCert { chain_id, validator_id: validator_id.0, network_addr: network_addr.0 },
+            &consensus,
+            &g,
+        );
+        let sig = match resp {
+            SignerResponse::Signature(s) => s,
+            other => panic!("expected a signature, got {other:?}"),
+        };
+        // Verifies for the exact tuple, under the consensus bundle.
+        assert!(
+            qchain_crypto::verify_network_key_cert(&consensus.public_key_bundle(), &chain_id, &validator_id.0, &network_addr.0, &sig),
+            "the cert must verify for the bound (chain_id, validator_id, network_addr)"
+        );
+        // And NOT for a different network address (a leaked cert can't be reused
+        // to delegate a different network key).
+        let other_net = Keypair::generate().unwrap().public_key_bundle().to_address();
+        assert!(
+            !qchain_crypto::verify_network_key_cert(&consensus.public_key_bundle(), &chain_id, &validator_id.0, &other_net.0, &sig),
+            "the cert must NOT verify for a different network address"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

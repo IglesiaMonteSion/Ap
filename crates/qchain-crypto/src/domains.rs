@@ -75,3 +75,15 @@ pub const VALIDATOR_POP_V1: &[u8] = b"qchain-v7-validator-pop-v1";
 /// preimágenes distintas). No cambia consenso/estado/wire de tx — es una capa de
 /// AUTENTICACIÓN del state-sync (endurece la weak-subjectivity de #109/#194).
 pub const STATE_CHECKPOINT_V1: &[u8] = b"qchain-state-checkpoint-v1";
+
+/// **Certificado de delegación de la clave de RED (P2P)** (auditoría #1 —
+/// separar la clave de CONSENSO de la clave de RED). La clave de CONSENSO firma
+/// UNA sola vez, al arrancar, `NETWORK_KEY_CERT_V1 ‖ chain_id ‖ validator_id ‖
+/// network_addr` para DELEGAR la identidad P2P de este validador en una
+/// `network_key` distinta. A partir de ahí el handshake por-conexión lo firma la
+/// `network_key` (no la de consenso), así que una fuga de la clave de red permite
+/// impersonar la identidad P2P del nodo pero **NO firmar bloques/votos/certs**
+/// (que sólo la clave de consenso firma). El dominio separa este certificado de
+/// un voto/tx/checkpoint: una firma de cert NUNCA vale como voto ni al revés. Es
+/// una firma TIPADA de un objeto de largo fijo (32+32+32), no bytes arbitrarios.
+pub const NETWORK_KEY_CERT_V1: &[u8] = b"qchain-network-key-cert-v1";

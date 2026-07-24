@@ -61,7 +61,7 @@
 use crate::session::Session;
 use borsh::{BorshDeserialize, BorshSerialize};
 use qchain_core::ValidatorId;
-use qchain_crypto::{MultiSignature, PublicKeyBundle};
+use qchain_crypto::{MultiSignature, PublicKeyBundle, Signer};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
@@ -97,10 +97,21 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// once at startup and never changes.
 pub struct AuthState {
     /// The validator's consensus signer (tarea #193). Holds the identity key in
-    /// process (`Keypair`) or talks to an out-of-process remote/HSM signer — the
-    /// handshake signs its transcript through it either way (`sign_raw`), so a
-    /// fully-remote setup keeps the key out of the node process here too.
+    /// process (`Keypair`) or talks to an out-of-process remote/HSM signer. It is
+    /// the validator IDENTITY (`bundle().to_address()` == validator id) and — when
+    /// no separate network key is configured (legacy) — also signs the handshake
+    /// transcript. When a `network` key IS configured (auditoría #1), the consensus
+    /// signer is used ONLY to have issued the delegation cert once at startup; the
+    /// per-connection transcript is signed by the network key, never this one.
     signer: Arc<dyn qchain_crypto::Signer>,
+    /// **Clave de RED separada (auditoría #1).** `Some((network_keypair, cert))` =
+    /// la identidad P2P está DELEGADA en una `network_key` distinta de la de
+    /// consenso: el handshake por-conexión se firma con `network_keypair` y se
+    /// anuncia `cert` (que la clave de consenso emitió una vez, atando
+    /// `network_addr → validator_id`). Una fuga de la clave de red permite
+    /// impersonar la identidad P2P pero NO firmar bloques/votos. `None` = legacy:
+    /// el handshake se firma con la clave de consenso (comportamiento previo).
+    network: Option<(Arc<qchain_crypto::Keypair>, MultiSignature)>,
     network_id: [u8; 32],
     authorized: StdRwLock<HashSet<ValidatorId>>,
     /// When true, the handshake also runs an ML-KEM exchange and returns a
@@ -123,12 +134,76 @@ impl AuthState {
     /// Like `new`, but `encrypt` selects whether the handshake also performs
     /// the ML-KEM exchange and encrypts the channel.
     pub fn new_with_encryption(signer: Arc<dyn qchain_crypto::Signer>, network_id: [u8; 32], authorized: HashSet<ValidatorId>, encrypt: bool) -> Self {
-        AuthState { signer, network_id, authorized: StdRwLock::new(authorized), encrypt }
+        AuthState { signer, network: None, network_id, authorized: StdRwLock::new(authorized), encrypt }
+    }
+
+    /// Like `new_with_encryption`, but the P2P handshake is signed by a SEPARATE
+    /// `network_key` (auditoría #1) instead of the consensus key. `network_cert`
+    /// is the delegation cert the consensus key issued once at startup
+    /// (`NETWORK_KEY_CERT_V1 ‖ network_id ‖ validator_id ‖ network_addr`); it is
+    /// advertised in the handshake so peers can verify the binding. The consensus
+    /// key thus never signs a per-connection P2P transcript.
+    pub fn new_with_network_key(
+        signer: Arc<dyn qchain_crypto::Signer>,
+        network_keypair: Arc<qchain_crypto::Keypair>,
+        network_cert: MultiSignature,
+        network_id: [u8; 32],
+        authorized: HashSet<ValidatorId>,
+        encrypt: bool,
+    ) -> Self {
+        AuthState {
+            signer,
+            network: Some((network_keypair, network_cert)),
+            network_id,
+            authorized: StdRwLock::new(authorized),
+            encrypt,
+        }
     }
 
     /// Whether this node runs the encrypted (ML-KEM + AEAD) transport.
     pub fn encrypts(&self) -> bool {
         self.encrypt
+    }
+
+    /// Signs a handshake transcript: with the SEPARATE network key if configured
+    /// (auditoría #1), else with the consensus signer (legacy). Both go through
+    /// the typed `sign_network_handshake` (which enforces the P2P_AUTH_V1 domain).
+    fn sign_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature> {
+        match &self.network {
+            Some((net_kp, _)) => net_kp.sign_network_handshake(transcript),
+            None => self.signer.sign_network_handshake(transcript),
+        }
+    }
+
+    /// The (network_bundle, network_cert) pair to advertise in the handshake, or
+    /// `None` in legacy mode (the consensus key signs the transcript directly).
+    fn network_advert(&self) -> Option<(PublicKeyBundle, MultiSignature)> {
+        self.network.as_ref().map(|(kp, cert)| (kp.public_key_bundle(), cert.clone()))
+    }
+
+    /// Verifies a peer's handshake signature over `transcript`, honoring the
+    /// network-key delegation (auditoría #1). `consensus_bundle` is the peer's
+    /// validator identity (already checked `is_authorized`). If the peer advertised
+    /// a `(network_bundle, network_cert)`, the cert MUST bind that network key to
+    /// this validator under our `network_id`, and the transcript MUST verify under
+    /// the network key. Otherwise (legacy peer) the transcript verifies under the
+    /// consensus key directly.
+    fn verify_peer_handshake(
+        &self,
+        consensus_bundle: &PublicKeyBundle,
+        network: &Option<(PublicKeyBundle, MultiSignature)>,
+        transcript: &[u8],
+        signature: &MultiSignature,
+    ) -> bool {
+        match network {
+            Some((net_bundle, cert)) => {
+                let validator_id = consensus_bundle.to_address();
+                let network_addr = net_bundle.to_address();
+                qchain_crypto::verify_network_key_cert(consensus_bundle, &self.network_id, &validator_id.0, &network_addr.0, cert)
+                    && qchain_crypto::verify(net_bundle, transcript, signature)
+            }
+            None => qchain_crypto::verify(consensus_bundle, transcript, signature),
+        }
     }
 
     pub fn is_authorized(&self, id: &ValidatorId) -> bool {
@@ -145,21 +220,31 @@ impl AuthState {
 
 #[derive(BorshSerialize, BorshDeserialize)]
 struct HandshakeInit {
+    /// The dialer's CONSENSUS bundle — its validator identity (`to_address()`).
     bundle: PublicKeyBundle,
     nonce: [u8; 32],
     /// The dialer's ephemeral ML-KEM public key. `Some` only when the dialer
     /// runs the encrypted transport; `None` for authentication-only.
     kem_pk: Option<Vec<u8>>,
+    /// Auditoría #1 — the dialer's SEPARATE network key + its delegation cert.
+    /// `Some((network_bundle, cert))` when the dialer runs a network key (the
+    /// transcript in `HandshakeFinal` is signed by it); `None` legacy (the
+    /// transcript is signed by the consensus `bundle`).
+    network: Option<(PublicKeyBundle, MultiSignature)>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
 struct HandshakeResp {
+    /// The acceptor's CONSENSUS bundle — its validator identity.
     bundle: PublicKeyBundle,
     nonce: [u8; 32],
     /// The acceptor's ML-KEM ciphertext (encapsulated against `kem_pk`).
     /// `Some` only in the encrypted transport.
     kem_ct: Option<Vec<u8>>,
     signature: MultiSignature,
+    /// Auditoría #1 — the acceptor's SEPARATE network key + delegation cert (as
+    /// in `HandshakeInit`). `signature` is by the network key when this is `Some`.
+    network: Option<(PublicKeyBundle, MultiSignature)>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -241,7 +326,7 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
             (Vec::new(), None)
         };
         let kem_pk_field = if auth.encrypt { Some(kem_pk.clone()) } else { None };
-        write_frame(stream, &HandshakeInit { bundle: bundle_c, nonce: nonce_c, kem_pk: kem_pk_field }).await?;
+        write_frame(stream, &HandshakeInit { bundle: bundle_c, nonce: nonce_c, kem_pk: kem_pk_field, network: auth.network_advert() }).await?;
 
         let resp: HandshakeResp = read_frame(stream).await?;
         let server_id = resp.bundle.to_address();
@@ -267,12 +352,12 @@ pub async fn client_handshake(stream: &mut TcpStream, auth: &AuthState, expected
             (false, _) => Vec::new(),
         };
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
-        if !qchain_crypto::verify(&resp.bundle, &t_server, &resp.signature) {
+        if !auth.verify_peer_handshake(&resp.bundle, &resp.network, &t_server, &resp.signature) {
             anyhow::bail!("peer {server_id}'s handshake signature did not verify");
         }
 
         let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &nonce_c, &resp.nonce, &kem_pk, &kem_ct);
-        let sig_c = auth.signer.sign_network_handshake(&t_client)?;
+        let sig_c = auth.sign_handshake(&t_client)?;
         write_frame(stream, &HandshakeFinal { signature: sig_c }).await?;
 
         // Only after the transcript (which binds kem_pk/kem_ct) verified do we
@@ -319,13 +404,13 @@ pub async fn server_handshake(stream: &mut TcpStream, auth: &AuthState) -> anyho
         let server_id = bundle_s.to_address();
         let nonce_s = fresh_nonce()?;
         let t_server = transcript(ROLE_SERVER, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
-        let sig_s = auth.signer.sign_network_handshake(&t_server)?;
+        let sig_s = auth.sign_handshake(&t_server)?;
         let kem_ct_field = if auth.encrypt { Some(kem_ct.clone()) } else { None };
-        write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, kem_ct: kem_ct_field, signature: sig_s }).await?;
+        write_frame(stream, &HandshakeResp { bundle: bundle_s, nonce: nonce_s, kem_ct: kem_ct_field, signature: sig_s, network: auth.network_advert() }).await?;
 
         let fin: HandshakeFinal = read_frame(stream).await?;
         let t_client = transcript(ROLE_CLIENT, &auth.network_id, &client_id, &server_id, &init.nonce, &nonce_s, &kem_pk, &kem_ct);
-        if !qchain_crypto::verify(&init.bundle, &t_client, &fin.signature) {
+        if !auth.verify_peer_handshake(&init.bundle, &init.network, &t_client, &fin.signature) {
             anyhow::bail!("inbound peer {client_id}'s handshake signature did not verify");
         }
         let session = shared.map(|ss| Session::new(&ss, &init.nonce, &nonce_s, &client_id, &server_id, false));
@@ -347,6 +432,19 @@ mod tests {
 
     fn auth_enc(kp: &Arc<Keypair>, network_id: [u8; 32], authorized: &[ValidatorId]) -> AuthState {
         AuthState::new_with_encryption(kp.clone(), network_id, authorized.iter().cloned().collect(), true)
+    }
+
+    /// Build an `AuthState` whose P2P handshake is signed by a SEPARATE network
+    /// key (auditoría #1). Generates a fresh network keypair and has the
+    /// consensus key issue the delegation cert once. Returns the AuthState plus
+    /// the network keypair (so a test can tamper with the cert if it wants).
+    fn auth_netkey(consensus: &Arc<Keypair>, network_id: [u8; 32], authorized: &[ValidatorId]) -> (AuthState, Arc<Keypair>) {
+        let net_kp = Arc::new(Keypair::generate().unwrap());
+        let validator_id = consensus.pubkey();
+        let network_addr = net_kp.pubkey();
+        let cert = qchain_crypto::sign_network_key_cert(consensus, &network_id, &validator_id.0, &network_addr.0).unwrap();
+        let auth = AuthState::new_with_network_key(consensus.clone(), net_kp.clone(), cert, network_id, authorized.iter().cloned().collect(), false);
+        (auth, net_kp)
     }
 
     /// Two validators that each know the other is authorized complete the
@@ -414,6 +512,106 @@ mod tests {
         assert_eq!(sess_s.open(&ct).unwrap(), b"encrypted consensus traffic");
         let ct2 = sess_s.seal(b"reply").unwrap();
         assert_eq!(sess_c.open(&ct2).unwrap(), b"reply");
+    }
+
+    /// Auditoría #1 — two validators each running a SEPARATE network key
+    /// complete the handshake, and each still learns the other's CONSENSUS id
+    /// (the validator identity). The per-connection transcript is signed by the
+    /// network key; the delegation cert (issued by the consensus key) binds it
+    /// to the consensus id, and the peer verifies that binding. The consensus
+    /// key never signed the per-connection handshake.
+    #[tokio::test]
+    async fn separate_network_keys_authenticate_and_still_reveal_the_consensus_id() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (auth_s, net_s) = auth_netkey(&kp_s, net, &[id_c, id_s]);
+        // The network key's own address is NOT the validator id — proving the
+        // handshake authenticates the CONSENSUS id via the cert, not the signer.
+        assert_ne!(net_s.pubkey(), id_s, "network key address differs from the validator id");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_handshake(&mut stream, &auth_s).await
+        });
+
+        let (auth_c, _net_c) = auth_netkey(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let (seen_server, _) = client_handshake(&mut stream, &auth_c, Some(id_s)).await.unwrap();
+        let (seen_client, _) = server.await.unwrap().unwrap();
+
+        assert_eq!(seen_server, id_s, "dialer learns the acceptor's CONSENSUS id even though the network key signed");
+        assert_eq!(seen_client, id_c, "acceptor learns the dialer's CONSENSUS id");
+    }
+
+    /// A network key with a delegation cert bound to a DIFFERENT validator id
+    /// is rejected: an attacker who leaks a network key cannot present it under
+    /// someone else's consensus identity, because the cert (which the consensus
+    /// key signed over `validator_id ‖ network_addr`) only verifies for the
+    /// real validator. Here the acceptor advertises kp_s's consensus id but a
+    /// cert that kp_s never issued for that network key.
+    #[tokio::test]
+    async fn a_network_cert_for_the_wrong_validator_is_rejected() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let kp_evil = Arc::new(Keypair::generate().unwrap()); // an unrelated consensus key
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Acceptor advertises kp_s's consensus bundle, but the cert was issued by
+        // kp_evil (a key that is NOT kp_s) — so it does not verify under kp_s.
+        let net_kp = Arc::new(Keypair::generate().unwrap());
+        let forged_cert = qchain_crypto::sign_network_key_cert(&kp_evil, &net, &id_s.0, &net_kp.pubkey().0).unwrap();
+        let auth_s = AuthState::new_with_network_key(kp_s.clone(), net_kp, forged_cert, net, [id_c, id_s].into_iter().collect(), false);
+        let _server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = server_handshake(&mut stream, &auth_s).await;
+        });
+
+        let (auth_c, _net_c) = auth_netkey(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let client_res = client_handshake(&mut stream, &auth_c, Some(id_s)).await;
+        assert!(client_res.is_err(), "a network cert not signed by the claimed validator must be rejected");
+    }
+
+    /// A network-keyed node and a LEGACY (consensus-key-signed) node interoperate:
+    /// the legacy peer advertises `network: None` and signs with the consensus
+    /// key, the network-keyed peer advertises its cert — both verify. Backward
+    /// compatibility during a mixed rollout.
+    #[tokio::test]
+    async fn a_network_keyed_node_interoperates_with_a_legacy_node() {
+        let kp_c = Arc::new(Keypair::generate().unwrap());
+        let kp_s = Arc::new(Keypair::generate().unwrap());
+        let id_c = kp_c.pubkey();
+        let id_s = kp_s.pubkey();
+        let net = [9u8; 32];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: legacy (consensus key signs the handshake, no network advert).
+        let auth_s = auth_for(&kp_s, net, &[id_c, id_s]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_handshake(&mut stream, &auth_s).await
+        });
+
+        // Client: network-keyed.
+        let (auth_c, _net_c) = auth_netkey(&kp_c, net, &[id_c, id_s]);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let (seen_server, _) = client_handshake(&mut stream, &auth_c, Some(id_s)).await.unwrap();
+        let (seen_client, _) = server.await.unwrap().unwrap();
+        assert_eq!(seen_server, id_s);
+        assert_eq!(seen_client, id_c, "legacy acceptor still authenticates a network-keyed dialer via its cert");
     }
 
     /// A mode mismatch fails to connect: an encrypting dialer against an
