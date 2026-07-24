@@ -474,12 +474,18 @@ enum Command {
         /// M for the new M-of-N (0 = majority).
         #[arg(long, default_value_t = 0)]
         threshold: u8,
+        /// Approvals for a SetPolicy op (política tier, roadmap #17). 0 = base threshold.
+        #[arg(long, default_value_t = 0)]
+        policy_threshold: u8,
+        /// Approvals for a SetSigners op (firmantes tier, roadmap #17). 0 = base threshold.
+        #[arg(long, default_value_t = 0)]
+        signers_threshold: u8,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 50_000_000)]
         fee_limit: u64,
     },
-    /// v7 treasury (MULTISIG): PROPOSE changing the timelock + limits.
+    /// v7 treasury (MULTISIG): PROPOSE changing the timelock + limits + op-expiry.
     TreasuryProposeSetPolicy {
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         rpc: String,
@@ -493,6 +499,10 @@ enum Command {
         max_per_window_qch: u64,
         #[arg(long, default_value_t = 0)]
         window_rounds: u64,
+        /// Rounds after which a pending op expires and is pruned (roadmap #17).
+        /// 0 = no expiry. Must exceed the timelock.
+        #[arg(long, default_value_t = 0)]
+        op_expiry_rounds: u64,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 50_000_000)]
@@ -1815,7 +1825,7 @@ fn main() -> anyhow::Result<()> {
             println!("submitted: {body}");
             println!("proposed a release of {amount} units ({} QCH) to {dest} — other signers approve, then execute after the timelock. See `treasury-status` for the op id.", amount / 1_000_000_000);
         }
-        Command::TreasuryProposeSetSigners { rpc, keypair, signers, threshold, nonce, fee_limit } => {
+        Command::TreasuryProposeSetSigners { rpc, keypair, signers, threshold, policy_threshold, signers_threshold, nonce, fee_limit } => {
             use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};
             let signer = qchain_crypto::read_keypair_file(&keypair)?;
             let mut parsed = Vec::with_capacity(signers.len());
@@ -1824,12 +1834,15 @@ fn main() -> anyhow::Result<()> {
             }
             let n = parsed.len();
             let m = if threshold == 0 { (n / 2 + 1) as u8 } else { threshold };
-            let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: parsed, threshold: m } })?;
+            // Threshold hierarchy (roadmap #17): 0 = default to the base threshold.
+            let pt = if policy_threshold == 0 { m } else { policy_threshold };
+            let st = if signers_threshold == 0 { m } else { signers_threshold };
+            let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: parsed, threshold: m, policy_threshold: pt, signers_threshold: st } })?;
             let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("proposed rotating the signer set to {m}-of-{n} — other signers approve, then execute after the timelock.");
+            println!("proposed rotating the signer set to {m}-of-{n} (tiers: release {m} / policy {pt} / signers {st}) — other signers approve, then execute after the timelock.");
         }
-        Command::TreasuryProposeSetPolicy { rpc, keypair, timelock_rounds, max_per_release_qch, max_per_window_qch, window_rounds, nonce, fee_limit } => {
+        Command::TreasuryProposeSetPolicy { rpc, keypair, timelock_rounds, max_per_release_qch, max_per_window_qch, window_rounds, op_expiry_rounds, nonce, fee_limit } => {
             use qchain_execution::treasury_v7::{TreasuryOp, TreasuryV7Instruction};
             let signer = qchain_crypto::read_keypair_file(&keypair)?;
             let op = TreasuryOp::SetPolicy {
@@ -1837,11 +1850,12 @@ fn main() -> anyhow::Result<()> {
                 max_per_release: max_per_release_qch.saturating_mul(1_000_000_000),
                 max_per_window: max_per_window_qch.saturating_mul(1_000_000_000),
                 window_rounds,
+                op_expiry_rounds,
             };
             let data = borsh::to_vec(&TreasuryV7Instruction::Propose { op })?;
             let body = submit_instruction(&rpc, &signer, qchain_execution::ids::TREASURY_V7_PROGRAM_ID, vec![signer.pubkey(), qchain_execution::ids::TREASURY_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("proposed a policy change (timelock {timelock_rounds}, per-op {max_per_release_qch} QCH, per-window {max_per_window_qch} QCH/{window_rounds} rounds).");
+            println!("proposed a policy change (timelock {timelock_rounds}, per-op {max_per_release_qch} QCH, per-window {max_per_window_qch} QCH/{window_rounds} rounds, op-expiry {op_expiry_rounds}).");
         }
         Command::TreasuryApprove { rpc, keypair, op_id, nonce, fee_limit } => {
             use qchain_execution::treasury_v7::TreasuryV7Instruction;

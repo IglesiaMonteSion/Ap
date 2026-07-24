@@ -141,6 +141,19 @@ struct Cli {
     /// (0 = disabled).
     #[arg(long, default_value_t = 0)]
     treasury_window_rounds: u64,
+    /// (v7, roadmap #17) approvals required for a treasury SetPolicy op (política
+    /// tier). 0 = default to the base threshold. Must be >= threshold, <= N.
+    #[arg(long, default_value_t = 0)]
+    treasury_policy_threshold: u8,
+    /// (v7, roadmap #17) approvals required for a treasury SetSigners op (firmantes
+    /// tier — the most sensitive). 0 = default to the base threshold. Must be
+    /// >= policy threshold, <= N.
+    #[arg(long, default_value_t = 0)]
+    treasury_signers_threshold: u8,
+    /// (v7, roadmap #17) rounds after which a pending treasury op expires and is
+    /// pruned (0 = no expiry). Must exceed the timelock.
+    #[arg(long, default_value_t = 0)]
+    treasury_op_expiry_rounds: u64,
     /// (v7, task #222) base58 administrative-fee wallet: the destination of the
     /// 10% admin fee, configured at genesis instead of a hidden constant. Point it
     /// at the multisig treasury to protect admin revenue. Folded into `chain_id`.
@@ -442,6 +455,9 @@ fn main() -> anyhow::Result<()> {
             treasury_max_per_release_qch: cli.treasury_max_per_release_qch,
             treasury_max_per_window_qch: cli.treasury_max_per_window_qch,
             treasury_window_rounds: cli.treasury_window_rounds,
+            treasury_policy_threshold: cli.treasury_policy_threshold,
+            treasury_signers_threshold: cli.treasury_signers_threshold,
+            treasury_op_expiry_rounds: cli.treasury_op_expiry_rounds,
             admin_fee_wallet: cli.admin_fee_wallet.clone(),
             hard_cap_supply: cli.hard_cap_supply,
             supply_cap_qch,

@@ -1097,19 +1097,22 @@ async fn treasury(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::
             let ready = p.ready_round(state.timelock_rounds);
             let kind = match &p.op {
                 TreasuryOp::Release { amount, destination } => json!({ "type": "release", "amount": amount.to_string(), "destination": destination.to_string() }),
-                TreasuryOp::SetSigners { signers, threshold } => json!({ "type": "set_signers", "signers": signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "threshold": threshold }),
-                TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds } => json!({ "type": "set_policy", "timelock_rounds": timelock_rounds, "max_per_release": max_per_release.to_string(), "max_per_window": max_per_window.to_string(), "window_rounds": window_rounds }),
+                TreasuryOp::SetSigners { signers, threshold, policy_threshold, signers_threshold } => json!({ "type": "set_signers", "signers": signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "threshold": threshold, "policy_threshold": policy_threshold, "signers_threshold": signers_threshold }),
+                TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds, op_expiry_rounds } => json!({ "type": "set_policy", "timelock_rounds": timelock_rounds, "max_per_release": max_per_release.to_string(), "max_per_window": max_per_window.to_string(), "window_rounds": window_rounds, "op_expiry_rounds": op_expiry_rounds }),
             };
+            let expires_round = if state.op_expiry_rounds > 0 { Some(p.proposed_round.saturating_add(state.op_expiry_rounds)) } else { None };
             json!({
                 "id": p.id,
                 "op": kind,
                 "proposed_round": p.proposed_round,
                 "approvals": p.approvals.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "approval_count": p.approvals.len(),
-                "threshold": state.threshold,
+                // The tier threshold THIS op-kind requires (roadmap #17), not always the base.
+                "threshold": state.required_threshold(&p.op),
                 "threshold_reached_round": p.threshold_reached_round,
                 "executable_round": ready,
                 "executable_now": ready.map(|r| current_round >= r).unwrap_or(false),
+                "expires_round": expires_round,
             })
         })
         .collect();
@@ -1118,6 +1121,9 @@ async fn treasury(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::
         "balance": acct.balance.to_string(),
         "signers": state.signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "threshold": state.threshold,
+        "policy_threshold": state.policy_threshold,
+        "signers_threshold": state.signers_threshold,
+        "op_expiry_rounds": state.op_expiry_rounds,
         "timelock_rounds": state.timelock_rounds,
         "max_per_release": state.max_per_release.to_string(),
         "max_per_window": state.max_per_window.to_string(),

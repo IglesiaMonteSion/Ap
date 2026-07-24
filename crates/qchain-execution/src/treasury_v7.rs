@@ -40,15 +40,40 @@
 //!
 //! ## Operation lifecycle (deterministic on every node → no fork)
 //! `Propose{op}` (a signer) → `Approve{op_id}` (each other signer, deduplicated)
-//! → once `threshold` distinct signers approve, the timelock clock starts →
-//! `Execute{op_id}` (permissionless, once the timelock elapses AND the limits
-//! allow it) applies the effect and removes the op. A signer may `Cancel{op_id}`
-//! a pending op. Operation kinds:
+//! → once the op-kind's required number of distinct signers approve, the timelock
+//! clock starts → `Execute{op_id}` (permissionless, once the timelock elapses AND
+//! the limits allow it) applies the effect and removes the op. A signer may
+//! `Cancel{op_id}` a pending op. Operation kinds:
 //! - `Release { amount, destination }` — move `amount` from the treasury to
 //!   `destination` (bounded by the per-op + per-window limits).
-//! - `SetSigners { signers, threshold }` — rotate the signer set (recovery).
-//! - `SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds }`
-//!   — change the timelock/limits (also multisig+timelock gated).
+//! - `SetSigners { signers, threshold, policy_threshold, signers_threshold }` —
+//!   rotate the signer set AND set the whole threshold hierarchy (recovery).
+//! - `SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds,
+//!   op_expiry_rounds }` — change the timelock/limits/op-expiry.
+//!
+//! ## Threshold HIERARCHY + op EXPIRATION (roadmap #17)
+//! Not every operation is equally sensitive, so each op KIND requires its own
+//! (increasingly strict) approval threshold — `liberar (Release) <= política
+//! (SetPolicy) <= firmantes (SetSigners)`:
+//! - **liberar** — a `Release` needs `threshold` approvals (the lowest bar;
+//!   routine releases are already bounded by the per-op/per-window limits).
+//! - **política** — a `SetPolicy` (timelock/limits/expiry) needs `policy_threshold`
+//!   approvals. It can NOT touch the signer set or the tier thresholds.
+//! - **firmantes** — a `SetSigners` (who controls the treasury, and the tier
+//!   thresholds themselves) needs `signers_threshold` approvals (the highest bar).
+//!
+//! Privilege can't escalate: a política-tier quorum can never weaken who controls
+//! the treasury (only `SetSigners`, firmantes-tier, changes signers/thresholds).
+//! The required threshold is re-checked at EXECUTE time against current state, so
+//! a mid-flight `SetSigners`/`SetPolicy` that raises a bar retroactively holds a
+//! stale op back until it re-reaches the new bar.
+//!
+//! **Op expiration** — a pending op that isn't executed within `op_expiry_rounds`
+//! of being proposed is pruned (non-executable). Prevents a coerced/forgotten
+//! approved op from lingering executable forever; `0` = no expiry (the default).
+//!
+//! A pre-#17 treasury migrates (`read_or_legacy`) with all tiers equal to
+//! `threshold` and `op_expiry_rounds = 0` → byte-identical behavior.
 //!
 //! ## Backward compatibility (brick-safe)
 //! A network deployed before this change stored a legacy `{authority: Pubkey}`
@@ -74,12 +99,22 @@ pub const MAX_TREASURY_PENDING: usize = 16;
 /// An operation the multisig can authorize.
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub enum TreasuryOp {
-    /// Unlock+send `amount` from the treasury to `destination`.
+    /// Unlock+send `amount` from the treasury to `destination`. **liberar** tier —
+    /// gated by the base `threshold` (the lowest bar), since routine releases are
+    /// already bounded by the per-op + per-window limits.
     Release { amount: u64, destination: Pubkey },
-    /// Rotate the signer set + threshold (recovery / substitution). Moves no funds.
-    SetSigners { signers: Vec<Pubkey>, threshold: u8 },
-    /// Change the timelock + limits. Moves no funds.
-    SetPolicy { timelock_rounds: u64, max_per_release: u64, max_per_window: u64, window_rounds: u64 },
+    /// Rotate the signer set + the whole threshold hierarchy (recovery /
+    /// substitution). Moves no funds. **firmantes** tier — gated by
+    /// `signers_threshold` (the highest bar), since it re-defines who controls the
+    /// treasury AND the tier thresholds. Carries the new `threshold` (release/
+    /// liberar), `policy_threshold` (política) and `signers_threshold` (firmantes);
+    /// validated `1 <= threshold <= policy_threshold <= signers_threshold <= len`.
+    SetSigners { signers: Vec<Pubkey>, threshold: u8, policy_threshold: u8, signers_threshold: u8 },
+    /// Change the timelock + limits + op-expiry. Moves no funds. **política** tier —
+    /// gated by `policy_threshold` (the middle bar). It can NOT change the tier
+    /// thresholds or the signer set (that's `SetSigners`, firmantes tier), so a
+    /// política-tier quorum can never weaken who controls the treasury.
+    SetPolicy { timelock_rounds: u64, max_per_release: u64, max_per_window: u64, window_rounds: u64, op_expiry_rounds: u64 },
 }
 
 /// A proposed operation accumulating approvals, plus its timelock anchor.
@@ -133,11 +168,25 @@ pub struct TreasuryState {
     pub next_op_id: u64,
     /// Operations awaiting approvals / timelock.
     pub pending: Vec<PendingOp>,
+    // --- roadmap #17: threshold hierarchy + op expiration (appended fields) ---
+    /// Approvals required to execute a `SetPolicy` op (política tier). `>= threshold`
+    /// (the release/liberar tier). A pre-#17 treasury migrates with this equal to
+    /// `threshold` (byte-identical behavior — all tiers the same).
+    pub policy_threshold: u8,
+    /// Approvals required to execute a `SetSigners` op (firmantes tier — rotating
+    /// who controls the treasury, the most sensitive op). `>= policy_threshold`.
+    /// Migrates equal to `threshold`.
+    pub signers_threshold: u8,
+    /// A pending operation EXPIRES (is pruned, becomes non-executable) once
+    /// `op_expiry_rounds` have elapsed since it was proposed. `0` = no expiry (the
+    /// pre-#17 default). Prevents a coerced/forgotten approved op from lingering
+    /// executable forever; a stale op must be re-proposed under the current policy.
+    pub op_expiry_rounds: u64,
 }
 
 impl TreasuryState {
     /// A single-signer treasury (used by the legacy-decode fallback and simple
-    /// setups): 1-of-1, no timelock, no limits.
+    /// setups): 1-of-1, no timelock, no limits, all tiers = 1, no expiry.
     pub fn single(authority: Pubkey) -> Self {
         TreasuryState {
             signers: vec![authority],
@@ -150,11 +199,78 @@ impl TreasuryState {
             released_in_window: 0,
             next_op_id: 0,
             pending: Vec::new(),
+            policy_threshold: 1,
+            signers_threshold: 1,
+            op_expiry_rounds: 0,
         }
     }
 
     fn is_signer(&self, pk: &Pubkey) -> bool {
         self.signers.contains(pk)
+    }
+
+    /// The approval threshold an op of this KIND requires (roadmap #17), enforcing
+    /// the hierarchy `liberar (Release) <= política (SetPolicy) <= firmantes
+    /// (SetSigners)`. The `.max` chain is defense-in-depth: even a mis-stored tier
+    /// below its predecessor is clamped up, so the ordering can never be violated
+    /// at runtime (config-time validation via `validate_thresholds` is the primary
+    /// guard). For a pre-#17 treasury every tier equals `threshold`, so this returns
+    /// `threshold` for every op — byte-identical to the single-threshold behavior.
+    pub fn required_threshold(&self, op: &TreasuryOp) -> u8 {
+        match op {
+            TreasuryOp::Release { .. } => self.threshold,
+            TreasuryOp::SetPolicy { .. } => self.policy_threshold.max(self.threshold),
+            TreasuryOp::SetSigners { .. } => self.signers_threshold.max(self.policy_threshold).max(self.threshold),
+        }
+    }
+}
+
+/// The pre-#17 `TreasuryState` layout (every field EXCEPT the three appended
+/// #17 fields), used only by `read_or_legacy` to decode a treasury account
+/// written before the threshold hierarchy / op-expiry existed. Private; must
+/// mirror `TreasuryState` up to (not including) `policy_threshold`.
+#[derive(BorshDeserialize, BorshSerialize)]
+struct TreasuryStateV0 {
+    signers: Vec<Pubkey>,
+    threshold: u8,
+    timelock_rounds: u64,
+    max_per_release: u64,
+    max_per_window: u64,
+    window_rounds: u64,
+    window_start_round: u64,
+    released_in_window: u64,
+    next_op_id: u64,
+    pending: Vec<PendingOp>,
+}
+
+impl TreasuryState {
+    /// Decode a `TreasuryState`, migrating a pre-#17 record (without the tier
+    /// thresholds / op-expiry) by defaulting `policy_threshold = signers_threshold
+    /// = threshold` (all tiers equal → byte-identical behavior) and `op_expiry_rounds
+    /// = 0` (no expiry). Try the new layout first; a pre-#17 blob is shorter (the 3
+    /// appended fields missing) → borsh hits EOF → falls through to `TreasuryStateV0`.
+    /// A new blob has trailing bytes the V0 struct can't consume (borsh rejects
+    /// trailing), so the two never cross-decode.
+    fn read_or_legacy(data: &[u8]) -> Option<Self> {
+        if let Ok(s) = borsh::from_slice::<TreasuryState>(data) {
+            return Some(s);
+        }
+        let v0 = borsh::from_slice::<TreasuryStateV0>(data).ok()?;
+        Some(TreasuryState {
+            signers: v0.signers,
+            threshold: v0.threshold,
+            timelock_rounds: v0.timelock_rounds,
+            max_per_release: v0.max_per_release,
+            max_per_window: v0.max_per_window,
+            window_rounds: v0.window_rounds,
+            window_start_round: v0.window_start_round,
+            released_in_window: v0.released_in_window,
+            next_op_id: v0.next_op_id,
+            pending: v0.pending,
+            policy_threshold: v0.threshold,
+            signers_threshold: v0.threshold,
+            op_expiry_rounds: 0,
+        })
     }
 }
 
@@ -202,7 +318,9 @@ fn read_state(accounts: &HashMap<Pubkey, Account>) -> Option<TreasuryState> {
     // a binary update, then upgrades itself via SetSigners). Anything else is real
     // corruption of the account that guards locked funds → refuse to run.
     accounts.get(&TREASURY_ACCOUNT_ID).map(|a| {
-        if let Ok(s) = TreasuryState::try_from_slice(&a.data) {
+        // `read_or_legacy` handles both the current layout and the pre-#17 layout
+        // (without the tier thresholds / op-expiry, migrated with all tiers equal).
+        if let Some(s) = TreasuryState::read_or_legacy(&a.data) {
             return s;
         }
         if a.data.len() == 32 {
@@ -212,6 +330,40 @@ fn read_state(accounts: &HashMap<Pubkey, Account>) -> Option<TreasuryState> {
         }
         panic!("TREASURY_ACCOUNT is present but does not decode as TreasuryState or a legacy authority; refusing to run on corrupt treasury state")
     })
+}
+
+/// Validate the threshold hierarchy against the signer set (roadmap #17):
+/// `1 <= threshold <= policy_threshold <= signers_threshold <= signers.len()`.
+/// Used at genesis and whenever `SetSigners` changes the set/tiers.
+pub fn validate_thresholds(state: &TreasuryState) -> Result<(), ExecError> {
+    let n = state.signers.len();
+    if state.threshold == 0
+        || (state.threshold as usize) > n
+        || state.policy_threshold < state.threshold
+        || state.signers_threshold < state.policy_threshold
+        || (state.signers_threshold as usize) > n
+    {
+        return Err(ExecError::ProgramError(format!(
+            "invalid treasury threshold hierarchy: need 1 <= threshold({}) <= policy({}) <= signers({}) <= {n}",
+            state.threshold, state.policy_threshold, state.signers_threshold
+        )));
+    }
+    Ok(())
+}
+
+/// Prune any pending op that has expired (roadmap #17): if `op_expiry_rounds > 0`
+/// and more than that many rounds have elapsed since an op was proposed, it is
+/// removed and can never be executed. Deterministic (same committed round on every
+/// node). No-op when expiry is disabled (`0`) → byte-identical for a pre-#17
+/// treasury. `saturating_add` keeps the round math overflow-safe (#218).
+fn prune_expired(state: &mut TreasuryState, current_round: Round) {
+    if state.op_expiry_rounds == 0 {
+        return;
+    }
+    let expiry = state.op_expiry_rounds;
+    state
+        .pending
+        .retain(|p| current_round <= p.proposed_round.saturating_add(expiry));
 }
 
 fn write_state(accounts: &mut HashMap<Pubkey, Account>, state: &TreasuryState) -> Result<(), ExecError> {
@@ -234,14 +386,16 @@ impl TreasuryV7Program {
             TreasuryV7Instruction::Propose { op } => Self::propose(accounts, instruction, payer, current_round, op),
             TreasuryV7Instruction::Approve { op_id } => Self::approve(accounts, instruction, payer, current_round, op_id),
             TreasuryV7Instruction::Execute { op_id } => Self::execute_op(accounts, instruction, payer, current_round, op_id),
-            TreasuryV7Instruction::Cancel { op_id } => Self::cancel(accounts, instruction, payer, op_id),
+            TreasuryV7Instruction::Cancel { op_id } => Self::cancel(accounts, instruction, payer, current_round, op_id),
         }
     }
 
     /// Shared preamble: accounts[0] is the acting account (must be the payer =
     /// the authenticated signer), accounts[1] must be the canonical treasury.
-    /// Returns the loaded state.
-    fn preamble(accounts: &HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey) -> Result<TreasuryState, ExecError> {
+    /// Returns the loaded state with any EXPIRED pending ops already pruned
+    /// (roadmap #17) — so a caller always sees, and persists, a queue free of
+    /// stale ops (which also frees slots against `MAX_TREASURY_PENDING`).
+    fn preamble(accounts: &HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round) -> Result<TreasuryState, ExecError> {
         let acct0 = *ix.accounts.first().ok_or_else(|| ExecError::ProgramError("treasury ix requires accounts[0]".into()))?;
         let treasury_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("treasury ix requires accounts[1] (treasury)".into()))?;
         if treasury_pk != TREASURY_ACCOUNT_ID {
@@ -252,7 +406,9 @@ impl TreasuryV7Program {
         if acct0 != *payer {
             return Err(ExecError::Unauthorized("treasury ix accounts[0] must be the transaction payer".into()));
         }
-        read_state(accounts).ok_or_else(|| ExecError::ProgramError("treasury account is not initialized".into()))
+        let mut state = read_state(accounts).ok_or_else(|| ExecError::ProgramError("treasury account is not initialized".into()))?;
+        prune_expired(&mut state, current_round);
+        Ok(state)
     }
 
     fn require_signer(state: &TreasuryState, payer: &Pubkey) -> Result<(), ExecError> {
@@ -273,13 +429,34 @@ impl TreasuryV7Program {
                 }
                 Ok(())
             }
-            TreasuryOp::SetSigners { signers, threshold } => validate_signer_set(signers, *threshold),
-            TreasuryOp::SetPolicy { .. } => Ok(()),
+            TreasuryOp::SetSigners { signers, threshold, policy_threshold, signers_threshold } => {
+                validate_signer_set(signers, *threshold)?;
+                // Validate the full hierarchy against the NEW set at propose time so
+                // a bad rotation is rejected early: 1 <= threshold <= policy <= signers <= len.
+                let probe = TreasuryState {
+                    signers: signers.clone(),
+                    threshold: *threshold,
+                    policy_threshold: *policy_threshold,
+                    signers_threshold: *signers_threshold,
+                    ..TreasuryState::single(signers[0])
+                };
+                validate_thresholds(&probe)
+            }
+            TreasuryOp::SetPolicy { op_expiry_rounds, timelock_rounds, .. } => {
+                // An op-expiry shorter than the timelock would make a legitimate op
+                // expire before it could ever execute — reject that footgun.
+                if *op_expiry_rounds > 0 && *op_expiry_rounds <= *timelock_rounds {
+                    return Err(ExecError::ProgramError(format!(
+                        "op_expiry_rounds {op_expiry_rounds} must exceed timelock_rounds {timelock_rounds} (else an op expires before it can execute)"
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
     fn propose(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round, op: TreasuryOp) -> Result<(), ExecError> {
-        let mut state = Self::preamble(accounts, ix, payer)?;
+        let mut state = Self::preamble(accounts, ix, payer, current_round)?;
         Self::require_signer(&state, payer)?;
         Self::validate_op(&op)?;
         if state.pending.len() >= MAX_TREASURY_PENDING {
@@ -287,32 +464,34 @@ impl TreasuryV7Program {
         }
         let id = state.next_op_id;
         state.next_op_id = state.next_op_id.saturating_add(1);
-        // The proposer's proposal counts as their approval. If threshold is 1, the
-        // timelock clock starts now.
-        let threshold_reached_round = if state.threshold <= 1 { current_round } else { 0 };
+        // The proposer's proposal counts as their approval. If this op-kind's tier
+        // threshold is 1 (roadmap #17), the timelock clock starts now.
+        let threshold_reached_round = if state.required_threshold(&op) <= 1 { current_round } else { 0 };
         state.pending.push(PendingOp { id, op, proposed_round: current_round, approvals: vec![*payer], threshold_reached_round });
         write_state(accounts, &state)
     }
 
     fn approve(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round, op_id: u64) -> Result<(), ExecError> {
-        let mut state = Self::preamble(accounts, ix, payer)?;
+        let mut state = Self::preamble(accounts, ix, payer, current_round)?;
         Self::require_signer(&state, payer)?;
-        let threshold = state.threshold;
-        let op = state.pending.iter_mut().find(|p| p.id == op_id).ok_or_else(|| ExecError::ProgramError(format!("no pending treasury op {op_id}")))?;
+        let idx = state.pending.iter().position(|p| p.id == op_id).ok_or_else(|| ExecError::ProgramError(format!("no pending treasury op {op_id}")))?;
+        // The tier threshold this op-kind requires (roadmap #17), computed before the
+        // mutable borrow below.
+        let req = state.required_threshold(&state.pending[idx].op);
+        let op = &mut state.pending[idx];
         if op.approvals.contains(payer) {
             return Err(ExecError::ProgramError("this signer already approved this operation".into()));
         }
         op.approvals.push(*payer);
-        let count = op.approvals.len();
-        // Once the threshold is first reached, start the timelock clock.
-        if op.threshold_reached_round == 0 && count as u32 >= threshold as u32 {
+        // Once the op-kind's tier threshold is first reached, start the timelock clock.
+        if op.threshold_reached_round == 0 && op.approvals.len() as u32 >= req as u32 {
             op.threshold_reached_round = current_round;
         }
         write_state(accounts, &state)
     }
 
-    fn cancel(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, op_id: u64) -> Result<(), ExecError> {
-        let mut state = Self::preamble(accounts, ix, payer)?;
+    fn cancel(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, current_round: Round, op_id: u64) -> Result<(), ExecError> {
+        let mut state = Self::preamble(accounts, ix, payer, current_round)?;
         Self::require_signer(&state, payer)?;
         let before = state.pending.len();
         state.pending.retain(|p| p.id != op_id);
@@ -330,11 +509,25 @@ impl TreasuryV7Program {
             return Err(ExecError::Unauthorized("Execute must name the canonical treasury account".into()));
         }
         let mut state = read_state(accounts).ok_or_else(|| ExecError::ProgramError("treasury account is not initialized".into()))?;
+        // Prune EXPIRED ops first (roadmap #17): an op past its expiry can never be
+        // executed — it's removed here and the lookup below then reports "no op".
+        prune_expired(&mut state, current_round);
         let pos = state.pending.iter().position(|p| p.id == op_id).ok_or_else(|| ExecError::ProgramError(format!("no pending treasury op {op_id}")))?;
+        // Re-check the op-kind's tier threshold against CURRENT state (roadmap #17):
+        // a mid-flight SetSigners/SetPolicy that raised this op's bar holds it back
+        // until it re-reaches the new bar, even if `threshold_reached_round` was
+        // stamped under the old (lower) bar.
+        let req = state.required_threshold(&state.pending[pos].op);
+        if (state.pending[pos].approvals.len() as u32) < req as u32 {
+            return Err(ExecError::Unauthorized(format!(
+                "treasury op {op_id} has {} approvals but its tier now requires {req}",
+                state.pending[pos].approvals.len()
+            )));
+        }
         // Threshold + timelock gate.
         let ready = state.pending[pos]
             .ready_round(state.timelock_rounds)
-            .ok_or_else(|| ExecError::Unauthorized(format!("treasury op {op_id} has not reached the {} approval threshold", state.threshold)))?;
+            .ok_or_else(|| ExecError::Unauthorized(format!("treasury op {op_id} has not reached the {req} approval threshold")))?;
         if current_round < ready {
             return Err(ExecError::Unauthorized(format!("treasury op {op_id} is timelocked until round {ready} (now {current_round})")));
         }
@@ -345,19 +538,24 @@ impl TreasuryV7Program {
             TreasuryOp::Release { amount, destination } => {
                 Self::apply_release(accounts, ix, &mut state, current_round, amount, destination)?;
             }
-            TreasuryOp::SetSigners { signers, threshold } => {
-                validate_signer_set(&signers, threshold)?;
+            TreasuryOp::SetSigners { signers, threshold, policy_threshold, signers_threshold } => {
                 state.signers = signers;
                 state.threshold = threshold;
-                // A signer change invalidates prior approvals (they came from the old
-                // set), so drop every OTHER pending op to avoid stale authorization.
+                state.policy_threshold = policy_threshold;
+                state.signers_threshold = signers_threshold;
+                // Re-validate the whole hierarchy against the new set (defense in
+                // depth — validate_op already checked at propose time).
+                validate_thresholds(&state)?;
+                // A signer/threshold change invalidates prior approvals (they came
+                // from the old set/tiers), so drop every OTHER pending op.
                 state.pending.retain(|p| p.id == op_id);
             }
-            TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds } => {
+            TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds, op_expiry_rounds } => {
                 state.timelock_rounds = timelock_rounds;
                 state.max_per_release = max_per_release;
                 state.max_per_window = max_per_window;
                 state.window_rounds = window_rounds;
+                state.op_expiry_rounds = op_expiry_rounds;
             }
         }
         // Remove the executed op (SetSigners already retained only this one; remove it too).
@@ -475,6 +673,9 @@ mod tests {
             released_in_window: 0,
             next_op_id: 0,
             pending: Vec::new(),
+            policy_threshold: 3,
+            signers_threshold: 3,
+            op_expiry_rounds: 0,
         };
         let mut a = HashMap::new();
         a.insert(TREASURY_ACCOUNT_ID, genesis_treasury_account_multisig(state, locked));
@@ -576,7 +777,7 @@ mod tests {
         exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 1000, destination: pk(9) } }, vec![s[0], t], s[0], 1).unwrap();
         // propose + approve a signer rotation to a fresh 2-of-3 set
         let new: Vec<Pubkey> = vec![pk(20), pk(21), pk(22)];
-        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: new.clone(), threshold: 2 } }, vec![s[0], t], s[0], 2).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: new.clone(), threshold: 2, policy_threshold: 2, signers_threshold: 2 } }, vec![s[0], t], s[0], 2).unwrap();
         exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 1 }, vec![s[1], t], s[1], 2).unwrap();
         exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 1 }, vec![s[2], t], s[2], 2).unwrap();
         exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 1 }, vec![pk(99), t], pk(99), 2).unwrap();
@@ -613,7 +814,7 @@ mod tests {
         assert_eq!(a[&pk(9)].balance, 5000);
         // and it can upgrade itself to a real multisig via SetSigners
         let new: Vec<Pubkey> = vec![pk(10), pk(11), pk(12)];
-        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: new.clone(), threshold: 2 } }, vec![authority, t], authority, 2).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: new.clone(), threshold: 2, policy_threshold: 2, signers_threshold: 2 } }, vec![authority, t], authority, 2).unwrap();
         exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 1 }, vec![authority, t], authority, 2).unwrap();
         assert_eq!(read_state(&a).unwrap().threshold, 2);
     }
@@ -637,7 +838,7 @@ mod tests {
         assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 1, destination: t } }, vec![s[0], t], s[0], 1), Err(ExecError::ProgramError(_))));
         // a SetSigners with threshold > signers is rejected at propose (validate_op)
         assert!(matches!(
-            exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: vec![pk(1), pk(2)], threshold: 3 } }, vec![s[0], t], s[0], 1),
+            exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::SetSigners { signers: vec![pk(1), pk(2)], threshold: 3, policy_threshold: 3, signers_threshold: 3 } }, vec![s[0], t], s[0], 1),
             Err(ExecError::ProgramError(_))
         ));
     }
@@ -654,5 +855,116 @@ mod tests {
         assert_eq!(borsh::to_vec(&TreasuryV7Instruction::Approve { op_id: 5 }).unwrap(), { let mut v = vec![1u8]; v.extend_from_slice(&5u64.to_le_bytes()); v });
         assert_eq!(borsh::to_vec(&TreasuryV7Instruction::Execute { op_id: 5 }).unwrap(), { let mut v = vec![2u8]; v.extend_from_slice(&5u64.to_le_bytes()); v });
         assert_eq!(borsh::to_vec(&TreasuryV7Instruction::Cancel { op_id: 5 }).unwrap(), { let mut v = vec![3u8]; v.extend_from_slice(&5u64.to_le_bytes()); v });
+    }
+
+    /// A 3-tier treasury (roadmap #17) with the given tiers, timelock/expiry off.
+    fn tiered_world(threshold: u8, policy: u8, signers_th: u8, expiry: u64) -> (HashMap<Pubkey, Account>, Vec<Pubkey>) {
+        let signers: Vec<Pubkey> = (1..=5).map(pk).collect();
+        let state = TreasuryState {
+            signers: signers.clone(),
+            threshold,
+            timelock_rounds: 0,
+            max_per_release: 0,
+            max_per_window: 0,
+            window_rounds: 0,
+            window_start_round: 0,
+            released_in_window: 0,
+            next_op_id: 0,
+            pending: Vec::new(),
+            policy_threshold: policy,
+            signers_threshold: signers_th,
+            op_expiry_rounds: expiry,
+        };
+        let mut a = HashMap::new();
+        a.insert(TREASURY_ACCOUNT_ID, genesis_treasury_account_multisig(state, 1_000_000));
+        (a, signers)
+    }
+
+    #[test]
+    fn the_threshold_hierarchy_gates_more_sensitive_ops_more_strictly() {
+        // Release needs 2 (liberar), SetPolicy needs 3 (política), SetSigners needs 4 (firmantes).
+        let (mut a, s) = tiered_world(2, 3, 4, 0);
+        let t = TREASURY_ACCOUNT_ID;
+
+        // liberar: a Release executes with just 2 approvals.
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 10_000, destination: pk(9) } }, vec![s[0], t], s[0], 1).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 0 }, vec![s[1], t], s[1], 1).unwrap(); // 2/2
+        exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 0 }, vec![s[0], t, pk(9)], s[0], 1).unwrap();
+        assert_eq!(a[&pk(9)].balance, 10_000);
+
+        // política: a SetPolicy needs 3 — 2 approvals is NOT enough.
+        let policy = TreasuryOp::SetPolicy { timelock_rounds: 0, max_per_release: 0, max_per_window: 0, window_rounds: 0, op_expiry_rounds: 0 };
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: policy }, vec![s[0], t], s[0], 2).unwrap(); // 1/3
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 1 }, vec![s[1], t], s[1], 2).unwrap(); // 2/3
+        assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 1 }, vec![s[0], t], s[0], 2), Err(ExecError::Unauthorized(_))), "política tier needs 3");
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 1 }, vec![s[2], t], s[2], 2).unwrap(); // 3/3
+        exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 1 }, vec![s[0], t], s[0], 2).unwrap();
+
+        // firmantes: a SetSigners needs 4 — 3 approvals is NOT enough.
+        let rotate = TreasuryOp::SetSigners { signers: vec![pk(20), pk(21), pk(22)], threshold: 2, policy_threshold: 2, signers_threshold: 2 };
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: rotate }, vec![s[0], t], s[0], 3).unwrap(); // 1/4
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 2 }, vec![s[1], t], s[1], 3).unwrap(); // 2/4
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 2 }, vec![s[2], t], s[2], 3).unwrap(); // 3/4
+        assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 2 }, vec![s[0], t], s[0], 3), Err(ExecError::Unauthorized(_))), "firmantes tier needs 4");
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 2 }, vec![s[3], t], s[3], 3).unwrap(); // 4/4
+        exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 2 }, vec![pk(99), t], pk(99), 3).unwrap();
+        assert_eq!(read_state(&a).unwrap().signers, vec![pk(20), pk(21), pk(22)]);
+    }
+
+    #[test]
+    fn an_op_expires_after_its_window_and_is_pruned() {
+        // 2-of-5, no timelock, expiry 50 rounds.
+        let (mut a, s) = tiered_world(2, 2, 2, 50);
+        let t = TREASURY_ACCOUNT_ID;
+        // proposed + approved at round 100 (fully authorized, but never executed)
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 1000, destination: pk(9) } }, vec![s[0], t], s[0], 100).unwrap();
+        exec(&mut a, &TreasuryV7Instruction::Approve { op_id: 0 }, vec![s[1], t], s[1], 100).unwrap();
+        // at round 150 (100+50) it is still executable (boundary inclusive)
+        assert_eq!(read_state(&a).unwrap().pending.len(), 1);
+        // at round 151 it has EXPIRED → Execute can't find it (pruned)
+        assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Execute { op_id: 0 }, vec![s[0], t, pk(9)], s[0], 151), Err(ExecError::ProgramError(_))), "an expired op is not executable");
+        assert_eq!(a.get(&pk(9)).map(|x| x.balance).unwrap_or(0), 0, "the expired release moved nothing");
+        // a new proposal at 151 prunes the expired op in the preamble → only the new op remains
+        exec(&mut a, &TreasuryV7Instruction::Propose { op: TreasuryOp::Release { amount: 2000, destination: pk(9) } }, vec![s[0], t], s[0], 151).unwrap();
+        let st = read_state(&a).unwrap();
+        assert_eq!(st.pending.len(), 1, "the expired op was pruned; only the fresh one remains");
+        assert_eq!(st.pending[0].proposed_round, 151);
+
+        // A SetPolicy whose expiry would be <= the timelock is rejected (footgun guard).
+        let bad = TreasuryOp::SetPolicy { timelock_rounds: 20, max_per_release: 0, max_per_window: 0, window_rounds: 0, op_expiry_rounds: 10 };
+        assert!(matches!(exec(&mut a, &TreasuryV7Instruction::Propose { op: bad }, vec![s[0], t], s[0], 151), Err(ExecError::ProgramError(_))));
+    }
+
+    #[test]
+    fn read_or_legacy_migrates_a_pre17_treasury_and_round_trips_a_new_one() {
+        // A pre-#17 blob (TreasuryStateV0, no tiers/expiry) migrates with all tiers
+        // equal to `threshold` and expiry 0 — byte-identical behavior.
+        let v0 = TreasuryStateV0 {
+            signers: vec![pk(1), pk(2), pk(3)],
+            threshold: 2,
+            timelock_rounds: 10,
+            max_per_release: 5,
+            max_per_window: 9,
+            window_rounds: 100,
+            window_start_round: 3,
+            released_in_window: 4,
+            next_op_id: 7,
+            pending: Vec::new(),
+        };
+        let legacy_bytes = borsh::to_vec(&v0).unwrap();
+        let migrated = TreasuryState::read_or_legacy(&legacy_bytes).unwrap();
+        assert_eq!(migrated.threshold, 2);
+        assert_eq!(migrated.policy_threshold, 2, "pre-#17 policy tier = threshold");
+        assert_eq!(migrated.signers_threshold, 2, "pre-#17 signers tier = threshold");
+        assert_eq!(migrated.op_expiry_rounds, 0, "pre-#17 expiry off");
+        assert_eq!(migrated.next_op_id, 7);
+
+        // A current record round-trips exactly, and its blob is 3 fields longer.
+        let (a, _) = tiered_world(2, 3, 4, 500);
+        let full = read_state(&a).unwrap();
+        let full_bytes = borsh::to_vec(&full).unwrap();
+        assert_eq!(TreasuryState::read_or_legacy(&full_bytes).unwrap(), full);
+        // The two layouts never cross-decode (borsh rejects the new blob's trailing bytes as V0).
+        assert!(borsh::from_slice::<TreasuryStateV0>(&full_bytes).is_err());
     }
 }

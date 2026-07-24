@@ -289,6 +289,20 @@ pub struct NodeConfig {
     /// Part of the network config hash.
     #[serde(default)]
     pub treasury_window_rounds: u64,
+    /// **Threshold hierarchy** (roadmap #17): approvals required for a `SetPolicy`
+    /// (política tier) and `SetSigners` (firmantes tier) op, respectively. Each
+    /// `>=` its predecessor: `treasury_threshold <= policy <= signers <= N`. `0` =
+    /// default to `treasury_threshold` (all tiers equal, the pre-#17 behavior).
+    /// Part of the network config hash.
+    #[serde(default)]
+    pub treasury_policy_threshold: u8,
+    #[serde(default)]
+    pub treasury_signers_threshold: u8,
+    /// **Op expiration** (roadmap #17): a pending treasury op is pruned (becomes
+    /// non-executable) this many rounds after being proposed. `0` = no expiry (the
+    /// pre-#17 default). Must exceed `treasury_timelock_rounds`. Part of the config hash.
+    #[serde(default)]
+    pub treasury_op_expiry_rounds: u64,
     /// **Administrative-fee wallet** (task #222): base58 destination of the 10%
     /// admin fee share, configured at GENESIS instead of a hidden compile-time
     /// constant. When set it overrides `ids::ADMIN_FEE_WALLET` and is folded into
@@ -575,6 +589,15 @@ impl NodeConfig {
                 bytes.extend_from_slice(&self.treasury_max_per_release_qch.to_le_bytes());
                 bytes.extend_from_slice(&self.treasury_max_per_window_qch.to_le_bytes());
                 bytes.extend_from_slice(&self.treasury_window_rounds.to_le_bytes());
+                // Threshold hierarchy + op-expiry (roadmap #17): folded ONLY when set,
+                // so an existing multisig network that doesn't use the tiers/expiry
+                // keeps its exact chain_id (byte-identical).
+                if self.treasury_policy_threshold != 0 || self.treasury_signers_threshold != 0 || self.treasury_op_expiry_rounds != 0 {
+                    bytes.extend_from_slice(b"treasury-tiers-v1");
+                    bytes.push(self.treasury_policy_threshold);
+                    bytes.push(self.treasury_signers_threshold);
+                    bytes.extend_from_slice(&self.treasury_op_expiry_rounds.to_le_bytes());
+                }
             }
             // The administrative-fee wallet is genesis state (it changes where the
             // 10% admin fee is credited = consensus), folded in only when overridden.
@@ -669,8 +692,15 @@ impl NodeConfig {
         let threshold = if self.treasury_threshold == 0 { (n / 2 + 1) as u8 } else { self.treasury_threshold };
         qchain_execution::treasury_v7::validate_signer_set(&signers, threshold)
             .map_err(|e| anyhow::anyhow!("invalid treasury signer set: {e:?}"))?;
+        // Threshold hierarchy (roadmap #17): 0 = default to the base threshold (all
+        // tiers equal = pre-#17 behavior). Validated below.
+        let policy_threshold = if self.treasury_policy_threshold == 0 { threshold } else { self.treasury_policy_threshold };
+        let signers_threshold = if self.treasury_signers_threshold == 0 { threshold } else { self.treasury_signers_threshold };
+        if self.treasury_op_expiry_rounds > 0 && self.treasury_op_expiry_rounds <= self.treasury_timelock_rounds {
+            return Err(anyhow::anyhow!("treasury_op_expiry_rounds must exceed treasury_timelock_rounds (else an op expires before it can execute)"));
+        }
         let units = qchain_core::UNITS_PER_QCH;
-        Ok(Some(qchain_execution::treasury_v7::TreasuryState {
+        let state = qchain_execution::treasury_v7::TreasuryState {
             signers,
             threshold,
             timelock_rounds: self.treasury_timelock_rounds,
@@ -681,7 +711,13 @@ impl NodeConfig {
             released_in_window: 0,
             next_op_id: 0,
             pending: Vec::new(),
-        }))
+            policy_threshold,
+            signers_threshold,
+            op_expiry_rounds: self.treasury_op_expiry_rounds,
+        };
+        qchain_execution::treasury_v7::validate_thresholds(&state)
+            .map_err(|e| anyhow::anyhow!("invalid treasury threshold hierarchy: {e:?}"))?;
+        Ok(Some(state))
     }
 
     /// The resolved administrative-fee wallet (task #222): the configured override
@@ -966,6 +1002,9 @@ mod tests {
             treasury_max_per_release_qch: 0,
             treasury_max_per_window_qch: 0,
             treasury_window_rounds: 0,
+            treasury_policy_threshold: 0,
+            treasury_signers_threshold: 0,
+            treasury_op_expiry_rounds: 0,
             admin_fee_wallet: None,
             hard_cap_supply: false,
             supply_cap_qch: None,
@@ -1224,6 +1263,54 @@ mod tests {
         c.treasury_window_rounds = 172_800;
         c.admin_fee_wallet = Some("adminwallet".into());
         c
+    }
+
+    /// Roadmap #17: the treasury threshold hierarchy + op-expiry resolve from
+    /// config (0 = default to the base threshold), validate the ordering, and fold
+    /// into `chain_id` ONLY when set (so an existing multisig network is unchanged).
+    #[test]
+    fn treasury_tier_hierarchy_resolves_validates_and_folds_into_chain_id_only_when_set() {
+        let addrs: Vec<String> = (0..5).map(|_| Keypair::generate().unwrap().pubkey().to_string()).collect();
+        // NodeConfig isn't Clone, so build a fresh base each time.
+        let mk = || {
+            let mut base = config_with(one_validator(), vec![]);
+            base.economics_v7 = true;
+            base.treasury_amount = Some(1_000_000);
+            base.treasury_signers = addrs.clone();
+            base.treasury_threshold = 2;
+            base.treasury_timelock_rounds = 100;
+            base
+        };
+
+        // Tiers unset (0) default to the base threshold — byte-identical behavior.
+        let base = mk();
+        let st = base.treasury_multisig_state().unwrap().unwrap();
+        assert_eq!((st.threshold, st.policy_threshold, st.signers_threshold), (2, 2, 2));
+        assert_eq!(st.op_expiry_rounds, 0);
+        // ... and its chain_id equals a config that never mentions the tiers.
+        let chain_no_tiers = base.chain_id();
+
+        // Explicit tiers 2 <= 3 <= 4 + a valid expiry resolve and validate.
+        let mut tiered = mk();
+        tiered.treasury_policy_threshold = 3;
+        tiered.treasury_signers_threshold = 4;
+        tiered.treasury_op_expiry_rounds = 500;
+        let st2 = tiered.treasury_multisig_state().unwrap().unwrap();
+        assert_eq!((st2.threshold, st2.policy_threshold, st2.signers_threshold), (2, 3, 4));
+        assert_eq!(st2.op_expiry_rounds, 500);
+        // Setting the tiers changes the chain_id (a distinct network), but the
+        // default (unset) config keeps the exact chain_id it had before #17.
+        assert_ne!(tiered.chain_id(), chain_no_tiers, "configured tiers fold into chain_id");
+
+        // A broken ordering (policy < threshold) is rejected.
+        let mut bad = mk();
+        bad.treasury_policy_threshold = 1; // < threshold 2
+        assert!(bad.treasury_multisig_state().is_err(), "policy < threshold must be rejected");
+
+        // An expiry that doesn't exceed the timelock is rejected (footgun guard).
+        let mut bad_exp = mk();
+        bad_exp.treasury_op_expiry_rounds = 50; // <= timelock 100
+        assert!(bad_exp.treasury_multisig_state().is_err(), "expiry <= timelock must be rejected");
     }
 
     /// Task #211: the mandatory mainnet profile fail-stops when ANY hard

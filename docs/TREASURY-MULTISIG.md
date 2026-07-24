@@ -40,7 +40,7 @@ se reparte forzosamente entre varias personas + una ventana de revisión + topes
 ```
 TreasuryState {
   signers: Vec<Pubkey>,          // los N firmantes (máx 16)
-  threshold: u8,                 // M (aprobaciones distintas requeridas)
+  threshold: u8,                 // M base — el umbral para LIBERAR (Release)
   timelock_rounds: u64,          // demora tras alcanzar el umbral
   max_per_release: u64,          // tope por operación (0 = sin tope)
   max_per_window: u64,           // tope por ventana rodante (0 = sin tope)
@@ -49,10 +49,16 @@ TreasuryState {
   released_in_window: u64,       // acumulado liberado en la ventana
   next_op_id: u64,               // id incremental de operaciones
   pending: Vec<PendingOp>,       // operaciones en curso (máx 16)
+  // --- jerarquía de umbrales + expiración (#17, appended) ---
+  policy_threshold: u8,          // umbral para cambiar POLÍTICA (SetPolicy)
+  signers_threshold: u8,         // umbral para cambiar FIRMANTES (SetSigners)
+  op_expiry_rounds: u64,         // una op no ejecutada caduca y se poda (0 = nunca)
 }
 
 PendingOp { id, op, proposed_round, approvals: Vec<Pubkey>, threshold_reached_round }
-TreasuryOp = Release{amount,destination} | SetSigners{signers,threshold} | SetPolicy{...}
+TreasuryOp = Release{amount,destination}
+           | SetSigners{signers,threshold,policy_threshold,signers_threshold}
+           | SetPolicy{timelock_rounds,max_per_release,max_per_window,window_rounds,op_expiry_rounds}
 ```
 
 **Instrucción** `TreasuryV7Instruction`:
@@ -72,6 +78,60 @@ los validadores computan lo mismo → sin fork.
 
 ---
 
+## 2-bis. Jerarquía de umbrales + expiración de operaciones (tarea #17)
+
+> **Problema que cierra.** Antes de #17 **toda** operación —liberar liquidez,
+> cambiar los límites, o rotar el set de firmantes— usaba el **mismo** umbral M.
+> Pero no todas tienen el mismo peso: **rotar quién controla los fondos** debería
+> exigir más firmas que una liberación de rutina. Y una operación aprobada por la
+> mitad pero nunca ejecutada quedaba pendiente **para siempre**, acumulándose.
+
+### Tres niveles (liberar < política < firmantes)
+
+Cada clase de operación tiene su propio umbral, y se **exige el más alto de los
+niveles aplicables** (nunca se puede escalar privilegio bajando un tier):
+
+| Operación | Qué toca | Umbral exigido |
+|---|---|---|
+| `Release` | libera fondos (rutina) | **`threshold`** (M base) |
+| `SetPolicy` | timelock / límites / expiración | **`max(policy_threshold, threshold)`** |
+| `SetSigners` | rota el set de firmantes + umbrales | **`max(signers_threshold, policy_threshold, threshold)`** |
+
+Invariante validado en génesis y en cada `SetSigners`:
+`1 ≤ threshold ≤ policy_threshold ≤ signers_threshold ≤ N`. Los tiers no
+configurados (0) **caen al umbral base** → una red pre-#17 (o una que sólo setea
+`threshold`) es **byte-idéntica** en comportamiento (los tres niveles coinciden).
+
+Sólo `SetSigners` (el tier más alto) puede cambiar los umbrales — `SetPolicy`
+**no** toca tiers ni firmantes, así que no hay forma de bajar el listón de
+`SetSigners` con una operación de nivel inferior.
+
+### Re-chequeo en la ejecución
+
+El umbral requerido se re-verifica **en el momento de ejecutar** (no sólo al
+proponer): si un `SetSigners` que ya estaba en curso sube el `signers_threshold`,
+una operación aprobada bajo el listón viejo pero ejecutada después queda sujeta
+al nuevo. Determinista (función del estado comprometido) → sin fork.
+
+### Expiración + poda de operaciones caducas
+
+`op_expiry_rounds` (0 = nunca) hace que una operación pendiente **caduque** si no
+se ejecuta dentro de `proposed_round + op_expiry_rounds`. Las caducas se **podan**
+de `pending` de forma determinista en el preámbulo de cada instrucción de
+tesorería **y** antes de ejecutar — así una op que junta la mitad de las firmas y
+se abandona no queda ocupando un slot (`pending` tiene tope 16) ni se puede
+ejecutar tras su ventana. **`op_expiry_rounds` debe exceder `timelock_rounds`**
+(si no, una op caducaría antes de volverse ejecutable — footgun rechazado en la
+validación de génesis y de `SetPolicy`).
+
+**Todo gated/aditivo:** los 3 campos nuevos van **al final** del `TreasuryState`,
+con `read_or_legacy` que migra un estado pre-#17 (tiers = `threshold`, expiry = 0)
+→ una tesorería viva no se brickea, y una red que no configura tiers ni expiry
+conserva su `chain_id` exacto (los tiers/expiry se pliegan en el `chain_id`
+**sólo cuando se setean**).
+
+---
+
 ## 3. Crear una red con tesorería multisig (génesis)
 
 ```bash
@@ -83,7 +143,10 @@ qchain-genesis-build \
   --treasury-signer <b58-firmante-3> \
   --treasury-signer <b58-firmante-4> \
   --treasury-signer <b58-firmante-5> \
-  --treasury-threshold 3 \
+  --treasury-threshold 3 \                  # umbral para LIBERAR
+  --treasury-policy-threshold 4 \           # umbral para cambiar POLÍTICA (#17)
+  --treasury-signers-threshold 5 \          # umbral para rotar FIRMANTES (#17)
+  --treasury-op-expiry-rounds 20000 \       # una op no ejecutada caduca (#17)
   --treasury-qch 5000 \
   --treasury-timelock-rounds 5760 \        # p.ej. ~1h a 1 ronda cada 0.5s → ajustar
   --treasury-max-per-release-qch 1000 \
@@ -93,6 +156,11 @@ qchain-genesis-build \
 ```
 
 - `--treasury-threshold 0` = **mayoría** (`floor(N/2)+1`).
+- `--treasury-policy-threshold` / `--treasury-signers-threshold` **0** = caen al
+  umbral base (byte-idéntico a pre-#17). Deben cumplir
+  `threshold ≤ policy ≤ signers ≤ N`.
+- `--treasury-op-expiry-rounds` **0** = las ops nunca caducan; si se setea, debe
+  **exceder** `--treasury-timelock-rounds`.
 - Los límites en **QCH enteros** (0 = sin límite).
 - `--admin-fee-wallet` fija el destino del **10% de fee administrativo**
   (genesis-configurado, plegado en el `chain_id`). **Apuntalo a la propia
@@ -136,22 +204,26 @@ qchain treasury-execute --rpc <url> --keypair firmante1.json --op-id <id> --to <
 # ver estado completo (firmantes, límites, ventana, pendientes con aprobaciones)
 qchain treasury-status --rpc <url>       # o:  curl <url>/treasury
 
-# ROTAR firmantes (recuperación / sustitución) — sujeto a umbral + timelock
+# ROTAR firmantes (tier más alto) — sujeto a signers_threshold + timelock
 qchain treasury-propose-set-signers --rpc <url> --keypair firmante2.json \
-  --signer <nuevo1> --signer <b> --signer <c> --signer <d> --signer <e> --threshold 3
+  --signer <nuevo1> --signer <b> --signer <c> --signer <d> --signer <e> --threshold 3 \
+  --policy-threshold 4 --signers-threshold 5    # 0 → cae al umbral base
 # aprobar + ejecutar igual que un release
 
-# CAMBIAR política (timelock / límites) — sujeto a umbral + timelock
+# CAMBIAR política (timelock / límites / expiración) — sujeto a policy_threshold + timelock
 qchain treasury-propose-set-policy --rpc <url> --keypair firmante2.json \
-  --timelock-rounds <r> --max-per-release-qch <x> --max-per-window-qch <y> --window-rounds <w>
+  --timelock-rounds <r> --max-per-release-qch <x> --max-per-window-qch <y> \
+  --window-rounds <w> --op-expiry-rounds <e>    # e debe exceder el timelock (o 0)
 
 # cancelar una operación pendiente
 qchain treasury-cancel --rpc <url> --keypair firmante2.json --op-id <id>
 ```
 
 `GET /treasury` devuelve, por operación pendiente: `id`, tipo+detalle, `approvals`,
-`approval_count`, `threshold`, `threshold_reached_round`, `executable_round`,
-`executable_now` — el registro de auditoría público.
+`approval_count`, `threshold` (el **requerido para ESA op** según su tier),
+`threshold_reached_round`, `executable_round`, `executable_now`, y `expires_round`
+(#17); a nivel de estado también expone `policy_threshold`, `signers_threshold` y
+`op_expiry_rounds` — el registro de auditoría público.
 
 ---
 
