@@ -379,6 +379,7 @@ fn base_router(engine: Arc<Engine>, sim_limiter: Option<SimRateLimiter>, tx_limi
         .route("/validator_registry", get(validator_registry))
         .route("/validator_v7_registry", get(validator_v7_registry))
         .route("/validator_v7_recovery", get(validator_v7_recovery))
+        .route("/validator_v7_pending_keys", get(validator_v7_pending_keys))
         .route("/treasury", get(treasury))
         .route("/active_validators", get(active_validators))
         .route("/equivocation_evidence", get(equivocation_evidence))
@@ -1015,6 +1016,43 @@ async fn validator_v7_recovery(State(engine): State<Arc<Engine>>) -> Result<Json
         })
         .collect();
     Ok(Json(json!({ "committees": committees })))
+}
+
+/// (KM#5) The v7 key-timelock registry: pending, timelocked cold-key changes of
+/// validators (operator/withdrawal/recovery), each with its `ready_quanto`.
+async fn validator_v7_pending_keys(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use borsh::BorshDeserialize;
+    use qchain_execution::ids::VALIDATOR_KEY_TIMELOCK_REGISTRY_ID;
+    use qchain_execution::validator_v7::{KeyTimelockRegistry, PendingKeyChange};
+    let Some(acct) = engine.get_account(&VALIDATOR_KEY_TIMELOCK_REGISTRY_ID).await else {
+        return Ok(Json(json!({ "pending": [] })));
+    };
+    if acct.data.is_empty() {
+        return Ok(Json(json!({ "pending": [] })));
+    }
+    let tl = KeyTimelockRegistry::try_from_slice(&acct.data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("key timelock registry decode: {e}")))?;
+    let pending: Vec<serde_json::Value> = tl
+        .pending
+        .iter()
+        .map(|p| {
+            let (kind, value) = match &p.change {
+                PendingKeyChange::Operator(pk) => ("operator", json!(pk.to_string())),
+                PendingKeyChange::Withdrawal(pk) => ("withdrawal", json!(pk.to_string())),
+                PendingKeyChange::RecoveryCommittee(cfg) => (
+                    "recovery_committee",
+                    json!({ "signers": cfg.signers.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "threshold": cfg.threshold }),
+                ),
+            };
+            json!({
+                "consensus_address": p.consensus_address.to_string(),
+                "kind": kind,
+                "value": value,
+                "proposed_quanto": p.proposed_quanto,
+                "ready_quanto": p.ready_quanto,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "pending": pending })))
 }
 
 async fn validator_registry(State(engine): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {

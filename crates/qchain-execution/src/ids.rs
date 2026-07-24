@@ -179,6 +179,19 @@ pub const SCHEMA_MANIFEST_ID: Pubkey = Pubkey::new([21u8; 32]);
 /// the compromised keys. Carries no funds.
 pub const VALIDATOR_RECOVERY_REGISTRY_ID: Pubkey = Pubkey::new([22u8; 32]);
 
+/// Singleton account (owned by `STAKING_PROGRAM_ID`) whose `data` is the v7 **key
+/// timelock registry** (programa de gestión de claves, KM#5). Holds the PENDING
+/// cold-key changes of validators — an operator rotation (~24h), a withdrawal
+/// rotation (~72h), or a recovery-committee change (~7d) is PROPOSED here and only
+/// takes effect after its mandatory window, so a compromised operator key cannot
+/// instantly rotate the withdrawal to itself (drain the bond/fees) or lock out the
+/// real owner: the window gives time to react (e.g. a recovery-committee REVOKE,
+/// KM#4). Held in its OWN account (not on each validator entry) so it is purely
+/// ADDITIVE: an existing v7 network with no such account has no pending changes
+/// until a validator first proposes one — no registry-format migration, no
+/// chain_id change, brick-safe on a live network. Lazily created. Carries no funds.
+pub const VALIDATOR_KEY_TIMELOCK_REGISTRY_ID: Pubkey = Pubkey::new([23u8; 32]);
+
 #[cfg(test)]
 mod wasm_id_contract_tests {
     use super::*;

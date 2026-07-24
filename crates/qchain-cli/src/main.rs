@@ -13,8 +13,8 @@ use qchain_execution::{
     BURN_ADDRESS, EconomicParams, EMERGENCY_ACCOUNT_ID, GovernanceInstruction, StakingInstruction, SystemInstruction, GOVERNANCE_PROGRAM_ID, PARAMS_ACCOUNT_ID,
     REGISTRY_ACCOUNT_ID, STAKING_PROGRAM_ID, STAKING_REWARDS_POOL_ID, STAKING_STATS_ID, VALIDATOR_REGISTRY_ACCOUNT_ID,
 };
-use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
-use qchain_execution::validator_v7::{RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
+use qchain_execution::ids::{STAKING_GLOBAL_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_UNBONDING_POOL_ID, VALIDATOR_V7_PROGRAM_ID};
+use qchain_execution::validator_v7::{KeyChangeKind, RecoveryApproval, RecoveryConfig, RecoveryOp, ValidatorV7Instruction};
 use qchain_governance::{Proposal, ProposalAction, ProposalId, VoteChoice};
 use std::path::PathBuf;
 
@@ -67,6 +67,16 @@ fn summarize_instruction(program_id: &Pubkey, accounts: &[Pubkey], data: &[u8]) 
 }
 
 /// Format base units as QCH (1 QCH = 1e9 units) for display only.
+/// (KM#5) Parse a `--kind` CLI string into a `KeyChangeKind`.
+fn parse_key_change_kind(s: &str) -> anyhow::Result<KeyChangeKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "operator" => Ok(KeyChangeKind::Operator),
+        "withdrawal" => Ok(KeyChangeKind::Withdrawal),
+        "recovery" | "recovery_committee" | "recovery-committee" => Ok(KeyChangeKind::RecoveryCommittee),
+        other => anyhow::bail!("invalid --kind '{other}' (expected: operator | withdrawal | recovery)"),
+    }
+}
+
 fn fmt_qch(units: u64) -> String {
     format!("{}.{:09}", units / 1_000_000_000, units % 1_000_000_000)
 }
@@ -530,6 +540,45 @@ enum Command {
         /// The NEW withdrawal (cold) address (base58).
         #[arg(long)]
         new_withdrawal: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#5): APPLY a validator's timelocked cold-key change once its window has
+    /// elapsed. PERMISSIONLESS — any keypair can pay/submit (the operator already
+    /// authorized it at propose). `--kind` is operator | withdrawal | recovery.
+    V7ApplyKeyChange {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// Any keypair (fee relayer).
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's consensus address (base58).
+        #[arg(long)]
+        consensus_address: String,
+        /// Which pending change: operator | withdrawal | recovery.
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value_t = 10_000_000)]
+        fee_limit: u64,
+    },
+    /// v7 (KM#5): CANCEL a still-pending timelocked cold-key change (operator-
+    /// authorized) before it applies. `--kind` is operator | withdrawal | recovery.
+    V7CancelKeyChange {
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        rpc: String,
+        /// The operator (cold) keypair.
+        #[arg(short, long)]
+        keypair: PathBuf,
+        /// The validator's consensus address (base58). Defaults to the operator's own address.
+        #[arg(long)]
+        consensus_address: Option<String>,
+        /// Which pending change: operator | withdrawal | recovery.
+        #[arg(long)]
+        kind: String,
         #[arg(long)]
         nonce: Option<u64>,
         #[arg(long, default_value_t = 10_000_000)]
@@ -1980,16 +2029,16 @@ fn main() -> anyhow::Result<()> {
                 &rpc,
                 &operator,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID],
+                vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID],
                 data,
                 nonce,
                 fee_limit,
             )?;
             println!("submitted: {body}");
             if signer_pks.is_empty() {
-                println!("cleared the recovery committee for v7 validator {target}");
+                println!("PROPOSED CLEARING the recovery committee for v7 validator {target} (KM#5 timelock ~7d; apply with `v7-apply-key-change --kind recovery` after the window)");
             } else {
-                println!("set a {threshold}-of-{} OFFLINE recovery committee for v7 validator {target}", signer_pks.len());
+                println!("PROPOSED a {threshold}-of-{} OFFLINE recovery committee for v7 validator {target} (KM#5 timelock ~7d; apply with `v7-apply-key-change --kind recovery` after the window)", signer_pks.len());
             }
         }
         Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce } => {
@@ -2057,9 +2106,9 @@ fn main() -> anyhow::Result<()> {
             };
             let new_op: qchain_crypto::Pubkey = new_operator.parse().map_err(|e| anyhow::anyhow!("invalid --new-operator: {e}"))?;
             let data = borsh::to_vec(&ValidatorV7Instruction::RotateOperator { consensus_address: target, new_operator: new_op })?;
-            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("rotated the operator (cold) key of v7 validator {target} → {new_op}");
+            println!("PROPOSED rotating the operator (cold) key of v7 validator {target} → {new_op} (KM#5 timelock ~24h; apply with `v7-apply-key-change --kind operator` after the window)");
         }
         Command::V7RotateWithdrawal { rpc, keypair, consensus_address, new_withdrawal, nonce, fee_limit } => {
             let operator = qchain_crypto::read_keypair_file(&keypair)?;
@@ -2069,9 +2118,30 @@ fn main() -> anyhow::Result<()> {
             };
             let new_wd: qchain_crypto::Pubkey = new_withdrawal.parse().map_err(|e| anyhow::anyhow!("invalid --new-withdrawal: {e}"))?;
             let data = borsh::to_vec(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: target, new_withdrawal: new_wd })?;
-            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID], data, nonce, fee_limit)?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
-            println!("rotated the withdrawal (cold) address of v7 validator {target} → {new_wd}");
+            println!("PROPOSED rotating the withdrawal (cold) address of v7 validator {target} → {new_wd} (KM#5 timelock ~72h; apply with `v7-apply-key-change --kind withdrawal` after the window)");
+        }
+        Command::V7ApplyKeyChange { rpc, keypair, consensus_address, kind, nonce, fee_limit } => {
+            let payer = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
+            let k = parse_key_change_kind(&kind)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: target, kind: k })?;
+            let body = submit_instruction(&rpc, &payer, VALIDATOR_V7_PROGRAM_ID, vec![payer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, STAKING_GLOBAL_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("applied the pending {kind} key change of v7 validator {target} (if its timelock window has elapsed)");
+        }
+        Command::V7CancelKeyChange { rpc, keypair, consensus_address, kind, nonce, fee_limit } => {
+            let operator = qchain_crypto::read_keypair_file(&keypair)?;
+            let target: qchain_crypto::Pubkey = match &consensus_address {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?,
+                None => operator.pubkey(),
+            };
+            let k = parse_key_change_kind(&kind)?;
+            let data = borsh::to_vec(&ValidatorV7Instruction::CancelPendingKeyChange { consensus_address: target, kind: k })?;
+            let body = submit_instruction(&rpc, &operator, VALIDATOR_V7_PROGRAM_ID, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID], data, nonce, fee_limit)?;
+            println!("submitted: {body}");
+            println!("cancelled the pending {kind} key change of v7 validator {target}");
         }
         Command::V7RotateConsensusKey { rpc, keypair, consensus_address, new_consensus_keypair, new_p2p_address, nonce, fee_limit } => {
             let operator = qchain_crypto::read_keypair_file(&keypair)?;

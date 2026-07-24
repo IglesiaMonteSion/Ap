@@ -38,7 +38,8 @@ use crate::economics_v7::{
 };
 use crate::error::ExecError;
 use crate::ids::{
-    STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_RECOVERY_REGISTRY_ID,
+    STAKING_GLOBAL_ID, STAKING_PROGRAM_ID, VALIDATOR_BOND_ESCROW_ID,
+    VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID,
     VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_UNBONDING_POOL_ID,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -188,6 +189,103 @@ pub fn recovery_message(consensus_address: &Pubkey, op: RecoveryOp, nonce: u64) 
     });
     m.extend_from_slice(&nonce.to_le_bytes());
     m
+}
+
+// ── KM#5: on-chain TIMELOCKS for cold-key changes ───────────────────────────
+//
+// A change to a validator's cold OPERATOR key, WITHDRAWAL address, or RECOVERY
+// committee is PROPOSED and only takes effect after a mandatory window. The window
+// gives the real owner (or an already-registered recovery committee) time to react
+// to a compromise — e.g. an attacker who steals the operator key can't INSTANTLY
+// rotate the withdrawal to itself and drain the bond/fees; the 72h window lets a
+// recovery-committee REVOKE (KM#4) neutralize the validator first.
+//
+// Windows are expressed in QUANTOS, the same deterministic time unit the bond
+// unbonding/activation already use. Under the standard cadence
+// (`DEFAULT_ROUNDS_PER_QUANTO`/`DEFAULT_QUANTOS_PER_YEAR` ⇒ ~365 quantos/year, so
+// 1 quanto ≈ 1 day) these map to the audit's wall-clock intent:
+//   operator ≈ 24h, withdrawal ≈ 72h, recovery ≈ 7d.
+// (The auditor's other two timelocks are already satisfied: consensus-key rotation
+// takes effect at the next epoch boundary via committee derivation, and the bond
+// withdrawal already waits the unbonding+evidence window ≈ 7d.)
+
+/// Operator-rotation timelock, in quantos (~24h under the standard cadence).
+pub const KEY_TIMELOCK_OPERATOR_QUANTOS: u64 = 1;
+/// Withdrawal-rotation timelock, in quantos (~72h).
+pub const KEY_TIMELOCK_WITHDRAWAL_QUANTOS: u64 = 3;
+/// Recovery-committee-change timelock, in quantos (~7d). A change to the OFFLINE
+/// recovery committee waits this window, so a compromised operator can't instantly
+/// swap in its own committee; you configure the committee in advance during calm
+/// operation, not under duress (honest tradeoff: the FIRST set is also delayed,
+/// which is fine because you set it up ahead of any attack).
+pub const KEY_TIMELOCK_RECOVERY_QUANTOS: u64 = 7;
+
+/// (KM#5) Which cold-key change a pending entry carries — the key naming an entry
+/// for `ApplyPendingKeyChange`/`CancelPendingKeyChange` (at most one pending change
+/// per validator per kind).
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub enum KeyChangeKind {
+    Operator,
+    Withdrawal,
+    RecoveryCommittee,
+}
+
+/// (KM#5) The pending cold-key change itself, carrying the proposed new value.
+/// `RecoveryCommittee` with an empty `RecoveryConfig` means "clear the committee".
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub enum PendingKeyChange {
+    Operator(Pubkey),
+    Withdrawal(Pubkey),
+    RecoveryCommittee(RecoveryConfig),
+}
+
+impl PendingKeyChange {
+    pub fn kind(&self) -> KeyChangeKind {
+        match self {
+            PendingKeyChange::Operator(_) => KeyChangeKind::Operator,
+            PendingKeyChange::Withdrawal(_) => KeyChangeKind::Withdrawal,
+            PendingKeyChange::RecoveryCommittee(_) => KeyChangeKind::RecoveryCommittee,
+        }
+    }
+    /// The timelock window (quantos) for this change's kind.
+    pub fn window_quantos(&self) -> u64 {
+        match self.kind() {
+            KeyChangeKind::Operator => KEY_TIMELOCK_OPERATOR_QUANTOS,
+            KeyChangeKind::Withdrawal => KEY_TIMELOCK_WITHDRAWAL_QUANTOS,
+            KeyChangeKind::RecoveryCommittee => KEY_TIMELOCK_RECOVERY_QUANTOS,
+        }
+    }
+}
+
+/// (KM#5) One pending, timelocked cold-key change of a validator.
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct PendingKeyChangeEntry {
+    pub consensus_address: Pubkey,
+    pub proposed_quanto: u64,
+    /// The change applies only at/after this quanto (`proposed_quanto + window`).
+    pub ready_quanto: u64,
+    pub change: PendingKeyChange,
+}
+
+/// (KM#5) The key-timelock registry singleton
+/// (`VALIDATOR_KEY_TIMELOCK_REGISTRY_ID.data`). Additive: absent/empty on a network
+/// with no pending changes.
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+pub struct KeyTimelockRegistry {
+    pub pending: Vec<PendingKeyChangeEntry>,
+}
+
+impl KeyTimelockRegistry {
+    fn find(&self, addr: &Pubkey, kind: KeyChangeKind) -> Option<usize> {
+        self.pending
+            .iter()
+            .position(|p| &p.consensus_address == addr && p.change.kind() == kind)
+    }
+    /// Drop every pending change for `addr` (used when the validator is revoked /
+    /// terminal — a pending cold-key change is then moot).
+    fn purge(&mut self, addr: &Pubkey) {
+        self.pending.retain(|p| &p.consensus_address != addr);
+    }
 }
 
 /// One validator's on-chain record (SPEC §7). The bond is always
@@ -472,16 +570,21 @@ pub enum ValidatorV7Instruction {
     /// bond was never touched by jailing, so nothing moves here.
     /// accounts = [operator(payer), REGISTRY].
     Unjail { consensus_address: Pubkey },
-    /// (#20) Hand off the cold OPERATOR role of `consensus_address` to
-    /// `new_operator` (authorized by the CURRENT operator, the payer). Keeps the
-    /// bond/activation/consensus key; only who may exit/withdraw/unjail/rotate in
-    /// future changes. `new_operator` must not already be a live validator's
-    /// consensus/operator/withdrawal key. accounts = [operator(payer), REGISTRY].
+    /// (#20/KM#5) PROPOSE handing off the cold OPERATOR role of `consensus_address`
+    /// to `new_operator` (authorized by the CURRENT operator, the payer). KM#5:
+    /// TIMELOCKED (~24h) — recorded pending and applied later via
+    /// `ApplyPendingKeyChange`, so a leaked operator key can't instantly lock out
+    /// the owner. Keeps the bond/activation/consensus key. `new_operator` must not
+    /// already be a live validator's consensus/operator/withdrawal key. accounts =
+    /// [operator(payer), REGISTRY, KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     RotateOperator { consensus_address: Pubkey, new_operator: Pubkey },
-    /// (#20) Change the cold WITHDRAWAL address of `consensus_address` (authorized
-    /// by the operator, the payer) — where the bond returns AND where fee
-    /// commissions accrue. `new_withdrawal` must not collide with another live
-    /// validator's key. accounts = [operator(payer), REGISTRY].
+    /// (#20/KM#5) PROPOSE changing the cold WITHDRAWAL address of `consensus_address`
+    /// (authorized by the operator, the payer) — where the bond returns AND where
+    /// fee commissions accrue. KM#5: TIMELOCKED (~72h) — recorded pending and
+    /// applied later via `ApplyPendingKeyChange`, so a leaked operator key can't
+    /// instantly redirect the bond/earnings. `new_withdrawal` must not collide with
+    /// another live validator's key. accounts = [operator(payer), REGISTRY,
+    /// KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     RotateWithdrawal { consensus_address: Pubkey, new_withdrawal: Pubkey },
     /// (#20) Rotate the CONSENSUS (block-signing) key of `consensus_address` to a
     /// fresh `new_bundle` (authorized by the operator, the payer), proving
@@ -504,11 +607,13 @@ pub enum ValidatorV7Instruction {
     /// `expiry_quanto` the validator is excluded from the committee AND fees until
     /// the operator rotates in a fresh key. accounts = [operator(payer), REGISTRY].
     SetConsensusKeyExpiry { consensus_address: Pubkey, expiry_quanto: u64 },
-    /// (KM#4) Set (or replace) the OFFLINE recovery committee of `consensus_address`
-    /// (authorized by the cold OPERATOR — set BEFORE any compromise, since it
-    /// doesn't need the recovery keys). Stored in the SEPARATE recovery registry
-    /// singleton (additive — no validator-entry format change). `config` empty →
-    /// clears the committee. accounts = [operator(payer), REGISTRY, RECOVERY_REGISTRY].
+    /// (KM#4/KM#5) PROPOSE setting (or replacing/clearing) the OFFLINE recovery
+    /// committee of `consensus_address` (authorized by the cold OPERATOR — set
+    /// BEFORE any compromise). KM#5: TIMELOCKED (~7d) — recorded pending and applied
+    /// later via `ApplyPendingKeyChange` (which writes the SEPARATE recovery
+    /// registry singleton, additive — no validator-entry format change). `config`
+    /// empty → clears the committee. accounts = [operator(payer), REGISTRY,
+    /// KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     SetRecoveryCommittee { consensus_address: Pubkey, config: RecoveryConfig },
     /// (KM#4) REVOKE `consensus_address` using its OFFLINE recovery committee —
     /// neutralize a validator whose consensus/operator keys are lost or
@@ -520,6 +625,16 @@ pub enum ValidatorV7Instruction {
     /// (like `ReportEquivocation`) — the M signatures are the authorization.
     /// accounts = [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL].
     RecoverRevoke { consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval> },
+    /// (KM#5) Apply a validator's timelocked cold-key change once its window has
+    /// elapsed. PERMISSIONLESS (the operator authorized it at propose; the payer is
+    /// a fee relayer). `kind` names which pending change (operator/withdrawal/
+    /// recovery). accounts = [payer, REGISTRY, KEY_TIMELOCK_REGISTRY,
+    /// RECOVERY_REGISTRY, STAKING_GLOBAL].
+    ApplyPendingKeyChange { consensus_address: Pubkey, kind: KeyChangeKind },
+    /// (KM#5) Cancel a still-pending timelocked cold-key change (operator-
+    /// authorized) — abort a legitimate proposal before it applies. accounts =
+    /// [operator(payer), REGISTRY, KEY_TIMELOCK_REGISTRY].
+    CancelPendingKeyChange { consensus_address: Pubkey, kind: KeyChangeKind },
 }
 
 pub struct ValidatorV7Program;
@@ -878,6 +993,30 @@ fn write_recovery_registry(accounts: &mut HashMap<Pubkey, Account>, r: &Recovery
     Ok(())
 }
 
+/// (KM#5) Read the key-timelock registry singleton, LAZILY DEFAULTED like the
+/// recovery registry: absent OR empty data → an empty registry; a PRESENT-but-
+/// undecodable one is fail-loud (a per-node disk fault stops that node, never
+/// forks). Additive — the live network is byte-identical until a validator first
+/// proposes a timelocked key change.
+fn read_key_timelock_registry(accounts: &HashMap<Pubkey, Account>) -> KeyTimelockRegistry {
+    match accounts.get(&VALIDATOR_KEY_TIMELOCK_REGISTRY_ID) {
+        None => KeyTimelockRegistry::default(),
+        Some(a) if a.data.is_empty() => KeyTimelockRegistry::default(),
+        Some(a) => KeyTimelockRegistry::try_from_slice(&a.data).unwrap_or_else(|_| {
+            panic!(
+                "VALIDATOR_KEY_TIMELOCK_REGISTRY (v7) is present but does not decode — refusing \
+                 to run on a corrupt key-timelock registry (restore from a good backup / re-sync)"
+            )
+        }),
+    }
+}
+
+fn write_key_timelock_registry(accounts: &mut HashMap<Pubkey, Account>, r: &KeyTimelockRegistry) -> Result<(), ExecError> {
+    let acct = accounts.entry(VALIDATOR_KEY_TIMELOCK_REGISTRY_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
+    acct.data = borsh::to_vec(r).map_err(|e| ExecError::ProgramError(e.to_string()))?;
+    Ok(())
+}
+
 fn current_quanto(accounts: &HashMap<Pubkey, Account>) -> u64 {
     crate::staking_v7::global_state(accounts).current_quanto
 }
@@ -915,21 +1054,22 @@ impl ValidatorV7Program {
             ValidatorV7Instruction::SetConsensusKeyExpiry { consensus_address, expiry_quanto } => Self::set_consensus_key_expiry(accounts, instruction, payer, consensus_address, expiry_quanto),
             ValidatorV7Instruction::SetRecoveryCommittee { consensus_address, config } => Self::set_recovery_committee(accounts, instruction, payer, consensus_address, config),
             ValidatorV7Instruction::RecoverRevoke { consensus_address, op, approvals } => Self::recover_revoke(accounts, instruction, payer, consensus_address, op, approvals),
+            ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address, kind } => Self::apply_pending_key_change(accounts, instruction, payer, consensus_address, kind),
+            ValidatorV7Instruction::CancelPendingKeyChange { consensus_address, kind } => Self::cancel_pending_key_change(accounts, instruction, payer, consensus_address, kind),
         }
     }
 
-    /// (KM#4) The OPERATOR sets/replaces/clears the OFFLINE recovery committee of
-    /// its own validator (before any compromise — it doesn't need the recovery
-    /// keys). Stored in the SEPARATE recovery registry singleton, lazily created.
-    /// accounts = [operator(payer), REGISTRY, RECOVERY_REGISTRY].
+    /// (KM#4/KM#5) The OPERATOR PROPOSES setting/replacing/clearing the OFFLINE
+    /// recovery committee of its own validator (before any compromise — it doesn't
+    /// need the recovery keys). KM#5: the change is TIMELOCKED
+    /// (`KEY_TIMELOCK_RECOVERY_QUANTOS` ≈ 7d) — recorded as a pending change and
+    /// applied later via `ApplyPendingKeyChange`, so a compromised operator can't
+    /// instantly swap in its own committee. Validated upfront so a doomed change
+    /// isn't queued. accounts = [operator(payer), REGISTRY, KEY_TIMELOCK_REGISTRY,
+    /// STAKING_GLOBAL].
     fn set_recovery_committee(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, config: RecoveryConfig) -> Result<(), ExecError> {
-        let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("SetRecoveryCommittee requires accounts[2]".into()))?;
-        if recovery_pk != VALIDATOR_RECOVERY_REGISTRY_ID {
-            return Err(ExecError::Unauthorized("SetRecoveryCommittee must name the canonical recovery registry account".into()));
-        }
-        // Only the cold operator of a LIVE validator may set its recovery committee.
+        // Only the cold operator of a LIVE validator may configure its recovery.
         let (reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "SetRecoveryCommittee")?;
-        // A revoked/removed validator can't (re)configure recovery.
         if matches!(reg.validators[idx].state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
             return Err(ExecError::ProgramError("validator is not in a state that can configure recovery".into()));
         }
@@ -937,28 +1077,140 @@ impl ValidatorV7Program {
         if !clearing {
             config.validate()?;
         }
-        let mut rec = read_recovery_registry(accounts);
-        match rec.find(&consensus_address) {
-            Some(i) => {
-                if clearing {
-                    rec.entries.remove(i);
-                } else {
-                    // Replacing the committee RESETS nothing about the nonce — keep it
-                    // monotonic so a stale offline authorization can never be replayed
-                    // across a committee change.
-                    rec.entries[i].config = config;
-                }
-            }
+        Self::propose_key_change(accounts, ix, consensus_address, PendingKeyChange::RecoveryCommittee(config))
+    }
+
+    /// (KM#5) Pin the key-timelock registry + staking global, read the current
+    /// quanto, and record (or REPLACE, resetting the clock) a pending timelocked
+    /// cold-key change. The caller has already required the operator + validated the
+    /// new value. accounts[2] = KEY_TIMELOCK_REGISTRY, accounts[3] = STAKING_GLOBAL.
+    fn propose_key_change(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, consensus_address: Pubkey, change: PendingKeyChange) -> Result<(), ExecError> {
+        let timelock_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("propose key change requires accounts[2] (key timelock registry)".into()))?;
+        let global_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("propose key change requires accounts[3] (staking global)".into()))?;
+        if timelock_pk != VALIDATOR_KEY_TIMELOCK_REGISTRY_ID || global_pk != STAKING_GLOBAL_ID {
+            return Err(ExecError::Unauthorized("propose key change must name the canonical key-timelock registry and staking global".into()));
+        }
+        let q = current_quanto(accounts);
+        let ready = q.saturating_add(change.window_quantos());
+        let kind = change.kind();
+        let entry = PendingKeyChangeEntry { consensus_address, proposed_quanto: q, ready_quanto: ready, change };
+        let mut tl = read_key_timelock_registry(accounts);
+        match tl.find(&consensus_address, kind) {
+            // Re-proposing the same kind RESETS the clock (standard timelock behavior).
+            Some(i) => tl.pending[i] = entry,
             None => {
-                if !clearing {
-                    if rec.entries.len() >= MAX_V7_VALIDATORS {
-                        return Err(ExecError::ProgramError("recovery registry is full".into()));
-                    }
-                    rec.entries.push(RecoveryEntry { consensus_address, config, nonce: 0 });
+                if tl.pending.len() >= MAX_V7_VALIDATORS * 3 {
+                    return Err(ExecError::ProgramError("key timelock registry is full".into()));
                 }
+                tl.pending.push(entry);
             }
         }
-        write_recovery_registry(accounts, &rec)?;
+        write_key_timelock_registry(accounts, &tl)?;
+        Ok(())
+    }
+
+    /// (KM#5) Apply a validator's timelocked cold-key change once its window has
+    /// elapsed. PERMISSIONLESS: the operator already authorized it at propose; the
+    /// payer is a fee relayer. Re-validates against the CURRENT committed state (the
+    /// validator must not be terminal, the new value must still not collide, and the
+    /// entry must not have been re-registered after the change was proposed — a
+    /// staleness guard against a re-registration replay). accounts = [payer,
+    /// REGISTRY, KEY_TIMELOCK_REGISTRY, RECOVERY_REGISTRY, STAKING_GLOBAL].
+    fn apply_pending_key_change(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, kind: KeyChangeKind) -> Result<(), ExecError> {
+        let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("ApplyPendingKeyChange requires accounts[1]".into()))?;
+        let timelock_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("ApplyPendingKeyChange requires accounts[2]".into()))?;
+        let recovery_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("ApplyPendingKeyChange requires accounts[3]".into()))?;
+        let global_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("ApplyPendingKeyChange requires accounts[4]".into()))?;
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID
+            || timelock_pk != VALIDATOR_KEY_TIMELOCK_REGISTRY_ID
+            || recovery_pk != VALIDATOR_RECOVERY_REGISTRY_ID
+            || global_pk != STAKING_GLOBAL_ID
+        {
+            return Err(ExecError::Unauthorized("ApplyPendingKeyChange must name the canonical accounts".into()));
+        }
+        let mut tl = read_key_timelock_registry(accounts);
+        let ti = tl.find(&consensus_address, kind).ok_or_else(|| ExecError::ProgramError("no pending key change of that kind for this validator".into()))?;
+        let q = current_quanto(accounts);
+        if q < tl.pending[ti].ready_quanto {
+            return Err(ExecError::Unauthorized(format!(
+                "key change is still timelocked: ready at quanto {}, now {q}",
+                tl.pending[ti].ready_quanto
+            )));
+        }
+        let proposed_quanto = tl.pending[ti].proposed_quanto;
+        let change = tl.pending[ti].change.clone();
+        // Re-validate against current committed state.
+        let mut reg = read_registry(accounts);
+        let vidx = reg.find(&consensus_address).ok_or_else(|| ExecError::ProgramError("not a registered validator".into()))?;
+        if matches!(reg.validators[vidx].state, ValidatorV7State::Revoked | ValidatorV7State::Removed) {
+            return Err(ExecError::ProgramError("validator is not in a state that can apply a key change".into()));
+        }
+        // Staleness guard: if the slot was re-registered AFTER this change was
+        // proposed, the pending change belongs to a prior incarnation — reject it so
+        // a re-registration can't inherit a stale (e.g. attacker-proposed) change.
+        if reg.validators[vidx].registered_quanto > proposed_quanto {
+            return Err(ExecError::ProgramError("pending key change predates the validator's current registration — stale".into()));
+        }
+        match change {
+            PendingKeyChange::Operator(new_operator) => {
+                let in_use = reg.addresses_in_use(Some(&consensus_address));
+                if in_use.contains(&new_operator) {
+                    return Err(ExecError::ProgramError("new operator address is already registered to another validator".into()));
+                }
+                reg.validators[vidx].operator_address = new_operator;
+                write_registry(accounts, &reg)?;
+            }
+            PendingKeyChange::Withdrawal(new_withdrawal) => {
+                let in_use = reg.addresses_in_use(Some(&consensus_address));
+                if in_use.contains(&new_withdrawal) {
+                    return Err(ExecError::ProgramError("new withdrawal address is already registered to another validator".into()));
+                }
+                reg.validators[vidx].withdrawal_address = new_withdrawal;
+                write_registry(accounts, &reg)?;
+            }
+            PendingKeyChange::RecoveryCommittee(config) => {
+                let clearing = config.signers.is_empty() && config.threshold == 0;
+                let mut rec = read_recovery_registry(accounts);
+                match rec.find(&consensus_address) {
+                    Some(i) => {
+                        if clearing {
+                            rec.entries.remove(i);
+                        } else {
+                            // Keep the nonce MONOTONIC across a committee change so a
+                            // stale offline authorization can never be replayed.
+                            rec.entries[i].config = config;
+                        }
+                    }
+                    None => {
+                        if !clearing {
+                            if rec.entries.len() >= MAX_V7_VALIDATORS {
+                                return Err(ExecError::ProgramError("recovery registry is full".into()));
+                            }
+                            rec.entries.push(RecoveryEntry { consensus_address, config, nonce: 0 });
+                        }
+                    }
+                }
+                write_recovery_registry(accounts, &rec)?;
+            }
+        }
+        tl.pending.remove(ti);
+        write_key_timelock_registry(accounts, &tl)?;
+        Ok(())
+    }
+
+    /// (KM#5) Cancel a still-pending timelocked key change (operator-authorized) —
+    /// abort a legitimate proposal before it applies. accounts = [operator(payer),
+    /// REGISTRY, KEY_TIMELOCK_REGISTRY].
+    fn cancel_pending_key_change(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, kind: KeyChangeKind) -> Result<(), ExecError> {
+        let _ = Self::require_operator(accounts, ix, payer, &consensus_address, "CancelPendingKeyChange")?;
+        let timelock_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("CancelPendingKeyChange requires accounts[2]".into()))?;
+        if timelock_pk != VALIDATOR_KEY_TIMELOCK_REGISTRY_ID {
+            return Err(ExecError::Unauthorized("CancelPendingKeyChange must name the canonical key-timelock registry".into()));
+        }
+        let mut tl = read_key_timelock_registry(accounts);
+        let ti = tl.find(&consensus_address, kind).ok_or_else(|| ExecError::ProgramError("no pending key change of that kind for this validator".into()))?;
+        tl.pending.remove(ti);
+        write_key_timelock_registry(accounts, &tl)?;
         Ok(())
     }
 
@@ -1034,6 +1286,16 @@ impl ValidatorV7Program {
             e.bond_release_quanto = q.saturating_add(VALIDATOR_BOND_UNBONDING_QUANTOS.max(SLASH_EVIDENCE_WINDOW_QUANTOS));
         }
         write_registry(accounts, &reg)?;
+        // (KM#5) A revoked validator is terminal; any pending timelocked cold-key
+        // change for it is moot (and must never apply post-revoke) — drop it.
+        let mut tl = read_key_timelock_registry(accounts);
+        if tl.find(&consensus_address, KeyChangeKind::Operator).is_some()
+            || tl.find(&consensus_address, KeyChangeKind::Withdrawal).is_some()
+            || tl.find(&consensus_address, KeyChangeKind::RecoveryCommittee).is_some()
+        {
+            tl.purge(&consensus_address);
+            write_key_timelock_registry(accounts, &tl)?;
+        }
         // Bump the recovery nonce so this collected authorization can't be replayed.
         rec.entries[ridx].nonce = nonce.saturating_add(1);
         write_recovery_registry(accounts, &rec)?;
@@ -1091,28 +1353,36 @@ impl ValidatorV7Program {
         Ok((reg, idx))
     }
 
+    /// (#20/KM#5) PROPOSE handing off the cold OPERATOR role to `new_operator`
+    /// (authorized by the CURRENT operator). KM#5: TIMELOCKED
+    /// (`KEY_TIMELOCK_OPERATOR_QUANTOS` ≈ 24h) — recorded pending, applied later via
+    /// `ApplyPendingKeyChange`, so a leaked operator key can't instantly lock out
+    /// the owner. Validated upfront (no collision with another live validator).
+    /// accounts = [operator(payer), REGISTRY, KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     fn rotate_operator(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_operator: Pubkey) -> Result<(), ExecError> {
-        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateOperator")?;
+        let (reg, _idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateOperator")?;
         // The new operator must not collide with ANY live validator's identity
         // (consensus/operator/withdrawal), except this validator's own slot.
         let in_use = reg.addresses_in_use(Some(&consensus_address));
         if in_use.contains(&new_operator) {
             return Err(ExecError::ProgramError("new operator address is already registered to another validator".into()));
         }
-        reg.validators[idx].operator_address = new_operator;
-        write_registry(accounts, &reg)?;
-        Ok(())
+        Self::propose_key_change(accounts, ix, consensus_address, PendingKeyChange::Operator(new_operator))
     }
 
+    /// (#20/KM#5) PROPOSE changing the cold WITHDRAWAL address (where the bond
+    /// returns AND fee commissions accrue), authorized by the operator. KM#5:
+    /// TIMELOCKED (`KEY_TIMELOCK_WITHDRAWAL_QUANTOS` ≈ 72h) — recorded pending,
+    /// applied later via `ApplyPendingKeyChange`, so a leaked operator key can't
+    /// instantly redirect the bond/earnings to itself. accounts = [operator(payer),
+    /// REGISTRY, KEY_TIMELOCK_REGISTRY, STAKING_GLOBAL].
     fn rotate_withdrawal(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_withdrawal: Pubkey) -> Result<(), ExecError> {
-        let (mut reg, idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateWithdrawal")?;
+        let (reg, _idx) = Self::require_operator(accounts, ix, payer, &consensus_address, "RotateWithdrawal")?;
         let in_use = reg.addresses_in_use(Some(&consensus_address));
         if in_use.contains(&new_withdrawal) {
             return Err(ExecError::ProgramError("new withdrawal address is already registered to another validator".into()));
         }
-        reg.validators[idx].withdrawal_address = new_withdrawal;
-        write_registry(accounts, &reg)?;
-        Ok(())
+        Self::propose_key_change(accounts, ix, consensus_address, PendingKeyChange::Withdrawal(new_withdrawal))
     }
 
     fn rotate_consensus_key(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, payer: &Pubkey, consensus_address: Pubkey, new_bundle: PublicKeyBundle, new_p2p_address: String, new_pop: MultiSignature) -> Result<(), ExecError> {
@@ -1583,11 +1853,27 @@ mod tests {
     fn recovery_of(accounts: &HashMap<Pubkey, Account>) -> RecoveryRegistry {
         read_recovery_registry(accounts)
     }
-    /// Set the recovery committee of `consensus` (authorized by `operator`).
+    /// PROPOSE setting the recovery committee of `consensus` (authorized by
+    /// `operator`). KM#5: this only records a pending, timelocked change.
     fn set_recovery(accounts: &mut HashMap<Pubkey, Account>, operator: &Keypair, consensus: Pubkey, signers: &[Pubkey], threshold: u8) -> Result<(), ExecError> {
         let cfg = RecoveryConfig { signers: signers.to_vec(), threshold };
         let data = ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: consensus, config: cfg };
-        ValidatorV7Program::execute(accounts, &ix(&data, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID]), &operator.pubkey())
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![operator.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]), &operator.pubkey())
+    }
+    /// Apply a pending key change of `kind` (permissionless — any payer).
+    fn apply_key_change(accounts: &mut HashMap<Pubkey, Account>, payer: &Keypair, consensus: Pubkey, kind: KeyChangeKind) -> Result<(), ExecError> {
+        let data = ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: consensus, kind };
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![payer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, STAKING_GLOBAL_ID]), &payer.pubkey())
+    }
+    /// Propose + cross the recovery timelock window + apply, so the committee is
+    /// ACTIVE — for tests that exercise the downstream revoke path. Advances the
+    /// mock quanto to the ready point (leaves it there).
+    fn set_recovery_now(accounts: &mut HashMap<Pubkey, Account>, operator: &Keypair, consensus: Pubkey, signers: &[Pubkey], threshold: u8) -> Result<(), ExecError> {
+        set_recovery(accounts, operator, consensus, signers, threshold)?;
+        let ready = current_quanto(accounts) + KEY_TIMELOCK_RECOVERY_QUANTOS;
+        set_quanto(accounts, ready);
+        let relayer = Keypair::generate().unwrap();
+        apply_key_change(accounts, &relayer, consensus, KeyChangeKind::RecoveryCommittee)
     }
     /// One recovery signer's OFFLINE approval of a Revoke of `consensus` at `nonce`.
     fn approve(signer: &Keypair, consensus: Pubkey, nonce: u64) -> RecoveryApproval {
@@ -1625,20 +1911,32 @@ mod tests {
         let reg_bytes_before = accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data.clone();
 
         let signers: Vec<Pubkey> = (0..5).map(|_| Keypair::generate().unwrap().pubkey()).collect();
-        // A NON-operator cannot set the committee.
+        // A NON-operator cannot propose the committee.
         let stranger = Keypair::generate().unwrap();
         assert!(set_recovery(&mut accounts, &stranger, cons.pubkey(), &signers, 3).is_err(), "only the operator can set recovery");
-        // The operator sets a 3-of-5 committee → stored in the recovery singleton.
+        // The operator PROPOSES a 3-of-5 committee → recorded pending (KM#5 timelock),
+        // NOT yet in the recovery registry.
         set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
+        assert!(recovery_of(&accounts).entries.is_empty(), "committee is not active until the timelock elapses");
+        assert_eq!(read_key_timelock_registry(&accounts).pending.len(), 1, "one pending recovery-committee change");
+        // Applying before the ~7d window → rejected.
+        let relayer = Keypair::generate().unwrap();
+        assert!(apply_key_change(&mut accounts, &relayer, cons.pubkey(), KeyChangeKind::RecoveryCommittee).is_err(), "can't apply before the window");
+        // Cross the window and apply (permissionless) → now stored in the recovery singleton.
+        set_quanto(&mut accounts, KEY_TIMELOCK_RECOVERY_QUANTOS);
+        apply_key_change(&mut accounts, &relayer, cons.pubkey(), KeyChangeKind::RecoveryCommittee).unwrap();
         let rec = recovery_of(&accounts);
         assert_eq!(rec.entries.len(), 1);
         assert_eq!(rec.entries[0].consensus_address, cons.pubkey());
         assert_eq!(rec.entries[0].config.threshold, 3);
         assert_eq!(rec.entries[0].nonce, 0);
+        assert!(read_key_timelock_registry(&accounts).pending.is_empty(), "pending cleared after apply");
         // The validator registry bytes did NOT change (purely additive).
         assert_eq!(accounts.get(&VALIDATOR_REGISTRY_ACCOUNT_ID).unwrap().data, reg_bytes_before, "recovery config does not touch the validator registry");
-        // Clearing (empty config) removes the entry.
+        // Clearing: propose empty + apply removes the entry.
         set_recovery(&mut accounts, &op, cons.pubkey(), &[], 0).unwrap();
+        set_quanto(&mut accounts, KEY_TIMELOCK_RECOVERY_QUANTOS * 2);
+        apply_key_change(&mut accounts, &relayer, cons.pubkey(), KeyChangeKind::RecoveryCommittee).unwrap();
         assert!(recovery_of(&accounts).entries.is_empty(), "empty config clears the committee");
     }
 
@@ -1651,7 +1949,7 @@ mod tests {
         register_full(&mut accounts, &op, &cons, None, "revoke-node").unwrap();
         let signer_kps: Vec<Keypair> = (0..5).map(|_| Keypair::generate().unwrap()).collect();
         let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
-        set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 3).unwrap();
         let relayer = Keypair::generate().unwrap();
         accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
 
@@ -1709,7 +2007,7 @@ mod tests {
 
         let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
         let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
-        set_recovery(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
         let relayer = Keypair::generate().unwrap();
         accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
         revoke(&mut accounts, &relayer, cons.pubkey(), vec![approve(&signer_kps[0], cons.pubkey(), 0), approve(&signer_kps[1], cons.pubkey(), 0)]).unwrap();
@@ -1744,11 +2042,13 @@ mod tests {
     fn validator_v7_instruction_encoding_is_stable() {
         // Pin the borsh discriminants so a CLI/relayer encoder can't silently drift.
         let cons = Pubkey::new([9u8; 32]);
-        let cases: [(ValidatorV7Instruction, u8); 4] = [
+        let cases: [(ValidatorV7Instruction, u8); 6] = [
             (ValidatorV7Instruction::BeginExit { consensus_address: cons }, 1),
             (ValidatorV7Instruction::Unjail { consensus_address: cons }, 4),
             (ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: cons, config: RecoveryConfig::default() }, 10),
             (ValidatorV7Instruction::RecoverRevoke { consensus_address: cons, op: RecoveryOp::Revoke, approvals: vec![] }, 11),
+            (ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::Operator }, 12),
+            (ValidatorV7Instruction::CancelPendingKeyChange { consensus_address: cons, kind: KeyChangeKind::RecoveryCommittee }, 13),
         ];
         for (instr, disc) in cases {
             let bytes = borsh::to_vec(&instr).unwrap();
@@ -2135,11 +2435,14 @@ mod tests {
         assert!(matches!(plan_registry_migration(&new_bytes), RegistryMigration::AlreadyCurrent { validators: 1 }));
     }
 
-    /// #20: the cold OPERATOR can rotate the operator + withdrawal keys in place
-    /// (keeping the bond/activation); a non-operator is rejected; a rotation that
-    /// collides with another live validator's identity is rejected.
+    /// #20/KM#5: the cold OPERATOR PROPOSES rotating the operator + withdrawal keys
+    /// (keeping the bond/activation); a non-operator is rejected; a collision is
+    /// rejected. KM#5: the change is TIMELOCKED — proposed now, applied only after
+    /// its window (operator ≈24h/1q, withdrawal ≈72h/3q) via a permissionless
+    /// `ApplyPendingKeyChange`. Apply-before-the-window is rejected; the operator can
+    /// CANCEL a pending change.
     #[test]
-    fn cold_key_rotation_is_operator_authorized_and_collision_checked() {
+    fn cold_key_rotation_is_timelocked_operator_authorized_and_collision_checked() {
         let mut accounts = HashMap::new();
         let op = Keypair::generate().unwrap();
         let consensus = Keypair::generate().unwrap();
@@ -2147,29 +2450,128 @@ mod tests {
         register_full(&mut accounts, &op, &consensus, None, "node-x").unwrap();
         let caddr = consensus.pubkey();
         let bond_before = registry_of(&accounts).validators[0].bond;
+        let anyone = Keypair::generate().unwrap();
+        // Propose helpers with the KM#5 account layout [operator, REGISTRY, KEY_TIMELOCK, GLOBAL].
+        let propose_wd = |new_wd: Pubkey| ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: new_wd }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        let apply = |kind: KeyChangeKind| ix(&ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: caddr, kind }, vec![anyone.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, STAKING_GLOBAL_ID]);
 
-        // A NON-operator can't rotate the withdrawal.
+        // A NON-operator can't propose a withdrawal rotation.
         let stranger = Keypair::generate().unwrap();
-        let bad = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: stranger.pubkey() }, vec![stranger.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        let bad = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: stranger.pubkey() }, vec![stranger.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
         assert!(ValidatorV7Program::execute(&mut accounts, &bad, &stranger.pubkey()).is_err(), "non-operator rejected");
 
-        // The operator rotates the withdrawal to a fresh cold address.
+        // The operator PROPOSES a withdrawal rotation → recorded pending, NOT applied.
         let new_wd = Pubkey::new([77u8; 32]);
-        let ok = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: new_wd }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
-        ValidatorV7Program::execute(&mut accounts, &ok, &op.pubkey()).unwrap();
+        ValidatorV7Program::execute(&mut accounts, &propose_wd(new_wd), &op.pubkey()).unwrap();
+        assert_ne!(registry_of(&accounts).validators[0].withdrawal_address, new_wd, "not applied at propose");
+        // Apply BEFORE the ~72h window → rejected.
+        assert!(ValidatorV7Program::execute(&mut accounts, &apply(KeyChangeKind::Withdrawal), &anyone.pubkey()).is_err(), "can't apply before the window");
+        // Cross the withdrawal window (3 quantos) and apply (permissionless).
+        set_quanto(&mut accounts, KEY_TIMELOCK_WITHDRAWAL_QUANTOS);
+        ValidatorV7Program::execute(&mut accounts, &apply(KeyChangeKind::Withdrawal), &anyone.pubkey()).unwrap();
         assert_eq!(registry_of(&accounts).validators[0].withdrawal_address, new_wd);
         assert_eq!(registry_of(&accounts).validators[0].bond, bond_before, "bond untouched by rotation");
 
-        // The operator rotates the operator key; the OLD operator can no longer act.
+        // The operator can CANCEL a pending change before it applies.
+        ValidatorV7Program::execute(&mut accounts, &propose_wd(Pubkey::new([88u8; 32])), &op.pubkey()).unwrap();
+        let cancel = ix(&ValidatorV7Instruction::CancelPendingKeyChange { consensus_address: caddr, kind: KeyChangeKind::Withdrawal }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID]);
+        ValidatorV7Program::execute(&mut accounts, &cancel, &op.pubkey()).unwrap();
+        assert!(read_key_timelock_registry(&accounts).find(&caddr, KeyChangeKind::Withdrawal).is_none(), "cancelled");
+        set_quanto(&mut accounts, KEY_TIMELOCK_WITHDRAWAL_QUANTOS * 3);
+        assert!(ValidatorV7Program::execute(&mut accounts, &apply(KeyChangeKind::Withdrawal), &anyone.pubkey()).is_err(), "nothing to apply after cancel");
+        assert_eq!(registry_of(&accounts).validators[0].withdrawal_address, new_wd, "cancelled change never took effect");
+
+        // The operator rotates the OPERATOR key (window 1 quanto); old operator then can't act.
+        let now = current_quanto(&accounts);
         let new_op = Keypair::generate().unwrap();
-        let rot = ix(&ValidatorV7Instruction::RotateOperator { consensus_address: caddr, new_operator: new_op.pubkey() }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
-        ValidatorV7Program::execute(&mut accounts, &rot, &op.pubkey()).unwrap();
+        let prop_op = ix(&ValidatorV7Instruction::RotateOperator { consensus_address: caddr, new_operator: new_op.pubkey() }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &prop_op, &op.pubkey()).unwrap();
+        set_quanto(&mut accounts, now + KEY_TIMELOCK_OPERATOR_QUANTOS);
+        ValidatorV7Program::execute(&mut accounts, &apply(KeyChangeKind::Operator), &anyone.pubkey()).unwrap();
         assert_eq!(registry_of(&accounts).validators[0].operator_address, new_op.pubkey());
-        // Old operator now unauthorized; new operator authorized.
-        let by_old = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([1u8; 32]) }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        // Old operator now unauthorized to propose; new operator authorized.
+        let by_old = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([1u8; 32]) }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
         assert!(ValidatorV7Program::execute(&mut accounts, &by_old, &op.pubkey()).is_err(), "rotated-out operator can't act");
-        let by_new = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([2u8; 32]) }, vec![new_op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID]);
+        let by_new = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: caddr, new_withdrawal: Pubkey::new([2u8; 32]) }, vec![new_op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
         ValidatorV7Program::execute(&mut accounts, &by_new, &new_op.pubkey()).unwrap();
+    }
+
+    /// KM#5: the three cold-key timelock windows are exactly operator ≈24h (1
+    /// quanto), withdrawal ≈72h (3 quantos), recovery ≈7d (7 quantos), computed from
+    /// the current quanto; re-proposing the same kind RESETS the clock.
+    #[test]
+    fn key_timelock_windows_are_operator_24h_withdrawal_72h_recovery_7d() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(2000 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "win-node").unwrap();
+        let c = cons.pubkey();
+        set_quanto(&mut accounts, 100);
+        let tl_accts = || vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID];
+        let rot_op = ValidatorV7Instruction::RotateOperator { consensus_address: c, new_operator: Pubkey::new([70u8; 32]) };
+        ValidatorV7Program::execute(&mut accounts, &ix(&rot_op, tl_accts()), &op.pubkey()).unwrap();
+        let rot_wd = ValidatorV7Instruction::RotateWithdrawal { consensus_address: c, new_withdrawal: Pubkey::new([71u8; 32]) };
+        ValidatorV7Program::execute(&mut accounts, &ix(&rot_wd, tl_accts()), &op.pubkey()).unwrap();
+        let signers: Vec<Pubkey> = (0..3).map(|_| Keypair::generate().unwrap().pubkey()).collect();
+        let set_rec = ValidatorV7Instruction::SetRecoveryCommittee { consensus_address: c, config: RecoveryConfig { signers, threshold: 2 } };
+        ValidatorV7Program::execute(&mut accounts, &ix(&set_rec, tl_accts()), &op.pubkey()).unwrap();
+
+        let ready = |accts: &HashMap<Pubkey, Account>, k: KeyChangeKind| {
+            read_key_timelock_registry(accts).pending.iter().find(|p| p.change.kind() == k).unwrap().ready_quanto
+        };
+        assert_eq!(ready(&accounts, KeyChangeKind::Operator), 101, "operator ≈24h = +1 quanto");
+        assert_eq!(ready(&accounts, KeyChangeKind::Withdrawal), 103, "withdrawal ≈72h = +3 quantos");
+        assert_eq!(ready(&accounts, KeyChangeKind::RecoveryCommittee), 107, "recovery ≈7d = +7 quantos");
+        assert_eq!(read_key_timelock_registry(&accounts).pending.len(), 3, "one pending per kind");
+
+        // Re-proposing the operator change at a later quanto REPLACES it (one entry)
+        // and resets the clock.
+        set_quanto(&mut accounts, 200);
+        let rot_op2 = ValidatorV7Instruction::RotateOperator { consensus_address: c, new_operator: Pubkey::new([72u8; 32]) };
+        ValidatorV7Program::execute(&mut accounts, &ix(&rot_op2, tl_accts()), &op.pubkey()).unwrap();
+        assert_eq!(read_key_timelock_registry(&accounts).pending.iter().filter(|p| p.change.kind() == KeyChangeKind::Operator).count(), 1, "still one pending operator change (replaced)");
+        assert_eq!(ready(&accounts, KeyChangeKind::Operator), 201, "re-propose reset the clock");
+    }
+
+    /// KM#5: a recovery-committee REVOKE (KM#4) drops any pending timelocked cold-key
+    /// change of the validator — an attacker who proposed (e.g.) a withdrawal
+    /// rotation to itself can be neutralized within the window, and the pending
+    /// change never applies.
+    #[test]
+    fn a_pending_key_change_is_dropped_when_the_validator_is_revoked() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        let orig_wd = Keypair::generate().unwrap().pubkey();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, Some(orig_wd), "purge-node").unwrap();
+        let c = cons.pubkey();
+
+        // Recovery committee is configured IN ADVANCE (before any compromise).
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, c, &signers, 2).unwrap(); // quanto now 7
+
+        // The (compromised) operator proposes redirecting the withdrawal to an attacker.
+        let attacker = Pubkey::new([0xAA; 32]);
+        let prop = ix(&ValidatorV7Instruction::RotateWithdrawal { consensus_address: c, new_withdrawal: attacker }, vec![op.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        ValidatorV7Program::execute(&mut accounts, &prop, &op.pubkey()).unwrap();
+        assert!(read_key_timelock_registry(&accounts).find(&c, KeyChangeKind::Withdrawal).is_some(), "attacker change is pending");
+
+        // WITHIN the window, the recovery committee REVOKES the validator.
+        let relayer = Keypair::generate().unwrap();
+        revoke(&mut accounts, &relayer, c, vec![approve(&signer_kps[0], c, 0), approve(&signer_kps[1], c, 0)]).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked);
+        // The pending attacker change was PURGED by the revoke.
+        assert!(read_key_timelock_registry(&accounts).find(&c, KeyChangeKind::Withdrawal).is_none(), "pending change purged on revoke");
+
+        // Even past the window, there is nothing to apply, and the withdrawal address
+        // is unchanged — the attacker's change never took effect.
+        set_quanto(&mut accounts, 100);
+        let apply = ix(&ValidatorV7Instruction::ApplyPendingKeyChange { consensus_address: c, kind: KeyChangeKind::Withdrawal }, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_KEY_TIMELOCK_REGISTRY_ID, VALIDATOR_RECOVERY_REGISTRY_ID, STAKING_GLOBAL_ID]);
+        assert!(ValidatorV7Program::execute(&mut accounts, &apply, &relayer.pubkey()).is_err(), "nothing to apply after revoke purge");
+        assert_eq!(registry_of(&accounts).validators[0].withdrawal_address, orig_wd, "withdrawal stays the original cold address");
     }
 
     /// #20: rotating the CONSENSUS key keeps the bond/activation, requires a fresh

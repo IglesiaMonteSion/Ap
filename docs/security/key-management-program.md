@@ -19,7 +19,7 @@ documentado como pendiente con su razón, no forzado.
 | 2 | Eliminar `sign_raw` → interfaz de firma TIPADA | 2 | **HECHO** (v8.6.28 — `sign_network_handshake`) |
 | 3 | Autenticar el firmante remoto (UDS/token/canal) | 3 | **HECHO** (v8.6.26/27) |
 | 4 | Recovery key offline (revoca/reemplaza/congela) | 4 | **HECHO** (v8.6.30 — REVOKE por comité M-de-N offline) |
-| 5 | Timelocks on-chain de cambios de clave | 5 | pendiente |
+| 5 | Timelocks on-chain de cambios de clave | 5 | **HECHO** (v8.6.31 — operator ~24h / withdrawal ~72h / recovery ~7d) |
 | 6 | Rotación de clave en DOS fases (propuesta + aceptación PoP) | 6 | pendiente |
 | 7 | El firmante remoto valida POLÍTICA (chain_id/round/height/nonce/anti-equivocación/rate-limit) | 7 | pendiente |
 | 8 | Keystore V2 (Argon2id→HKDF-SHA3→XChaCha20-Poly1305) + HKDF jerárquico + anti-rollback | 8 | pendiente |
@@ -167,13 +167,75 @@ OFFLINE, el relayer las envió → el validador quedó **`Revoked` en AMBOS nodo
 **rechazado** (el nonce quedó en 1, sin cambio de estado), y el bono quedó
 escrowado con `bond_release_quanto` agendado (recuperable a la withdrawal fría).
 
-## #5–#10 — pendientes
+## #5 — Timelocks on-chain de cambios de clave (HECHO, v8.6.31)
+
+**Problema.** Toda instrucción de cambio de clave FRÍA de un validador v7 se
+aplicaba INMEDIATAMENTE: `RotateOperator`, `RotateWithdrawal` y (KM#4)
+`SetRecoveryCommittee`. Así, si la clave de operador se compromete, el atacante
+puede AL INSTANTE redirigir la `withdrawal_address` a la suya (drenar el bono + las
+comisiones de fee) o cambiar el operador para dejar afuera al dueño real — sin
+ninguna ventana para reaccionar.
+
+**Diseño (propuesta + aplicación tras una ventana, singleton separado).** Cada uno
+de esos tres cambios pasa a ser **timelockeado**: la instrucción PROPONE (registra
+un cambio pendiente con su `ready_quanto`) y sólo se aplica después de la ventana
+vía `ApplyPendingKeyChange` (**permissionless** — el operador ya autorizó al
+proponer; el que aplica es un relayer). El operador puede abortar un cambio
+legítimo con `CancelPendingKeyChange`. Los pendientes viven en un **singleton nuevo
+y perezoso** `VALIDATOR_KEY_TIMELOCK_REGISTRY_ID = [23]` — igual que KM#4 [22], NO
+cambia el formato de la entrada de validador (cero migración; byte-idéntico hasta
+el primer uso; brick-safe).
+
+**Ventanas (en QUANTOS, la misma unidad determinista que el unbonding/activación).**
+Bajo la cadencia estándar (`DEFAULT_ROUNDS_PER_QUANTO`/`DEFAULT_QUANTOS_PER_YEAR` ⇒
+~365 quantos/año, 1 quanto ≈ 1 día) mapean a la intención del auditor:
+
+- **operador ≈ 24 h** → `KEY_TIMELOCK_OPERATOR_QUANTOS = 1`
+- **withdrawal ≈ 72 h** → `KEY_TIMELOCK_WITHDRAWAL_QUANTOS = 3`
+- **recovery ≈ 7 d** → `KEY_TIMELOCK_RECOVERY_QUANTOS = 7`
+
+Las otras dos ventanas del auditor ya estaban satisfechas: la **rotación de
+consenso = próxima época** (vía la derivación del comité, ya en #20) y el **retiro
+del bono = ~7 d** (la ventana de unbonding + evidencia ya existente).
+
+**Garantías.** Re-proponer el mismo tipo RESETEA el reloj (comportamiento estándar
+de timelock). Al aplicar se RE-VALIDA contra el estado comprometido actual (el
+validador no puede ser terminal, la dirección nueva no debe colisionar, y un guard
+de anti-staleness rechaza un cambio cuyo `proposed_quanto` es anterior a la
+`registered_quanto` actual — cierra un replay por re-registro). Un `RecoverRevoke`
+(KM#4) PURGA los cambios pendientes del validador revocado — un atacante que propuso
+(p.ej.) redirigir el withdrawal se neutraliza dentro de la ventana con la recovery
+key, y el cambio pendiente nunca se aplica. Determinista → sin fork.
+
+**Honesto.** Timelockear `SetRecoveryCommittee` implica que hasta el PRIMER set el
+validador no tiene comité de recuperación activo por ~7 d — pero el comité se
+configura POR ADELANTADO durante operación tranquila (KM#4: "antes de cualquier
+compromiso"), no bajo coacción, así que es el tradeoff correcto.
+
+**Cambios.** (1) `qchain-execution` ids: `VALIDATOR_KEY_TIMELOCK_REGISTRY_ID=[23]`;
+(2) `qchain-execution` validator_v7: constantes de ventana, tipos `KeyChangeKind`/
+`PendingKeyChange`/`PendingKeyChangeEntry`/`KeyTimelockRegistry`,
+`read/write_key_timelock_registry` (perezoso, fail-loud si presente-pero-
+indecodificable), `RotateOperator`/`RotateWithdrawal`/`SetRecoveryCommittee` ahora
+PROPONEN, instrucciones `ApplyPendingKeyChange` (permissionless) + `CancelPendingKeyChange`
+(operator), purga en `recover_revoke`; (3) `qchain-node` rpc: ruta read-only
+`/validator_v7_pending_keys`; (4) `qchain-cli`: `v7-apply-key-change`,
+`v7-cancel-key-change` (los `v7-rotate-operator`/`-withdrawal`/`v7-set-recovery`
+ahora proponen).
+
+**Verificado.** qchain-execution **248 tests** (+2: las tres ventanas exactas +
+re-propose resetea el reloj; un pendiente se PURGA al revocar). clippy limpio
+cli/node/execution. **En vivo (2 validadores v7, rpq=6):** una rotación de
+withdrawal PROPUESTA quedó pendiente con `ready_quanto` IDÉNTICO en ambos nodos y
+NO se aplicó; aplicar DENTRO de la ventana (recovery, 7q) fue RECHAZADO (registro de
+recuperación vacío); aplicar TRAS la ventana cambió la withdrawal con **root
+byte-idéntico en ambos nodos** → SIN FORK; un `CancelPendingKeyChange` limpió el
+pendiente en ambos nodos con root byte-idéntico.
+
+## #6–#10 — pendientes
 
 Se implementan en orden de prioridad. Notas de diseño resumidas:
 
-- **#5 Timelocks on-chain.** Todo cambio de clave espera una ventana antes de
-  tomar efecto: rotación de consenso = próxima época; operador = 24 h; withdrawal
-  = 72 h; recovery = 7 d; retiro/destino del bono = 7 d.
 - **#6 Rotación en dos fases.** Propuesta (clave vieja) + aceptación con PoP de la
   clave nueva (`QCHAIN_KEY_ROTATION_ACCEPT_V1`), para que una rotación a una clave
   que no se posee sea imposible.
