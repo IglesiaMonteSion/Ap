@@ -18,8 +18,8 @@ es el que entregó el operador; acá se registra el trabajo.
 | # | Sev | Título | Clase(s) | Prioridad | Estado |
 |---|-----|--------|----------|-----------|--------|
 | 1 | **Crítico** | Falsificación de propuesta de gobernanza: `read_proposal` decodifica cualquier cuenta sin owner/dirección/magic; `CreateProposal` acepta dirección arbitraria; `passed_round + timelock` puede desbordar | EC-01, EC-05 | **P0** | ✅ **CORREGIDO (v8.6.18)** — owner check + dirección canónica + saturating timelock + 2 tests de exploit + sweep EC-01 limpio |
-| 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | por verificar |
-| 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | por verificar |
+| 2 | **Crítico** | Gate de arranque de tesorería usa un decodificador DISTINTO al del runtime → puede brickear una red viva al actualizar | EC-02, EC-07, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryState::decode_any_version` único, compartido gate+runtime |
+| 3 | **Alto** | `TreasuryStateV0` (migración) reusa el enum `PendingOp` NUEVO → no representa el formato histórico (regresión introducida en #17) | EC-02, EC-09 | **P0** | ✅ **CORREGIDO (v8.6.18)** — `TreasuryOpV0`/`PendingOpV0` históricos exactos + conversión + test |
 | 4 | **Alto** | Firmante remoto: `SignPeerVote` no pasa por la guardia anti-doble-firma; el daemon no autentica la identidad del cliente | EC-06 | P1 | por verificar |
 | 5 | Medio | Mezcla de aritmética de expiración/timelock de ops de tesorería sin `checked_*` / invariante | EC-05 | P1 | por verificar |
 | 6 | Medio | `Cancel` de tesorería ejecutable por un solo firmante → un firmante puede paralizar el multisig | EC-10 | P1 | por verificar |
@@ -100,33 +100,38 @@ mismo audit ataca en #2/#3). Se difiere a un incremento propio para NO introduci
 un bug de migración nuevo dentro del fix crítico — la regla "si no hay una
 optimización segura mejor no se hace nada".
 
-## #2 — Gate de arranque de tesorería ≠ decodificador de runtime (Crítico)
+## #2 — Gate de arranque de tesorería ≠ decodificador de runtime (Crítico) — ✅ CORREGIDO (v8.6.18)
 
-**Hipótesis (del audit):** `validate_critical_singletons`/el gate de arranque
-decodifica la cuenta de tesorería con un camino distinto al que usa el runtime
-(`treasury_v7::read_state`/`read_or_legacy`), así que una red viva cuya tesorería
-está en un formato que el runtime tolera pero el gate no, se **brickea** al
-actualizar (clase EC-09 + EC-02; precedente directo: el brick de #8.2.2).
+**Confirmado leyendo el código:** el gate (`ledger.rs:1318`) decodificaba con
+`TreasuryState::try_from_slice` (SÓLO el layout actual) mientras el runtime
+`read_state` (`treasury_v7.rs`) usa `read_or_legacy` (que ACEPTA además el layout
+pre-#17). Un blob pre-#17 (multisig sin los 3 campos de tier/expiry) FALLA
+`try_from_slice` (borsh EOF) y no es de 32 bytes → **el gate haltea** = brick al
+actualizar, aunque el runtime lo migraría (clase EC-09; precedente: brick de
+#8.2.2). El propio `deploy/qsep-sweep.sh EC-01` destapó el sitio exacto.
 
-**Fix (P0):** un único `TreasuryState::decode_any_version` compartido por
-arranque, runtime, inspección, migración y state-sync. El gate usa EXACTAMENTE
-ese decodificador.
+**Fix:** `TreasuryState::decode_any_version` — el ÚNICO decodificador (current →
+pre-#17 `read_or_legacy` → 32-byte authority) — compartido por el gate y
+`read_state`. Test `decode_any_version_accepts_every_live_layout_and_rejects_garbage`.
 
-**Por verificar en código** antes de parchar (QSEP-1: verify-before-patch):
-ubicar el gate y `read_state`, confirmar que difieren.
+## #3 — `TreasuryStateV0` reusaba el enum nuevo (Alto) — ✅ CORREGIDO (v8.6.18)
 
-## #3 — `TreasuryStateV0` reusa el enum nuevo (Alto)
+**Confirmado:** `TreasuryStateV0.pending` era `Vec<PendingOp>` con el `PendingOp`/
+`TreasuryOp` ACTUALES. `TreasuryOp` CAMBIÓ en #17 (`SetSigners` pasó de 2 a 4
+campos; `SetPolicy` ganó `op_expiry_rounds`), así que decodificar los bytes
+pre-#17 de un pending `SetSigners`/`SetPolicy` con el enum nuevo MISPARSEA (el
+layout de bytes difiere).
 
-**Hipótesis (del audit):** la struct histórica `TreasuryStateV0` (ruta de
-migración legacy→#17) referencia el enum `PendingOp` ACTUAL en vez de una copia
-histórica exacta `PendingOpV0`/`TreasuryOpV0`, así que "el formato viejo" que
-pretende decodificar no es el que realmente se publicó → migración incorrecta
-(clase EC-09).
-
-**Fix (P0):** structs históricas EXACTAS (`TreasuryStateV0`/`PendingOpV0`/
-`TreasuryOpV0` tal como se publicaron antes de #17) + conversión
-variante-por-variante + un fixture binario REAL de la versión anterior + prueba
-de migración + reinicio.
+**Fix:** `TreasuryOpV0` (Release / SetSigners{signers,threshold} /
+SetPolicy{4 campos}) + `PendingOpV0` — copias históricas EXACTAS (mismo orden de
+variantes; #17 sólo apéndió campos) — con conversión variante-por-variante
+`into_current()` (tiers = threshold de la op, expiry = 0). Test de regresión
+`a_pre17_treasury_with_pending_ops_migrates_each_op_exactly` construye los bytes
+pre-#17 reales (vía los tipos V0) y confirma que cada op migra exacta; falla sin
+el fix. **Límite honesto:** el fixture es sintético-pero-real (se serializan los
+tipos V0, que SON el layout pre-#17 byte-a-byte); no se pudo linkear un test de
+integración de reinicio en el sandbox (ENOSPC, documentado en #20), pero la
+migración está cubierta por este unit test + `decode_any_version`.
 
 ## #4 — Firmante remoto: guardia y autenticación (Alto)
 

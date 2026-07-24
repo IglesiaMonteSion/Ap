@@ -36,14 +36,14 @@ sigue cerrada.
 | ID | Clase | Enforcement automatizable | Estado |
 |---|---|---|---|
 | EC-01 | Autenticidad de cuenta privilegiada no forzada | parcial (grep de lecturas sin owner-check) | **CERRADA-VIGILADA** (v8.6.13 #1 corregido v8.6.18; sweep limpio) |
-| EC-02 | Detección de versión por "trial-borsh" | sí (grep de decoders en cascada / structs `*V0`) | **ABIERTA** (#2/#3/#7) |
+| EC-02 | Detección de versión por "trial-borsh" | sí (grep de decoders en cascada / structs `*V0`) | **PARCIAL** (#2 gate=runtime corregido v8.6.18; #7 pendiente) |
 | EC-03 | Se arregla la instancia, no la CLASE | proceso (este ledger + sweep) | permanente |
 | EC-04 | Crecimiento de recurso sin cota | parcial | cerrada-vigilada (#18) |
 | EC-05 | Aritmética de dinero/ronda/tiempo sin `checked_*` | sí (grep en módulos de valor) | **ABIERTA** (#1 timelock, #5) |
 | EC-06 | Falta separación de dominio de firma | parcial | cerrada-vigilada (#187) |
 | EC-07 | No-determinismo / riesgo de fork | proceso (DST) | cerrada-vigilada |
 | EC-08 | La interfaz como frontera de seguridad | parcial (grep de `.version` no comparada) | **ABIERTA** (#7) |
-| EC-09 | Peligros de migración (struct nueva para formato viejo; gate ≠ runtime) | sí | **ABIERTA** (#2/#3) |
+| EC-09 | Peligros de migración (struct nueva para formato viejo; gate ≠ runtime) | sí | **CERRADA-VIGILADA** (#2/#3 corregidos v8.6.18; sweep hecho) |
 | EC-10 | Hueco de autorización en flujo privilegiado | parcial | **ABIERTA** (#6 cancel) |
 | EC-11 | Sesgo de test al camino feliz / al modelo de amenazas propio | proceso | permanente |
 | EC-12 | Punto ciego del auditor = autor/mismo modelo | proceso (revisión externa) | permanente |
@@ -116,10 +116,31 @@ sigue cerrada.
 - **Causa raíz:** `read_or_legacy` fue cómodo y se generalizó sin un byte de
   versión persistido; #19 lo mitigó a nivel de singleton (manifiesto) pero los
   caminos por-struct siguen adivinando.
-- **Instancias (v8.6.13):** #2 el gate de arranque de tesorería NO usa el mismo
-  decodificador versionado que el runtime → puede brickear el arranque. #3
-  `TreasuryStateV0` reusa el enum `PendingOp` NUEVO → no representa el formato
-  viejo (bug introducido en #17). #7 `tx.version` firmado pero no enforzado.
+- **Instancias (v8.6.13):** #2 (CORREGIDO v8.6.18) el gate de arranque de tesorería
+  usaba `TreasuryState::try_from_slice` mientras el runtime usa `read_or_legacy`
+  → un blob pre-#17 (multisig sin tiers) pasaba el runtime pero el gate lo
+  rechazaba = **brick al actualizar**. Fix: `TreasuryState::decode_any_version`,
+  el ÚNICO decodificador, compartido por gate (`ledger.rs`) y runtime
+  (`read_state`). #3 (CORREGIDO v8.6.18) `TreasuryStateV0.pending` reusaba el
+  `PendingOp`/`TreasuryOp` NUEVO; como `TreasuryOp` CAMBIÓ en #17 (`SetSigners`
+  ganó 2 campos, `SetPolicy` ganó `op_expiry_rounds`), un pending SetSigners/
+  SetPolicy pre-#17 misparseaba. Fix: `TreasuryOpV0`/`PendingOpV0` históricos
+  EXACTOS + conversión variante-por-variante. #7 `tx.version` firmado pero no
+  enforzado (P1, pendiente).
+- **Barrido (v8.6.18):** (a) **gate = runtime** para TODOS los singletons —
+  treasury ahora comparte `decode_any_version`; validator-registry usa
+  `decode_registry` en gate y runtime (#20); params/fee-state/crypto-registry/
+  staking-global/pool/emergency usan el MISMO `read_or_legacy`/`try_from_slice`
+  en el gate (`ledger.rs:1262-1320`) que su lector de runtime. Sólo treasury
+  difería → cerrado. (b) **structs `*V0` que embeben un tipo cambiado:**
+  `TreasuryStateV0` era el único con un enum interno cambiado (TreasuryOp) →
+  corregido. `ProposalV0` (governance) embebe `ProposalAction`/`ProposalStatus`,
+  que desde su cutover (#16) sólo AGREGARON variantes (nunca cambiaron los campos
+  de una variante existente) → hoy decodifica correcto, pero **LATENTEMENTE
+  frágil**: si alguna vez se agrega/cambia un CAMPO de una variante existente de
+  `ProposalAction`/`ProposalStatus`, hay que congelar un `ProposalActionV0`
+  (misma lección que TreasuryOp). `StakeAccountDataLegacy`/`EconomicParams`/
+  `FeeState` sólo apéndan campos escalares → seguros.
 - **Regla que lo cierra:** UN único decodificador canónico (`decode_any_version`)
   compartido por arranque/runtime/inspección/migración/state-sync. Todo formato
   persistente lleva `magic|version` explícito; las structs históricas se

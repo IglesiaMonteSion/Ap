@@ -225,10 +225,60 @@ impl TreasuryState {
     }
 }
 
+/// The pre-#17 `TreasuryOp` layout (audit v8.6.13 #3 / LESSONS-LEDGER EC-09).
+/// A `*V0` historical struct MUST embed the historical inner types EXACTLY, not
+/// the CURRENT ones: `TreasuryOp` CHANGED in #17 (`SetSigners` gained
+/// `policy_threshold`/`signers_threshold`; `SetPolicy` gained `op_expiry_rounds`),
+/// so decoding a pre-#17 blob's `pending` with the NEW `TreasuryOp` misparses any
+/// pending `SetSigners`/`SetPolicy` op (byte layouts differ). This is the pre-#17
+/// (#222-era) enum: same variant ORDER/discriminants (#17 only appended fields),
+/// with the appended fields REMOVED. Private; used only by `read_or_legacy`.
+#[derive(BorshDeserialize, BorshSerialize)]
+enum TreasuryOpV0 {
+    Release { amount: u64, destination: Pubkey },
+    SetSigners { signers: Vec<Pubkey>, threshold: u8 },
+    SetPolicy { timelock_rounds: u64, max_per_release: u64, max_per_window: u64, window_rounds: u64 },
+}
+
+impl TreasuryOpV0 {
+    /// Convert a pre-#17 op to the current one, defaulting the #17 fields to their
+    /// migration values (tiers = the base `threshold` of the migrated state; op
+    /// expiry = 0). `SetSigners` carries the signer set's own threshold, so its
+    /// tiers default to that; `SetPolicy` carries no threshold, so it defaults
+    /// `op_expiry_rounds = 0`.
+    fn into_current(self) -> TreasuryOp {
+        match self {
+            TreasuryOpV0::Release { amount, destination } => TreasuryOp::Release { amount, destination },
+            TreasuryOpV0::SetSigners { signers, threshold } => TreasuryOp::SetSigners {
+                signers,
+                threshold,
+                policy_threshold: threshold,
+                signers_threshold: threshold,
+            },
+            TreasuryOpV0::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds } => {
+                TreasuryOp::SetPolicy { timelock_rounds, max_per_release, max_per_window, window_rounds, op_expiry_rounds: 0 }
+            }
+        }
+    }
+}
+
+/// The pre-#17 `PendingOp` layout — identical shape to the current one except its
+/// `op` is a `TreasuryOpV0` (the pre-#17 enum), so it decodes pre-#17 pending ops
+/// byte-exactly. `PendingOp`'s OWN fields didn't change in #17.
+#[derive(BorshDeserialize, BorshSerialize)]
+struct PendingOpV0 {
+    id: u64,
+    op: TreasuryOpV0,
+    proposed_round: u64,
+    approvals: Vec<Pubkey>,
+    threshold_reached_round: u64,
+}
+
 /// The pre-#17 `TreasuryState` layout (every field EXCEPT the three appended
 /// #17 fields), used only by `read_or_legacy` to decode a treasury account
 /// written before the threshold hierarchy / op-expiry existed. Private; must
-/// mirror `TreasuryState` up to (not including) `policy_threshold`.
+/// mirror `TreasuryState` up to (not including) `policy_threshold`, and embed the
+/// pre-#17 `PendingOpV0` (NOT the current `PendingOp`).
 #[derive(BorshDeserialize, BorshSerialize)]
 struct TreasuryStateV0 {
     signers: Vec<Pubkey>,
@@ -240,7 +290,7 @@ struct TreasuryStateV0 {
     window_start_round: u64,
     released_in_window: u64,
     next_op_id: u64,
-    pending: Vec<PendingOp>,
+    pending: Vec<PendingOpV0>,
 }
 
 impl TreasuryState {
@@ -266,11 +316,42 @@ impl TreasuryState {
             window_start_round: v0.window_start_round,
             released_in_window: v0.released_in_window,
             next_op_id: v0.next_op_id,
-            pending: v0.pending,
+            // Convert each pre-#17 pending op to the current layout (audit #3).
+            pending: v0
+                .pending
+                .into_iter()
+                .map(|p| PendingOp {
+                    id: p.id,
+                    op: p.op.into_current(),
+                    proposed_round: p.proposed_round,
+                    approvals: p.approvals,
+                    threshold_reached_round: p.threshold_reached_round,
+                })
+                .collect(),
             policy_threshold: v0.threshold,
             signers_threshold: v0.threshold,
             op_expiry_rounds: 0,
         })
+    }
+
+    /// THE single canonical decoder for a treasury account's `data`, shared by
+    /// runtime (`read_state`), the startup gate (`Ledger::validate_critical_singletons`),
+    /// inspection and migration (audit v8.6.13 #2 / LESSONS-LEDGER EC-02). Accepts,
+    /// in order: the current multisig layout, a pre-#17 multisig blob
+    /// (`read_or_legacy`), or the pre-#222 32-byte single-authority blob (lifted to
+    /// a 1-of-1). `None` only for genuinely-corrupt bytes. Using ONE decoder
+    /// everywhere prevents the class where the gate rejects a blob the runtime
+    /// accepts (→ brick on upgrade).
+    pub fn decode_any_version(data: &[u8]) -> Option<Self> {
+        if let Some(s) = TreasuryState::read_or_legacy(data) {
+            return Some(s);
+        }
+        if data.len() == 32 {
+            if let Ok(authority) = Pubkey::try_from_slice(data) {
+                return Some(TreasuryState::single(authority));
+            }
+        }
+        None
     }
 }
 
@@ -318,17 +399,12 @@ fn read_state(accounts: &HashMap<Pubkey, Account>) -> Option<TreasuryState> {
     // a binary update, then upgrades itself via SetSigners). Anything else is real
     // corruption of the account that guards locked funds → refuse to run.
     accounts.get(&TREASURY_ACCOUNT_ID).map(|a| {
-        // `read_or_legacy` handles both the current layout and the pre-#17 layout
-        // (without the tier thresholds / op-expiry, migrated with all tiers equal).
-        if let Some(s) = TreasuryState::read_or_legacy(&a.data) {
-            return s;
-        }
-        if a.data.len() == 32 {
-            if let Ok(authority) = Pubkey::try_from_slice(&a.data) {
-                return TreasuryState::single(authority);
-            }
-        }
-        panic!("TREASURY_ACCOUNT is present but does not decode as TreasuryState or a legacy authority; refusing to run on corrupt treasury state")
+        // ONE canonical decoder shared with the startup gate (audit #2): current
+        // layout, pre-#17 layout (tiers/expiry migrated), or the 32-byte legacy
+        // authority (lifted to 1-of-1). Anything else is real corruption.
+        TreasuryState::decode_any_version(&a.data).unwrap_or_else(|| {
+            panic!("TREASURY_ACCOUNT is present but does not decode as TreasuryState or a legacy authority; refusing to run on corrupt treasury state")
+        })
     })
 }
 
@@ -966,5 +1042,107 @@ mod tests {
         assert_eq!(TreasuryState::read_or_legacy(&full_bytes).unwrap(), full);
         // The two layouts never cross-decode (borsh rejects the new blob's trailing bytes as V0).
         assert!(borsh::from_slice::<TreasuryStateV0>(&full_bytes).is_err());
+    }
+
+    #[test]
+    fn a_pre17_treasury_with_pending_ops_migrates_each_op_exactly() {
+        // REGRESSION — audit v8.6.13 #3 / EC-09. A pre-#17 pending `SetSigners`
+        // had 2 fields {signers, threshold}; the current one has 4. If
+        // `TreasuryStateV0` embedded the NEW `TreasuryOp` (the pre-fix bug), a
+        // pending SetSigners/SetPolicy would MISPARSE. This builds the real pre-#17
+        // bytes (via the historical V0 types) and confirms every pending op
+        // migrates to the current layout exactly. Fails without the V0-op fix.
+        let v0 = TreasuryStateV0 {
+            signers: vec![pk(1), pk(2), pk(3)],
+            threshold: 2,
+            timelock_rounds: 10,
+            max_per_release: 5,
+            max_per_window: 9,
+            window_rounds: 100,
+            window_start_round: 3,
+            released_in_window: 4,
+            next_op_id: 10,
+            pending: vec![
+                PendingOpV0 {
+                    id: 7,
+                    op: TreasuryOpV0::SetSigners { signers: vec![pk(4), pk(5), pk(6)], threshold: 2 },
+                    proposed_round: 42,
+                    approvals: vec![pk(1)],
+                    threshold_reached_round: 0,
+                },
+                PendingOpV0 {
+                    id: 9,
+                    op: TreasuryOpV0::SetPolicy { timelock_rounds: 11, max_per_release: 1, max_per_window: 2, window_rounds: 3 },
+                    proposed_round: 43,
+                    approvals: vec![pk(2), pk(3)],
+                    threshold_reached_round: 44,
+                },
+            ],
+        };
+        let bytes = borsh::to_vec(&v0).unwrap();
+        let migrated = TreasuryState::read_or_legacy(&bytes).expect("pre-#17 blob with pending ops migrates");
+        assert_eq!(migrated.pending.len(), 2);
+        match &migrated.pending[0].op {
+            TreasuryOp::SetSigners { signers, threshold, policy_threshold, signers_threshold } => {
+                assert_eq!(signers, &vec![pk(4), pk(5), pk(6)]);
+                assert_eq!((*threshold, *policy_threshold, *signers_threshold), (2, 2, 2), "tiers default to the op's threshold");
+            }
+            other => panic!("expected SetSigners, got {other:?}"),
+        }
+        assert_eq!(migrated.pending[0].proposed_round, 42);
+        assert_eq!(migrated.pending[0].approvals, vec![pk(1)]);
+        match &migrated.pending[1].op {
+            TreasuryOp::SetPolicy { timelock_rounds, op_expiry_rounds, .. } => {
+                assert_eq!(*timelock_rounds, 11);
+                assert_eq!(*op_expiry_rounds, 0, "a pre-#17 SetPolicy has no op-expiry");
+            }
+            other => panic!("expected SetPolicy, got {other:?}"),
+        }
+        assert_eq!(migrated.pending[1].threshold_reached_round, 44);
+    }
+
+    #[test]
+    fn decode_any_version_accepts_every_live_layout_and_rejects_garbage() {
+        // REGRESSION — audit v8.6.13 #2 / EC-02. The startup gate now uses the SAME
+        // `decode_any_version` as the runtime `read_state`, so no blob the node can
+        // run is rejected at startup (no brick on upgrade). This asserts the shared
+        // decoder accepts every live layout and rejects corruption.
+        // (a) current multisig layout
+        let (a, _) = tiered_world(2, 3, 4, 500);
+        let current = borsh::to_vec(&read_state(&a).unwrap()).unwrap();
+        // (b) pre-#17 multisig layout (with a pending op, the exact #3 case)
+        let v0 = TreasuryStateV0 {
+            signers: vec![pk(1), pk(2)],
+            threshold: 1,
+            timelock_rounds: 10,
+            max_per_release: 5,
+            max_per_window: 9,
+            window_rounds: 100,
+            window_start_round: 3,
+            released_in_window: 4,
+            next_op_id: 7,
+            pending: vec![PendingOpV0 {
+                id: 1,
+                op: TreasuryOpV0::Release { amount: 500, destination: pk(8) },
+                proposed_round: 5,
+                approvals: vec![pk(1)],
+                threshold_reached_round: 5,
+            }],
+        };
+        let pre17 = borsh::to_vec(&v0).unwrap();
+        // (c) pre-#222 32-byte single authority
+        let legacy32 = borsh::to_vec(&pk(9)).unwrap();
+        assert_eq!(legacy32.len(), 32);
+
+        assert!(TreasuryState::decode_any_version(&current).is_some(), "current layout");
+        assert!(TreasuryState::decode_any_version(&pre17).is_some(), "pre-#17 layout");
+        assert_eq!(
+            TreasuryState::decode_any_version(&legacy32).unwrap(),
+            TreasuryState::single(pk(9)),
+            "32-byte authority lifts to 1-of-1"
+        );
+        // Genuinely corrupt bytes → None (fail-loud at the gate / read_state panic),
+        // never a silent default.
+        assert!(TreasuryState::decode_any_version(&[0xFFu8; 9]).is_none(), "corrupt blob rejected");
     }
 }

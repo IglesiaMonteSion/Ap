@@ -1315,10 +1315,12 @@ impl Ledger {
             // present. Accept the multisig `TreasuryState` OR a legacy 32-byte
             // single-authority blob (brick-safe: a pre-#222 treasury still boots and
             // runs as a 1-of-1 until upgraded via SetSigners).
-            let treasok = |d: &[u8]| {
-                crate::treasury_v7::TreasuryState::try_from_slice(d).is_ok()
-                    || (d.len() == 32 && Pubkey::try_from_slice(d).is_ok())
-            };
+            // Use the SAME canonical decoder as the runtime `read_state` (audit
+            // v8.6.13 #2 / EC-02): a gate that decoded with a narrower path than
+            // the runtime would REJECT a blob the node can actually run — bricking
+            // a live network on upgrade. `decode_any_version` accepts the current
+            // layout, the pre-#17 multisig layout, and the 32-byte legacy authority.
+            let treasok = |d: &[u8]| crate::treasury_v7::TreasuryState::decode_any_version(d).is_some();
             decodes_if_present(crate::ids::TREASURY_ACCOUNT_ID, "TREASURY", &treasok)?;
         }
         Ok(())
