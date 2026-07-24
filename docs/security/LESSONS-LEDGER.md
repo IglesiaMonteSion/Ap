@@ -183,7 +183,16 @@ sigue cerrada.
   movimientos de fondos usan `arith::sub_u64/add_u64` checked, y el invariante
   `op_expiry_rounds > timelock_rounds` se valida en génesis y en `SetPolicy`;
   verificado por barrido — sin `+`/`-`/`*` crudo sobre round/amount/expiry en el
-  módulo).
+  módulo). **Barrido QSEP-1 proactivo (v8.6.23):** corrido el `qsep-sweep.sh`
+  sobre TODO el árbol post-audit; de los 10 candidatos EC-05, 9 eran tests y el
+  ÚNICO de producción era `fees_v7::distribute_fee_pool` (`paid = reward * n` +
+  `remainder = pool - paid`) — provablemente sin desborde (`reward*n =
+  floor(pool/n)*n ≤ pool ≤ u64::MAX`) pero el único `*`/`-` de dinero crudo
+  junto a vecinos `checked_*` (líneas del `credit`/débito del pool). CERRADO a
+  `checked_mul`/`checked_sub` fail-loud por consistencia (cero cambio de
+  comportamiento — no puede desbordar; falla ruidoso ante estado corrupto en vez
+  de un panic de overflow-checks). 6/6 tests de `fees_v7` pasan (incl.
+  `distribution_is_equal_with_remainder_kept_in_the_pool`).
 - **Regla:** `checked_add/sub/mul/div` (o `saturating_*` documentado en no-dinero)
   en TODO cálculo de valor/ronda/tiempo; un overflow rechaza la transición.
 - **Detección (sweep):** grep de `+`/`-`/`*` sin `checked_`/`saturating_` en

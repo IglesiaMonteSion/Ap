@@ -96,7 +96,11 @@ pub fn distribute_fee_pool(accounts: &mut HashMap<Pubkey, Account>, registry: &V
     }
     let n = eligible.len() as u64;
     let reward = pool / n;
-    let paid = reward * n;
+    // #218/EC-05 (barrido QSEP-1): dinero → aritmética comprobada fail-loud, igual
+    // que `credit`/el débito del pool de arriba. `reward*n = floor(pool/n)*n ≤ pool`
+    // por construcción (no puede desbordar), pero se usa `checked_*` por consistencia
+    // y para fallar ruidoso ante un estado corrupto en vez de un panic de overflow-checks.
+    let paid = reward.checked_mul(n).expect("v7 fee-pool payout overflow — corrupt state");
     if reward > 0 {
         // Debit the pool by exactly what's paid; the remainder stays.
         { let a = accounts.get_mut(&VALIDATOR_FEE_POOL_ID).unwrap(); a.balance = a.balance.checked_sub(paid).expect("v7 fee-pool debit underflow — corrupt state"); }
@@ -104,7 +108,7 @@ pub fn distribute_fee_pool(accounts: &mut HashMap<Pubkey, Account>, registry: &V
             credit(accounts, addr, reward);
         }
     }
-    let remainder = pool - paid;
+    let remainder = pool.checked_sub(paid).expect("v7 fee-pool remainder underflow — corrupt state");
     (reward, eligible.len(), remainder)
 }
 
