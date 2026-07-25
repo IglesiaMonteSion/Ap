@@ -21,6 +21,7 @@ sbom.cdx.json
 # corrida del mismo operador (o la del verificador independiente) fallaría
 # `worktree_clean` por su propio artefacto.
 mainnet-gate-report.json
+mainnet-gate-report-logs/
 
 # cargo-fuzz artifacts (task #200)
 /fuzz/target/

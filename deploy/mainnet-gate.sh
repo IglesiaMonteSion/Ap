@@ -89,7 +89,11 @@ done
 # FIN CHEQUEOS
 
 WORK="$(mktemp -d /tmp/qchain-gate.XXXXXX)"
-LOGS="$WORK/logs"; mkdir -p "$LOGS"
+# Los logs viven FUERA del workdir efímero, al lado del reporte: un veredicto
+# FAIL/INCOMPLETE es exactamente cuando hacen falta, y borrarlos al salir dejaba
+# al operador sin nada que diagnosticar (defecto encontrado corriendo el gate: la
+# primera corrida marcó dos chequeos en rojo y sus logs ya no existían).
+LOGS="${OUT%.json}-logs"; rm -rf "$LOGS"; mkdir -p "$LOGS"
 trap 'rm -rf "$WORK"' EXIT
 
 RESULTS="$WORK/results.tsv"; : > "$RESULTS"
@@ -253,10 +257,14 @@ else
   # Builder B: OTRO directorio + OTRO CARGO_HOME. Si un path se filtrara al
   # binario, los hashes diferirían y este chequeo lo delata.
   SRCB="$WORK/builderB"; rm -rf "$SRCB"
+  # `unset RUSTFLAGS` antes de sourcear: el shell principal ya tiene el remap del
+  # builder A, y acumularlos dejaría a B con remaps de A que no matchean nada.
+  # No cambia los bytes (los extra son no-ops) pero vuelve al chequeo dependiente
+  # de un detalle frágil; mejor que cada builder derive su env desde cero.
   if ( set -e
        git -c advice.detachedHead=false clone --quiet --no-hardlinks "$ROOT" "$SRCB"
-       cd "$SRCB"; git checkout --quiet "$COMMIT"
-       export CARGO_HOME="$WORK/cargohomeB"
+       cd "$SRCB"; git -c advice.detachedHead=false checkout --quiet "$COMMIT"
+       export CARGO_HOME="$WORK/cargohomeB"; unset RUSTFLAGS
        . "$SRCB/deploy/reproducible-env.sh"
        QCHAIN_REPRO_QUIET=1 cargo build --locked --release $QCHAIN_RELEASE_PKGS
      ) > "$LOGS/reproducible_cross.log" 2>&1; then
@@ -272,6 +280,11 @@ else
       bad "NO reproducible cross-builder (difieren:$diffs) — ¿fuga de path?"
       record reproducible_cross fail required "differ:$diffs"
     fi
+    # LIBERAR YA el árbol del builder B (clone + target de release completo, varios
+    # GB). Si se deja hasta el final, los harness EN VIVO de más abajo — que
+    # levantan testnets reales con su propio estado en disco — corren con el disco
+    # innecesariamente comprimido. (Defecto encontrado corriendo el gate.)
+    rm -rf "$SRCB" "$WORK/cargohomeB"
   else
     bad "falló el builder B — log: $LOGS/reproducible_cross.log"
     tail -20 "$LOGS/reproducible_cross.log" | sed 's/^/      /'
@@ -357,7 +370,7 @@ else
     if bash deploy/chaos-test.sh > "$LOGS/live_chaos.log" 2>&1 \
        && grep -q 'FAIL=0' "$LOGS/live_chaos.log"; then
       ok "chaos-test: convergencia sin fork tras cada falla mecánica"
-      record live_chaos pass required "$(grep -oE 'PASS=[0-9]+ FAIL=[0-9]+' "$LOGS/live_chaos.log" | tail -1)"
+      record live_chaos pass required "$(grep -oE 'PASS=[0-9]+ +FAIL=[0-9]+' "$LOGS/live_chaos.log" | tail -1)"
     else
       bad "chaos-test — log: $LOGS/live_chaos.log"; tail -15 "$LOGS/live_chaos.log" | sed 's/^/      /'
       record live_chaos fail required "see log"
@@ -365,7 +378,7 @@ else
     if bash deploy/byzantine-injector.sh > "$LOGS/live_byzantine.log" 2>&1 \
        && grep -q 'VEREDICTO: PASS' "$LOGS/live_byzantine.log"; then
       ok "byzantine-injector: la red honesta resistió cada ataque firmado (sin fork, viva)"
-      record live_byzantine pass required "$(grep -oE 'PASS=[0-9]+  FAIL=[0-9]+' "$LOGS/live_byzantine.log" | tail -1)"
+      record live_byzantine pass required "$(grep -oE 'PASS=[0-9]+ +FAIL=[0-9]+' "$LOGS/live_byzantine.log" | tail -1)"
     else
       bad "byzantine-injector — log: $LOGS/live_byzantine.log"; tail -15 "$LOGS/live_byzantine.log" | sed 's/^/      /'
       record live_byzantine fail required "see log"
