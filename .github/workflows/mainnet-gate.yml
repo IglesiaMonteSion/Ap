@@ -1,0 +1,143 @@
+name: Gate de mainnet (arsenal completo sobre UN commit)
+
+# PRE-MAINNET #3 — "CI INDEPENDIENTE SOBRE EL COMMIT FINAL".
+#
+# POR QUÉ EXISTE ESTE WORKFLOW APARTE. `ci.yml` corre el gate rápido en cada
+# push y deja los jobs PESADOS (fuzz, sanitizers, reproducible cross-builder)
+# detrás de `schedule || workflow_dispatch` — o sea que corren sobre el HEAD que
+# hubiera a las 04:00 UTC, NO sobre el commit que se va a lanzar. Y `release.yml`
+# gatea el commit tagueado con un SUBCONJUNTO. Ninguno de los dos produce la
+# afirmación que un lanzamiento necesita: *el arsenal COMPLETO está verde sobre
+# ESTE commit exacto*.
+#
+# Este workflow lo produce, y lo produce de forma VERIFICABLE por terceros:
+#   · Corre `deploy/mainnet-gate.sh`, que es el MISMO script que cualquier
+#     operador puede correr en su propia máquina — la verificación no depende de
+#     confiar en la palabra de GitHub.
+#   · SIN CACHÉ de cargo, a propósito: un gate de lanzamiento debe construirse
+#     desde cero. Una caché envenenada o simplemente stale volvería el resultado
+#     no reproducible por otro (que es justo lo que se quiere demostrar).
+#   · Sube `mainnet-gate-report.json`, cuyo `report_hash` es lo ÚNICO que un
+#     verificador independiente necesita comparar.
+#
+# El veredicto tiene tres estados y `INCOMPLETE` **no** es aprobado: si un
+# chequeo obligatorio se saltea (herramienta ausente, flag `--skip-*`), el script
+# sale con código 2 y el job falla. Un gate que "pasa" salteando la mitad sería
+# la mentira que esto existe para impedir.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit/tag EXACTO a gatear (default: el ref del dispatch)"
+        required: false
+        type: string
+      skip_live:
+        description: "Saltear los harness EN VIVO (el veredicto será INCOMPLETE)"
+        required: false
+        default: false
+        type: boolean
+  # Un release oficial también dispara el gate completo sobre su tag. No bloquea
+  # a `release.yml` (son workflows distintos); es el registro auditable de que el
+  # arsenal completo corrió sobre exactamente esa tag.
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mainnet-gate-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: Arsenal completo (sin caché) sobre el commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `fetch-depth: 0` porque el gate hace un `git clone` local del repo
+          # para el builder B de la verificación reproducible cross-builder.
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Toolchain de Rust (pinneado por rust-toolchain.toml) + wasm32
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      # nightly + rust-src: los chequeos `fuzz_wire` y `sanitizers` del gate los
+      # necesitan. Sin ellos el script los marca SALTEADOS y el veredicto cae a
+      # INCOMPLETE — correcto, pero acá los queremos CORRIDOS sobre este commit.
+      - name: Toolchain nightly (fuzzing + sanitizers)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      # cargo-audit y cargo-fuzz son chequeos OBLIGATORIOS del gate: si faltan,
+      # el script los marca `skip` y el veredicto cae a INCOMPLETE (exit 2) — así
+      # que se instalan acá en vez de dejar que el gate quede a medias.
+      - name: Instalar cargo-audit + cargo-fuzz
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-fuzz --locked
+
+      # DELIBERADAMENTE SIN `Swatinem/rust-cache`: ver la cabecera.
+
+      - name: Correr el gate completo
+        id: gate
+        run: |
+          ARGS=""
+          if [ "${{ inputs.skip_live }}" = "true" ]; then ARGS="--skip-live"; fi
+          bash deploy/mainnet-gate.sh --out mainnet-gate-report.json $ARGS
+
+      # El reporte se sube SIEMPRE (también si el gate falló): un veredicto
+      # FAIL/INCOMPLETE es exactamente lo que hay que poder auditar después.
+      - name: Subir el reporte del gate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mainnet-gate-report
+          path: mainnet-gate-report.json
+          if-no-files-found: warn
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Gate de mainnet — \`${{ inputs.ref || github.ref_name }}\`"
+            echo
+            if [ -s mainnet-gate-report.json ]; then
+              python3 - <<'PY'
+          import json
+          r = json.load(open("mainnet-gate-report.json"))
+          print(f"**Veredicto: {r['verdict']}**\n")
+          print(f"- commit: `{r['commit']}`")
+          print(f"- version: `{r['version']}`")
+          print(f"- toolchain: `{r['rustc']}`")
+          print(f"- **report_hash: `{r['report_hash']}`**\n")
+          print("| chequeo | tipo | estado | detalle |")
+          print("|---|---|---|---|")
+          for c in r["checks"]:
+              mark = {"pass": "✅", "fail": "❌", "skip": "⚠️ SALTEADO"}.get(c["status"], c["status"])
+              print(f"| `{c['name']}` | {c['kind']} | {mark} | {c['detail']} |")
+          print()
+          print("Verificación independiente: corré `deploy/mainnet-gate.sh` sobre el mismo")
+          print("commit y compará el `report_hash`.")
+          PY
+            else
+              echo "El gate no llegó a emitir reporte."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

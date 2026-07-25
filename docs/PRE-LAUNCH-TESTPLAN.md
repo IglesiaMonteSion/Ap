@@ -21,6 +21,11 @@ herramienta concreta + criterio de pass/fail, y define el protocolo del soak.
     sobre-dimensionado + bytes basura, y flood de tx de un pagador sin fondos —,
     verificando tras cada uno que la red honesta no forkea Y sigue viva (una tx
     nueva finaliza). Cada ataque mapea 1:1 a una defensa (#88/#175/#208/#210).
+  - `deploy/mainnet-gate.sh` — el GATE sobre el commit final: corre el arsenal
+    COMPLETO (build/clippy/tests/DST/SDK-wasm32/audit/SBOM/reproducible
+    cross-builder/fuzzing/sanitizers/barrido QSEP-1 + los DOS harness en vivo) y
+    emite un reporte determinista cuyo `report_hash` un tercero reproduce sobre
+    el mismo commit. Un chequeo obligatorio salteado da `INCOMPLETE`, nunca PASS.
   - `deploy/soak-canary.py` — monitor CONTINUO de las 5 invariantes contra
     TODOS los RPC de la red real, durante todo el soak.
   - `deploy/qchain-watchdog.py` — alertas de runtime (fork, RAM/disco, stall,

@@ -66,10 +66,93 @@ jobs:
           echo "tag=$TAGV workspace=$WSV"
           [ "$TAGV" = "$WSV" ] || { echo "FALLO: la tag ($TAGV) no coincide con Cargo.toml ($WSV)"; exit 1; }
 
-  # 2) ARTEFACTOS + PROVENANCE: sólo tras el gate verde, sobre el mismo commit.
+  # 1-bis) REPRODUCIBLE CROSS-BUILDER **SOBRE EL COMMIT TAGUEADO**.
+  # POR QUÉ ES OBLIGATORIO ACÁ (pre-mainnet #3): el job `provenance` de abajo
+  # publica los sha256 de los binarios y afirma que son los que reproduce
+  # cualquier builder independiente. Antes NADA lo verificaba sobre ESTE commit
+  # — el job `reproducible` de `ci.yml` corre de noche, sobre el HEAD que
+  # hubiera a las 04:00 UTC. Una afirmación en un comentario no es un gate: si
+  # un path se filtrara al binario, se publicaban hashes irreproducibles y el
+  # verificador independiente fallaría sin que nadie se hubiera enterado.
+  reproducible:
+    name: Reproducible cross-builder (dos builders -> hashes idénticos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dependencias de sistema (liboqs / bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Toolchain de Rust (pinneado por rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+      - name: Builder A (checkout path, CARGO_HOME del runner)
+        run: |
+          . deploy/reproducible-env.sh
+          cargo build --locked --release $QCHAIN_RELEASE_PKGS
+          mkdir -p /tmp/relA && cp $(for b in $QCHAIN_RELEASE_BINS; do echo "target/release/$b"; done) /tmp/relA/
+          (cd /tmp/relA && sha256sum * | sort -k2 > SHA256SUMS) && cat /tmp/relA/SHA256SUMS
+      - name: Builder B (OTRO path + OTRO CARGO_HOME)
+        run: |
+          SRCB="$RUNNER_TEMP/relB-src"; rm -rf "$SRCB"; cp -a "$GITHUB_WORKSPACE" "$SRCB"
+          cd "$SRCB"; export CARGO_HOME="$RUNNER_TEMP/cargohomeB"
+          . "$SRCB/deploy/reproducible-env.sh"
+          cargo build --locked --release $QCHAIN_RELEASE_PKGS
+          mkdir -p /tmp/relB && cp $(for b in $QCHAIN_RELEASE_BINS; do echo "target/release/$b"; done) /tmp/relB/
+          (cd /tmp/relB && sha256sum * | sort -k2 > SHA256SUMS)
+      - name: Exigir hashes idénticos (si no, no se publica nada)
+        run: |
+          if diff /tmp/relA/SHA256SUMS /tmp/relB/SHA256SUMS; then
+            echo "OK: los binarios de ESTE commit son reproducibles cross-builder."
+          else
+            echo "FALLO: no reproducible cross-builder. No se publica el release."; exit 1
+          fi
+
+  # 1-ter) SDK + plantillas a wasm32: están EXCLUIDOS del workspace, así que el
+  # `cargo test --workspace` del gate NUNCA los compila. Sin esto, un release
+  # podía publicarse con la capa de seguridad del SDK rota.
+  sdk:
+    name: SDK de contratos + plantillas (wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Toolchain de Rust + wasm32
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch pinned
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - name: Clippy + tests + build (host y wasm32)
+        run: |
+          set -e
+          cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/qchain-sdk/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+          cargo test  --manifest-path crates/qchain-sdk/Cargo.toml
+          for t in token vault payments counter shared_counter escrow; do
+            cargo build --manifest-path "crates/qchain-sdk/templates/$t/Cargo.toml" --release --target wasm32-unknown-unknown
+          done
+
+  # 1-quater) BARRIDO QSEP-1 sobre el commit tagueado. Es ADVISORY por su propio
+  # contrato (flaggea candidatos, no reprueba), pero QSEP-1 exige que quede
+  # CORRIDO y ARCHIVADO — antes no corría en ningún workflow.
+  sweep:
+    name: Barrido de clases de error (QSEP-1, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: qsep-sweep
+        run: bash deploy/qsep-sweep.sh | tee qsep-sweep-report.txt
+      - name: Archivar el barrido
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qsep-sweep-report
+          path: qsep-sweep-report.txt
+
+  # 2) ARTEFACTOS + PROVENANCE: sólo tras TODOS los gates verdes, sobre el mismo
+  # commit. `reproducible` está en `needs` a propósito — sin él, la provenance
+  # publicaría hashes cuya reproducibilidad nadie verificó para estos bytes.
   provenance:
     name: Binarios + imagen + provenance (+ firma si hay clave)
-    needs: gate
+    needs: [gate, reproducible, sdk, sweep]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

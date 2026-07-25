@@ -24,13 +24,57 @@ commit  ->  version  ->  binarios  ->  imagen de despliegue  ->  wasm de la wall
 | **Sanitizers** (ASan/UBSan sobre los deserializadores) | `ci.yml` job `sanitizers` | nightly + manual |
 | **Builds reproducibles** (2 builds → hashes idénticos) | `ci.yml` job `reproducible` | nightly + manual |
 | **Gate de release** (build+clippy+tests+audit + tag==version) | `release.yml` job `gate` | al pushear tag `vX.Y.Z` |
-| **Binarios + imagen + provenance (+ firma)** | `release.yml` job `provenance` | tras el gate verde |
+| **Reproducible cross-builder sobre el commit tagueado** | `release.yml` job `reproducible` | al pushear tag `vX.Y.Z` |
+| **SDK + plantillas a wasm32 sobre el commit tagueado** | `release.yml` job `sdk` | al pushear tag `vX.Y.Z` |
+| **Barrido QSEP-1 archivado** | `release.yml` job `sweep` | al pushear tag `vX.Y.Z` |
+| **Binarios + imagen + provenance (+ firma)** | `release.yml` job `provenance` | tras TODOS los gates verdes |
+| **GATE DE MAINNET: arsenal COMPLETO sobre UN commit** | `mainnet-gate.yml` (= `deploy/mainnet-gate.sh`) | manual (`workflow_dispatch`) + al pushear tag |
 
-Los jobs pesados (fuzz/sanitizers/reproducible) corren de noche (`cron 04:00 UTC`)
-y a demanda (`workflow_dispatch`), no en cada push, para no volver lento el gate
-rápido. El **release** los ata: sus artefactos firmados sólo se producen si el
-gate está verde sobre el commit tagueado, y la tag debe coincidir con la versión
-del `Cargo.toml`.
+En `ci.yml` los jobs pesados (fuzz/sanitizers/reproducible) corren de noche
+(`cron 04:00 UTC`) y a demanda, no en cada push, para no volver lento el gate
+rápido — pero eso significa que corren sobre el HEAD que hubiera a esa hora, **no
+necesariamente sobre el commit que se lanza**. El release cierra la parte que le
+toca: `provenance` depende de `gate` + `reproducible` + `sdk` + `sweep`, así que
+los hashes publicados **no pueden** afirmar una reproducibilidad que nadie
+verificó para esos bytes.
+
+Para un lanzamiento, la afirmación que hace falta es más fuerte: *el arsenal
+COMPLETO está verde sobre ESTE commit exacto*. Eso lo produce el **gate de
+mainnet** (sección siguiente).
+
+## Gate de mainnet: el arsenal completo sobre el commit final
+
+`deploy/mainnet-gate.sh` corre **todo** sobre el checkout actual y emite un
+reporte determinista:
+
+```bash
+deploy/mainnet-gate.sh --out mainnet-gate-report.json
+```
+
+Chequeos (`--list` los enumera): árbol limpio · versión coherente
+(`Cargo.toml` = `version.json` = todas las `qchain-*` del lock, y ninguna
+third-party arrastrada) · `build --locked` · `clippy -D warnings` · tests del
+workspace · **DST de consenso** · SDK + 6 plantillas a wasm32 · `cargo audit` ·
+SBOM · los 7 binarios construidos con el env reproducible y hasheados ·
+**reproducible cross-builder** (dos builders con paths y `CARGO_HOME` distintos
+→ hashes idénticos) · **fuzzing** de los 5 targets del wire · **ASan/UBSan** ·
+barrido QSEP-1 (advisory) · **harness en vivo**: `chaos-test.sh` (fallas
+mecánicas) y `byzantine-injector.sh` (adversario bizantino firmado).
+
+Tres propiedades que lo hacen un gate y no un adorno:
+
+1. **Un chequeo obligatorio SALTEADO no es un PASS.** El veredicto es `PASS`
+   sólo si todos están en `pass`; si alguno falló → `FAIL` (exit 1); si alguno se
+   salteó (herramienta ausente, `--skip-*`) → `INCOMPLETE` (exit 2), nunca 0.
+2. **El reporte es reproducible**, a propósito: claves ordenadas, sin reloj
+   adentro, con el `sha256` de cada binario (que es reproducible cross-builder).
+   Dos verificadores independientes sobre el mismo commit obtienen el **mismo
+   `report_hash`** → la verificación independiente se reduce a comparar UN valor.
+   El `rustc -V` va dentro del objeto hasheado a propósito: determina los bytes,
+   así que si dos reportes difieren, el reporte dice por qué.
+3. **Lo corre cualquiera**, no sólo GitHub: `mainnet-gate.yml` ejecuta el MISMO
+   script, **sin caché de cargo** (un gate de lanzamiento se construye desde
+   cero), y sube el reporte como artefacto.
 
 ## Cómo cortar un release firmado
 

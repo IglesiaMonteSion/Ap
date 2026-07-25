@@ -106,7 +106,32 @@ anti-relay), **post-cuántico** (ML-DSA + ML-KEM-768 + ChaCha20-Poly1305):
 - Para crear una red nueva ya con auth+cifrado: `install-node.sh --modo solo
   --cifrado` (implica `--autenticado`).
 
-## 7. Auditoría externa + bug bounty (proceso humano)
+## 7. Gate de mainnet: el arsenal COMPLETO sobre el commit que vas a lanzar
+
+Antes de taguear el commit del lanzamiento, corré el gate sobre **ese commit
+exacto** — no sobre "más o menos lo mismo":
+
+```bash
+deploy/mainnet-gate.sh --out mainnet-gate-report.json   # exit 0 = PASS
+```
+
+Corre todo (build/clippy/tests/DST/SDK-wasm32/audit/SBOM/reproducible
+cross-builder/fuzzing/sanitizers/barrido QSEP-1) **más los harness adversariales
+en vivo** (`chaos-test.sh` y `byzantine-injector.sh`), y emite un reporte
+determinista con un `report_hash`.
+
+Reglas duras:
+
+- **`INCOMPLETE` NO es aprobado.** Si un chequeo obligatorio se saltea (falta
+  `cargo-audit`, falta `nightly`, usaste un `--skip-*`), el script sale con
+  código 2. No lances con eso.
+- **Verificación independiente:** que un segundo operador corra el mismo script
+  sobre el mismo commit y compare el `report_hash`. Si coinciden, dos partes
+  verificaron los mismos bytes con el mismo arsenal.
+- En GitHub: el workflow `mainnet-gate.yml` (manual o al pushear la tag) corre lo
+  mismo **sin caché** y sube el reporte como artefacto.
+
+## 8. Auditoría externa + bug bounty (proceso humano)
 
 Antes de valor real serio: contratar una **auditoría externa** independiente y
 abrir un **bug bounty** público. Esto es un proceso de semanas con terceros,
@@ -123,5 +148,7 @@ herramienta reemplaza.
 4. Backups + monitoreo (5).
 5. Tesorería + wallet de prueba en frío (3).
 6. Sumar validadores + auth/cifrado (6) cuando estés listo para descentralizar.
-7. Auditoría externa (7) antes de valor real serio.
-8. Re-corré `prelaunch-check.sh` → todo ✓.
+7. **Gate de mainnet (7) sobre el commit final** → `PASS`, y que un segundo
+   operador reproduzca el mismo `report_hash`.
+8. Auditoría externa (8) antes de valor real serio.
+9. Re-corré `prelaunch-check.sh` → todo ✓.
