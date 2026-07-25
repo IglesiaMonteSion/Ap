@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
-# Builds all qchain binaries (qchain-node, qchain-genesis-build, qchain the
-# wallet CLI, qchain-faucet, qchain-wallet the web wallet, qchain-indexer the
-# QScan explorer) into one runtime
+# Builds all qchain binaries (qchain-node, qchain-genesis-build, the operator
+# pre-flight tools qchain-inspect-state / qchain-verify-genesis /
+# qchain-migrate-registry, qchain the wallet CLI, qchain-faucet, qchain-wallet
+# the web wallet, qchain-indexer the QScan explorer) into one runtime
 # image. `oqs`'s "vendored" feature builds liboqs from C source bundled inside
 # the crate itself (no network access needed at build time) via cmake + a C/C++
 # compiler; bindgen (also used by oqs-sys) needs libclang.
@@ -41,6 +42,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p /out && \
     cp target/release/qchain-node \
        target/release/qchain-genesis-build \
+       target/release/qchain-inspect-state \
+       target/release/qchain-verify-genesis \
+       target/release/qchain-migrate-registry \
        target/release/qchain \
        target/release/qchain-faucet \
        target/release/qchain-wallet \
@@ -53,6 +57,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /out/qchain-node /usr/local/bin/qchain-node
 COPY --from=builder /out/qchain-genesis-build /usr/local/bin/qchain-genesis-build
+# Operator pre-flight tools. These are the ones an operator needs BEFORE
+# restarting or relaunching a live network — `inspect-state` reports whether the
+# on-disk state is still readable (its whole reason to exist), `verify-genesis`
+# recomputes a launch manifest offline, `migrate-registry` persists the V1→V2
+# validator-registry migration. They were built by the `-p qchain-node` build all
+# along but never copied into the image, so an operator running Docker (the
+# documented path) could not run any of them.
+COPY --from=builder /out/qchain-inspect-state /usr/local/bin/qchain-inspect-state
+COPY --from=builder /out/qchain-verify-genesis /usr/local/bin/qchain-verify-genesis
+COPY --from=builder /out/qchain-migrate-registry /usr/local/bin/qchain-migrate-registry
 COPY --from=builder /out/qchain /usr/local/bin/qchain
 COPY --from=builder /out/qchain-faucet /usr/local/bin/qchain-faucet
 COPY --from=builder /out/qchain-wallet /usr/local/bin/qchain-wallet
