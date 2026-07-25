@@ -207,10 +207,32 @@ arreglás en una pasada, no una por una). Exige:
 | Parámetros económicos explícitos | `economics_v7: true` + `quanto_rate_fp` BAKED + `rounds_per_quanto` |
 | Configuración idéntica entre nodos | el nodo loguea el **network fingerprint** al arrancar — comparalo entre TODOS los nodos |
 | TLS en wallet/servicios públicos | la wallet exige `--behind-trusted-proxy` bajo su propio `--network-profile mainnet` (TLS en el proxy) |
+| **Clave de validador CIFRADA EN REPOSO** | el firmante remoto debe correr con un **keystore V2** (`--keypair <keystore.json> --keystore-passphrase-file <archivo> --require-keystore`) **y** no debe quedar un `keypair.json` en TEXTO PLANO en el box del nodo |
 
 Los **límites de P2P** (conexión global/por-IP, timeouts, cuotas de ancho de
 banda, ban temporal, batch-vertex gating) son **SIEMPRE activos por
-construcción** — no necesitan config. Ejemplo mínimo de un `config.json`
+construcción** — no necesitan config.
+
+**Sobre la clave cifrada en reposo (pre-mainnet #1).** El requisito del firmante
+remoto saca la clave del proceso del nodo, pero por sí solo no dice nada de cómo
+está guardada allá. Al arrancar, un nodo mainnet le PIDE al firmante una
+atestación (`KeySecurity`) y **rehúsa arrancar** si el firmante sostiene la clave
+en texto plano — o si no puede atestiguarlo (un daemon anterior no implementa el
+pedido): sin atestación no hay garantía, y aceptarla igual dejaría el chequeo
+saltéable. Además rehúsa si `keypair_path` existe y es un keypair plano, aunque el
+nodo no lo lea: es material de clave sin proteger en la máquina expuesta.
+
+Convertir una clave existente:
+
+```bash
+qchain keystore-encrypt --keypair keypair.json --out keystore.json \
+  --passphrase-file /root/keystore.pass      # 0600, fuera del repo
+# verificá que descifra (el comando lo hace solo) y RECIÉN AHÍ borrá keypair.json
+```
+
+Un **testnet no se restringe**: el chequeo es no-op sin `network_profile:
+"mainnet"`, y `--require-keystore` en el daemon es opt-in — volverlo el default
+rehusaría arrancar en cada red existente al primer reinicio tras actualizar. Ejemplo mínimo de un `config.json`
 mainnet (además de `validators`/`genesis`/`keypair_path`/`listen_addr`):
 
 ```json

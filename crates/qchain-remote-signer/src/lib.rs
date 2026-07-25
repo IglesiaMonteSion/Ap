@@ -119,6 +119,18 @@ pub enum SignerRequest {
     /// delegar la identidad P2P en una `network_key` distinta; la clave de consenso
     /// no firma nada de red por-conexión. Sin guardia (no es un voto).
     SignNetworkKeyCert { chain_id: [u8; 32], validator_id: [u8; 32], network_addr: [u8; 32] },
+    /// **Atestación de protección de la clave en reposo (pre-mainnet #1).** El
+    /// daemon reporta CÓMO cargó su clave: desde un keystore V2 cifrado (KM#8) o
+    /// desde un `keypair.json` en texto plano. No firma nada ni revela material de
+    /// clave — es un booleano sobre su propia configuración.
+    ///
+    /// Existe porque el gate de mainnet exige un firmante remoto, pero eso sólo
+    /// MUEVE la clave a otro proceso: sin esta atestación el nodo no tiene forma
+    /// de saber si allá está cifrada, y el requisito quedaría en el honor system.
+    /// Va **al final del enum** para no mover ningún discriminante borsh anterior;
+    /// un daemon viejo no conoce este discriminante y falla al decodificar, lo que
+    /// el cliente traduce a "no se pudo atestiguar" → en mainnet, rechazo.
+    KeySecurity,
 }
 
 /// Respuesta del firmante.
@@ -130,6 +142,11 @@ pub enum SignerResponse {
     /// error — el nodo lo trata como un fallo de firma (recuperable: salta esa
     /// ronda, reintenta cuando corresponda).
     Refused(String),
+    /// Respuesta a [`SignerRequest::KeySecurity`]: `true` si la clave de este
+    /// daemon se cargó desde un keystore V2 CIFRADO; `false` si vino de un
+    /// `keypair.json` en texto plano. Al final del enum (discriminantes previos
+    /// intactos).
+    KeySecurity { keystore_backed: bool },
 }
 
 /// #4.2 — Primer mensaje que el SERVIDOR manda en cada conexión: negocia la
@@ -504,6 +521,29 @@ impl RemoteSigner {
         unreachable!("loop returns on the last attempt")
     }
 
+    /// **Atestación de protección de la clave en reposo (pre-mainnet #1).**
+    /// Devuelve `Some(true/false)` si el daemon respondió, y **`None` cuando no se
+    /// pudo saber** — un daemon anterior no conoce el discriminante `KeySecurity`,
+    /// falla al decodificar el pedido y cierra la conexión, así que el error de
+    /// transporte se traduce a `None` en vez de propagarse.
+    ///
+    /// El llamador decide qué hacer con `None`. El gate de mainnet lo trata como
+    /// RECHAZO (fail-closed): tolerarlo dejaría el chequeo saltéable por cualquier
+    /// daemon que no implemente la atestación, que es justo el agujero que cierra.
+    pub fn key_security(&self) -> Option<bool> {
+        match self.request(&SignerRequest::KeySecurity) {
+            Ok(SignerResponse::KeySecurity { keystore_backed }) => Some(keystore_backed),
+            Ok(other) => {
+                tracing::warn!("remote signer answered the key-at-rest attestation with {other:?} — treating it as UNKNOWN");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("remote signer did not answer the key-at-rest attestation ({e}) — treating it as UNKNOWN (an older daemon does not implement it)");
+                None
+            }
+        }
+    }
+
     fn signature_from(resp: SignerResponse) -> anyhow::Result<MultiSignature> {
         match resp {
             SignerResponse::Signature(s) => Ok(s),
@@ -571,6 +611,13 @@ pub struct SignerPolicy {
     pub expected_chain_id: Option<[u8; 32]>,
     /// Si está seteado, límite de tasa de firmas por ventana. `None` = sin límite.
     pub rate_limit: Option<RateLimit>,
+    /// **Cómo se cargó la clave de este daemon (pre-mainnet #1).** `true` = desde
+    /// un keystore V2 CIFRADO (KM#8); `false` = desde un `keypair.json` en texto
+    /// plano. Es lo que responde [`SignerRequest::KeySecurity`], para que el gate
+    /// de mainnet del nodo pueda EXIGIR la clave cifrada en reposo en vez de
+    /// confiar en que el operador lo hizo bien. `Default` = `false` (un dev que
+    /// arma la política a mano no debe quedar marcado como cifrado por accidente).
+    pub keystore_backed: bool,
 }
 
 impl SignerPolicy {
@@ -905,6 +952,12 @@ fn handle_conn(
 pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleSignGuard>>) -> SignerResponse {
     match req {
         SignerRequest::GetBundle => SignerResponse::Bundle(keypair.public_key_bundle()),
+        // `respond` no conoce la política, así que no puede atestiguar: sólo el
+        // camino con política (`respond_with_policy`, el que usa el daemon real)
+        // responde esto. Acá se rehúsa a propósito — nunca se afirma "cifrada".
+        SignerRequest::KeySecurity => SignerResponse::Refused(
+            "key-at-rest attestation is only served by the policy-aware path".into(),
+        ),
         SignerRequest::SignOwnVote { chain_id, round, digest } => {
             // Guardia PRIMERO (persist-before-sign): sólo firmamos tras un Ok.
             let mut g = guard.lock().expect("guard mutex poisoned");
@@ -1021,7 +1074,9 @@ pub fn respond_with_policy(
 ) -> SignerResponse {
     // (1) Rate-limit: cada pedido de FIRMA cuenta (GetBundle no). Se chequea ANTES
     // de cualquier cripto/estado para acotar a un nodo comprometido barato.
-    if !matches!(req, SignerRequest::GetBundle) && !limiter.lock().expect("limiter mutex poisoned").allow() {
+    if !matches!(req, SignerRequest::GetBundle | SignerRequest::KeySecurity)
+        && !limiter.lock().expect("limiter mutex poisoned").allow()
+    {
         let reason = "rate limit exceeded: too many sign requests in the window".to_string();
         tracing::warn!("signer: {reason}");
         return SignerResponse::Refused(reason);
@@ -1045,6 +1100,13 @@ pub fn respond_with_policy(
                 return SignerResponse::Refused(reason);
             }
         }
+    }
+    // (3) Atestación de protección en reposo (pre-mainnet #1). No firma nada ni
+    // revela material de clave: reporta cómo se cargó la clave de ESTE daemon,
+    // para que el gate de mainnet del nodo pueda EXIGIR el cifrado en reposo en
+    // vez de confiar en que el operador lo hizo bien.
+    if matches!(req, SignerRequest::KeySecurity) {
+        return SignerResponse::KeySecurity { keystore_backed: policy.keystore_backed };
     }
     respond(req, keypair, guard)
 }
@@ -1229,6 +1291,54 @@ mod tests {
         let sig2 = client.sign_peer_vote(&TEST_CHAIN, &borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
         assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &TEST_CHAIN, &pd, &sig2));
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// **Atestación de protección de la clave en reposo (pre-mainnet #1).** El
+    /// daemon reporta cómo cargó su clave, sobre el socket REAL, y el valor
+    /// refleja la política con la que se arrancó — no un default. Es lo que hace
+    /// que el gate de mainnet del nodo pueda EXIGIR el cifrado en reposo en vez de
+    /// confiar en la palabra del operador.
+    #[test]
+    fn the_signer_attests_whether_its_key_is_encrypted_at_rest() {
+        use qchain_crypto::Signer;
+        for backed in [true, false] {
+            let tmp = std::env::temp_dir().join(format!("qrs-keysec-{}-{backed}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let kp = Keypair::generate().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let g = guard(&tmp);
+            let policy = SignerPolicy { expected_chain_id: None, rate_limit: None, keystore_backed: backed };
+            std::thread::spawn(move || serve(kp, SignerListener::Tcp(listener), g, None, policy));
+
+            let client = RemoteSigner::connect(&addr).unwrap();
+            assert_eq!(
+                client.key_security(),
+                Some(backed),
+                "el daemon debe atestiguar exactamente cómo cargó su clave (backed={backed})"
+            );
+            // La atestación NO consume presupuesto de rate-limit ni firma nada:
+            // tras preguntarla, firmar sigue funcionando igual.
+            let sig = client.sign_own_vote(&TEST_CHAIN, 1, &[9u8; 32]).unwrap();
+            assert!(qchain_crypto::verify_vertex_vote(&client.bundle(), &TEST_CHAIN, &[9u8; 32], &sig));
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    /// El camino SIN política (`respond`) no puede atestiguar — y **rehúsa** en vez
+    /// de afirmar "cifrada". Si devolviera `KeySecurity{true}` por defecto, el gate
+    /// de mainnet se volvería mentira en cuanto alguien usara ese camino.
+    #[test]
+    fn the_policy_less_path_never_claims_the_key_is_encrypted() {
+        let tmp = std::env::temp_dir().join(format!("qrs-keysec-nopolicy-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let kp = Keypair::generate().unwrap();
+        let g = guard(&tmp);
+        assert!(
+            matches!(respond(&SignerRequest::KeySecurity, &kp, &g), SignerResponse::Refused(_)),
+            "sin política, la atestación se rehúsa (nunca un `true` por defecto)"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1448,7 +1558,7 @@ mod tests {
         let g = guard(&tmp);
         let chain_a = [0xAAu8; 32];
         let chain_b = [0xBBu8; 32];
-        let policy = SignerPolicy { expected_chain_id: Some(chain_a), rate_limit: None };
+        let policy = SignerPolicy { expected_chain_id: Some(chain_a), rate_limit: None, keystore_backed: true };
         let limiter = Arc::new(Mutex::new(RateLimiter::unlimited()));
 
         // Checkpoint de la red EQUIVOCADA → rechazado (sin firmar).
@@ -1544,7 +1654,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let kp = Keypair::generate().unwrap();
         let g = guard(&tmp);
-        let policy = SignerPolicy { expected_chain_id: None, rate_limit: Some(RateLimit { max_signs: 2, window: Duration::from_secs(600) }) };
+        let policy = SignerPolicy { expected_chain_id: None, rate_limit: Some(RateLimit { max_signs: 2, window: Duration::from_secs(600) }), keystore_backed: false };
         let limiter = Arc::new(Mutex::new(RateLimiter::new(policy.rate_limit)));
         // GetBundle no cuenta (varias veces).
         for _ in 0..5 {

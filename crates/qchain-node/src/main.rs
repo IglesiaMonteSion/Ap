@@ -138,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
     // the key in-process from `keypair_path`, byte-identical to before. Either
     // way the identity (self_id) is the SAME validator key — a local↔remote
     // migration needs no re-registration and does not change `chain_id`.
+    // (pre-mainnet #1) Lo que el firmante REMOTO atestigua sobre su clave en
+    // reposo: `Some(true)` keystore cifrado, `Some(false)` texto plano, `None` no
+    // se pudo saber. Sin firmante remoto queda `None` y el chequeo mira el archivo
+    // local (que en ese caso SÍ es la clave que usa este proceso).
+    let mut signer_keystore_backed: Option<bool> = None;
     let signer: Arc<dyn qchain_crypto::Signer> = match &config.remote_signer {
         Some(endpoint) => {
             // #4.2 — client-auth token for the signer socket challenge-response.
@@ -163,6 +168,11 @@ async fn main() -> anyhow::Result<()> {
                 "consensus signer: REMOTE at {endpoint} — the block-signing key is NOT in this node process (#193) [client auth: {}]",
                 if auth_token.is_some() { "TOKEN" } else { "none" }
             );
+            // (pre-mainnet #1) Atestación de protección de la clave EN REPOSO. El
+            // gate de mainnet exige un firmante remoto, pero eso sólo mueve la
+            // clave a otro proceso: acá se le pregunta cómo la cargó. `None` = no
+            // se pudo saber (daemon anterior) → mainnet lo rechaza (fail-closed).
+            signer_keystore_backed = rs.key_security();
             Arc::new(rs) as Arc<dyn qchain_crypto::Signer>
         }
         None => {
@@ -253,6 +263,19 @@ async fn main() -> anyhow::Result<()> {
     // one clear error. No-op for a testnet (the default). Log the network
     // fingerprint so an operator can confirm every node shares the SAME config.
     config.validate_network_profile()?;
+    // Exigencia #13 del perfil: la clave de validador CIFRADA EN REPOSO
+    // (pre-mainnet #1). No se puede responder desde el config solo — hace falta
+    // mirar el disco y lo que el firmante remoto atestiguó —, así que los dos
+    // hechos se juntan acá y el chequeo puro los evalúa. Sin firmante remoto, la
+    // clave que usa ESTE proceso es `keypair_path`: si es un keystore, cuenta como
+    // atestación positiva. No-op para un testnet.
+    let key_file_is_plaintext = config.keypair_path.exists()
+        && !qchain_crypto::keystore::is_keystore_file(&config.keypair_path);
+    let key_at_rest = match config.remote_signer {
+        Some(_) => signer_keystore_backed,
+        None => Some(!key_file_is_plaintext),
+    };
+    config.validate_key_at_rest(key_file_is_plaintext, key_at_rest)?;
     if config.is_mainnet_profile() {
         tracing::info!(
             "network_profile: MAINNET — all hard protections satisfied. network fingerprint: {} (MUST be identical on every node)",

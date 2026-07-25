@@ -857,6 +857,11 @@ impl NodeConfig {
     /// 11. TLS en wallet/servicios públicos — el RPC del validador NO se expone
     ///     directo (req 6); la wallet exige TLS/proxy en su propio perfil mainnet
     ///     (ver `qchain-wallet`), y el nodo lo documenta.
+    ///
+    /// La exigencia **#13 (clave de validador CIFRADA EN REPOSO)** vive aparte en
+    /// [`Self::validate_key_at_rest`]: no se puede responder desde el config solo
+    /// — hace falta mirar el disco y preguntarle al firmante remoto —, así que el
+    /// llamador junta esos hechos y la invoca justo después de ésta.
     pub fn validate_network_profile(&self) -> anyhow::Result<()> {
         // Reject an unknown profile string outright (a typo must fail loud, not
         // silently fall back to testnet and ship a mainnet with no protections).
@@ -1013,6 +1018,63 @@ impl NodeConfig {
         }
 
         Ok(())
+    }
+
+    /// **Exigencia #13 del perfil mainnet — la clave de validador CIFRADA EN
+    /// REPOSO (pre-mainnet #1).** Separada de [`Self::validate_network_profile`]
+    /// porque no se puede responder desde el config solo: hace falta observar el
+    /// disco y **preguntarle al firmante remoto** cómo cargó su clave. El
+    /// llamador (`main.rs`) junta los dos hechos y se los pasa; así esta función
+    /// queda pura y testeable, y el I/O vive en el borde.
+    ///
+    /// **Por qué existe.** El gate ya exige `remote_signer`, pero eso sólo MUEVE
+    /// la clave a otro proceso — no dice nada de cómo está guardada. El keystore
+    /// V2 (KM#8) existe desde v8.6.34 pero es **auto-detectado**: si el archivo es
+    /// un `keypair.json` plano, el nodo y el daemon lo cargan en silencio. O sea:
+    /// una mainnet podía arrancar con la clave que firma bloques en texto plano en
+    /// disco. Y aunque el nodo use firmante remoto, un `keypair.json` plano
+    /// olvidado en el box del nodo (el que sí está expuesto a internet) es el mismo
+    /// material de clave sin proteger.
+    ///
+    /// - `key_file_is_plaintext`: `keypair_path` EXISTE y NO es un keystore V2.
+    /// - `signer_keystore_backed`: `Some(true/false)` si el firmante lo atestiguó;
+    ///   **`None` = no se pudo saber** (daemon viejo, sin la request, o sin
+    ///   respuesta) → **se RECHAZA**. Tolerar `None` dejaría el gate saltéable por
+    ///   cualquier daemon que no implemente la atestación, que es justo el agujero.
+    pub fn validate_key_at_rest(
+        &self,
+        key_file_is_plaintext: bool,
+        signer_keystore_backed: Option<bool>,
+    ) -> anyhow::Result<()> {
+        if !self.is_mainnet_profile() {
+            return Ok(());
+        }
+        let mut missing: Vec<String> = Vec::new();
+        if key_file_is_plaintext {
+            missing.push(format!(
+                "keypair_path {}: es un keypair en TEXTO PLANO. En mainnet la clave de validador va CIFRADA en reposo (keystore V2, KM#8) — convertila con `qchain keystore-encrypt` y seteá `keystore_passphrase_path`, o borrá el archivo del box del nodo si la clave ya vive sólo en el firmante remoto",
+                self.keypair_path.display()
+            ));
+        }
+        match signer_keystore_backed {
+            Some(true) => {}
+            Some(false) => missing.push(
+                "remote_signer: el firmante sostiene su clave en TEXTO PLANO. Arrancá el daemon con un keystore V2 (`--keypair <keystore.json> --keystore-passphrase-file <archivo>`) y `--require-keystore`"
+                    .into(),
+            ),
+            None => missing.push(
+                "remote_signer: no se pudo verificar que la clave esté cifrada en reposo (el daemon no respondió la atestación `KeySecurity` — probablemente es una versión anterior). En mainnet esto se RECHAZA: sin atestación no hay garantía, y aceptarla igual dejaría el chequeo saltéable"
+                    .into(),
+            ),
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "network_profile=\"mainnet\": la clave de validador NO está protegida en reposo ({} problema(s)):\n  - {}",
+            missing.len(),
+            missing.join("\n  - ")
+        );
     }
 
     /// **Fingerprint de red — el req 'configuración idéntica entre nodos' (#211).**
@@ -1500,6 +1562,59 @@ mod tests {
         assert!(legacy.validate_network_profile().is_ok(), "legacy mainnet:true satisfied is OK");
         legacy.remote_signer = None;
         assert!(legacy.validate_network_profile().is_err(), "legacy mainnet:true also enforces the full profile");
+    }
+
+    /// **Keystore obligatorio en mainnet (pre-mainnet #1).** El gate de config
+    /// exige un firmante remoto, pero eso sólo mueve la clave a OTRO proceso: nada
+    /// obligaba a que estuviera CIFRADA en reposo, ni impedía que el `keypair.json`
+    /// en texto plano siguiera tirado en el box del nodo (expuesto a internet).
+    /// Este chequeo cierra las dos cosas, y es **fail-closed**: un firmante que no
+    /// puede atestiguar cómo cargó su clave (daemon viejo, o que no responde) NO
+    /// se acepta — tolerarlo sería exactamente el agujero que esto cierra.
+    #[test]
+    fn mainnet_requires_the_validator_key_encrypted_at_rest() {
+        let mainnet = mainnet_config_with(one_validator());
+        let testnet = config_with(one_validator(), vec![]);
+
+        // El caso bueno: firmante respaldado por keystore y sin clave plana en disco.
+        assert!(
+            mainnet.validate_key_at_rest(false, Some(true)).is_ok(),
+            "un firmante con keystore y sin keypair plano en disco debe arrancar; err: {:?}",
+            mainnet.validate_key_at_rest(false, Some(true)).err()
+        );
+
+        // El firmante sostiene la clave en TEXTO PLANO → rechazo.
+        let e = mainnet.validate_key_at_rest(false, Some(false)).unwrap_err().to_string();
+        assert!(e.contains("keystore"), "el error debe nombrar el keystore: {e}");
+
+        // El firmante NO puede atestiguar (daemon viejo / sin respuesta) → rechazo
+        // FAIL-CLOSED. Ésta es la aserción central: si esto pasara a Ok, el gate
+        // se lo saltea cualquier daemon que no implemente la atestación.
+        assert!(
+            mainnet.validate_key_at_rest(false, None).is_err(),
+            "sin atestación del firmante, mainnet DEBE rechazar (fail-closed)"
+        );
+
+        // Queda un keypair.json PLANO en el disco del nodo — aunque el nodo no lo
+        // lea (usa el firmante remoto), es material de clave sin proteger en la
+        // máquina expuesta.
+        let e2 = mainnet.validate_key_at_rest(true, Some(true)).unwrap_err().to_string();
+        assert!(e2.contains("keypair_path"), "el error debe nombrar el archivo plano: {e2}");
+
+        // Ambas fallas a la vez se ACUMULAN (mismo estilo que el resto del gate).
+        let both = mainnet.validate_key_at_rest(true, Some(false)).unwrap_err().to_string();
+        assert!(both.contains("keystore") && both.contains("keypair_path"), "deben acumularse: {both}");
+
+        // Un TESTNET nunca se restringe — ninguna combinación lo frena (no brickea
+        // la red viva del usuario, que corre sin perfil).
+        for plain in [false, true] {
+            for att in [Some(true), Some(false), None] {
+                assert!(
+                    testnet.validate_key_at_rest(plain, att).is_ok(),
+                    "un testnet nunca se restringe (plain={plain}, att={att:?})"
+                );
+            }
+        }
     }
 
     /// The network fingerprint changes when a network-wide field changes, and is

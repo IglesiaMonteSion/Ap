@@ -72,6 +72,19 @@ struct Cli {
     /// (KM#7) Largo de la ventana del rate-limit en segundos (default 10).
     #[arg(long, default_value_t = 10)]
     rate_window_secs: u64,
+    /// **(pre-mainnet #1) Rehusar arrancar con la clave en TEXTO PLANO.** Con este
+    /// flag el daemon exige que `--keypair` sea un keystore V2 cifrado (KM#8) y se
+    /// niega a servir si es un `keypair.json` plano. Es la postura obligatoria en
+    /// mainnet: la clave que firma bloques nunca queda en claro en disco.
+    ///
+    /// Es OPT-IN a propósito. Volverlo el default rehusaría arrancar en cada
+    /// testnet existente al primer `restart` tras actualizar el binario — la clase
+    /// exacta de gate demasiado agresivo que brickeó una red viva en v8.2.2. El
+    /// nodo con `network_profile: "mainnet"` lo EXIGE de todos modos: le pide al
+    /// daemon la atestación `KeySecurity` y rehúsa si no está respaldada por
+    /// keystore, así que en mainnet no depende de que el operador acuerde el flag.
+    #[arg(long, default_value_t = false)]
+    require_keystore: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -159,7 +172,20 @@ fn main() -> anyhow::Result<()> {
         max_signs,
         window: std::time::Duration::from_secs(cli.rate_window_secs),
     });
-    let policy = qchain_remote_signer::SignerPolicy { expected_chain_id, rate_limit };
+    // (pre-mainnet #1) Rehusar la clave en claro cuando el operador lo exige.
+    // Se chequea DESPUÉS de cargarla (así un keystore ilegible falla con su propio
+    // error, más útil) y ANTES de bindear el listener: nunca se sirve una firma.
+    if cli.require_keystore && !keystore_encrypted {
+        anyhow::bail!(
+            "--require-keystore: {} es un keypair en TEXTO PLANO. Convertilo a un keystore V2 cifrado (`qchain keystore-encrypt`) y pasá --keystore-passphrase-file, o quitá --require-keystore (NO recomendado: es la postura obligatoria de mainnet).",
+            cli.keypair
+        );
+    }
+    let policy = qchain_remote_signer::SignerPolicy {
+        expected_chain_id,
+        rate_limit,
+        keystore_backed: keystore_encrypted,
+    };
 
     tracing::info!(
         "qchain remote signer up: validator {} listening on {} (guard: {guard_path}) [client auth: {}] [chain binding: {}] [rate limit: {}] [key at rest: {}]",

@@ -453,6 +453,21 @@ keystore.json --passphrase-file pass.txt`, apuntar el daemon con
 `--keystore-passphrase-file` (o el nodo con `keystore_passphrase_path`), verificar que
 arranca, y recién ahí borrar el `keypair.json` plano.
 
+**ACTUALIZACIÓN (v8.6.39 — pre-mainnet #1: en MAINNET deja de ser opt-in).** El
+keystore quedaba **auto-detectado**: si el archivo era un `keypair.json` plano, el
+nodo y el daemon lo cargaban en silencio, y el gate de `network_profile: "mainnet"`
+—que exige firmante remoto— no decía nada de cómo estaba guardada la clave allá.
+O sea: una mainnet podía arrancar con la clave que firma bloques en claro en disco.
+Ahora: (a) el daemon acepta `--require-keystore` y rehúsa arrancar con clave plana;
+(b) responde `SignerRequest::KeySecurity` atestiguando cómo la cargó; (c) un nodo
+mainnet le pide esa atestación y **rehúsa arrancar** si la clave está en texto plano
+—o si el firmante no puede atestiguarlo (daemon anterior): **fail-closed**, porque
+tolerar el "no sé" dejaría el chequeo saltéable— y también si queda un `keypair_path`
+plano en el box del nodo. Sigue **OPT-IN fuera de mainnet**: un testnet no se
+restringe, y `--require-keystore` no es el default (volverlo default rehusaría
+arrancar en cada red existente al primer reinicio, la clase de gate que brickeó una
+red viva en v8.2.2).
+
 ## #9 — Emergency freeze + expiración + audit trail (HECHO, v8.6.35)
 
 **PROBLEMA.** KM#4 dio un REVOKE **terminal** por el comité de recuperación (salida
