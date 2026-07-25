@@ -11,6 +11,12 @@
 //! conflicting vertex, purely so the two vertices hash differently.
 
 use qchain_consensus::{verify_certificate, ConsensusState, DagStore, ValidatorSchedule};
+
+/// `chain_id` de la red simulada (#187). El DST modela UNA red, así que todos
+/// sus validadores firman y verifican bajo el mismo id — igual que un nodo real
+/// usa el `chain_id` de su config. Tenerlo explícito mantiene el harness FIEL al
+/// camino de producción: si el binding se rompiera, el DST lo vería.
+pub const SIM_CHAIN_ID: [u8; 32] = [0x51; 32];
 use qchain_core::{Certificate, Digest, EquivocationEvidence, Round, ValidatorId, Vertex};
 use qchain_crypto::{Keypair, MultiSignature};
 use std::collections::HashMap;
@@ -168,7 +174,7 @@ impl SimValidator {
         // `qchain-node::engine::propose_round`'s identical reuse.
         // #187: envelope de voto etiquetado por dominio, idéntico al real
         // (`qchain-node::engine`) para que el DST siga siendo fiel.
-        let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]).expect("signing never fails in this harness");
+        let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &SIM_CHAIN_ID, &digest[..]).expect("signing never fails in this harness");
         self.own_pending_vertex = Some((vertex.clone(), sig.clone()));
         self.next_round = round + 1;
         self.voted_for.insert((round, self.id), digest);
@@ -185,7 +191,7 @@ impl SimValidator {
 
         if self.behavior == ByzantineBehavior::Equivocator && !peers.is_empty() {
             let evil_vertex = Vertex { round, author: self.id, batch_digests: vec![(0, [1u8; 32])], parents };
-            let evil_signature = qchain_crypto::sign_vertex_vote(&self.keypair, &evil_vertex.digest()[..]).expect("signing never fails in this harness");
+            let evil_signature = qchain_crypto::sign_vertex_vote(&self.keypair, &SIM_CHAIN_ID, &evil_vertex.digest()[..]).expect("signing never fails in this harness");
             let half = peers.len() / 2;
             for &peer in &peers[..half.max(1)] {
                 out.push((peer, SimMessage::VertexProposal { vertex: evil_vertex.clone(), author_signature: evil_signature.clone() }));
@@ -258,7 +264,7 @@ impl SimValidator {
                 };
                 let author_info = author_info.clone();
                 let digest = vertex.digest();
-                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &SIM_CHAIN_ID, &digest[..], &author_signature) {
                     return vec![];
                 }
                 let key = (vertex.round, vertex.author);
@@ -292,7 +298,7 @@ impl SimValidator {
                         self.voted_for.insert(key, digest);
                     }
                 }
-                let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &digest[..]).expect("signing never fails in this harness");
+                let sig = qchain_crypto::sign_vertex_vote(&self.keypair, &SIM_CHAIN_ID, &digest[..]).expect("signing never fails in this harness");
                 out.push((from, SimMessage::Vote { vertex_digest: digest, signature: sig }));
                 out
             }
@@ -308,7 +314,7 @@ impl SimValidator {
                 // round (`for_round(cert.vertex.round)`), exactly like the real
                 // engine — so a cert from an epoch resolves under that epoch's
                 // committee even after a boundary. `single` = the one committee.
-                if verify_certificate(&cert, schedule.for_round(cert.vertex.round)) {
+                if verify_certificate(&cert, schedule.for_round(cert.vertex.round), &SIM_CHAIN_ID) {
                     let parents = cert.vertex.parents.clone();
                     self.dag.insert(cert);
                     self.missing_parent_requests(&parents, from)
@@ -321,7 +327,7 @@ impl SimValidator {
                 None => vec![],
             },
             SimMessage::CertificateResponse(cert) => {
-                if verify_certificate(&cert, schedule.for_round(cert.vertex.round)) {
+                if verify_certificate(&cert, schedule.for_round(cert.vertex.round), &SIM_CHAIN_ID) {
                     let parents = cert.vertex.parents.clone();
                     self.dag.insert(cert);
                     self.missing_parent_requests(&parents, from)

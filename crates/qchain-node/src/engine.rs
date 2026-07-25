@@ -3458,7 +3458,7 @@ impl Engine {
                     tracing::warn!("dropping vertex proposal from unknown validator {from}");
                     return;
                 };
-                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &digest[..], &author_signature) {
+                if !qchain_crypto::verify_vertex_vote(&author_info.pubkey_bundle, &self.chain_id, &digest[..], &author_signature) {
                     tracing::warn!("dropping vertex proposal from {from} - author_signature does not verify");
                     return;
                 }
@@ -3632,7 +3632,7 @@ impl Engine {
                     tracing::warn!("dropping vote from unknown validator {from}");
                     return;
                 };
-                if !qchain_crypto::verify_vertex_vote(&voter_info.pubkey_bundle, &vertex_digest[..], &signature) {
+                if !qchain_crypto::verify_vertex_vote(&voter_info.pubkey_bundle, &self.chain_id, &vertex_digest[..], &signature) {
                     tracing::warn!("dropping vote from {from} whose signature does not verify over the voted digest");
                     return;
                 }
@@ -3644,7 +3644,7 @@ impl Engine {
             NetMessage::CertificateBroadcast(cert) => {
                 // A certificate can be for an older round than the current one
                 // (resync), so verify it against *its round's* committee.
-                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round)) {
+                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round), &self.chain_id) {
                     tracing::warn!("dropping certificate that fails quorum verification");
                     return;
                 }
@@ -3686,7 +3686,7 @@ impl Engine {
                 }
             }
             NetMessage::CertificateResponse(cert) => {
-                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round)) {
+                if !verify_certificate(&cert, self.schedule().for_round(cert.vertex.round), &self.chain_id) {
                     tracing::warn!("dropping certificate response that fails quorum verification");
                     return;
                 }
@@ -3869,7 +3869,7 @@ impl Engine {
                 return;
             }
         };
-        let sig = match self.signer.sign_peer_vote(&vertex_bytes, &digest) {
+        let sig = match self.signer.sign_peer_vote(&self.chain_id, &vertex_bytes, &digest) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to sign vote: {e}");
@@ -4994,7 +4994,7 @@ impl Engine {
             // en un firmante remoto pasa por la guardia anti-doble-firma (una
             // sola versión del propio vértice por ronda), defensa-en-profundidad
             // sobre el candado `voted_for`.
-            let sig = match self.signer.sign_own_vote(round, &digest) {
+            let sig = match self.signer.sign_own_vote(&self.chain_id, round, &digest) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to sign proposed vertex: {e}");

@@ -2099,7 +2099,11 @@ fn main() -> anyhow::Result<()> {
             // accounts[1] = staking stats, so the slash also decrements the
             // global `total_staked` counter (keeps reward-per-share and
             // governance turnout accounting correct after a slash).
-            let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID], data, nonce, fee_limit)?;
+            // accounts[2] = the chain-id singleton (#187): the handler verifies
+            // both evidence signatures under THIS network's chain_id, so evidence
+            // assembled from two different chains can no longer burn an honest
+            // validator's bond. Mandatory - the handler rejects without it.
+            let body = submit_instruction(&rpc, &reporter, STAKING_PROGRAM_ID, vec![stake_pk, STAKING_STATS_ID, qchain_execution::ids::CHAIN_ID_ACCOUNT_ID], data, nonce, fee_limit)?;
             println!("submitted: {body}");
         }
         Command::RegisterValidator { rpc, keypair, stake_account, address, nonce, fee_limit } => {

@@ -94,7 +94,7 @@ pub enum SignerRequest {
     GetBundle,
     /// Auto-voto del proposer sobre su PROPIO vértice de la ronda `round` —
     /// sujeto a la guardia anti-doble-firma.
-    SignOwnVote { round: u64, digest: [u8; 32] },
+    SignOwnVote { chain_id: [u8; 32], round: u64, digest: [u8; 32] },
     /// Voto sobre el vértice de OTRO validador. Lleva los BYTES borsh del vértice
     /// además del digest: el daemon deserializa el vértice, recomputa su digest
     /// (debe coincidir con `digest`) y REHÚSA si el autor es NUESTRA propia clave
@@ -102,7 +102,7 @@ pub enum SignerRequest {
     /// bypass de auto-equivocación por SignPeerVote (#4, auditoría v8.6.13): sin
     /// esto un nodo comprometido podía enrutar su SEGUNDO vértice propio de una
     /// ronda por aquí y firmar evidencia de auto-equivocación (slasheable).
-    SignPeerVote { vertex_bytes: Vec<u8>, digest: [u8; 32] },
+    SignPeerVote { chain_id: [u8; 32], vertex_bytes: Vec<u8>, digest: [u8; 32] },
     /// Firmar el **transcript de un handshake P2P** (`P2P_AUTH_V1 ‖ …`). TIPADO
     /// (auditoría #2): reemplaza al viejo `SignRaw`; el daemon EXIGE el dominio
     /// `P2P_AUTH_V1` y rechaza todo lo demás, así que la clave del validador NUNCA
@@ -517,11 +517,11 @@ impl qchain_crypto::Signer for RemoteSigner {
     fn bundle(&self) -> PublicKeyBundle {
         self.bundle.clone()
     }
-    fn sign_own_vote(&self, round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
-        Self::signature_from(self.request(&SignerRequest::SignOwnVote { round, digest: *digest })?)
+    fn sign_own_vote(&self, chain_id: &[u8; 32], round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignOwnVote { chain_id: *chain_id, round, digest: *digest })?)
     }
-    fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
-        Self::signature_from(self.request(&SignerRequest::SignPeerVote { vertex_bytes: vertex_bytes.to_vec(), digest: *digest })?)
+    fn sign_peer_vote(&self, chain_id: &[u8; 32], vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        Self::signature_from(self.request(&SignerRequest::SignPeerVote { chain_id: *chain_id, vertex_bytes: vertex_bytes.to_vec(), digest: *digest })?)
     }
     fn sign_network_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature> {
         Self::signature_from(self.request(&SignerRequest::SignNetworkHandshake { transcript: transcript.to_vec() })?)
@@ -552,10 +552,12 @@ pub struct RateLimit {
 /// oráculo ciego dentro de su allowlist"):
 ///
 /// - **chain_id binding:** rechaza cualquier pedido que nombre un `chain_id`
-///   DISTINTO del configurado (`SignCheckpoint`/`SignNetworkKeyCert`, los únicos que
-///   llevan un chain_id explícito; los votos/handshake están atados a la red por su
-///   estructura). Impide que un nodo comprometido/mal-cableado use este firmante para
-///   atestar la red equivocada.
+///   DISTINTO del configurado. Desde #187 lo llevan explícito TAMBIÉN los votos
+///   (`SignOwnVote`/`SignPeerVote`), además de `SignCheckpoint`/`SignNetworkKeyCert`;
+///   el handshake sigue atado por su transcript, que incluye el chain_id. Antes los
+///   votos NO nombraban su red y este binding no los cubría — la doc lo daba por
+///   cerrado y no lo estaba. Impide que un nodo comprometido/mal-cableado use este
+///   firmante para atestar la red equivocada.
 /// - **rate-limit:** ver `RateLimit`.
 ///
 /// El resto de la política del auditor ya está cubierto: **round/height + anti-
@@ -903,11 +905,11 @@ fn handle_conn(
 pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleSignGuard>>) -> SignerResponse {
     match req {
         SignerRequest::GetBundle => SignerResponse::Bundle(keypair.public_key_bundle()),
-        SignerRequest::SignOwnVote { round, digest } => {
+        SignerRequest::SignOwnVote { chain_id, round, digest } => {
             // Guardia PRIMERO (persist-before-sign): sólo firmamos tras un Ok.
             let mut g = guard.lock().expect("guard mutex poisoned");
             match g.check_and_record_own(*round, digest) {
-                Ok(()) => match qchain_crypto::sign_vertex_vote(keypair, digest) {
+                Ok(()) => match qchain_crypto::sign_vertex_vote(keypair, chain_id, digest) {
                     Ok(sig) => SignerResponse::Signature(sig),
                     Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
                 },
@@ -917,7 +919,7 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 }
             }
         }
-        SignerRequest::SignPeerVote { vertex_bytes, digest } => {
+        SignerRequest::SignPeerVote { chain_id, vertex_bytes, digest } => {
             // GUARDIA DE AUTORÍA (#4, auditoría v8.6.13 — cierra el bypass de
             // auto-equivocación): un voto de "peer" DEBE ser sobre el vértice de
             // OTRO validador. Deserializamos el vértice, recomputamos su digest
@@ -946,7 +948,7 @@ pub fn respond(req: &SignerRequest, keypair: &Keypair, guard: &Arc<Mutex<DoubleS
                 tracing::error!("signer: {reason}");
                 return SignerResponse::Refused(reason);
             }
-            match qchain_crypto::sign_vertex_vote(keypair, digest) {
+            match qchain_crypto::sign_vertex_vote(keypair, chain_id, digest) {
                 Ok(sig) => SignerResponse::Signature(sig),
                 Err(e) => SignerResponse::Refused(format!("sign error: {e}")),
             }
@@ -1029,6 +1031,11 @@ pub fn respond_with_policy(
         let named = match req {
             SignerRequest::SignCheckpoint { chain_id, .. } => Some(chain_id),
             SignerRequest::SignNetworkKeyCert { chain_id, .. } => Some(chain_id),
+            // #187: los VOTOS también nombran su red ahora. Antes no lo hacían y
+            // este binding no los cubría — el hueco que la doc de KM#7 daba por
+            // cerrado ("los votos están atados a la red por su estructura").
+            SignerRequest::SignOwnVote { chain_id, .. } => Some(chain_id),
+            SignerRequest::SignPeerVote { chain_id, .. } => Some(chain_id),
             _ => None,
         };
         if let Some(chain_id) = named {
@@ -1044,6 +1051,9 @@ pub fn respond_with_policy(
 
 #[cfg(test)]
 mod tests {
+    /// `chain_id` sintético de los tests (#187: un voto va atado a su red).
+    const TEST_CHAIN: [u8; 32] = [0xA7; 32];
+
     use super::*;
 
     fn guard(dir: &std::path::Path) -> Arc<Mutex<DoubleSignGuard>> {
@@ -1061,15 +1071,15 @@ mod tests {
         let d2 = [2u8; 32];
 
         // Auto-voto de la ronda 5 con d1 → OK.
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 5, digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 5, digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
         // Re-firma idéntica (retry) del MISMO (5, d1) → OK (idempotente).
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 5, digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 5, digest: d1 }, &kp, &g), SignerResponse::Signature(_)));
         // Auto-voto de la ronda 5 con d2 DISTINTO → RECHAZADO (doble-firma).
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 5, digest: d2 }, &kp, &g), SignerResponse::Refused(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 5, digest: d2 }, &kp, &g), SignerResponse::Refused(_)));
         // Ronda regresiva (4) → RECHAZADO.
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 4, digest: d1 }, &kp, &g), SignerResponse::Refused(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 4, digest: d1 }, &kp, &g), SignerResponse::Refused(_)));
         // Ronda mayor (6) con cualquier digest → OK.
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 6, digest: d2 }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 6, digest: d2 }, &kp, &g), SignerResponse::Signature(_)));
         // Un VOTO DE PEER sobre el vértice de OTRO validador → OK (sin guardia).
         let peer_v = qchain_core::dag::Vertex {
             round: 3,
@@ -1078,7 +1088,7 @@ mod tests {
             parents: vec![],
         };
         assert!(matches!(
-            respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
+            respond(&SignerRequest::SignPeerVote { chain_id: TEST_CHAIN, vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
             SignerResponse::Signature(_)
         ));
         // SignRaw de un transcript de handshake (dominio P2P) → OK.
@@ -1175,15 +1185,15 @@ mod tests {
         let path = tmp.join("guard.bin");
         {
             let g = Arc::new(Mutex::new(DoubleSignGuard::load(&path).unwrap()));
-            assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 9, digest: [7u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
+            assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 9, digest: [7u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
         }
         // Reiniciar el firmante (recargar el guard del disco): una ronda <= 9 con
         // distinto digest sigue bloqueada.
         let g2 = Arc::new(Mutex::new(DoubleSignGuard::load(&path).unwrap()));
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 9, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)));
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 8, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 9, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 8, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)));
         // Y una ronda mayor sigue permitida.
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 10, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 10, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Signature(_)));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1206,8 +1216,8 @@ mod tests {
         let client = RemoteSigner::connect(&addr).unwrap();
         assert_eq!(client.bundle().to_address(), expected_bundle.to_address());
         let digest = [42u8; 32];
-        let sig = client.sign_own_vote(1, &digest).unwrap();
-        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &digest, &sig), "la firma del firmante remoto verifica bajo el dominio de voto");
+        let sig = client.sign_own_vote(&TEST_CHAIN, 1, &digest).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &TEST_CHAIN, &digest, &sig), "la firma del firmante remoto verifica bajo el dominio de voto");
         // Un peer-vote sobre el vértice de OTRO validador también funciona.
         let peer_v = qchain_core::dag::Vertex {
             round: 1,
@@ -1216,8 +1226,8 @@ mod tests {
             parents: vec![],
         };
         let pd = peer_v.digest();
-        let sig2 = client.sign_peer_vote(&borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
-        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &pd, &sig2));
+        let sig2 = client.sign_peer_vote(&TEST_CHAIN, &borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected_bundle, &TEST_CHAIN, &pd, &sig2));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1240,7 +1250,7 @@ mod tests {
         let own_v = qchain_core::dag::Vertex { round: 7, author: my_addr, batch_digests: vec![], parents: vec![] };
         assert!(
             matches!(
-                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&own_v).unwrap(), digest: own_v.digest() }, &kp, &g),
+                respond(&SignerRequest::SignPeerVote { chain_id: TEST_CHAIN, vertex_bytes: borsh::to_vec(&own_v).unwrap(), digest: own_v.digest() }, &kp, &g),
                 SignerResponse::Refused(_)
             ),
             "a compromised node must NOT be able to peer-sign its OWN vertex (self-equivocation bypass)"
@@ -1249,7 +1259,7 @@ mod tests {
         let peer_v = qchain_core::dag::Vertex { round: 7, author: Keypair::generate().unwrap().public_key_bundle().to_address(), batch_digests: vec![], parents: vec![] };
         assert!(
             matches!(
-                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
+                respond(&SignerRequest::SignPeerVote { chain_id: TEST_CHAIN, vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() }, &kp, &g),
                 SignerResponse::Signature(_)
             ),
             "a vote over another validator's vertex must be signed"
@@ -1257,7 +1267,7 @@ mod tests {
         // Un digest que NO ata al vértice pasado → RECHAZADO (no se firma un digest arbitrario).
         assert!(
             matches!(
-                respond(&SignerRequest::SignPeerVote { vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: [9u8; 32] }, &kp, &g),
+                respond(&SignerRequest::SignPeerVote { chain_id: TEST_CHAIN, vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: [9u8; 32] }, &kp, &g),
                 SignerResponse::Refused(_)
             ),
             "the requested digest must match the passed vertex; an arbitrary digest is refused"
@@ -1265,7 +1275,7 @@ mod tests {
         // Bytes de vértice malformados → RECHAZADO (sin panic).
         assert!(
             matches!(
-                respond(&SignerRequest::SignPeerVote { vertex_bytes: vec![0xff; 3], digest: [9u8; 32] }, &kp, &g),
+                respond(&SignerRequest::SignPeerVote { chain_id: TEST_CHAIN, vertex_bytes: vec![0xff; 3], digest: [9u8; 32] }, &kp, &g),
                 SignerResponse::Refused(_)
             ),
             "malformed vertex bytes must be refused, not panic"
@@ -1369,8 +1379,8 @@ mod tests {
         let ok = RemoteSigner::connect_with_token(&addr, Some(token.clone())).unwrap();
         assert_eq!(ok.bundle().to_address(), expected.to_address());
         let digest = [3u8; 32];
-        let sig = ok.sign_own_vote(1, &digest).unwrap();
-        assert!(qchain_crypto::verify_vertex_vote(&expected, &digest, &sig));
+        let sig = ok.sign_own_vote(&TEST_CHAIN, 1, &digest).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected, &TEST_CHAIN, &digest, &sig));
 
         // (b) Token INCORRECTO → la conexión se cierra sin servir; GetBundle falla.
         assert!(
@@ -1415,8 +1425,8 @@ mod tests {
             parents: vec![],
         };
         let pd = peer_v.digest();
-        let sig = client.sign_peer_vote(&borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
-        assert!(qchain_crypto::verify_vertex_vote(&expected, &pd, &sig));
+        let sig = client.sign_peer_vote(&TEST_CHAIN, &borsh::to_vec(&peer_v).unwrap(), &pd).unwrap();
+        assert!(qchain_crypto::verify_vertex_vote(&expected, &TEST_CHAIN, &pd, &sig));
         // Un endpoint UDS se reconoce como tal; un host:puerto no.
         assert_eq!(unix_endpoint_path(&endpoint), Some(sock.to_str().unwrap()));
         assert_eq!(unix_endpoint_path("127.0.0.1:9200"), None);
@@ -1450,9 +1460,20 @@ mod tests {
         // El mismo checkpoint de NUESTRA red → firmado.
         let ok_ckpt = SignerRequest::SignCheckpoint { chain_id: chain_a, round: 1, merkle_root: [1u8; 32] };
         assert!(matches!(respond_with_policy(&ok_ckpt, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)), "own-network checkpoint signed");
-        // Un voto propio (sin chain_id) sigue firmándose bajo la política.
-        let vote = SignerRequest::SignOwnVote { round: 1, digest: [7u8; 32] };
-        assert!(matches!(respond_with_policy(&vote, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)), "votes unaffected by chain binding");
+        // #187: un VOTO tambien nombra su red ahora, asi que el binding lo CUBRE.
+        // Esta asercion decia antes "votes unaffected by chain binding" — el test
+        // codificaba el hueco que este incremento cierra: un nodo comprometido o
+        // mal-cableado podia usar este firmante, configurado para la red A, para
+        // producir votos validos en la red B; y esos votos, pareados con uno
+        // legitimo de A, son evidencia de equivocacion que quema un bono honesto.
+        let wrong_vote = SignerRequest::SignOwnVote { chain_id: chain_b, round: 1, digest: [7u8; 32] };
+        assert!(matches!(respond_with_policy(&wrong_vote, &kp, &g, &policy, &limiter), SignerResponse::Refused(_)), "wrong-network vote rejected");
+        let peer_v = qchain_core::dag::Vertex { round: 1, author: Keypair::generate().unwrap().pubkey(), batch_digests: vec![], parents: vec![] };
+        let wrong_peer = SignerRequest::SignPeerVote { chain_id: chain_b, vertex_bytes: borsh::to_vec(&peer_v).unwrap(), digest: peer_v.digest() };
+        assert!(matches!(respond_with_policy(&wrong_peer, &kp, &g, &policy, &limiter), SignerResponse::Refused(_)), "wrong-network peer vote rejected");
+        // El voto de NUESTRA red si se firma.
+        let vote = SignerRequest::SignOwnVote { chain_id: chain_a, round: 1, digest: [7u8; 32] };
+        assert!(matches!(respond_with_policy(&vote, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)), "own-network vote signed");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1482,7 +1503,7 @@ mod tests {
             // Ronda mayor (6) con cualquier root → OK.
             assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 6, merkle_root: r2 }, &kp, &g), SignerResponse::Signature(_)));
             // La guardia de checkpoints NO interfiere con la de votos (campos separados).
-            assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 3, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
+            assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 3, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
         }
         // Reinicio del daemon: el estado persiste → un root en conflicto para la ronda
         // 6 (ya atestada con r2) sigue rechazado.
@@ -1490,7 +1511,7 @@ mod tests {
             let g2 = guard(&tmp);
             assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: cid, round: 6, merkle_root: r1 }, &kp, &g2), SignerResponse::Refused(_)), "checkpoint equivocation memory survives a restart");
             // El voto de la ronda 3 también persistió → un digest distinto para 3 se rechaza.
-            assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 3, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)), "own-vote memory survives too");
+            assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 3, digest: [8u8; 32] }, &kp, &g2), SignerResponse::Refused(_)), "own-vote memory survives too");
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1530,10 +1551,10 @@ mod tests {
             assert!(matches!(respond_with_policy(&SignerRequest::GetBundle, &kp, &g, &policy, &limiter), SignerResponse::Bundle(_)));
         }
         // 2 firmas de votos (rondas distintas) OK.
-        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { round: 1, digest: [1u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
-        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { round: 2, digest: [2u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
+        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 1, digest: [1u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
+        assert!(matches!(respond_with_policy(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 2, digest: [2u8; 32] }, &kp, &g, &policy, &limiter), SignerResponse::Signature(_)));
         // La 3ª firma en la ventana → rechazada por rate-limit (no por la guardia).
-        let r = respond_with_policy(&SignerRequest::SignOwnVote { round: 3, digest: [3u8; 32] }, &kp, &g, &policy, &limiter);
+        let r = respond_with_policy(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 3, digest: [3u8; 32] }, &kp, &g, &policy, &limiter);
         match r {
             SignerResponse::Refused(reason) => assert!(reason.contains("rate limit"), "refused for rate limit, got: {reason}"),
             other => panic!("expected rate-limit Refused, got {other:?}"),
@@ -1557,8 +1578,8 @@ mod tests {
         let g = Arc::new(Mutex::new(DoubleSignGuard::load(&path).unwrap()));
         // La memoria de votos V1 sobrevivió: un voto de la ronda 7 con un digest
         // DISTINTO se rechaza (doble-firma), pero la ronda 8 firma.
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 7, digest: [9u8; 32] }, &kp, &g), SignerResponse::Refused(_)), "V1 own-vote memory preserved after migration");
-        assert!(matches!(respond(&SignerRequest::SignOwnVote { round: 8, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 7, digest: [9u8; 32] }, &kp, &g), SignerResponse::Refused(_)), "V1 own-vote memory preserved after migration");
+        assert!(matches!(respond(&SignerRequest::SignOwnVote { chain_id: TEST_CHAIN, round: 8, digest: [9u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
         // Y los campos de checkpoint arrancaron por defecto → un primer checkpoint firma.
         assert!(matches!(respond(&SignerRequest::SignCheckpoint { chain_id: [0u8; 32], round: 1, merkle_root: [1u8; 32] }, &kp, &g), SignerResponse::Signature(_)));
         std::fs::remove_dir_all(&tmp).ok();

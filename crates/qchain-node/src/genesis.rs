@@ -38,6 +38,22 @@ pub fn seed_genesis(ledger: &mut Ledger, config: &NodeConfig) -> anyhow::Result<
     // `staking`/`governance` module docs): the staking-stats counter starts
     // at zero, and the algorithm registry starts at its genesis contents
     // (Ed25519 + ML-DSA-65, both Active).
+    // #187 — identidad de red on-chain. Los 32 bytes del `chain_id` que este
+    // nodo derivo de su config, sembrados en un singleton para que un programa
+    // nativo pueda ATAR una verificacion a ESTA red. Lo consume el handler de
+    // `ReportEquivocation` (v6 y v7): el voto se firma como
+    // `VERTEX_VOTE_V1 || chain_id || digest`, asi que sin el chain_id local no se
+    // puede distinguir una equivocacion REAL de dos vertices legitimos firmados
+    // por el mismo validador en dos REDES distintas (el robo de bono que #187
+    // cierra). Sembrarlo NO cambia el `chain_id` (que se computa del CONFIG, no
+    // del estado), solo el state root de genesis — como cualquier singleton nuevo.
+    ledger.seed_account(
+        qchain_execution::ids::CHAIN_ID_ACCOUNT_ID,
+        qchain_core::Account {
+            data: config.chain_id().to_vec(),
+            ..qchain_core::Account::new_wallet(STAKING_PROGRAM_ID)
+        },
+    );
     ledger.seed_account(
         STAKING_STATS_ID,
         qchain_core::Account {

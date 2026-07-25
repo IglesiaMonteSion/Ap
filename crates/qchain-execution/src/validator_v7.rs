@@ -2264,9 +2264,16 @@ impl ValidatorV7Program {
         let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[1]".into()))?;
         let escrow_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[2]".into()))?;
         let unbonding_pk = *ix.accounts.get(3).ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[3]".into()))?;
-        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID || escrow_pk != VALIDATOR_BOND_ESCROW_ID || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID {
+        // #187: accounts[4] = el singleton con el `chain_id` de ESTA red. Es
+        // OBLIGATORIO, no tolerado-ausente: sin el no hay con que atar la firma a
+        // esta cadena, y "tolerar la ausencia" reabriria exactamente el agujero
+        // (una evidencia armada con un vertice de OTRA red quemando un bono
+        // honesto). Fail-closed.
+        let chain_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[4] = the chain-id singleton (#187)".into()))?;
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID || escrow_pk != VALIDATOR_BOND_ESCROW_ID || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID || chain_pk != crate::ids::CHAIN_ID_ACCOUNT_ID {
             return Err(ExecError::Unauthorized("ReportEquivocation must name the canonical accounts".into()));
         }
+        let chain_id = crate::ids::read_chain_id(accounts)?;
         // Verify the evidence exactly as the v6 slashing does: same (round,
         // author), distinct vertices, bundle matches the accused, both signatures
         // verify under the accused's own bundle.
@@ -2287,10 +2294,10 @@ impl ValidatorV7Program {
         // code did) would reject every REAL equivocation evidence produced by
         // consensus → a v7 equivocator would go unslashed. A raw (domain-less)
         // signature must NOT be accepted as vote evidence.
-        if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_a.digest(), &evidence.signature_a) {
+        if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &chain_id, &evidence.vertex_a.digest(), &evidence.signature_a) {
             return Err(ExecError::ProgramError("evidence signature_a does not verify".into()));
         }
-        if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &evidence.vertex_b.digest(), &evidence.signature_b) {
+        if !qchain_crypto::verify_vertex_vote(&evidence.author_bundle, &chain_id, &evidence.vertex_b.digest(), &evidence.signature_b) {
             return Err(ExecError::ProgramError("evidence signature_b does not verify".into()));
         }
 
@@ -2346,6 +2353,10 @@ pub fn is_registered_validator(accounts: &HashMap<Pubkey, Account>, addr: &Pubke
 
 #[cfg(test)]
 mod tests {
+    /// `chain_id` de la red simulada por estos tests (#187: el voto va atado a
+    /// su red, asi que la evidencia se firma y se verifica bajo el mismo id).
+    const V7_TEST_CHAIN: [u8; 32] = [0xC7; 32];
+
     use super::*;
     use qchain_core::UNITS_PER_QCH;
     use qchain_crypto::Keypair;
@@ -2358,6 +2369,14 @@ mod tests {
     fn ix(data: &ValidatorV7Instruction, accts: Vec<Pubkey>) -> Instruction {
         Instruction { program_id: STAKING_PROGRAM_ID, accounts: accts, data: borsh::to_vec(data).unwrap() }
     }
+    /// Siembra el singleton del `chain_id` que `ReportEquivocation` exige (#187).
+    fn seed_chain_id(accounts: &mut HashMap<Pubkey, Account>) {
+        accounts.insert(
+            crate::ids::CHAIN_ID_ACCOUNT_ID,
+            Account { data: V7_TEST_CHAIN.to_vec(), ..Account::new_wallet(Pubkey::system_program_id()) },
+        );
+    }
+
     fn set_quanto(accounts: &mut HashMap<Pubkey, Account>, q: u64) {
         let g = crate::staking_v7::GlobalStakingState { current_quanto: q, ..crate::staking_v7::GlobalStakingState::genesis() };
         let acct = accounts.entry(STAKING_GLOBAL_ID).or_insert_with(|| Account::new_wallet(STAKING_PROGRAM_ID));
@@ -2656,11 +2675,12 @@ mod tests {
         let mut accounts_slash = accounts.clone();
         let va = Vertex { round: 7, author: cons.pubkey(), batch_digests: vec![(0, [1u8; 32])], parents: vec![] };
         let vb = Vertex { round: 7, author: cons.pubkey(), batch_digests: vec![(0, [2u8; 32])], parents: vec![] };
-        let sa = qchain_crypto::sign_vertex_vote(&cons, &va.digest()[..]).unwrap();
-        let sb = qchain_crypto::sign_vertex_vote(&cons, &vb.digest()[..]).unwrap();
+        let sa = qchain_crypto::sign_vertex_vote(&cons, &V7_TEST_CHAIN, &va.digest()[..]).unwrap();
+        let sb = qchain_crypto::sign_vertex_vote(&cons, &V7_TEST_CHAIN, &vb.digest()[..]).unwrap();
         let evidence = EquivocationEvidence { vertex_a: va, vertex_b: vb, signature_a: sa, signature_b: sb, author_bundle: cons.public_key_bundle() };
         let rep = ValidatorV7Instruction::ReportEquivocation { evidence: Box::new(evidence) };
-        ValidatorV7Program::execute(&mut accounts_slash, &ix(&rep, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID]), &relayer.pubkey()).unwrap();
+        seed_chain_id(&mut accounts_slash);
+        ValidatorV7Program::execute(&mut accounts_slash, &ix(&rep, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, crate::ids::CHAIN_ID_ACCOUNT_ID]), &relayer.pubkey()).unwrap();
         assert_eq!(accounts_slash.get(&VALIDATOR_UNBONDING_POOL_ID).unwrap().balance, 0, "revoked equivocator's bond burned from the unbonding pool");
         assert_eq!(registry_of(&accounts_slash).validators[0].state, ValidatorV7State::Slashed);
 
@@ -2998,8 +3018,8 @@ mod tests {
         // #187: sign the way REAL consensus does — domain-tagged
         // (`VERTEX_VOTE_V1 ‖ digest`), NOT a bare digest sign. This is exactly
         // the evidence a Byzantine validator's `VertexProposal` produces.
-        let sig_a = qchain_crypto::sign_vertex_vote(&v, &va.digest()[..]).unwrap();
-        let sig_b = qchain_crypto::sign_vertex_vote(&v, &vb.digest()[..]).unwrap();
+        let sig_a = qchain_crypto::sign_vertex_vote(&v, &V7_TEST_CHAIN, &va.digest()[..]).unwrap();
+        let sig_b = qchain_crypto::sign_vertex_vote(&v, &V7_TEST_CHAIN, &vb.digest()[..]).unwrap();
         let evidence = EquivocationEvidence {
             vertex_a: va.clone(),
             vertex_b: vb.clone(),
@@ -3010,7 +3030,8 @@ mod tests {
         let data = ValidatorV7Instruction::ReportEquivocation { evidence: Box::new(evidence) };
         // Permissionless: a third party reports.
         let reporter = Keypair::generate().unwrap();
-        ValidatorV7Program::execute(&mut accounts, &ix(&data, vec![reporter.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID]), &reporter.pubkey()).unwrap();
+        seed_chain_id(&mut accounts);
+        ValidatorV7Program::execute(&mut accounts, &ix(&data, vec![reporter.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, crate::ids::CHAIN_ID_ACCOUNT_ID]), &reporter.pubkey()).unwrap();
         assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, 0, "the full bond was burned");
         assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Slashed);
     }
@@ -3158,7 +3179,8 @@ mod tests {
         let evidence = EquivocationEvidence { vertex_a: va, vertex_b: vb, signature_a: sig_a, signature_b: sig_b, author_bundle: v.public_key_bundle() };
         let data = ValidatorV7Instruction::ReportEquivocation { evidence: Box::new(evidence) };
         let reporter = Keypair::generate().unwrap();
-        let r = ValidatorV7Program::execute(&mut accounts, &ix(&data, vec![reporter.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID]), &reporter.pubkey());
+        seed_chain_id(&mut accounts);
+        let r = ValidatorV7Program::execute(&mut accounts, &ix(&data, vec![reporter.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, crate::ids::CHAIN_ID_ACCOUNT_ID]), &reporter.pubkey());
         assert!(r.is_err(), "a domain-less (raw) signature must not verify as vote evidence");
         assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "the bond must be untouched when the evidence is rejected");
         assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::BondedPending, "state unchanged");

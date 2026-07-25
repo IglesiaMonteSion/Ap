@@ -349,7 +349,7 @@ mod tests {
         // La firma de la tx (dominio TX_SIG_V1) no verifica como voto de vértice
         // (dominio VERTEX_VOTE_V1) sobre los mismos bytes del mensaje.
         assert!(
-            !qchain_crypto::verify_vertex_vote(&tx.message.payer_keys, &msg_bytes, &tx.signature),
+            !qchain_crypto::verify_vertex_vote(&tx.message.payer_keys, &[0u8; 32], &msg_bytes, &tx.signature),
             "una firma de tx no debe pasar como voto de vértice"
         );
     }

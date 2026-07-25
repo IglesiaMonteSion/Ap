@@ -27,11 +27,18 @@ use qchain_core::{Certificate, Digest, Round};
 use std::collections::HashSet;
 
 /// Verify a certificate carries real, quorum-weighted signatures over its
-/// vertex digest. A validator's signature only counts once even if it
-/// somehow appears twice (no restaking the same stake); a signer absent
-/// from the validator set is silently ignored rather than rejecting the
+/// vertex digest, **for this chain**. A validator's signature only counts once
+/// even if it somehow appears twice (no restaking the same stake); a signer
+/// absent from the validator set is silently ignored rather than rejecting the
 /// whole certificate outright.
-pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool {
+///
+/// `chain_id` (#187) is part of the signed preimage, so a certificate carrying
+/// perfectly valid signatures made on ANOTHER qchain network — including a
+/// previous incarnation of this one, relaunched with a fresh genesis but the
+/// same validator keys — verifies to `false` here instead of being accepted as
+/// this chain's. See `qchain_crypto::vertex_vote_message` for the slashing
+/// vector this closes.
+pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet, chain_id: &[u8; 32]) -> bool {
     let digest = cert.vertex.digest();
     let mut counted = HashSet::new();
     let mut signer_stake = 0u64;
@@ -43,8 +50,8 @@ pub fn verify_certificate(cert: &Certificate, validators: &ValidatorSet) -> bool
             continue;
         };
         // #187: la firma de un voto va etiquetada por dominio
-        // (`VERTEX_VOTE_V1 ‖ digest`), no sobre el digest pelado.
-        if qchain_crypto::verify_vertex_vote(&info.pubkey_bundle, &digest[..], sig) {
+        // (`VERTEX_VOTE_V1 ‖ chain_id ‖ digest`), no sobre el digest pelado.
+        if qchain_crypto::verify_vertex_vote(&info.pubkey_bundle, chain_id, &digest[..], sig) {
             // saturating_add for policy consistency (release builds run with
             // overflow-checks=true, where a plain `+` overflow is a
             // deterministic panic-halt). Unreachable here - this sums a subset
@@ -268,6 +275,10 @@ pub fn can_advance_round(dag: &DagStore, schedule: &ValidatorSchedule, round: Ro
 
 #[cfg(test)]
 mod tests {
+    /// `chain_id` sintético para los tests de este crate (#187: el voto va
+    /// atado a la red, así que firmar y verificar deben usar el MISMO id).
+    const TEST_CHAIN: [u8; 32] = [0xC1; 32];
+
     use super::*;
     use qchain_core::{Batch, Vertex};
     use qchain_crypto::{MultiSignature, Keypair};
@@ -296,7 +307,7 @@ mod tests {
     fn certify(vertex: Vertex, signers: &[TestValidator]) -> Certificate {
         let digest = vertex.digest();
         let signatures: Vec<(qchain_core::ValidatorId, MultiSignature)> =
-            signers.iter().map(|v| (v.id, qchain_crypto::sign_vertex_vote(&v.keypair, &digest[..]).unwrap())).collect();
+            signers.iter().map(|v| (v.id, qchain_crypto::sign_vertex_vote(&v.keypair, &TEST_CHAIN, &digest[..]).unwrap())).collect();
         Certificate { vertex, signatures }
     }
 
@@ -330,7 +341,7 @@ mod tests {
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         // Only one signer - below the quorum threshold of 3.
         let cert = certify(vertex, &tvs[..1]);
-        assert!(!verify_certificate(&cert, validators.base()));
+        assert!(!verify_certificate(&cert, validators.base(), &TEST_CHAIN));
     }
 
     #[test]
@@ -338,7 +349,9 @@ mod tests {
         let (tvs, validators) = make_validators(4);
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let cert = certify(vertex, &tvs[..3]);
-        assert!(verify_certificate(&cert, validators.base()));
+        assert!(verify_certificate(&cert, validators.base(), &TEST_CHAIN));
+        // #187: la misma evidencia criptográfica NO vale en otra red.
+        assert!(!verify_certificate(&cert, validators.base(), &[0xEE; 32]), "un certificado de esta red no debe verificar en otra");
     }
 
     #[test]
@@ -347,7 +360,7 @@ mod tests {
         let vertex = Vertex { round: 0, author: tvs[0].id, batch_digests: vec![(0, [0u8; 32])], parents: vec![] };
         let mut cert = certify(vertex, &tvs[..3]);
         cert.signatures[0].1.components[0].bytes[0] ^= 0xFF;
-        assert!(!verify_certificate(&cert, validators.base()), "a quorum count that includes a forged signature must not pass");
+        assert!(!verify_certificate(&cert, validators.base(), &TEST_CHAIN), "a quorum count that includes a forged signature must not pass");
     }
 
     #[test]
@@ -493,7 +506,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != silent_idx)
-                    .map(|(_, signer)| (signer.id, qchain_crypto::sign_vertex_vote(&signer.keypair, &digest[..]).unwrap()))
+                    .map(|(_, signer)| (signer.id, qchain_crypto::sign_vertex_vote(&signer.keypair, &TEST_CHAIN, &digest[..]).unwrap()))
                     .collect();
                 let cert = Certificate { vertex, signatures };
                 this_round_digests.push(dag.insert(cert));
@@ -560,7 +573,9 @@ mod fuzz_proptests {
             let vs = small_set();
             if let Ok(cert) = borsh::from_slice::<Certificate>(&bytes) {
                 // Nunca panica; devuelve un bool (casi siempre false para basura).
-                let _ = verify_certificate(&cert, &vs);
+                // El literal va inline: `proptest!` genera un módulo anidado
+                // desde el que la const privada del módulo de tests no es visible.
+                let _ = verify_certificate(&cert, &vs, &[0xC1; 32]);
             }
         }
     }

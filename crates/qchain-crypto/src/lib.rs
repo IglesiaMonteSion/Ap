@@ -416,7 +416,7 @@ pub trait Signer: Send + Sync {
     /// digest`). En el firmante remoto está sujeto a la guardia ANTI-DOBLE-FIRMA
     /// (una sola versión del propio vértice por ronda) — defensa-en-profundidad
     /// sobre el candado `voted_for` del engine.
-    fn sign_own_vote(&self, round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
+    fn sign_own_vote(&self, chain_id: &[u8; 32], round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
     /// Firma un voto sobre el vértice de OTRO validador (`VERTEX_VOTE_V1 ‖
     /// digest`). No es una auto-equivocación → sin guardia local. En el firmante
     /// REMOTO (#193) el daemon recibe además los BYTES borsh del vértice
@@ -431,7 +431,7 @@ pub trait Signer: Send + Sync {
     /// ignora (no tiene guardia: el candado `voted_for` del engine ya cubre la
     /// equivocación, y si el proceso está comprometido la clave local ya está
     /// expuesta).
-    fn sign_peer_vote(&self, vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
+    fn sign_peer_vote(&self, chain_id: &[u8; 32], vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature>;
     /// Firma el **transcript de un handshake P2P** (`P2P_AUTH_V1 ‖ …`). Es una
     /// operación TIPADA, no un `sign_raw` de bytes arbitrarios (auditoría #2, punto
     /// 2): la implementación EXIGE que el mensaje empiece por el dominio
@@ -470,16 +470,16 @@ impl Signer for Keypair {
     fn bundle(&self) -> PublicKeyBundle {
         self.public_key_bundle()
     }
-    fn sign_own_vote(&self, _round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
-        sign_vertex_vote(self, digest)
+    fn sign_own_vote(&self, chain_id: &[u8; 32], _round: u64, digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+        sign_vertex_vote(self, chain_id, digest)
     }
-    fn sign_peer_vote(&self, _vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
+    fn sign_peer_vote(&self, chain_id: &[u8; 32], _vertex_bytes: &[u8], digest: &[u8; 32]) -> anyhow::Result<MultiSignature> {
         // El firmante en-proceso no verifica autoría (no tiene guardia): el
         // candado `voted_for` del engine ya evita la doble-firma, y si el proceso
         // del nodo está comprometido la clave local ya está expuesta, así que un
         // chequeo de autoría acá no agrega nada. La autoría SÍ se verifica en el
         // firmante remoto, donde la clave vive fuera del proceso.
-        sign_vertex_vote(self, digest)
+        sign_vertex_vote(self, chain_id, digest)
     }
     fn sign_network_handshake(&self, transcript: &[u8]) -> anyhow::Result<MultiSignature> {
         // TIPADO (auditoría #2): sólo un transcript del handshake P2P (dominio
@@ -545,22 +545,48 @@ pub fn verify_network_key_cert(consensus_bundle: &PublicKeyBundle, chain_id: &[u
     verify_domain(consensus_bundle, domains::NETWORK_KEY_CERT_V1, &network_key_cert_message(chain_id, validator_id, network_addr), signature)
 }
 
+/// Preimagen canónica de la atestación de un voto/vértice: `chain_id ‖ digest`
+/// (bajo el dominio [`domains::VERTEX_VOTE_V1`]). El `chain_id` va PRIMERO y
+/// ambos campos son de largo fijo (32 + 32) → sin ambigüedad de framing.
+///
+/// **Por qué el `chain_id` (tarea #187, el ítem que v6.15.0 dejó diferido).** Un
+/// voto firmaba `VERTEX_VOTE_V1 ‖ digest` pelado, y el digest de un vértice es
+/// `ronda ‖ autor ‖ batch_digests ‖ parents` — **nada de eso identifica la red**.
+/// El diferimiento razonó que un vértice de otra red se rechaza igual porque sus
+/// `parents` son digests desconocidos acá, y eso es cierto **para la decisión de
+/// consenso**… pero el camino de SLASHING no inserta el vértice en ningún DAG:
+/// `ReportEquivocation` sólo exige (misma ronda, mismo autor, digests distintos,
+/// ambas firmas verifican). Así que un validador HONESTO que corre la misma clave
+/// en dos cadenas — o en dos incarnaciones de la misma red tras un relanzamiento
+/// con génesis fresco, algo que este proyecto hace de rutina — firma UN vértice
+/// por ronda en cada una, y juntarlos producía evidencia válida que le quemaba el
+/// bono entero. Verificado con el exploit como test antes del fix. Atar el voto a
+/// `chain_id` lo cierra por construcción: una firma hecha para la cadena A no
+/// verifica jamás bajo la B.
+pub fn vertex_vote_message(chain_id: &[u8; 32], digest: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(32 + digest.len());
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(digest);
+    m
+}
+
 /// Firma la **atestación de un voto/vértice** sobre el digest de un vértice
-/// (tarea #187): firma `VERTEX_VOTE_V1 ‖ digest`. Es el ÚNICO punto por el que
-/// debe pasar todo firmante de un vértice — el autor en su auto-voto y cada
-/// votante — para que un `Certificate` trate todas las firmas de forma uniforme
-/// y ninguna se pueda confundir con una firma de transacción. La evidencia de
-/// equivocación se verifica bajo el mismo dominio (sus firmas SON votos del
-/// autor). `digest` es el `Vertex::digest()` de `qchain-core` (32 B) — se toma
-/// como `&[u8]` para no acoplar `qchain-crypto` a `qchain-core`.
-pub fn sign_vertex_vote(kp: &Keypair, digest: &[u8]) -> anyhow::Result<MultiSignature> {
-    sign_domain(kp, domains::VERTEX_VOTE_V1, digest)
+/// (tarea #187): firma `VERTEX_VOTE_V1 ‖ chain_id ‖ digest`. Es el ÚNICO punto
+/// por el que debe pasar todo firmante de un vértice — el autor en su auto-voto y
+/// cada votante — para que un `Certificate` trate todas las firmas de forma
+/// uniforme y ninguna se pueda confundir con una firma de transacción ni con un
+/// voto de OTRA red. La evidencia de equivocación se verifica bajo el mismo
+/// dominio y el mismo `chain_id` (sus firmas SON votos del autor). `digest` es el
+/// `Vertex::digest()` de `qchain-core` (32 B) — se toma como `&[u8]` para no
+/// acoplar `qchain-crypto` a `qchain-core`.
+pub fn sign_vertex_vote(kp: &Keypair, chain_id: &[u8; 32], digest: &[u8]) -> anyhow::Result<MultiSignature> {
+    sign_domain(kp, domains::VERTEX_VOTE_V1, &vertex_vote_message(chain_id, digest))
 }
 
 /// Verifica una firma de voto/vértice sobre `VERTEX_VOTE_V1 ‖ digest`
 /// (contraparte de [`sign_vertex_vote`]).
-pub fn verify_vertex_vote(bundle: &PublicKeyBundle, digest: &[u8], signature: &MultiSignature) -> bool {
-    verify_domain(bundle, domains::VERTEX_VOTE_V1, digest, signature)
+pub fn verify_vertex_vote(bundle: &PublicKeyBundle, chain_id: &[u8; 32], digest: &[u8], signature: &MultiSignature) -> bool {
+    verify_domain(bundle, domains::VERTEX_VOTE_V1, &vertex_vote_message(chain_id, digest), signature)
 }
 
 /// Verify just the Ed25519 half against a raw 32-byte public key. Exposed
@@ -768,6 +794,8 @@ mod tests {
     /// defensa contra confusión entre protocolos (tx vs voto/vértice).
     #[test]
     fn domain_tagged_signatures_do_not_cross_verify() {
+        const TEST_CHAIN: [u8; 32] = [7u8; 32];
+        const OTHER_CHAIN: [u8; 32] = [9u8; 32];
         let kp = Keypair::generate().unwrap();
         let bundle = kp.public_key_bundle();
         let digest = [7u8; 32]; // mismo mensaje crudo en ambos dominios
@@ -775,17 +803,20 @@ mod tests {
         // Firmada como transacción, NO verifica como voto de vértice (y vice).
         let tx_sig = sign_domain(&kp, domains::TX_SIG_V1, &digest).unwrap();
         assert!(verify_domain(&bundle, domains::TX_SIG_V1, &digest, &tx_sig));
-        assert!(!verify_vertex_vote(&bundle, &digest, &tx_sig), "una firma de tx no debe verificar como voto");
+        assert!(!verify_vertex_vote(&bundle, &TEST_CHAIN, &digest, &tx_sig), "una firma de tx no debe verificar como voto");
 
         // Firmada como voto de vértice, NO verifica como transacción.
-        let vote_sig = sign_vertex_vote(&kp, &digest).unwrap();
-        assert!(verify_vertex_vote(&bundle, &digest, &vote_sig));
+        let vote_sig = sign_vertex_vote(&kp, &TEST_CHAIN, &digest).unwrap();
+        assert!(verify_vertex_vote(&bundle, &TEST_CHAIN, &digest, &vote_sig));
+        // #187: la MISMA firma NO verifica bajo otra red — el binding de chain_id
+        // es lo que cierra el slashing cross-cadena (ver `vertex_vote_message`).
+        assert!(!verify_vertex_vote(&bundle, &OTHER_CHAIN, &digest, &vote_sig), "un voto de una red no debe verificar en otra");
         assert!(!verify_domain(&bundle, domains::TX_SIG_V1, &digest, &vote_sig), "un voto no debe verificar como tx");
 
         // Una firma cruda sobre el digest pelado (sin dominio) tampoco cuenta
         // como voto — el dominio es obligatorio.
         let raw_sig = kp.sign(&digest).unwrap();
-        assert!(!verify_vertex_vote(&bundle, &digest, &raw_sig), "una firma sin dominio no debe verificar como voto");
+        assert!(!verify_vertex_vote(&bundle, &TEST_CHAIN, &digest, &raw_sig), "una firma sin dominio no debe verificar como voto");
     }
 
     #[test]

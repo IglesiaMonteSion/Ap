@@ -652,6 +652,19 @@ impl NativeProgram for StakingProgram {
                 // omits it degrades to a no-op on the counter rather than a
                 // hard rejection (the slash itself still applies either way).
                 let stats_pk = instruction.accounts.get(1).copied();
+                // #187: accounts[2] = el singleton con el `chain_id` de ESTA red,
+                // OBLIGATORIO (fail-closed). El voto se firma como
+                // `VERTEX_VOTE_V1 || chain_id || digest`, asi que sin saber el
+                // chain_id local no hay forma de distinguir una equivocacion REAL
+                // de dos vertices legitimos firmados por el mismo validador en dos
+                // REDES distintas. Tolerar su ausencia reabriria el agujero.
+                let chain_pk = *instruction.accounts.get(2).ok_or_else(|| {
+                    ExecError::ProgramError("ReportEquivocation requires accounts[2] = the chain-id singleton (#187)".into())
+                })?;
+                if chain_pk != crate::ids::CHAIN_ID_ACCOUNT_ID {
+                    return Err(ExecError::Unauthorized("ReportEquivocation must name the canonical chain-id account".into()));
+                }
+                let chain_id = crate::ids::read_chain_id(accounts)?;
                 // Pin the stats singleton when present (it's optional here) - a
                 // reporter naming a throwaway account would leave the real
                 // `total_staked` un-decremented after a slash, the same
@@ -693,6 +706,7 @@ impl NativeProgram for StakingProgram {
                 // `VERTEX_VOTE_V1` que produjo el proponente.
                 if !qchain_crypto::verify_vertex_vote(
                     &evidence.author_bundle,
+                    &chain_id,
                     &evidence.vertex_a.digest(),
                     &evidence.signature_a,
                 ) {
@@ -702,6 +716,7 @@ impl NativeProgram for StakingProgram {
                 }
                 if !qchain_crypto::verify_vertex_vote(
                     &evidence.author_bundle,
+                    &chain_id,
                     &evidence.vertex_b.digest(),
                     &evidence.signature_b,
                 ) {
@@ -1731,6 +1746,30 @@ mod tests {
     /// Builds two genuinely conflicting, validly author-signed vertices for
     /// the same (round, author) - the real shape `qchain-node::engine`
     /// constructs from two conflicting live `VertexProposal`s.
+    /// `chain_id` de la red simulada por estos tests (#187).
+    const TEST_CHAIN_ID: [u8; 32] = [0xC7; 32];
+    /// Otra red — usada por el test del exploit cross-cadena.
+    const OTHER_CHAIN_ID: [u8; 32] = [0xD9; 32];
+
+    /// Los singletons que `ReportEquivocation` necesita en el working set: el
+    /// del `chain_id` (#187, OBLIGATORIO) y el de stats (opcional, pero como
+    /// ahora va nombrado en `accounts[1]` tiene que existir para poder leerse).
+    /// Sólo se insertan si faltan, para no pisar el estado que arme el test.
+    fn seed_equivocation_singletons(accounts: &mut HashMap<Pubkey, Account>) {
+        accounts.entry(crate::ids::CHAIN_ID_ACCOUNT_ID).or_insert_with(|| Account {
+            data: TEST_CHAIN_ID.to_vec(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        });
+        // El contador arranca alto a proposito: un slash lo DECREMENTA por el
+        // monto quemado, y con 0 la resta chequeada aborta (ArithmeticOverflow).
+        // Los tests que verifican el decremento exacto traen su propia cuenta y
+        // `or_insert_with` no la pisa.
+        accounts.entry(STAKING_STATS_ID).or_insert_with(|| Account {
+            data: borsh::to_vec(&1_000_000_000_000_000u64).unwrap(),
+            ..Account::new_wallet(STAKING_PROGRAM_ID)
+        });
+    }
+
     fn conflicting_evidence(
         author_kp: &qchain_crypto::Keypair,
         round: qchain_core::Round,
@@ -1748,9 +1787,9 @@ mod tests {
             parents: vec![],
         };
         let signature_a =
-            qchain_crypto::sign_vertex_vote(author_kp, &vertex_a.digest()[..]).unwrap();
+            qchain_crypto::sign_vertex_vote(author_kp, &TEST_CHAIN_ID, &vertex_a.digest()[..]).unwrap();
         let signature_b =
-            qchain_crypto::sign_vertex_vote(author_kp, &vertex_b.digest()[..]).unwrap();
+            qchain_crypto::sign_vertex_vote(author_kp, &TEST_CHAIN_ID, &vertex_b.digest()[..]).unwrap();
         EquivocationEvidence {
             vertex_a,
             signature_a,
@@ -1786,9 +1825,11 @@ mod tests {
         )]);
 
         let evidence = conflicting_evidence(&validator_kp, 7);
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -1853,9 +1894,11 @@ mod tests {
         ]);
 
         let evidence = conflicting_evidence(&validator_kp, 9);
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -1934,9 +1977,11 @@ mod tests {
         // burn the position while it's mid-unbonding, not yet withdrawn.
         let reporter = Pubkey::new([41u8; 32]);
         let evidence = conflicting_evidence(&validator_kp, 7);
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let report_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2023,6 +2068,96 @@ mod tests {
         );
     }
 
+    /// **Exploit (escrito ANTES del fix).** Un validador honesto que corre la
+    /// MISMA clave de consenso en dos cadenas — o en dos incarnaciones de la
+    /// misma red tras un relanzamiento con génesis fresco, algo que este
+    /// proyecto hace de rutina (§15, `docs/RELAUNCH-V7.md`, el hard cap de
+    /// #221 lo exige) — firma UN solo vértice por ronda EN CADA UNA. Eso no es
+    /// equivocación: en ninguna cadena firmó dos cosas en conflicto.
+    ///
+    /// Pero la evidencia sólo exige (misma ronda, mismo autor, digests
+    /// distintos, ambas firmas verifican), y la preimagen firmada es
+    /// `VERTEX_VOTE_V1 ‖ vertex.digest()` — **sin ninguna atadura a la
+    /// cadena**. Así que juntar el vértice de la cadena A con el de la B
+    /// produce evidencia que el handler acepta, y le quema el self-stake
+    /// COMPLETO a un validador que se portó bien.
+    ///
+    /// Este test debe FALLAR una vez que el voto quede atado al `chain_id`.
+    #[test]
+    fn evidence_built_from_two_different_chains_must_not_slash_an_honest_validator() {
+        let validator_kp = qchain_crypto::Keypair::generate().unwrap();
+        let validator = validator_kp.pubkey();
+        let stake_pk = Pubkey::new([30u8; 32]);
+        let reporter = Pubkey::new([31u8; 32]);
+        let mut accounts = HashMap::from([(
+            stake_pk,
+            Account {
+                data: borsh::to_vec(&StakeAccountData {
+                    owner: validator,
+                    validator,
+                    amount: 5_000_000,
+                    reward_debt: 0,
+                    locked_until_round: 0,
+                    bonding_until_round: 0,
+                    unbonding_requested_at_round: None,
+                    created_round: 0,
+                })
+                .unwrap(),
+                balance: 5_000_000,
+                ..Account::new_wallet(STAKING_PROGRAM_ID)
+            },
+        )]);
+
+        // El MISMO validador, la MISMA ronda, en dos cadenas distintas. Los
+        // vértices difieren sólo en sus padres — que es exactamente lo que
+        // pasa de verdad: los padres son digests de certificados de SU red.
+        let round = 7;
+        let vertex_chain_a = qchain_core::Vertex {
+            round,
+            author: validator,
+            batch_digests: vec![(0, [1u8; 32])],
+            parents: vec![[0xAA; 32]], // certificado de la cadena A
+        };
+        let vertex_chain_b = qchain_core::Vertex {
+            round,
+            author: validator,
+            batch_digests: vec![(0, [1u8; 32])],
+            parents: vec![[0xBB; 32]], // certificado de la cadena B
+        };
+        // Cada firma es LEGÍTIMA en su propia cadena: una sola por ronda.
+        let signature_a = qchain_crypto::sign_vertex_vote(&validator_kp, &TEST_CHAIN_ID, &vertex_chain_a.digest()[..]).unwrap();
+        let signature_b = qchain_crypto::sign_vertex_vote(&validator_kp, &OTHER_CHAIN_ID, &vertex_chain_b.digest()[..]).unwrap();
+
+        // #187: el handler exige el singleton del chain_id pinneado.
+
+        seed_equivocation_singletons(&mut accounts);
+
+        let ix = Instruction {
+            program_id: STAKING_PROGRAM_ID,
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
+                evidence: Box::new(EquivocationEvidence {
+                    vertex_a: vertex_chain_a,
+                    signature_a,
+                    vertex_b: vertex_chain_b,
+                    signature_b,
+                    author_bundle: validator_kp.public_key_bundle(),
+                }),
+            })
+            .unwrap(),
+        };
+        let result = StakingProgram.process(&mut accounts, &ix, &reporter, 0);
+
+        assert!(
+            result.is_err(),
+            "cross-chain evidence must be REJECTED - the validator never equivocated on any single chain"
+        );
+        assert_eq!(
+            accounts[&stake_pk].balance, 5_000_000,
+            "an honest validator's self-stake must survive cross-chain 'evidence'"
+        );
+    }
+
     #[test]
     fn report_equivocation_rejects_a_delegators_position_not_the_validators_own_self_stake() {
         let validator_kp = qchain_crypto::Keypair::generate().unwrap();
@@ -2053,9 +2188,11 @@ mod tests {
         )]);
 
         let evidence = conflicting_evidence(&validator_kp, 7);
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2097,9 +2234,11 @@ mod tests {
 
         let mut evidence = conflicting_evidence(&validator_kp, 7);
         evidence.signature_b.components[0].bytes[0] ^= 0xFF;
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2142,9 +2281,11 @@ mod tests {
         let mut evidence = conflicting_evidence(&validator_kp, 7);
         evidence.vertex_b = evidence.vertex_a.clone();
         evidence.signature_b = evidence.signature_a.clone();
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2197,9 +2338,9 @@ mod tests {
             parents: vec![],
         };
         let signature_a =
-            qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_a.digest()[..]).unwrap();
+            qchain_crypto::sign_vertex_vote(&validator_kp, &TEST_CHAIN_ID, &vertex_a.digest()[..]).unwrap();
         let signature_b =
-            qchain_crypto::sign_vertex_vote(&validator_kp, &vertex_b.digest()[..]).unwrap();
+            qchain_crypto::sign_vertex_vote(&validator_kp, &TEST_CHAIN_ID, &vertex_b.digest()[..]).unwrap();
         let evidence = EquivocationEvidence {
             vertex_a,
             signature_a,
@@ -2207,9 +2348,11 @@ mod tests {
             signature_b,
             author_bundle: validator_kp.public_key_bundle(),
         };
+        // #187: el handler exige el singleton del chain_id pinneado.
+        seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk],
+            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })

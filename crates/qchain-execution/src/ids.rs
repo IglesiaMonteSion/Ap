@@ -246,3 +246,48 @@ mod wasm_id_contract_tests {
         assert_eq!(STAKING_GLOBAL_ID, Pubkey::new([15u8; 32]), "wasm STAKING_GLOBAL_ID");
     }
 }
+
+/// **Identidad de red on-chain (`chain_id`) — sembrada en génesis, inmutable
+/// (tarea #187).** Guarda los 32 bytes del `chain_id` que el nodo deriva de su
+/// config (`validators` + `genesis`), para que un programa nativo pueda ATAR una
+/// verificación a ESTA red sin que haya que enroscar el chain_id por la firma de
+/// `NativeProgram::process`.
+///
+/// **Por qué existe.** La evidencia de equivocación (`ReportEquivocation`, v6 y
+/// v7) sólo exige (misma ronda, mismo autor, digests distintos, ambas firmas
+/// verifican). Como el voto pasó a firmar `VERTEX_VOTE_V1 ‖ chain_id ‖ digest`,
+/// el handler necesita saber CUÁL es el chain_id de esta red para verificar bajo
+/// él — si no, un atacante nombraría el de otra cadena y las dos firmas (hechas
+/// en redes distintas por un validador HONESTO) verificarían igual, quemándole el
+/// bono. El valor vive en un singleton porque es exactamente el patrón que este
+/// código ya usa para `PARAMS`/`STAKING_STATS`/`STAKING_GLOBAL`: un dato de
+/// consenso que el handler lee de una cuenta PINNEADA en `ix.accounts`.
+///
+/// No lleva fondos y ninguna instrucción lo escribe: se siembra una vez en
+/// génesis y queda fijo. Sembrarlo NO cambia el `chain_id` (que se computa del
+/// CONFIG, no del estado) — sólo el state root de génesis, igual que cualquier
+/// otro singleton nuevo.
+pub const CHAIN_ID_ACCOUNT_ID: Pubkey = Pubkey::new([26u8; 32]);
+
+/// Lee el `chain_id` de esta red desde [`CHAIN_ID_ACCOUNT_ID`], que el llamador
+/// DEBE haber pinneado en `ix.accounts` (la lección de KM#6: sin el pin, la
+/// cuenta no está en el working set y la lectura fallaría en silencio).
+///
+/// **Fail-closed a propósito:** si la cuenta falta o no tiene exactamente 32
+/// bytes, esto es un ERROR, nunca un default. Un default (p. ej. ceros) haría que
+/// las firmas se verificaran bajo un chain_id que ninguna red usa —o peor, bajo
+/// uno común a todas—, reabriendo justo el agujero que el binding cierra (la
+/// clase EC-18: la protección coincide con el default y desaparece en silencio).
+pub fn read_chain_id(
+    accounts: &std::collections::HashMap<Pubkey, qchain_core::Account>,
+) -> Result<[u8; 32], crate::ExecError> {
+    let acct = accounts
+        .get(&CHAIN_ID_ACCOUNT_ID)
+        .ok_or_else(|| crate::ExecError::ProgramError("the chain-id singleton is not in this instruction's accounts (#187)".into()))?;
+    let bytes: [u8; 32] = acct
+        .data
+        .as_slice()
+        .try_into()
+        .map_err(|_| crate::ExecError::ProgramError("the chain-id singleton must hold exactly 32 bytes".into()))?;
+    Ok(bytes)
+}

@@ -5,7 +5,7 @@ archivo es la memoria de **clases** de error (no de instancias sueltas): cada
 vez que aparece un bug de seguridad, se clasifica aquí, se registra su causa
 raíz, la regla que lo cierra, cómo se detecta automáticamente, y **la pregunta
 que toda auditoría futura DEBE volver a responder**. Ninguna auditoría se cierra
-sin recorrer las 18 clases de abajo y demostrar (con test o grep) que cada una
+sin recorrer las 19 clases de abajo y demostrar (con test o grep) que cada una
 sigue cerrada.
 
 > Regla operativa (QSEP-1 §13, obligatoria): un hallazgo NO está resuelto cuando
@@ -53,6 +53,7 @@ sigue cerrada.
 | EC-16 | Endpoint/socket privilegiado sin autenticar; "acotado" tratado como "eliminado" | parcial (grep de listeners sin auth) | **CERRADA-VIGILADA** (#4.2 socket del firmante remoto, corregido v8.6.26/27) |
 | EC-17 | Control de PAUSA/BLOQUEO gateado en una decisión pero no en toda la superficie que promete detener | no (enumeración manual de instrucciones) | **CERRADA-VIGILADA** (KM#9 freeze → robo del bono; corregido v8.6.36 por la pasada adversarial KM#10) |
 | EC-18 | Protección cableada a una identidad HARDCODEADA mientras el valor se rutea a una CONFIGURABLE | sí (grep: constante usada donde existe un campo de config homónimo) | **CERRADA-VIGILADA** (barrido de polvo vs. `admin_fee_wallet`; corregido v8.6.37) |
+| EC-19 | Firma sin binding de INSTANCIA (red/época): vale como evidencia en otra instancia — y la superficie de ACUSACIÓN se olvida | sí (grep: preimagen firmada que no incluye `chain_id`) | **CERRADA-VIGILADA** (voto de vértice atado al `chain_id`; v8.6.38) |
 
 ---
 
@@ -584,6 +585,46 @@ sigue cerrada.
   cada sitio.*
 
 ---
+
+---
+
+## EC-19 — Firma sin binding de INSTANCIA (red/época): vale como evidencia en otra instancia, y la superficie de ACUSACIÓN se olvida
+
+- **Clase:** una firma cuya preimagen no nombra la INSTANCIA del protocolo en la
+  que se emitió (la red, la época, el despliegue) es criptográficamente válida en
+  cualquier otra instancia con las mismas claves. El análisis suele concluir que
+  "está cerrado estructuralmente" mirando la superficie donde el objeto se
+  **CONSUME** normalmente — y se olvida de la superficie donde la MISMA firma se
+  usa como **ACUSACIÓN** (evidencia de mala conducta), que no ejecuta ninguna de
+  esas validaciones estructurales.
+- **Instancia (v8.6.38, hallada retomando #187):** el voto de vértice firmaba
+  `VERTEX_VOTE_V1 ‖ digest`, y el digest es `ronda ‖ autor ‖ batches ‖ parents`.
+  El diferimiento de v6.15.0 lo declaró defensa-en-profundidad marginal porque
+  "un vértice de otra red se rechaza: sus `parents` son digests desconocidos acá".
+  Cierto **para el consenso**. Pero `ReportEquivocation` **no inserta el vértice en
+  ningún DAG**: sólo exige (misma ronda, mismo autor, digests distintos, ambas
+  firmas verifican). Un validador HONESTO que corre la misma clave en dos cadenas
+  —o en dos incarnaciones de la misma red tras un relanzamiento con génesis fresco,
+  que este proyecto hace de rutina— firma UN vértice por ronda en cada una, y
+  juntar los dos era evidencia válida que **le quemaba el bono entero**. Exploit
+  escrito antes del fix: el `process` devolvió `Ok` y el self-stake quedó en 0.
+- **Agravante documental:** el firmante remoto (KM#7) afirmaba en su doc que "los
+  votos están atados a la red por su estructura", y tenía un test llamado
+  `chain_id_binding_rejects_a_wrong_network_request` cuya aserción decía
+  literalmente *"votes unaffected by chain binding"*. **El repo tenía un test que
+  codificaba el hueco** — y por eso ninguna corrida lo iba a delatar.
+- **Causa raíz:** se razonó la resistencia al replay sobre el camino de aceptación
+  y se extrapoló al resto. Es el primo de EC-17 (allá la lista incompleta era de
+  INSTRUCCIONES que una pausa rehúsa; acá es la lista de SUPERFICIES que verifican
+  una misma firma).
+- **Invariante que la cierra:** toda firma nombra su instancia en la preimagen
+  (`chain_id`), no en el contexto que la rodea. Y cuando una firma se puede usar
+  para ACUSAR, esa superficie se audita aparte de la de aceptación: no comparte
+  ninguna de sus validaciones estructurales.
+- **Pregunta recurrente de auditoría:** *para cada firma del sistema — ¿su
+  preimagen nombra la red/época? Y: ¿en qué superficies se verifica esta firma
+  además de aquella donde el objeto se consume, y esas superficies re-ejecutan las
+  validaciones de las que depende el argumento de "está cerrado estructuralmente"?*
 
 ## Registro de auditorías
 
