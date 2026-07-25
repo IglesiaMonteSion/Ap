@@ -2269,8 +2269,10 @@ impl ValidatorV7Program {
         // esta cadena, y "tolerar la ausencia" reabriria exactamente el agujero
         // (una evidencia armada con un vertice de OTRA red quemando un bono
         // honesto). Fail-closed.
-        let chain_pk = *ix.accounts.get(4).ok_or_else(|| ExecError::ProgramError("ReportEquivocation requires accounts[4] = the chain-id singleton (#187)".into()))?;
-        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID || escrow_pk != VALIDATOR_BOND_ESCROW_ID || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID || chain_pk != crate::ids::CHAIN_ID_ACCOUNT_ID {
+        if !ix.accounts.contains(&crate::ids::CHAIN_ID_ACCOUNT_ID) {
+            return Err(ExecError::ProgramError("ReportEquivocation must name the chain-id singleton (#187)".into()));
+        }
+        if registry_pk != VALIDATOR_REGISTRY_ACCOUNT_ID || escrow_pk != VALIDATOR_BOND_ESCROW_ID || unbonding_pk != VALIDATOR_UNBONDING_POOL_ID {
             return Err(ExecError::Unauthorized("ReportEquivocation must name the canonical accounts".into()));
         }
         let chain_id = crate::ids::read_chain_id(accounts)?;

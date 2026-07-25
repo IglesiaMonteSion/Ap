@@ -651,18 +651,22 @@ impl NativeProgram for StakingProgram {
                 // is kept correct; it's tolerated-absent only so a caller that
                 // omits it degrades to a no-op on the counter rather than a
                 // hard rejection (the slash itself still applies either way).
-                let stats_pk = instruction.accounts.get(1).copied();
-                // #187: accounts[2] = el singleton con el `chain_id` de ESTA red,
-                // OBLIGATORIO (fail-closed). El voto se firma como
-                // `VERTEX_VOTE_V1 || chain_id || digest`, asi que sin saber el
-                // chain_id local no hay forma de distinguir una equivocacion REAL
-                // de dos vertices legitimos firmados por el mismo validador en dos
-                // REDES distintas. Tolerar su ausencia reabriria el agujero.
-                let chain_pk = *instruction.accounts.get(2).ok_or_else(|| {
-                    ExecError::ProgramError("ReportEquivocation requires accounts[2] = the chain-id singleton (#187)".into())
-                })?;
-                if chain_pk != crate::ids::CHAIN_ID_ACCOUNT_ID {
-                    return Err(ExecError::Unauthorized("ReportEquivocation must name the canonical chain-id account".into()));
+                // Stats y chain-id se resuelven por PRESENCIA del id canonico, no
+                // por indice: los dos son constantes, asi que "estar nombrado" ya
+                // los fija de forma exacta (nadie puede sustituirlos por otra
+                // cuenta), y ningun llamador queda obligado a nombrar una cuenta
+                // que no necesita solo para alcanzar una posicion fija.
+                let stats_pk = instruction.accounts.iter().copied().find(|a| *a == STAKING_STATS_ID);
+                // #187: el singleton del `chain_id` de ESTA red es OBLIGATORIO
+                // (fail-closed). El voto se firma como
+                // `VERTEX_VOTE_V1 || chain_id || digest`, asi que sin el chain_id
+                // local no hay forma de distinguir una equivocacion REAL de dos
+                // vertices legitimos firmados por el mismo validador en dos REDES
+                // distintas. Tolerar su ausencia reabriria el agujero.
+                if !instruction.accounts.contains(&crate::ids::CHAIN_ID_ACCOUNT_ID) {
+                    return Err(ExecError::ProgramError(
+                        "ReportEquivocation must name the chain-id singleton (#187)".into(),
+                    ));
                 }
                 let chain_id = crate::ids::read_chain_id(accounts)?;
                 // Pin the stats singleton when present (it's optional here) - a
@@ -1829,7 +1833,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -1981,7 +1985,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let report_ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2134,7 +2138,7 @@ mod tests {
 
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(EquivocationEvidence {
                     vertex_a: vertex_chain_a,
@@ -2192,7 +2196,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2238,7 +2242,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2285,7 +2289,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })
@@ -2352,7 +2356,7 @@ mod tests {
         seed_equivocation_singletons(&mut accounts);
         let ix = Instruction {
             program_id: STAKING_PROGRAM_ID,
-            accounts: vec![stake_pk, STAKING_STATS_ID, crate::ids::CHAIN_ID_ACCOUNT_ID],
+            accounts: vec![stake_pk, crate::ids::CHAIN_ID_ACCOUNT_ID],
             data: borsh::to_vec(&StakingInstruction::ReportEquivocation {
                 evidence: Box::new(evidence),
             })

@@ -632,4 +632,5 @@ sigue cerrada.
 |---|---|---|---|
 | Externa v8.6.13 | [`audits/2026-audit-v8.6.13.md`](./audits/2026-audit-v8.6.13.md) | 2C/2A/4M/3B | en corrección (P0 primero) |
 | Composición económica v7 (interna) | [`audits/2026-economic-composition.md`](./audits/2026-economic-composition.md) | 1 real (quema del acumulado admin) + 2 latentes + 1 doc | **CERRADO** (v8.6.37) |
+| #187 binding de red en la firma de consenso (interna) | [`audits/2026-187-vote-chain-binding.md`](./audits/2026-187-vote-chain-binding.md) | 1 ALTO (robo de bono cross-cadena) + 1 medio + 1 doc/test | **CERRADO** (v8.6.38) |
 | KM#10 (adversarial, interna) | [`audits/2026-km10-adversarial.md`](./audits/2026-km10-adversarial.md) | 1 ALTO (robo del bono con freeze activo) + 2 de enumeración/doc | **CERRADO** (v8.6.36) |
