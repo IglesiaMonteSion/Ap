@@ -76,6 +76,13 @@ Tres propiedades que lo hacen un gate y no un adorno:
    script, **sin caché de cargo** (un gate de lanzamiento se construye desde
    cero), y sube el reporte como artefacto.
 
+**Cuánto tarda (esperalo):** entre **1 y 3 horas** en una máquina modesta, y está
+bien que así sea. Lo que domina, medido: el **DST de consenso** (los barridos de
+decenas de semillas bajo pérdida de certificados son CPU-bound — solo ese paso
+puede llevar ~30 min en 4 núcleos), los **dos builds de release completos** de la
+verificación cross-builder (liboqs + wasmtime + winterfell desde cero), y los dos
+harness en vivo. No es un check de PR: es el gate de lanzamiento.
+
 ## Cómo cortar un release firmado
 
 1. Bumpeá la versión (`deploy/bump-version.sh X.Y.Z`), actualizá notas, commiteá.
@@ -141,6 +148,10 @@ defecto:
 - ✅ **Require status checks to pass before merging** → seleccioná los checks del
   CI (`test`, `sdk`, `audit`, `sbom`) → **CI verde sobre el commit antes de fusionar**.
   - ✅ **Require branches to be up to date before merging**
+  - ⚠️ El **gate de mainnet** (`mainnet-gate.yml`) **NO** va acá: corre sin caché
+    y levanta testnets reales, así que como check por-PR sería inviable. Es el
+    gate **de lanzamiento**, que se corre a mano sobre el commit final (ver la
+    sección anterior) y cuyo `report_hash` reproduce un segundo operador.
 - ✅ **Require signed commits** (opcional pero recomendado, va con la firma GPG).
 - ✅ **Do not allow bypassing the above settings** (aplica también a admins).
 

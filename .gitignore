@@ -15,6 +15,13 @@ image-attestation.json
 /release/
 sbom.cdx.json
 
+# Reporte del gate de mainnet (deploy/mainnet-gate.sh) - artefacto por-corrida.
+# IMPORTANTE que esté acá y no sólo en .git/info/exclude: el gate exige un árbol
+# LIMPIO, así que si el reporte quedara como archivo sin trackear, la SEGUNDA
+# corrida del mismo operador (o la del verificador independiente) fallaría
+# `worktree_clean` por su propio artefacto.
+mainnet-gate-report.json
+
 # cargo-fuzz artifacts (task #200)
 /fuzz/target/
 /fuzz/corpus/
