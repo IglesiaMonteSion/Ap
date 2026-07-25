@@ -13,6 +13,7 @@ members = [
     "crates/qchain-remote-signer",
     "crates/qchain-node",
     "crates/qchain-cli",
+    "crates/qchain-byzantine-injector",
     "crates/qchain-faucet",
     "crates/qchain-wallet",
     "crates/qchain-indexer",
@@ -24,7 +25,7 @@ members = [
 exclude = ["crates/qchain-wasm", "crates/qchain-sdk", "fuzz"]
 
 [workspace.package]
-version = "8.6.39"
+version = "8.6.40"
 edition = "2021"
 
 # Defense-in-depth for a ledger: catch integer overflow/underflow as a loud

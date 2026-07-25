@@ -14,6 +14,13 @@ herramienta concreta + criterio de pass/fail, y define el protocolo del soak.
 - **SÍ automatizado (lo que este repo entrega):**
   - `deploy/chaos-test.sh` — inyecta las fallas MECÁNICAS en una máquina y
     verifica convergencia sin fork tras cada una (smoke repetible).
+  - `deploy/byzantine-injector.sh` — el ADVERSARIO real (no mecánico): levanta 3
+    nodos honestos + 1 identidad bizantina del comité (impersonada por
+    `qchain-byzantine-injector`, sin correr su nodo) y le suelta ataques
+    genuinamente firmados — equivocación, withholding de batches, vértice
+    sobre-dimensionado + bytes basura, y flood de tx de un pagador sin fondos —,
+    verificando tras cada uno que la red honesta no forkea Y sigue viva (una tx
+    nueva finaliza). Cada ataque mapea 1:1 a una defensa (#88/#175/#208/#210).
   - `deploy/soak-canary.py` — monitor CONTINUO de las 5 invariantes contra
     TODOS los RPC de la red real, durante todo el soak.
   - `deploy/qchain-watchdog.py` — alertas de runtime (fork, RAM/disco, stall,
@@ -47,13 +54,13 @@ herramienta concreta + criterio de pass/fail, y define el protocolo del soak.
 | **Corrupción de archivos** | El nodo v8.2.0+ **falla-fuerte** (halt) ante un singleton de DINERO corrupto y **tolera** un registro de validadores corrupto (fallback al comité de génesis). Reproducible con el helper de corrupción del store. | Money singleton corrupto → NO arranca (fail-loud); validator registry corrupto → arranca y cae al comité de génesis |
 | **Pérdida, retraso y duplicación de paquetes** | `chaos-test.sh --with-netem` (tc netem loss/delay/duplicate en la iface) | Converge bajo pérdida; al limpiar, sigue sin fork |
 | **Particiones de red** | `chaos-test.sh --with-partition` (iptables DROP entre nodos) · en vivo: firewall entre regiones | Al sanar la partición, converge (sin dos historias) |
-| **Validadores bizantinos** | **DST** escenario `Equivocator` (11/11) + el inyector externo de equivocación (usa una clave de validador para proponer dos vértices en conflicto) | El equivocador es slasheado; la red no forkea |
-| **Batches maliciosos** | Cubierto por el **batch-vertex gating** (#175): un batch no referenciado por un vértice válido nunca se ejecuta ni se persiste. + el inyector de data-availability. | Un batch retenido/basura no cuelga ni forkea la red |
+| **Validadores bizantinos** | **DST** escenario `Equivocator` (11/11) + `deploy/byzantine-injector.sh` (ataque `equivocate`: una clave del comité propone dos vértices en conflicto para la misma ronda) | El equivocador es slasheado (evidencia capturada por un nodo honesto); la red no forkea |
+| **Batches maliciosos** | Cubierto por el **batch-vertex gating** (#175): un batch no referenciado por un vértice válido nunca se ejecuta ni se persiste. + `deploy/byzantine-injector.sh` (ataques `withhold` = vértice que referencia un batch nunca enviado, y `oversized` = 5000 parents + frames de bytes basura, contra las cotas estructurales #208). | Un batch retenido/basura no cuelga ni forkea la red |
 | **Transacciones inválidas** | `qchain stress` mezcla + tx con firma/nonce/fee malos; el nodo las rechaza en admisión. Cubierto por tests de `qchain-execution`. | Rechazadas sin afectar el estado; supply intacto |
 | **Contratos que agotan gas** | Desplegar un contrato busy-loop (ver `SMART-CONTRACTS.md`) y llamarlo con `fee_limit` ajustado; el fuel se cobra al `fee_limit` firmado (#206). | Trap out-of-fuel, se cobra ≤ fee_limit, cambios descartados |
 | **Reinicios en cambios de época** | `chaos-test.sh` (ESCENARIO 3: mata/reinicia en el borde de quanto) | Converge cruzando el borde; sin fork |
 | **Entrada y salida de validadores** | Rotación dinámica (fase 3.3) con `validator_rotation:true` en un testnet dedicado: `register-validator` / `unregister-validator`. **DST** cubre rotación+shrink bajo pérdida de certs. | El comité crece/encoge en el borde de época sin fork |
-| **Slashing** | `report-equivocation` con evidencia real (el inyector la produce). Tests de `qchain-execution::staking`. | El bono del equivocador se quema; converge |
+| **Slashing** | `report-equivocation` con evidencia real (el ataque `equivocate` de `byzantine-injector.sh` la produce y un nodo honesto la CAPTURA por `/equivocation_evidence`). Tests de `qchain-execution::staking`. | El bono del equivocador se quema; converge |
 | **State sync desde cero** | Borrar el `data_dir` de un nodo y reiniciarlo con `state_sync_peers` (#109/#212). | Descarga snapshot verificado (root coincide), resume |
 | **Floods prolongados** | `qchain stress --fire-and-forget` / `--sustained-secs` (ver `run-stress.sh`) durante horas. | Sin fork; el fee sube y DECAE; RAM/disco acotados; nada perdido |
 | **Invariantes de supply y conservación** | `soak-canary.py --genesis-supply <N>` en vivo + el **DST diferencial económico** (`invariants_v7`, #182). | `balances + burned − emitted == génesis` en todo momento y nodo |
@@ -62,11 +69,14 @@ herramienta concreta + criterio de pass/fail, y define el protocolo del soak.
 
 ### 1. Smoke local de las fallas mecánicas (antes de desplegar)
 ```bash
-cargo build --release -p qchain-node -p qchain-cli
-deploy/chaos-test.sh --nodes 4 --rpq 15                     # básico (crash/kill/epoch)
+cargo build --release -p qchain-node -p qchain-cli -p qchain-byzantine-injector
+deploy/chaos-test.sh --nodes 4 --rpq 15                     # MECÁNICO: crash/kill/epoch
 deploy/chaos-test.sh --nodes 4 --with-netem --with-partition  # + red (necesita root: tc/iptables)
+deploy/byzantine-injector.sh                                 # ADVERSARIAL: equivocación/withhold/oversized/flood
 ```
-Debe imprimir `RESULTADO CAOS LOCAL: PASS=N FAIL=0`.
+`chaos-test.sh` debe imprimir `RESULTADO CAOS LOCAL: PASS=N FAIL=0`;
+`byzantine-injector.sh` debe imprimir `VEREDICTO: PASS` (`PASS=6 FAIL=0`) — la red
+honesta no forkeó y siguió viva bajo cada ataque bizantino firmado.
 
 ### 2. Testnet real de 10–20 validadores (varias semanas)
 - Cada operador levanta su nodo (`install-node.sh`), todos con el MISMO

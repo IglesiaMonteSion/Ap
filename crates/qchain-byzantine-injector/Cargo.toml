@@ -1,0 +1,36 @@
+[package]
+name = "qchain-byzantine-injector"
+version.workspace = true
+edition.workspace = true
+
+# Inyector BIZANTINO de primera clase — la contraparte adversarial del harness de
+# caos mecánico (`deploy/chaos-test.sh`, que sólo mata/particiona/corrompe). Este
+# tool corre como un validador MALICIOSO real: sostiene una clave del comité y
+# construye mensajes P2P GENUINAMENTE FIRMADOS (equivocación, withholding de
+# batches, vértices sobre-dimensionados, flood de tx) contra nodos honestos. La
+# `lib` son los BUILDERS puros (unit-testeados, sin red); el `bin` los DIALOGA y
+# los envía por el mismo transporte del nodo. Es una herramienta de TEST — no se
+# despliega en un nodo de producción — pero se compila/testea en el workspace
+# para que no driftee de los tipos reales que ataca.
+[lib]
+name = "qchain_byzantine_injector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qchain-byzantine-injector"
+path = "src/main.rs"
+
+[dependencies]
+# Reusa los tipos REALES que ataca — un mensaje construido acá es byte-idéntico a
+# uno legítimo salvo por el contenido malicioso; nada de re-implementar el wire a
+# mano (que driftearía en silencio).
+qchain-core = { path = "../qchain-core" }
+qchain-crypto = { path = "../qchain-crypto" }
+qchain-network = { path = "../qchain-network" }
+borsh.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
