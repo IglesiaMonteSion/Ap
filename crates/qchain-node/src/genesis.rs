@@ -450,7 +450,12 @@ impl GenesisManifest {
 
         let total_supply_atoms: u128 = accounts.iter().map(|a| a.balance as u128).sum();
 
-        let treasury = if let Ok(Some(state)) = config.treasury_multisig_state() {
+        // `?`, not a tolerant `if let Ok(..)`: `seed_genesis` reads the SAME
+        // config with `?`, so a config the node would refuse to boot on (a
+        // duplicate treasury signer, an inverted threshold hierarchy) must not
+        // quietly produce a manifest that describes a network nobody can
+        // launch. Gate and runtime read identically — the EC-02 discipline.
+        let treasury = if let Some(state) = config.treasury_multisig_state()? {
             config.treasury_amount.map(|amt| {
                 format!(
                     "{}-of-{} multisig, {} QCH locked",

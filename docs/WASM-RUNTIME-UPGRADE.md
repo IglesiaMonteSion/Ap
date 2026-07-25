@@ -74,6 +74,31 @@ por 7 unidades de fuel). Ahora el fuel la cobra sola.
 con un `fee_limit` suficientemente grande puede pagar mucha memoria. El límite
 duro no se puede pagar; el precio sí.
 
+### Qué se puede ROMPER (no sólo encarecer)
+
+El fuel está topeado por `DEFAULT_FUEL_LIMIT` (5 000 000) **sin importar el
+`fee_limit`** — `wasm_fuel_budget(u64::MAX, 1) == DEFAULT_FUEL_LIMIT`, y hay un
+test que lo fija. Combinado con el precio nuevo por byte:
+
+> **Una op de bulk-memory sobre ~5 MB ahora TRAPEA SIEMPRE, a cualquier
+> `fee_limit`.** Bajo wasmtime 27 costaba ~1 fuel. No se arregla firmando un
+> `fee_limit` más alto: el techo de fuel es lo que ata, no el fee.
+
+`memory.grow` sigue plano y barato, así que un contrato todavía puede
+**reservar** hasta 16 MiB — pero ya no puede **inicializarlos de una** con un
+solo `memory.fill`/`memory.copy`.
+
+Esto importa porque **un contrato desplegado es inmutable**: si una red viva
+tuviera un contrato que rellena varios MB de un saque, el cutover lo deja
+inejecutable. Ninguna de las 6 plantillas del SDK está en ese caso (rellenan
+structs de decenas de bytes), pero un contrato de terceros podría estarlo, así
+que **es parte del checklist previo al cutover**, no una nota al pie.
+
+No se movió `DEFAULT_FUEL_LIMIT` a propósito: es consensus-affecting por su
+cuenta (cambia qué trapea → cambia el estado) y no hay una razón de *seguridad*
+para subirlo — el efecto de dejarlo es estrictamente más restrictivo, que es el
+lado correcto en el que equivocarse.
+
 ## Procedimiento de cutover (obligatorio)
 
 Un cambio de fuel **no admite rollout gradual**. Un validador en 27 y otro en 47
@@ -84,6 +109,11 @@ distintos → fork.
    y guardar viejo-vs-nuevo. Si son idénticos, es un update ordinario.
 2. Si hay delta, es **cutover coordinado**: todos los validadores actualizan al
    mismo binario, juntos, no de a uno.
+2-bis. **Revisar los contratos YA desplegados** contra la sección "Qué se puede
+   ROMPER": si alguno queda por encima del techo de fuel con el precio nuevo,
+   deja de ser ejecutable y no hay `fee_limit` que lo salve. Es lo único del
+   cutover que no se puede deshacer del lado del usuario, porque el bytecode
+   desplegado es inmutable.
 3. Verificar en vivo con más de un nodo que una tx que ejecuta un contrato
    converge al **mismo root** en todos.
 4. Actualizar los números pinneados en el mismo commit que sube la versión, con
