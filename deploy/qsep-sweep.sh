@@ -108,6 +108,22 @@ if run EC-19; then
     | grep -vE 'fn (sign|verify)_domain' | while IFS= read -r l; do note "$l"; done
 fi
 
+# ── EC-20: dependencia consensus-affecting disfrazada de normal ────────
+if run EC-20; then
+  head "EC-20  dependencias cuyo COMPORTAMIENTO numérico entra al state root"
+  note "revisar: ¿qué dependencia produce un número que se debita/acredita o"
+  note "se hashea al estado? Esa versión ES una regla de consenso, y actualizarla"
+  note "es un CUTOVER COORDINADO, no un 'cargo update'."
+  note "— pin de la que hoy alimenta consenso (fuel -> gas -> state root):"
+  grep -nE '^wasmtime = ' Cargo.toml 2>/dev/null | while IFS= read -r l; do note "$l"; done
+  note "— rangos MAYORES abiertos (juicio humano: ¿alguno alimenta el estado?):"
+  grep -nE '^[a-z0-9_-]+ = "[0-9]+"$' Cargo.toml 2>/dev/null \
+    | while IFS= read -r l; do note "$l"; done
+  note "— KAT que pinean la cantidad (si falta uno, la clase está ABIERTA):"
+  grep -rnE 'fn fuel_.*pinned|consensus_affecting' crates/qchain-execution/src --include='*.rs' 2>/dev/null \
+    | grep -E 'fn ' | while IFS= read -r l; do note "$l"; done
+fi
+
 # ── Presencia del sistema de aprendizaje ───────────────────────────────
 head "Sistema de aprendizaje (debe existir y estar al día)"
 for f in docs/security/LESSONS-LEDGER.md docs/security/audits; do

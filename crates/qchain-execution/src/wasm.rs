@@ -38,25 +38,31 @@ pub fn derive_pda(program_id: &Pubkey, seed: &[u8]) -> Pubkey {
     Pubkey::new(h.finalize().into())
 }
 
-/// A real, live-confirmed memory-bomb DoS this closes: fuel meters
-/// instructions, not the data volume they touch (confirmed in
-/// wasmtime-cranelift's `fuel_before_op` - every instruction costs exactly 1
-/// fuel regardless of operand size), so `memory.grow`/`memory.fill` can
-/// commit gigabytes of real RAM for a handful of fuel. Measured live: a
-/// 72-byte contract calling `memory.grow` then a single `memory.fill` drove
-/// a validator's RSS from ~9MB to ~1.96GB and blocked it for several real
-/// seconds, for a fuel cost of 7 out of a 5,000,000 budget. 16MiB is
-/// generous for this project's actual reference contracts (a few KB at
-/// most) while making a bomb attempt fail cheaply instead of committing
-/// real memory.
+/// A real, live-confirmed memory-bomb DoS this closes: a 72-byte contract
+/// calling `memory.grow` then a single `memory.fill` drove a validator's RSS
+/// from ~9MB to ~1.96GB and blocked it for several real seconds, for a fuel
+/// cost of **7** out of a 5,000,000 budget — because wasmtime 27 metered
+/// instructions, not the data volume they touched (every op cost exactly 1
+/// fuel regardless of operand size). This limiter is what made that fail
+/// cheaply instead of committing real memory.
+///
+/// Since the wasmtime 47 upgrade the runtime ALSO meters bulk memory ops by
+/// size (`memory.fill`/`memory.copy` now cost ~1 fuel per byte; measured, and
+/// pinned by the fuel KAT in this file's tests), so the original bomb is now
+/// priced out by fuel on its own. `memory.grow` is still flat, and pricing is
+/// not a hard ceiling anyway — a contract with a large enough `fee_limit`
+/// could still buy a lot of memory. So this stays as the hard bound: 16MiB is
+/// generous for this project's actual reference contracts (a few KB at most)
+/// and, unlike a price, cannot be paid past.
 const MAX_CONTRACT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // HOST-CALL FUEL METERING (QCH-WASM-001).
 //
-// Wasmtime's fuel meter charges exactly 1 fuel per *wasm* instruction and
-// nothing for the native work a host call does (confirmed in wasmtime-27's
-// `fuel_before_op`). So an unmetered host call is FREE native CPU: a contract
+// Wasmtime's fuel meter charges ~1 fuel per *wasm* instruction (bulk memory
+// ops are size-metered since 47; everything else is still per-op) and nothing
+// at all for the native work a host call does — the host boundary is outside
+// its accounting entirely. So an unmetered host call is FREE native CPU: a contract
 // could loop `host_verify_signature` (a ~150µs PQC verify) or `host_log`/
 // `host_set_data` with megabyte payloads for near-zero fuel — unbounded work
 // per transaction, one call at a time. We fix that by charging fuel from
@@ -1356,6 +1362,151 @@ mod tests {
             .call(&wasm_bytes, "spin", &[Val::I64(10)], Pubkey::system_program_id(), vec![], vec![], vec![], 0, Pubkey::new([0u8; 32]), 5_000_000)
             .unwrap();
         assert!(ok.trap.is_none(), "a small host-call loop must still complete within budget");
+    }
+
+    /// Known-answer test for the *fuel* a contract burns — the one number in
+    /// this file that is CONSENSUS-AFFECTING.
+    ///
+    /// `Ledger::run_wasm_instruction` turns `fuel_consumed` into a gas fee
+    /// (`fuel × gas_price_per_fuel`), debits the payer with it, and that debit
+    /// lands in the committed state root. So if a runtime upgrade changes how
+    /// many fuel units the SAME bytecode costs, two nodes on different
+    /// wasmtime versions charge different fees for the same transaction and
+    /// **fork**. The upgrade is only safe as a same-binary coordinated cutover,
+    /// and this test is what makes the difference impossible to miss: it pins
+    /// the exact numbers, so a runtime bump either reproduces them or fails
+    /// loudly here with the old and new values side by side.
+    ///
+    /// The cases are chosen to cover the distinct metering surfaces, not just
+    /// "a contract":
+    ///   - `arith`  — straight-line wasm ops (the baseline 1-fuel-per-op rule)
+    ///   - `loop`   — a counted loop (op count scales, so a per-op change shows)
+    ///   - `memory` — `memory.grow` + `memory.fill`, the ops whose fuel is
+    ///     famously independent of operand size (the memory-bomb defense at
+    ///     `MAX_CONTRACT_MEMORY_BYTES` depends on that staying true)
+    ///   - `host`   — a host call, where OUR explicit `charge()` constants
+    ///     dominate; pinning it proves the host-side accounting is unchanged
+    ///   - `trap`   — fuel burned *up to* an explicit trap, the gas-metering
+    ///     bypass closed earlier (a trap must not make compute free)
+    #[test]
+    fn fuel_per_contract_is_a_pinned_known_answer_consensus_affecting() {
+        const ARITH_WAT: &str = r#"
+            (module (func (export "go") (result i64)
+                (local $a i64)
+                (local.set $a (i64.const 7))
+                (local.set $a (i64.mul (local.get $a) (i64.const 3)))
+                (local.set $a (i64.add (local.get $a) (i64.const 11)))
+                (local.get $a)))
+        "#;
+        const LOOP_WAT: &str = r#"
+            (module (func (export "go") (param $n i64)
+                (local $i i64)
+                (block $done (loop $l
+                    (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+                    (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                    (br $l)))))
+        "#;
+        // Split per bulk op on purpose: each is its own metering surface, so a
+        // future runtime change points at the exact opcode instead of at a
+        // lump sum.
+        const MEM_GROW_WAT: &str = r#"
+            (module (memory (export "memory") 1)
+                (func (export "go") (drop (memory.grow (i32.const 16)))))
+        "#;
+        const MEM_FILL_WAT: &str = r#"
+            (module (memory (export "memory") 2)
+                (func (export "go") (memory.fill (i32.const 0) (i32.const 7) (i32.const 65536))))
+        "#;
+        const MEM_COPY_WAT: &str = r#"
+            (module (memory (export "memory") 2)
+                (func (export "go") (memory.copy (i32.const 65536) (i32.const 0) (i32.const 65536))))
+        "#;
+        const HOST_WAT: &str = r#"
+            (module
+                (import "env" "host_get_balance" (func $bal (param i32) (result i64)))
+                (func (export "go") (result i64) (call $bal (i32.const 0))))
+        "#;
+        const TRAP_WAT: &str = r#"
+            (module (func (export "go")
+                (local $i i64)
+                (block $done (loop $l
+                    (br_if $done (i64.ge_s (local.get $i) (i64.const 50)))
+                    (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                    (br $l)))
+                (unreachable)))
+        "#;
+
+        let executor = WasmExecutor::new().unwrap();
+        let mut got = String::new();
+        for (name, wat, params) in [
+            ("arith", ARITH_WAT, vec![]),
+            ("loop", LOOP_WAT, vec![Val::I64(100)]),
+            ("mem_grow", MEM_GROW_WAT, vec![]),
+            ("mem_fill", MEM_FILL_WAT, vec![]),
+            ("mem_copy", MEM_COPY_WAT, vec![]),
+            ("host", HOST_WAT, vec![]),
+            ("trap", TRAP_WAT, vec![]),
+        ] {
+            let bytes = wat::parse_str(wat).unwrap();
+            let r = executor
+                .call(&bytes, "go", &params, Pubkey::system_program_id(), vec![Pubkey::new([1u8; 32])], vec![wallet(1_000)], vec![true], 0, Pubkey::new([0u8; 32]), 5_000_000)
+                .unwrap();
+            got.push_str(&format!("{name}={}\n", r.fuel_consumed));
+        }
+
+        // Measured, not guessed: these are what the pinned runtime actually
+        // charges. A change here is not a test to "update" — it is a
+        // consensus-affecting cutover that every validator must take together.
+        let expected = "\
+arith=12
+loop=905
+mem_grow=3
+mem_fill=65541
+mem_copy=65541
+host=103
+trap=455
+";
+        assert_eq!(got, expected, "WASM fuel accounting CHANGED — this is consensus-affecting (fuel -> gas fee -> state root). Do NOT just update this test: a rolling upgrade would fork the network. See docs/WASM-RUNTIME-UPGRADE.md.");
+    }
+
+    /// The same fuel KAT, but over the **real SDK templates** rather than
+    /// hand-written WAT — because those are the bytecode shapes an actual
+    /// deployed contract has, and a deployed contract is immutable: whatever
+    /// it costs, it costs forever, on every validator.
+    ///
+    /// This is not redundant with the synthetic KAT. `token`, `escrow` and
+    /// `vault` contain `memory.fill` that nobody wrote by hand — LLVM lowers
+    /// Rust's `memset` to it — so a runtime that changes bulk-memory metering
+    /// changes their gas without a single line of contract source changing.
+    /// That is exactly how a fuel change reaches production unnoticed, and
+    /// exactly what this pins.
+    #[test]
+    fn fuel_for_the_real_sdk_templates_is_pinned_consensus_affecting() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../qchain-sdk/templates");
+        let executor = WasmExecutor::new().unwrap();
+        let mut got = String::new();
+        for name in ["counter", "escrow", "payments", "shared_counter", "token", "vault"] {
+            let path = root.join(name).join(format!("{name}.wasm"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("no pude leer {}: {e}", path.display()));
+            // Fixed arity 4 (`sel, a, b, c`) — the SDK's `entrypoint!` shape.
+            // Selector 0 with zero args: most templates reject it, and that's
+            // fine — a trap still burns real fuel up to the failure point, and
+            // that number is what gets billed and must stay stable.
+            let r = executor
+                .call(&bytes, "run", &[Val::I64(0), Val::I64(0), Val::I64(0), Val::I64(0)], Pubkey::system_program_id(), vec![Pubkey::new([1u8; 32])], vec![wallet(1_000)], vec![true], 0, Pubkey::new([0u8; 32]), 5_000_000)
+                .unwrap();
+            got.push_str(&format!("{name}={}\n", r.fuel_consumed));
+        }
+
+        let expected = "\
+counter=238
+escrow=269
+payments=8
+shared_counter=123
+token=17
+vault=270
+";
+        assert_eq!(got, expected, "el fuel de un template REAL cambió — es consensus-affecting (fuel -> gas -> state root). Ver docs/WASM-RUNTIME-UPGRADE.md antes de tocar este número.");
     }
 
     /// QCH-WASM-002: a contract is validated at deploy — it must compile and

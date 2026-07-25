@@ -54,6 +54,55 @@ sigue cerrada.
 | EC-17 | Control de PAUSA/BLOQUEO gateado en una decisión pero no en toda la superficie que promete detener | no (enumeración manual de instrucciones) | **CERRADA-VIGILADA** (KM#9 freeze → robo del bono; corregido v8.6.36 por la pasada adversarial KM#10) |
 | EC-18 | Protección cableada a una identidad HARDCODEADA mientras el valor se rutea a una CONFIGURABLE | sí (grep: constante usada donde existe un campo de config homónimo) | **CERRADA-VIGILADA** (barrido de polvo vs. `admin_fee_wallet`; corregido v8.6.37) |
 | EC-19 | Firma sin binding de INSTANCIA (red/época): vale como evidencia en otra instancia — y la superficie de ACUSACIÓN se olvida | sí (grep: preimagen firmada que no incluye `chain_id`) | **CERRADA-VIGILADA** (voto de vértice atado al `chain_id`; v8.6.38) |
+| EC-20 | Dependencia cuyo COMPORTAMIENTO alimenta el consenso, declarada como una dependencia normal — nada en el `Cargo.toml` dice que actualizarla es un hard fork | sí (KAT de la cantidad que entra al estado) | **CERRADA-VIGILADA** (fuel de wasmtime → gas → state root; KAT pinneado + doc de cutover, v8.6.42) |
+
+---
+
+## EC-20 — Dependencia consensus-affecting disfrazada de dependencia normal
+
+- **Clase:** una dependencia externa cuyo **comportamiento numérico** entra en el
+  estado comprometido. Su versión es de facto una regla de consenso, pero se
+  declara igual que `hex` o `anyhow`, así que un `cargo update` de rutina, un
+  rango de versión abierto, o dos operadores resolviendo distinto producen un
+  **fork sin que nadie haya tocado código de consenso**.
+- **Causa raíz:** el proyecto sabía que el fuel se convierte en fee (por eso
+  existe `wasm_fuel_budget` atado al `fee_limit` firmado, #206) pero esa cadena
+  —fuel → gas → débito → hoja Merkle → state root— nunca estaba **forzada** por
+  un chequeo: vivía en comentarios. Un doc que afirma una propiedad no la
+  garantiza; es el mismo patrón que ya cerró EC-16 ("acotado" ≠ "eliminado") y
+  el hueco que destapó el gate de mainnet (#3): una afirmación en un comentario
+  no es un gate.
+- **Instancias:**
+  - v8.6.42 wasmtime 27 → 47 (encontrado por el gate de mainnet en su PRIMERA
+    corrida, vía `cargo audit`, no por revisión dirigida). La actualización era
+    obligatoria por **RUSTSEC-2026-0096** (9.0, sandbox escape en aarch64
+    Cranelift — alcanzable: el proyecto usa Cranelift y ARM es objetivo de
+    despliegue). **Medido, no supuesto:** `memory.fill`/`memory.copy` pasaron de
+    costar ~1 fuel plano a **~1 fuel por byte** (el caso `grow+fill(64KiB)`:
+    7 → 65 543). Todo lo demás —aritmética, loops, host calls, fuel-hasta-el-trap,
+    `memory.grow`— **idéntico**. No es teórico: `token`, `escrow` y `vault` del
+    SDK **contienen `memory.fill` que nadie escribió** (LLVM baja el `memset` de
+    Rust), así que su gas cambia sin que cambie una línea de contrato.
+- **Invariante que la cierra:** toda cantidad producida por una dependencia que
+  termine en el estado comprometido tiene un **KAT con el número medido**. Un
+  KAT que falla no es un test para actualizar: es el aviso de que la red
+  necesita un **cutover coordinado**.
+- **Detección:** `fuel_per_contract_is_a_pinned_known_answer_consensus_affecting`
+  (WAT sintético, una superficie de medición por caso) y
+  `fuel_for_the_real_sdk_templates_is_pinned_consensus_affecting` (los 6
+  templates reales). El segundo no es redundante: cubre el bytecode que un
+  contrato desplegado realmente tiene, incluidas las instrucciones que el
+  compilador emite solo.
+- **Pregunta recurrente:** *¿qué dependencias producen un número que entra al
+  state root, y cuál de ellas está pinneada sólo por rango en vez de por un KAT
+  del número?* Hoy: wasmtime (fuel) — pinneada a rango MENOR + dos KAT. Candidatas
+  a revisar si alguna vez alimentan estado: `winterfell` (si una prueba se
+  volviera parte del estado en vez de un artefacto verificable aparte) y
+  cualquier cambio de `sha3`/`ed25519-dalek`/`oqs` que altere bytes de salida
+  (hoy fijos por sus propios KAT y vectores oficiales).
+- **Límite honesto:** un KAT prueba que el número **no cambió**; no prueba que el
+  número sea el correcto. Para eso está el resto del arsenal (invariantes
+  económicas, DST, harness en vivo).
 
 ---
 
