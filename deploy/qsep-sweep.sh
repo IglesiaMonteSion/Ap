@@ -95,6 +95,19 @@ if run EC-13; then
     | grep -vE 'test|//' | while IFS= read -r l; do note "$l"; done
 fi
 
+# ── EC-19: firma sin binding de INSTANCIA ──────────────────────────────
+if run EC-19; then
+  head "EC-19  preimágenes firmadas: ¿nombran la red/época? ¿quién más las verifica?"
+  note "revisar por cada dominio: (a) su preimagen incluye chain_id/época,"
+  note "(b) qué superficies la verifican ADEMÁS de donde se consume el objeto,"
+  note "(c) esas superficies re-ejecutan las validaciones del argumento 'ya está cerrado'."
+  grep -rnE 'pub const [A-Z_]+_V[0-9]+: &\[u8\]' crates/qchain-crypto/src --include='*.rs' 2>/dev/null \
+    | while IFS= read -r l; do note "$l"; done
+  note "— sitios que construyen/verifican una preimagen con dominio:"
+  grep -rnE '(sign|verify)_domain\(' crates --include='*.rs' 2>/dev/null \
+    | grep -vE 'fn (sign|verify)_domain' | while IFS= read -r l; do note "$l"; done
+fi
+
 # ── Presencia del sistema de aprendizaje ───────────────────────────────
 head "Sistema de aprendizaje (debe existir y estar al día)"
 for f in docs/security/LESSONS-LEDGER.md docs/security/audits; do

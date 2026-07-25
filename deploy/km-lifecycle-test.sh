@@ -78,6 +78,9 @@ assert_same_root() {
 vfield() { rpc "$1" /validator_v7_registry | jqf "[v for v in d['validators'] if v['address']=='$CONS'][0]['$2']"; }
 # The recovery-committee entry (and its anti-replay nonce) for OUR validator.
 rfield() { rpc "$1" /validator_v7_recovery | jqf "[c for c in d['committees'] if c['consensus_address']=='$CONS'][0]['$2']"; }
+# The network's chain_id — every recovery approval is bound to it (#187), so a
+# signature collected for one network can never authorize a recovery op on another.
+cid()    { rpc "$1" /chain_id | jqf "d['chain_id']"; }
 
 log "0. building a 2-validator economics_v7 testnet in $WORK"
 mkdir -p "$WORK"/{manifests,n1,n2}
@@ -175,11 +178,12 @@ assert_same_root "after the attacker's proposal"
 
 log "4. DEFENSE — the recovery committee EMERGENCY-FREEZES the validator"
 NONCE=$(rfield "$RPC1" nonce)
+CHAIN_ID=$(cid "$RPC1")
 FREEZE_UNTIL=1000000
 A1=$("$BIN/qchain" v7-recovery-sign --recovery-keypair rs1.json --consensus-address "$CONS" \
-      --recovery-nonce "$NONCE" --op freeze --until-quanto $FREEZE_UNTIL | tail -1)
+      --recovery-nonce "$NONCE" --chain-id "$CHAIN_ID" --op freeze --until-quanto $FREEZE_UNTIL | tail -1)
 A2=$("$BIN/qchain" v7-recovery-sign --recovery-keypair rs2.json --consensus-address "$CONS" \
-      --recovery-nonce "$NONCE" --op freeze --until-quanto $FREEZE_UNTIL | tail -1)
+      --recovery-nonce "$NONCE" --chain-id "$CHAIN_ID" --op freeze --until-quanto $FREEZE_UNTIL | tail -1)
 "$BIN/qchain" v7-recover-op --rpc "$RPC1" --keypair relayer.json --consensus-address "$CONS" \
   --op freeze --until-quanto $FREEZE_UNTIL --approvals "$A1,$A2" >/dev/null
 sleep 3
@@ -229,9 +233,9 @@ assert_same_root "after killing and restarting node 2"
 log "7. RECOVERY — the committee lifts the pause, the honest lifecycle resumes"
 NONCE=$(rfield "$RPC1" nonce)
 U1=$("$BIN/qchain" v7-recovery-sign --recovery-keypair rs1.json --consensus-address "$CONS" \
-      --recovery-nonce "$NONCE" --op unfreeze | tail -1)
+      --recovery-nonce "$NONCE" --chain-id "$CHAIN_ID" --op unfreeze | tail -1)
 U2=$("$BIN/qchain" v7-recovery-sign --recovery-keypair rs3.json --consensus-address "$CONS" \
-      --recovery-nonce "$NONCE" --op unfreeze | tail -1)
+      --recovery-nonce "$NONCE" --chain-id "$CHAIN_ID" --op unfreeze | tail -1)
 "$BIN/qchain" v7-recover-op --rpc "$RPC1" --keypair relayer.json --consensus-address "$CONS" \
   --op unfreeze --approvals "$U1,$U2" >/dev/null
 sleep 3

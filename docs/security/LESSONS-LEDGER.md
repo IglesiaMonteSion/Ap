@@ -613,6 +613,27 @@ sigue cerrada.
   `chain_id_binding_rejects_a_wrong_network_request` cuya aserción decía
   literalmente *"votes unaffected by chain binding"*. **El repo tenía un test que
   codificaba el hueco** — y por eso ninguna corrida lo iba a delatar.
+- **Segunda instancia (v8.6.38, hallada por el barrido MECÁNICO de la clase — la
+  prueba de que el sweep vale):** al agregar la sección EC-19 a `qsep-sweep.sh`
+  (lista los 11 dominios y todos los sitios que construyen/verifican una preimagen)
+  saltó `RECOVERY_AUTH_V1`. Su preimagen era `validador ‖ op ‖ param ‖ nonce` — sin
+  red — y su propio doc decía *"anti-replay dentro de la red, consistente con
+  `pop_message`, que tampoco ata chain_id"*: la MISMA extrapolación, escrita. Una
+  aprobación de recuperación es un artefacto OFFLINE independiente **y el relayer es
+  PERMISSIONLESS**, así que las firmas juntadas legítimamente en la cadena A (un
+  `Revoke` real por clave perdida) revocaban/congelaban en la B a un validador
+  honesto cuyo operador nunca consintió — con el nonce de recuperación arrancando
+  en 0 en ambas tras un relanzamiento. El nonce es anti-replay DENTRO de una red;
+  no dice nada entre redes. **Test con dientes:** revertir el binding hace fallar
+  `recovery_approvals_from_another_chain_must_not_revoke_a_validator_here`.
+- **Resultado NEGATIVO del mismo barrido (igual de valioso, documentado para no
+  re-litigarlo):** `VALIDATOR_POP_V1` y `KEY_ROTATION_ACCEPT_V1` tampoco atan la
+  red, pero **no son alcanzables**: la instrucción que los consume exige que el
+  PAYER sea la clave fría de operador y la firma de esa transacción SÍ está atada
+  al `chain_id` (va en el `Message`). Replayar el PoP sólo permite que el mismo
+  operador haga en su red lo que ya podía hacer. `TXID_V1` no es una autorización;
+  `KEYSTORE_HKDF_V2` y `KM_AUDIT_V1` no son firmas de autorización cruzada;
+  `STATE_CHECKPOINT_V1` y `NETWORK_KEY_CERT_V1` ya incluían `chain_id` explícito.
 - **Causa raíz:** se razonó la resistencia al replay sobre el camino de aceptación
   y se extrapoló al resto. Es el primo de EC-17 (allá la lista incompleta era de
   INSTRUCCIONES que una pausa rehúsa; acá es la lista de SUPERFICIES que verifican

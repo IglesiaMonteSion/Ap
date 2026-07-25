@@ -216,13 +216,24 @@ impl RecoveryOp {
 }
 
 /// (KM#4/#9) The preimage each recovery signer signs OFFLINE (domain
-/// `RECOVERY_AUTH_V1`). Binds the target validator, the op TAG, the op PARAMETER
-/// (a `until_quanto`), and the current per-validator recovery nonce (anti-replay
-/// within the network — consistent with `pop_message`, which also does not bind
-/// chain_id). Binding the tag+param means an approval collected for one op/param
-/// can never be replayed for a different one.
-pub fn recovery_message(consensus_address: &Pubkey, op: RecoveryOp, nonce: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(32 + 1 + 8 + 8);
+/// `RECOVERY_AUTH_V1`). Binds **la red** (`chain_id`), el validador objetivo, el
+/// TAG de la op, su PARÁMETRO (un `until_quanto`) y el nonce de recuperación
+/// vigente de ese validador. Atar tag+param significa que una aprobación juntada
+/// para una op/param no puede autorizar otra.
+///
+/// **Por qué el `chain_id` (tarea #187, clase EC-19).** Una aprobación de
+/// recuperación es un artefacto OFFLINE e independiente: el relayer es
+/// PERMISSIONLESS, así que quien tenga las firmas las puede presentar. Sin atar
+/// la red, las aprobaciones juntadas legítimamente en la cadena A (p. ej. un
+/// `Revoke` real por clave perdida) valen tal cual en la cadena B — y relanzar
+/// con génesis fresco manteniendo las MISMAS claves de validador y comité está
+/// documentado como procedimiento normal (§15), con el nonce de recuperación
+/// arrancando en 0 en ambas. El resultado sería revocar/congelar en B a un
+/// validador honesto cuyo operador nunca consintió. El nonce es anti-replay
+/// DENTRO de una red; no dice nada entre redes.
+pub fn recovery_message(chain_id: &[u8; 32], consensus_address: &Pubkey, op: RecoveryOp, nonce: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(32 + 32 + 1 + 8 + 8);
+    m.extend_from_slice(chain_id);
     m.extend_from_slice(&consensus_address.0);
     m.push(op.tag());
     m.extend_from_slice(&op.param().to_le_bytes());
@@ -1601,7 +1612,9 @@ impl ValidatorV7Program {
     /// - **SetExpiry** (KM#9) — mandatory consensus-key rotation deadline.
     ///
     /// Every op is APPENDED to the hash-chained KM audit trail. accounts =
-    /// [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL, STAKING_GLOBAL, KM_AUDIT_LOG].
+    /// [payer, REGISTRY, RECOVERY_REGISTRY, BOND_ESCROW, VALIDATOR_UNBONDING_POOL,
+    /// STAKING_GLOBAL, KM_AUDIT_LOG, CHAIN_ID] — el último para verificar las
+    /// aprobaciones bajo el `chain_id` de ESTA red (#187).
     fn recover_op(accounts: &mut HashMap<Pubkey, Account>, ix: &Instruction, _payer: &Pubkey, consensus_address: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
         let registry_pk = *ix.accounts.get(1).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[1]".into()))?;
         let recovery_pk = *ix.accounts.get(2).ok_or_else(|| ExecError::ProgramError("RecoverOp requires accounts[2]".into()))?;
@@ -1627,9 +1640,17 @@ impl ValidatorV7Program {
         }
         let signer_set: std::collections::HashSet<Pubkey> = rec.entries[ridx].config.signers.iter().copied().collect();
         let nonce = rec.entries[ridx].nonce;
-        // The exact bytes each recovery signer signed OFFLINE — binds the op TAG and
-        // its PARAMETER, so an approval for one op/param can't authorize another.
-        let msg = recovery_message(&consensus_address, op, nonce);
+        // The exact bytes each recovery signer signed OFFLINE — binds LA RED, the op
+        // TAG and its PARAMETER, so an approval for one op/param (o para OTRA cadena)
+        // can't authorize this one. Fail-closed: sin el singleton de chain_id
+        // pinneado, la instrucción se rechaza (nunca un default, clase EC-18/EC-19).
+        if !ix.accounts.contains(&crate::ids::CHAIN_ID_ACCOUNT_ID) {
+            return Err(ExecError::Unauthorized(
+                "RecoverOp must name the chain-id singleton (#187)".into(),
+            ));
+        }
+        let chain_id = crate::ids::read_chain_id(accounts)?;
+        let msg = recovery_message(&chain_id, &consensus_address, op, nonce);
         // Count DISTINCT valid approvals from REGISTERED signers. An approval whose
         // signer isn't registered, or whose signature doesn't verify, is IGNORED
         // (not counted) — so padded/garbage approvals can't grief a real quorum.
@@ -2371,12 +2392,12 @@ mod tests {
     fn ix(data: &ValidatorV7Instruction, accts: Vec<Pubkey>) -> Instruction {
         Instruction { program_id: STAKING_PROGRAM_ID, accounts: accts, data: borsh::to_vec(data).unwrap() }
     }
-    /// Siembra el singleton del `chain_id` que `ReportEquivocation` exige (#187).
+    /// Siembra el singleton del `chain_id` que `ReportEquivocation` y `RecoverOp`
+    /// exigen (#187). Idempotente: no pisa un valor ya sembrado.
     fn seed_chain_id(accounts: &mut HashMap<Pubkey, Account>) {
-        accounts.insert(
-            crate::ids::CHAIN_ID_ACCOUNT_ID,
-            Account { data: V7_TEST_CHAIN.to_vec(), ..Account::new_wallet(Pubkey::system_program_id()) },
-        );
+        accounts.entry(crate::ids::CHAIN_ID_ACCOUNT_ID).or_insert_with(|| {
+            Account { data: V7_TEST_CHAIN.to_vec(), ..Account::new_wallet(Pubkey::system_program_id()) }
+        });
     }
 
     fn set_quanto(accounts: &mut HashMap<Pubkey, Account>, q: u64) {
@@ -2396,6 +2417,9 @@ mod tests {
     /// `consensus` (hot, block-signing) key, optionally routing to a cold
     /// `withdrawal` address. The consensus key produces the proof-of-possession.
     fn register_full(accounts: &mut HashMap<Pubkey, Account>, operator: &Keypair, consensus: &Keypair, withdrawal: Option<Pubkey>, moniker: &str) -> Result<(), ExecError> {
+        // Toda red REAL siembra el singleton del chain_id en génesis; los tests que
+        // registran un validador modelan esa red (#187).
+        seed_chain_id(accounts);
         let norm = normalize_moniker(moniker);
         let wd = withdrawal.unwrap_or(operator.pubkey());
         let pop = qchain_crypto::sign_domain(consensus, qchain_crypto::domains::VALIDATOR_POP_V1, &pop_message(&operator.pubkey(), &wd, &norm)).unwrap();
@@ -2523,9 +2547,15 @@ mod tests {
         let relayer = Keypair::generate().unwrap();
         apply_key_change(accounts, &relayer, consensus, KeyChangeKind::RecoveryCommittee)
     }
-    /// One recovery signer's OFFLINE approval of a Revoke of `consensus` at `nonce`.
+    /// One recovery signer's OFFLINE approval of a Revoke of `consensus` at `nonce`,
+    /// bound to THIS test network.
     fn approve(signer: &Keypair, consensus: Pubkey, nonce: u64) -> RecoveryApproval {
-        let msg = recovery_message(&consensus, RecoveryOp::Revoke, nonce);
+        approve_on_chain(&V7_TEST_CHAIN, signer, consensus, RecoveryOp::Revoke, nonce)
+    }
+    /// The same approval but signed for an ARBITRARY network — the knob the
+    /// cross-chain replay test needs (#187).
+    fn approve_on_chain(chain: &[u8; 32], signer: &Keypair, consensus: Pubkey, op: RecoveryOp, nonce: u64) -> RecoveryApproval {
+        let msg = recovery_message(chain, &consensus, op, nonce);
         let sig = qchain_crypto::sign_domain(signer, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg).unwrap();
         RecoveryApproval { bundle: signer.public_key_bundle(), signature: sig }
     }
@@ -2534,14 +2564,12 @@ mod tests {
     }
     /// One recovery signer's OFFLINE approval of `op` on `consensus` at `nonce`.
     fn approve_op(signer: &Keypair, consensus: Pubkey, op: RecoveryOp, nonce: u64) -> RecoveryApproval {
-        let msg = recovery_message(&consensus, op, nonce);
-        let sig = qchain_crypto::sign_domain(signer, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg).unwrap();
-        RecoveryApproval { bundle: signer.public_key_bundle(), signature: sig }
+        approve_on_chain(&V7_TEST_CHAIN, signer, consensus, op, nonce)
     }
     /// Submit a `RecoverOp` (KM#4/#9) with the canonical account list (incl. the KM audit log).
     fn recover_op_tx(accounts: &mut HashMap<Pubkey, Account>, relayer: &Keypair, consensus: Pubkey, op: RecoveryOp, approvals: Vec<RecoveryApproval>) -> Result<(), ExecError> {
         let data = ValidatorV7Instruction::RecoverOp { consensus_address: consensus, op, approvals };
-        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID]), &relayer.pubkey())
+        ValidatorV7Program::execute(accounts, &ix(&data, vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID, crate::ids::CHAIN_ID_ACCOUNT_ID]), &relayer.pubkey())
     }
 
     #[test]
@@ -2648,6 +2676,99 @@ mod tests {
             approve(&signer_kps[4], cons.pubkey(), 0),
         ];
         assert!(revoke(&mut accounts, &relayer, cons.pubkey(), replay).is_err(), "replayed old-nonce authorization rejected");
+    }
+
+    /// **#187 / clase EC-19 — replay CROSS-CADENA de una autorización de
+    /// recuperación.** Una aprobación de recuperación es un artefacto OFFLINE
+    /// independiente y el relayer es PERMISSIONLESS: quien tenga las firmas las
+    /// presenta. Antes del binding de red, `recovery_message` era función de
+    /// (validador, op, param, nonce) — nada nombraba la cadena —, así que las
+    /// aprobaciones juntadas legítimamente en la cadena A valían TAL CUAL en la B.
+    /// Relanzar con génesis fresco conservando las MISMAS claves de validador y el
+    /// MISMO comité está documentado como procedimiento normal (§15) y el nonce de
+    /// recuperación arranca en 0 en ambas → un `Revoke` real de A revocaba en B a
+    /// un validador honesto cuyo operador nunca consintió (estado `Revoked` + bono
+    /// al pool de unbonding). El nonce es anti-replay DENTRO de una red; no dice
+    /// nada entre redes.
+    ///
+    /// Con el binding, la MISMA quórum-cantidad de firmas de otra cadena no cuenta
+    /// ni una sola aprobación → la op se rechaza y el validador queda intacto.
+    #[test]
+    fn recovery_approvals_from_another_chain_must_not_revoke_a_validator_here() {
+        const OTHER_CHAIN: [u8; 32] = [0xD9; 32];
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "cross-chain-node").unwrap();
+        let signer_kps: Vec<Keypair> = (0..3).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        assert_ne!(V7_TEST_CHAIN, OTHER_CHAIN);
+
+        // Aprobaciones VÁLIDAS, de firmantes REGISTRADOS, con el nonce correcto —
+        // pero juntadas en OTRA red. Quórum de sobra (3 >= threshold 2).
+        let from_other_chain: Vec<RecoveryApproval> = signer_kps
+            .iter()
+            .map(|k| approve_on_chain(&OTHER_CHAIN, k, cons.pubkey(), RecoveryOp::Revoke, 0))
+            .collect();
+        assert!(
+            revoke(&mut accounts, &relayer, cons.pubkey(), from_other_chain).is_err(),
+            "una autorización de recuperación de OTRA cadena no puede revocar acá (#187)"
+        );
+        // El validador honesto quedó INTACTO: ni estado ni bono se movieron.
+        assert_ne!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked);
+        assert_eq!(accounts.get(&VALIDATOR_BOND_ESCROW_ID).unwrap().balance, VALIDATOR_BOND_ATOMS, "el bono no se tocó");
+        assert_eq!(accounts.get(&VALIDATOR_UNBONDING_POOL_ID).map(|a| a.balance).unwrap_or(0), 0);
+        assert_eq!(recovery_of(&accounts).entries[0].nonce, 0, "el nonce no avanzó");
+
+        // Y el camino legítimo (mismas claves, MISMA red) sigue funcionando.
+        let here = vec![
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&signer_kps[1], cons.pubkey(), 0),
+        ];
+        revoke(&mut accounts, &relayer, cons.pubkey(), here).unwrap();
+        assert_eq!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked);
+    }
+
+    /// El singleton del `chain_id` es OBLIGATORIO en `RecoverOp`: sin él no hay
+    /// contra qué verificar las aprobaciones, y tolerar su ausencia (o caer a un
+    /// default) reabriría el replay cross-cadena — fail-closed a propósito.
+    #[test]
+    fn recover_op_without_the_chain_id_singleton_is_rejected() {
+        let mut accounts = HashMap::new();
+        let op = Keypair::generate().unwrap();
+        let cons = Keypair::generate().unwrap();
+        accounts.insert(op.pubkey(), wallet(600 * UNITS_PER_QCH, Pubkey::system_program_id()));
+        register_full(&mut accounts, &op, &cons, None, "no-chain-id").unwrap();
+        let signer_kps: Vec<Keypair> = (0..2).map(|_| Keypair::generate().unwrap()).collect();
+        let signers: Vec<Pubkey> = signer_kps.iter().map(|k| k.pubkey()).collect();
+        set_recovery_now(&mut accounts, &op, cons.pubkey(), &signers, 2).unwrap();
+        let relayer = Keypair::generate().unwrap();
+        accounts.insert(relayer.pubkey(), wallet(10 * UNITS_PER_QCH, Pubkey::system_program_id()));
+
+        let approvals = vec![
+            approve(&signer_kps[0], cons.pubkey(), 0),
+            approve(&signer_kps[1], cons.pubkey(), 0),
+        ];
+        let data = ValidatorV7Instruction::RecoverOp { consensus_address: cons.pubkey(), op: RecoveryOp::Revoke, approvals };
+        // Lista canónica SIN el singleton de chain_id.
+        let accts = vec![
+            relayer.pubkey(),
+            VALIDATOR_REGISTRY_ACCOUNT_ID,
+            VALIDATOR_RECOVERY_REGISTRY_ID,
+            VALIDATOR_BOND_ESCROW_ID,
+            VALIDATOR_UNBONDING_POOL_ID,
+            STAKING_GLOBAL_ID,
+            VALIDATOR_KM_AUDIT_LOG_ID,
+        ];
+        assert!(
+            ValidatorV7Program::execute(&mut accounts, &ix(&data, accts), &relayer.pubkey()).is_err(),
+            "sin el singleton de chain_id la op debe rechazarse, nunca caer a un default"
+        );
+        assert_ne!(registry_of(&accounts).validators[0].state, ValidatorV7State::Revoked);
     }
 
     #[test]

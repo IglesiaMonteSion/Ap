@@ -550,6 +550,12 @@ enum Command {
         /// The validator's current recovery nonce.
         #[arg(long)]
         recovery_nonce: u64,
+        /// The TARGET NETWORK's chain_id, hex (64 chars). Get it from `GET /chain_id`
+        /// on any node of that network. The approval is bound to it (#187), so an
+        /// approval signed for one network can never authorize a recovery op on
+        /// another — the recovery nonce is anti-replay WITHIN a network only.
+        #[arg(long)]
+        chain_id: String,
         /// The recovery op: revoke | freeze | unfreeze | set-expiry.
         #[arg(long, default_value = "revoke")]
         op: String,
@@ -2251,11 +2257,15 @@ fn main() -> anyhow::Result<()> {
                 println!("PROPOSED a {threshold}-of-{} OFFLINE recovery committee for v7 validator {target} (KM#5 timelock ~7d; apply with `v7-apply-key-change --kind recovery` after the window)", signer_pks.len());
             }
         }
-        Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce, op, until_quanto } => {
+        Command::V7RecoverySign { recovery_keypair, consensus_address, recovery_nonce, chain_id, op, until_quanto } => {
             let kp = qchain_crypto::read_keypair_file(&recovery_keypair)?;
             let target: qchain_crypto::Pubkey = consensus_address.parse().map_err(|e| anyhow::anyhow!("invalid --consensus-address: {e}"))?;
             let recovery_op = parse_recovery_op(&op, until_quanto)?;
-            let msg = qchain_execution::validator_v7::recovery_message(&target, recovery_op, recovery_nonce);
+            let chain: [u8; 32] = hex::decode(chain_id.trim_start_matches("0x"))
+                .map_err(|e| anyhow::anyhow!("invalid --chain-id (expected 64 hex chars): {e}"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid --chain-id: must be exactly 32 bytes (64 hex chars)"))?;
+            let msg = qchain_execution::validator_v7::recovery_message(&chain, &target, recovery_op, recovery_nonce);
             let sig = qchain_crypto::sign_domain(&kp, qchain_crypto::domains::RECOVERY_AUTH_V1, &msg)?;
             let approval = RecoveryApproval { bundle: kp.public_key_bundle(), signature: sig };
             let hex = hex::encode(borsh::to_vec(&approval)?);
@@ -2283,7 +2293,7 @@ fn main() -> anyhow::Result<()> {
                 &rpc,
                 &relayer,
                 VALIDATOR_V7_PROGRAM_ID,
-                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID],
+                vec![relayer.pubkey(), VALIDATOR_REGISTRY_ACCOUNT_ID, VALIDATOR_RECOVERY_REGISTRY_ID, VALIDATOR_BOND_ESCROW_ID, VALIDATOR_UNBONDING_POOL_ID, STAKING_GLOBAL_ID, VALIDATOR_KM_AUDIT_LOG_ID, qchain_execution::ids::CHAIN_ID_ACCOUNT_ID],
                 data,
                 nonce,
                 fee_limit,

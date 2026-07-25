@@ -4513,7 +4513,7 @@ mod tests {
         ledger.apply_transaction(&tx, &validator, 0).unwrap();
         assert!(ledger.dust_burned > 0, "this scenario must actually sweep dust, or it proves nothing");
 
-        let accounts: HashMap<Pubkey, Account> = ledger.store().iter().into_iter().collect();
+        let accounts: HashMap<Pubkey, Account> = ledger.store().iter().collect();
         let tally = SupplyTally {
             genesis,
             minted: ledger.total_emitted as u128,

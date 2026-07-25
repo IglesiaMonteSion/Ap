@@ -149,7 +149,9 @@ puede cerrar de forma segura y verificable.
 `v7-set-recovery` (la clave FRÍA de operador fija/reemplaza/limpia el comité —
 `--signers` CSV base58, `--threshold` M; se hace ANTES de cualquier compromiso, no
 necesita las claves de recuperación), `v7-recovery-sign` (OFFLINE, sin red: firma
-una aprobación y la imprime en hex para dársela al relayer), `v7-recover-revoke`
+una aprobación y la imprime en hex para dársela al relayer; desde #187 exige
+`--chain-id`, el `chain_id` de la red objetivo — se obtiene de `GET /chain_id` de
+cualquier nodo de esa red —, así una aprobación NUNCA vale en otra cadena), `v7-recover-revoke`
 (el relayer envía las M aprobaciones en una tx). RPC read-only:
 `/validator_v7_recovery` (lista los comités con firmantes/threshold/nonce). Nuevas
 instrucciones v7 `SetRecoveryCommittee`/`RecoverRevoke` y el estado `Revoked`
@@ -527,8 +529,8 @@ execution/node/cli/crypto — consenso/simulación intactos).
 
 **DESPLIEGUE.** Cutover coordinado al actualizar el binario (el registro migra V3→V4
 tolerante; byte-idéntico en comportamiento hasta que se USE un freeze/expiry). Para
-congelar de emergencia: cada firmante de recuperación corre `v7-recovery-sign --op
-freeze --until-quanto Q` OFFLINE, un relayer junta las M firmas y envía `v7-recover-op
+congelar de emergencia: cada firmante de recuperación corre `v7-recovery-sign
+--chain-id <chain_id de la red> --op freeze --until-quanto Q` OFFLINE, un relayer junta las M firmas y envía `v7-recover-op
 --op freeze --until-quanto Q --approvals ...`; se levanta con `--op unfreeze`.
 
 ## #10 — Pruebas multinodo + adversariales del ciclo de vida (HECHO, v8.6.36)
